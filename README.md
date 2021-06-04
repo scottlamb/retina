@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/scottlamb/retina/workflows/CI/badge.svg)](https://github.com/scottlamb/retina/actions?query=workflow%3ACI)
 
-High-level RTSP multimedia RTSP streaming library, in Rust. Good support for
+High-level RTSP multimedia streaming library, in Rust. Good support for
 IP surveillance cameras, as needed by
 [Moonfire NVR](https://github.com/scottlamb/moonfire-nvr).
 
