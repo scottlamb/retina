@@ -823,7 +823,6 @@ dependencies = [
  "log",
  "mylog",
  "once_cell",
- "parking_lot",
  "pin-project",
  "pretty-hex",
  "rtcp",
