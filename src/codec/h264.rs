@@ -432,30 +432,6 @@ impl AccessUnit {
     }
 }
 
-/// Decodes a NAL unit (minus header byte) into its RBSP.
-/// Stolen from h264-reader's src/avcc.rs. This shouldn't last long, see:
-/// <https://github.com/dholroyd/h264-reader/issues/4>.
-fn decode(encoded: &[u8]) -> Vec<u8> {
-    struct NalRead(Vec<u8>);
-    use h264_reader::nal::NalHandler;
-    use h264_reader::Context;
-    impl NalHandler for NalRead {
-        type Ctx = ();
-        fn start(&mut self, _ctx: &mut Context<Self::Ctx>, _header: h264_reader::nal::NalHeader) {}
-
-        fn push(&mut self, _ctx: &mut Context<Self::Ctx>, buf: &[u8]) {
-            self.0.extend_from_slice(buf)
-        }
-
-        fn end(&mut self, _ctx: &mut Context<Self::Ctx>) {}
-    }
-    let mut decode = h264_reader::rbsp::RbspDecoder::new(NalRead(vec![]));
-    let mut ctx = Context::new(());
-    decode.push(&mut ctx, encoded);
-    let read = decode.into_handler();
-    read.0
-}
-
 #[derive(Clone, Debug)]
 struct InternalParameters {
     generic_parameters: super::Parameters,
@@ -524,7 +500,7 @@ impl InternalParameters {
     }
 
     fn parse_sps_and_pps(sps_nal: &[u8], pps_nal: &[u8]) -> Result<InternalParameters, Error> {
-        let sps_rbsp = decode(&sps_nal[1..]);
+        let sps_rbsp = h264_reader::rbsp::decode_nal(&sps_nal[1..]);
         if sps_rbsp.len() < 4 {
             bail!("bad sps");
         }
