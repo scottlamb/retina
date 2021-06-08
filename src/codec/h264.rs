@@ -578,10 +578,11 @@ impl InternalParameters {
                     .map(|(h, v)| (u32::from(h), (u32::from(v))));
 
                 // TODO: study H.264, (E-34). This quick'n'dirty calculation isn't always right.
-                frame_rate = vui
-                    .timing_info
-                    .as_ref()
-                    .and_then(|t| t.num_units_in_tick.checked_mul(2).map(|doubled| (doubled, t.time_scale)));
+                frame_rate = vui.timing_info.as_ref().and_then(|t| {
+                    t.num_units_in_tick
+                        .checked_mul(2)
+                        .map(|doubled| (doubled, t.time_scale))
+                });
             }
             None => {
                 pixel_aspect_ratio = None;

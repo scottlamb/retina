@@ -54,7 +54,7 @@ impl Timestamp {
                 timestamp,
                 clock_rate,
                 start,
-            })
+            }),
         }
     }
 
@@ -182,7 +182,7 @@ pub struct Context {
 impl Context {
     #[doc(hidden)]
     pub fn dummy() -> Self {
-        use std::net::{Ipv4Addr, IpAddr, SocketAddr};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         Self {
             conn_local_addr: addr,

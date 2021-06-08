@@ -343,7 +343,6 @@ impl bytes::Buf for VideoFrame {
 #[derive(Debug)]
 pub struct Depacketizer(DepacketizerInner);
 
-
 #[derive(Debug)]
 #[allow(clippy::clippy::large_enum_variant)]
 enum DepacketizerInner {
@@ -376,40 +375,40 @@ impl Depacketizer {
                 channels,
                 format_specific_params,
             )?),
-            ("audio", "g726-16") => DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(
-                clock_rate, 2,
-            )),
-            ("audio", "g726-24") => DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(
-                clock_rate, 3,
-            )),
-            ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(
-                simple_audio::Depacketizer::new(clock_rate, 4),
-            ),
-            ("audio", "g726-40") => DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(
-                clock_rate, 5,
-            )),
-            ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => (
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 8))
-            ),
-            ("audio", "l16") => DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(
-                clock_rate, 16,
-            )),
+            ("audio", "g726-16") => {
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 2))
+            }
+            ("audio", "g726-24") => {
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 3))
+            }
+            ("audio", "dvi4") | ("audio", "g726-32") => {
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 4))
+            }
+            ("audio", "g726-40") => {
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 5))
+            }
+            ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
+                (DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 8)))
+            }
+            ("audio", "l16") => {
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 16))
+            }
             // Dahua cameras when configured with G723 send packets with a
             // non-standard encoding-name "G723.1" and length 40, which doesn't
             // make sense. Don't try to depacketize these.
             ("audio", "g723") => DepacketizerInner::G723(g723::Depacketizer::new(clock_rate)?),
-            ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(
-                onvif::Depacketizer::new(CompressionType::Uncompressed),
-            ),
-            ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(
-                onvif::Depacketizer::new(CompressionType::GzipCompressed),
-            ),
-            ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(
-                onvif::Depacketizer::new(CompressionType::ExiDefault),
-            ),
-            ("application", "vnd.onvif.metadata.exi.ext") => DepacketizerInner::Onvif(
-                onvif::Depacketizer::new(CompressionType::ExiInBand),
-            ),
+            ("application", "vnd.onvif.metadata") => {
+                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::Uncompressed))
+            }
+            ("application", "vnd.onvif.metadata.gzip") => {
+                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::GzipCompressed))
+            }
+            ("application", "vnd.onvif.metadata.exi.onvif") => {
+                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::ExiDefault))
+            }
+            ("application", "vnd.onvif.metadata.exi.ext") => {
+                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::ExiInBand))
+            }
             (_, _) => {
                 log::info!(
                     "no depacketizer for media/encoding_name {}/{}",
