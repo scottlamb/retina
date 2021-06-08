@@ -46,6 +46,18 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
+    /// Creates a new timestamp, ensuring `timestamp - start` doesn't underflow.
+    pub fn new(timestamp: i64, clock_rate: NonZeroU32, start: u32) -> Result<Self, Error> {
+        match timestamp.checked_sub(i64::from(start)) {
+            None => bail!("timestamp - start must not underflow"),
+            Some(_) => Ok(Timestamp {
+                timestamp,
+                clock_rate,
+                start,
+            })
+        }
+    }
+
     /// Returns time since some arbitrary point before the stream started.
     #[inline]
     pub fn timestamp(&self) -> i64 {
@@ -168,6 +180,21 @@ pub struct Context {
 }
 
 impl Context {
+    #[doc(hidden)]
+    pub fn dummy() -> Self {
+        use std::net::{Ipv4Addr, IpAddr, SocketAddr};
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        Self {
+            conn_local_addr: addr,
+            conn_peer_addr: addr,
+            conn_established_wall: time::get_time(),
+            conn_established: std::time::Instant::now(),
+            msg_pos: 0,
+            msg_received_wall: time::get_time(),
+            msg_received: std::time::Instant::now(),
+        }
+    }
+
     pub fn conn_established(&self) -> std::time::Instant {
         self.conn_established
     }

@@ -240,7 +240,7 @@ impl Depacketizer {
                     }
                 }
             }
-            25..=27 | 29 => unimplemented!(
+            25..=27 | 29 => bail!(
                 "unimplemented NAL (header 0x{:02x}) at seq {:04x} {:#?}",
                 nal_header,
                 seq,
@@ -396,6 +396,9 @@ impl AccessUnit {
     }
 
     fn nal(&mut self, parameters: &mut InternalParameters, nal: Bytes) -> Result<(), Error> {
+        if !nal.has_remaining() {
+            bail!("empty NAL");
+        }
         let nal_header = h264_reader::nal::NalHeader::new(nal[0])
             .map_err(|e| format_err!("bad NAL header 0x{:x}: {:#?}", nal[0], e))?;
         let unit_type = nal_header.nal_unit_type();
@@ -578,7 +581,7 @@ impl InternalParameters {
                 frame_rate = vui
                     .timing_info
                     .as_ref()
-                    .map(|t| (2 * t.num_units_in_tick, t.time_scale));
+                    .and_then(|t| t.num_units_in_tick.checked_mul(2).map(|doubled| (doubled, t.time_scale)));
             }
             None => {
                 pixel_aspect_ratio = None;
