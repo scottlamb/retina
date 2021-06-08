@@ -11,7 +11,6 @@ use pretty_hex::PrettyHex;
 use crate::client::PacketItem;
 
 /// An RTP packet.
-#[derive(Debug)]
 pub struct Packet {
     pub rtsp_ctx: crate::Context,
     pub stream_id: usize,
@@ -30,6 +29,20 @@ pub struct Packet {
 
     /// Guaranteed to be less than u16::MAX bytes.
     pub payload: Bytes,
+}
+
+impl std::fmt::Debug for Packet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Packet")
+            .field("rtsp_ctx", &self.rtsp_ctx)
+            .field("stream_id", &self.stream_id)
+            .field("timestamp", &self.timestamp)
+            .field("sequence_number", &self.sequence_number)
+            .field("loss", &self.loss)
+            .field("mark", &self.mark)
+            .field("payload", &self.payload.hex_dump())
+            .finish()
+    }
 }
 
 /// An RTCP sender report.

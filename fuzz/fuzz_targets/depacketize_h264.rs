@@ -34,6 +34,7 @@ fuzz_target!(|data: &[u8]| {
             mark,
             payload: data.split_off(usize::from(len)),
         };
+        //println!("pkt: {:#?}", pkt);
         if depacketizer.push(pkt).is_err() {
             return;
         }

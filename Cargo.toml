@@ -17,7 +17,7 @@ digest_auth = "0.3.0"
 failure = "0.1.8"
 futures = "0.3.14"
 hex = "0.4.3"
-h264-reader = { git = "https://github.com/dholroyd/h264-reader" }
+h264-reader = { git = "https://github.com/scottlamb/h264-reader", branch = "pr-sps-overflow" }
 log = "0.4.8"
 once_cell = "1.7.2"
 pin-project = "1.0.7"

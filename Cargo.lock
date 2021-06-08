@@ -376,7 +376,7 @@ checksum = "0e4075386626662786ddb0ec9081e7c7eeb1ba31951f447ca780ef9f5d568189"
 [[package]]
 name = "h264-reader"
 version = "0.4.0"
-source = "git+https://github.com/dholroyd/h264-reader#dd2d05d54bec596993be9a0833690b54219f6778"
+source = "git+https://github.com/scottlamb/h264-reader?branch=pr-sps-overflow#7d347e160ff73dcb8ae4680513db2618efe9c28d"
 dependencies = [
  "bitreader",
  "memchr",
