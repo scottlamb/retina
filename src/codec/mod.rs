@@ -388,7 +388,7 @@ impl Depacketizer {
                 DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 5))
             }
             ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
-                (DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 8)))
+                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 8))
             }
             ("audio", "l16") => {
                 DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 16))
