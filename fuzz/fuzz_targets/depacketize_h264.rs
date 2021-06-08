@@ -1,3 +1,6 @@
+// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![no_main]
 use bytes::{Buf, Bytes};
 use libfuzzer_sys::fuzz_target;
