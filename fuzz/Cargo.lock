@@ -705,7 +705,8 @@ checksum = "e1110d695193d446e901de09921ffbf2d86ae351bbfde9c5b53863ce177e17f5"
 [[package]]
 name = "rtsp-types"
 version = "0.0.2"
-source = "git+https://github.com/sdroege/rtsp-types#53bdf9a74175946572eb3509a6343696724123eb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90e677628cb208d61181b19f9b0b01efd7fce158bfba1bcb6e57e00fda291d6d"
 dependencies = [
  "cookie-factory",
  "nom",
