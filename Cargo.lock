@@ -375,10 +375,12 @@ checksum = "0e4075386626662786ddb0ec9081e7c7eeb1ba31951f447ca780ef9f5d568189"
 
 [[package]]
 name = "h264-reader"
-version = "0.4.0"
-source = "git+https://github.com/scottlamb/h264-reader?branch=pr-sps-overflow#7d347e160ff73dcb8ae4680513db2618efe9c28d"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8d87669bdeca3d51902f1bf1f2c71c8f514a8f3011d9b81e63719b374091da1"
 dependencies = [
  "bitreader",
+ "log",
  "memchr",
  "rfc6381-codec",
 ]

@@ -1,45 +1,81 @@
 # retina
 
+[![crates.io version](https://img.shields.io/crates/v/retina.svg)](https://crates.io/crates/retina)
+[![Documentation](https://docs.rs/retina/badge.svg)](https://docs.rs/retina)
 [![CI](https://github.com/scottlamb/retina/workflows/CI/badge.svg)](https://github.com/scottlamb/retina/actions?query=workflow%3ACI)
 
 High-level RTSP multimedia streaming library, in Rust. Good support for
-IP surveillance cameras, as needed by
-[Moonfire NVR](https://github.com/scottlamb/moonfire-nvr).
+ONVIF RTSP/1.0 IP surveillance cameras, as needed by
+[Moonfire NVR](https://github.com/scottlamb/moonfire-nvr). Works around
+brokenness in cheap closed-source cameras.
 
 Progress:
 
 *   [x] client support
-*   *   [x] digest authentication
-*   *   [x] RTP over TCP via RTSP interleaved channels.
-*   *   [ ] RTP over UDP. (Shouldn't be hard but I haven't needed it.)
-*   *   [ ] SRTP
-*   *   [ ] ONVIF backchannel support (for sending audio).
+    *   [x] digest authentication.
+    *   [x] RTP over TCP via RTSP interleaved channels.
+    *   [ ] RTP over UDP.
+    *   [x] RTSP/1.0.
+    *   [ ] RTSP/2.0.
+    *   [ ] SRTP.
+    *   [ ] ONVIF backchannel support (for sending audio).
+    *   [ ] ONVIF replay mode.
+    *   [x] receiving RTCP Sender Reports (currently only uses the timestamp)
+    *   [ ] sending RTCP Receiver Reports
 *   [ ] server support
-*   async 
-*   *   [x] tokio
-*   *   [ ] async-std. (Most of the crate's code is independent of the async
+*   I/O modes
+    *   [x] async with tokio
+    *   [ ] async-std. (Most of the crate's code is independent of the async
         library, so I don't expect this would be too hard to add.)
+        [ ] synchronous with std only
 *   codec depacketization
-*   *   [x] video: H.264
-*   *   *   [ ] SVC
-*   *   *   [ ] periodic infra refresh
-*   *   *   [ ] partitioned slices
-*   *   audio
-*   *   *   [x] AAC
-*   *   *   *   [ ] interleaving
-*   *   *   [x] RFC 3551 codecs: G.711,G.723, L8/L16
-*   *   [x] application: ONVIF metadata
+    *   [x] video: H.264
+        ([RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
+        *   [ ] SVC
+        *   [ ] periodic infra refresh
+        *   [ ] multiple slices per picture
+        *   [ ] multiple SPS/PPS
+        *   [ ] interleaved mode
+    *   audio
+        *   [x] AAC
+            *   [ ] interleaving
+        *   [x] [RFC 3551](https://datatracker.ietf.org/doc/html/rfc3551)
+            codecs: G.711, G.723, L8/L16
+    *   [x] application: ONVIF metadata
 *   [ ] uniform, documented API. (Currently haphazard in terms of naming, what
         fields are exposed directly vs use an accessors, etc.)
-*   [ ] rich errors. (Currently uses untyped errors with the deprecated failure
-        crate; some error messages are quite detailed, others aren't.)
-*   [ ] released versions of all deps. (crates.io publishing requirement.)
+*   [ ] rich errors. (Currently uses untyped errors with the deprecated
+        `failure` crate; some error messages are quite detailed, others aren't.)
 *   [ ] good functional testing coverage. (Currently lightly / unevenly tested.
-        The depacketizers have no test coverage, and there's at least one place
-        left that can panic on bad input.)
-*   [ ] fuzz testing
+        The depacketizers have no tests.)
+*   [ ] fuzz testing. (In progress.)
+*   [ ] benchmarks
+
+Currently very unstable: expect breaking API changes at every release as I work
+through items above.
 
 Help welcome!
+
+## Getting started
+
+Try the `mp4` example. It streams from an RTSP server to a `.mp4` file until
+you hit ctrl-C.
+
+```
+$ cargo run --example client mp4 --url rtsp://ip.address.goes.here/ --username admin --password test out.mp4
+...
+^C
+```
+
+## Acknowledgements
+
+This builds on the whole Rust ecosystem. A couple folks have been especially
+helpful:
+
+*   Sebastian Dröge, author of
+    [`rtsp-types`](https://crates.io/crates/rtsp-types)
+*   David Holroyd, author of
+    [`h264-reader`](https://crates.io/crates/h264-reader)
 
 ## Why "retina"?
 
