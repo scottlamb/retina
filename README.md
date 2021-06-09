@@ -27,7 +27,7 @@ Progress:
     *   [x] async with tokio
     *   [ ] async-std. (Most of the crate's code is independent of the async
         library, so I don't expect this would be too hard to add.)
-        [ ] synchronous with std only
+    *   [ ] synchronous with std only
 *   codec depacketization
     *   [x] video: H.264
         ([RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
