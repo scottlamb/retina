@@ -40,6 +40,9 @@ mylog = { git = "https://github.com/scottlamb/mylog" }
 structopt = "0.3.21"
 tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal"] }
 
+[profile.bench]
+debug = true
+
 [[bench]]
 name = "depacketize"
 harness = false

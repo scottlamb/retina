@@ -3,13 +3,12 @@
 
 use std::num::NonZeroU16;
 
+use bytes::Buf;
 use criterion::{criterion_group, criterion_main, Criterion};
-use retina::{
-    client::{rtp::StrictSequenceChecker, Timeline},
-    codec::Depacketizer,
-};
-use rtsp_types::Message;
+use retina::client::{rtp::StrictSequenceChecker, Timeline};
+use retina::codec::{CodecItem, Depacketizer};
 use std::convert::TryFrom;
+use std::io::Write;
 
 // This holds just the RTSP data portions of a session from this public endpoint.
 // https://www.wowza.com/html/mobile.html
@@ -19,7 +18,7 @@ const BUNNY: &[u8] = include_bytes!("bunny.rtsp");
 
 // TODO: it'd be nice to have a slick way of loading saved RTSP flows for testing.
 // For now, this builds state via several internal interfaces.
-fn h264_aac() {
+fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
     let mut remaining = BUNNY;
     let mut timelines = [
         Timeline::new(Some(0), 12_000, None).unwrap(),
@@ -35,34 +34,57 @@ fn h264_aac() {
     ];
     let ctx = retina::Context::dummy();
     while !remaining.is_empty() {
-        let (msg, len): (Message<&[u8]>, _) = Message::parse(remaining).unwrap();
-        let data = match msg {
-            Message::Data(d) => d,
-            _ => panic!("{:#?}", msg),
-        };
-        let stream_id = match data.channel_id() {
+        assert!(remaining.len() > 4);
+        assert_eq!(remaining[0], b'$');
+        let channel_id = remaining[1];
+        let len = u16::from_be_bytes([remaining[2], remaining[3]]);
+        let (data, after) = remaining.split_at(4 + usize::from(len));
+        let data = bytes::Bytes::from_static(&data[4..]);
+        remaining = after;
+        let stream_id = match channel_id {
             0 => 0,
             2 => 1,
             1 | 3 => continue, // RTCP
             _ => unreachable!(),
         };
-        let raw_pkt = bytes::Bytes::from_static(data.into_body());
-        remaining = &remaining[len..];
-        let pkt = match rtps[stream_id].rtp(ctx, &mut timelines[stream_id], stream_id, raw_pkt) {
+        let pkt = match rtps[stream_id].rtp(ctx, &mut timelines[stream_id], stream_id, data) {
             Ok(retina::client::PacketItem::RtpPacket(rtp)) => rtp,
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();
-        while depacketizers[stream_id].pull().unwrap().is_some() {}
+        while let Some(pkt) = depacketizers[stream_id].pull().unwrap() {
+            f(pkt);
+        }
     }
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut g = c.benchmark_group("depacketize");
+    let mut w = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .unwrap();
+    let w = &mut w;
     g.throughput(criterion::Throughput::Bytes(
         u64::try_from(BUNNY.len()).unwrap(),
-    ))
-    .bench_function("h264_aac", |b| b.iter(h264_aac));
+    ));
+    g.bench_function("h264_aac_discard", |b| {
+        b.iter(|| h264_aac(|_pkt: CodecItem| ()))
+    });
+    g.bench_function("h264_aac_writevideo", move |b| {
+        b.iter(|| {
+            h264_aac(|pkt: CodecItem| {
+                let v = match pkt {
+                    CodecItem::VideoFrame(v) => v,
+                    _ => return,
+                };
+                let mut slices = [std::io::IoSlice::new(b""); 2];
+                let n = v.chunks_vectored(&mut slices);
+                assert_eq!(n, 2);
+                assert_eq!(w.write_vectored(&slices[..]).unwrap(), v.remaining());
+            })
+        })
+    });
 }
 
 criterion_group!(benches, criterion_benchmark);
