@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::{borrow::Cow, fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
-use self::timeline::Timeline;
+pub use self::timeline::Timeline;
 use async_stream::try_stream;
 use bytes::Bytes;
 use failure::{bail, format_err, Error};

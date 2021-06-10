@@ -338,7 +338,7 @@ impl bytes::Buf for VideoFrame {
 }
 
 /// Turns RTP packets into [CodecItem]s.
-/// This interface unstable and for internal use; it's exposed for direct fuzzing.
+/// This interface unstable and for internal use; it's exposed for direct fuzzing and benchmarking.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Depacketizer(DepacketizerInner);

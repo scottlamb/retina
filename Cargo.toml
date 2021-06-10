@@ -8,6 +8,7 @@ keywords = ["rtsp", "multimedia", "video", "streaming", "ip-camera"]
 categories = ["network-programming", "multimedia"]
 description = "high-level RTSP multimedia streaming library"
 repository = "https://github.com/scottlamb/retina"
+include = ["src/**/*", "Cargo.toml"]
 
 [dependencies]
 async-stream = "0.3.1"
@@ -34,6 +35,11 @@ tokio-util = { version = "0.6.6", features = ["codec"] }
 url = "2.2.1"
 
 [dev-dependencies]
+criterion = "0.3.4"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 structopt = "0.3.21"
 tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal"] }
+
+[[bench]]
+name = "depacketize"
+harness = false

@@ -55,7 +55,7 @@ pub struct SenderReport {
 }
 
 /// RTP/RTCP demarshaller which ensures packets have the correct SSRC and
-/// monotonically increasing SEQ.
+/// monotonically increasing SEQ. Unstable; exposed for benchmark.
 ///
 /// This reports packet loss (via [Packet::loss]) but doesn't prohibit it, except for losses
 /// of more than `i16::MAX` which would be indistinguishable from non-monotonic sequence numbers.
@@ -69,18 +69,19 @@ pub struct SenderReport {
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
 /// not sure it will ever come up with IP cameras.
+#[doc(hidden)]
 #[derive(Debug)]
-pub(super) struct StrictSequenceChecker {
+pub struct StrictSequenceChecker {
     ssrc: Option<u32>,
     next_seq: Option<u16>,
 }
 
 impl StrictSequenceChecker {
-    pub(super) fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
+    pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
         Self { ssrc, next_seq }
     }
 
-    pub(super) fn rtp(
+    pub fn rtp(
         &mut self,
         rtsp_ctx: crate::Context,
         timeline: &mut super::Timeline,
@@ -160,7 +161,7 @@ impl StrictSequenceChecker {
         }))
     }
 
-    pub(super) fn rtcp(
+    pub fn rtcp(
         &mut self,
         rtsp_ctx: crate::Context,
         timeline: &mut super::Timeline,

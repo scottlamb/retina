@@ -49,7 +49,7 @@ Progress:
 *   [ ] good functional testing coverage. (Currently lightly / unevenly tested.
         The depacketizers have no tests.)
 *   [ ] fuzz testing. (In progress.)
-*   [ ] benchmarks
+*   [x] benchmark
 
 Currently very unstable: expect breaking API changes at every release as I work
 through items above.
