@@ -344,12 +344,11 @@ impl bytes::Buf for VideoFrame {
 pub struct Depacketizer(DepacketizerInner);
 
 #[derive(Debug)]
-#[allow(clippy::clippy::large_enum_variant)]
 enum DepacketizerInner {
-    Aac(aac::Depacketizer),
+    Aac(Box<aac::Depacketizer>),
     SimpleAudio(simple_audio::Depacketizer),
     G723(g723::Depacketizer),
-    H264(h264::Depacketizer),
+    H264(Box<h264::Depacketizer>),
     Onvif(onvif::Depacketizer),
 }
 
@@ -366,15 +365,15 @@ impl Depacketizer {
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
         Ok(Depacketizer(match (media, encoding_name) {
-            ("video", "h264") => DepacketizerInner::H264(h264::Depacketizer::new(
+            ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
                 clock_rate,
                 format_specific_params,
-            )?),
-            ("audio", "mpeg4-generic") => DepacketizerInner::Aac(aac::Depacketizer::new(
+            )?)),
+            ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
                 format_specific_params,
-            )?),
+            )?)),
             ("audio", "g726-16") => {
                 DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 2))
             }
