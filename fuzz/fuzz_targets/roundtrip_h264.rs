@@ -1,0 +1,55 @@
+// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Test a roundtrip through the H.264 packetizer and depacketizer with an arbitrary
+//! input packet size and frame. Ensures the following:
+//! *   there are no crashes.
+//! *   the round trip produces an error or identical data.
+
+#![no_main]
+use bytes::Bytes;
+use libfuzzer_sys::fuzz_target;
+use std::num::NonZeroU32;
+
+fuzz_target!(|data: &[u8]| {
+    if data.len() < 2 {
+        return;
+    }
+    let max_payload_size = u16::from_be_bytes([data[0], data[1]]);
+    let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut d = retina::codec::Depacketizer::new(
+        "video", "h264", 90_000, None,
+        Some("packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4"),
+    ).unwrap();
+    let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+    if p.push(timestamp, Bytes::copy_from_slice(&data[2..])).is_err() {
+        return;
+    }
+    let frame = loop {
+        match p.pull() {
+            Ok(Some(pkt)) => {
+                let mark = pkt.mark;
+                if d.push(pkt).is_err() {
+                    return;
+                }
+                match d.pull() {
+                    Err(_) => return,
+                    Ok(Some(retina::codec::CodecItem::VideoFrame(f))) => {
+                        assert!(mark);
+                        break f
+                    },
+                    Ok(Some(_)) => panic!(),
+                    Ok(None) => assert!(!mark),
+                }
+            }
+            Ok(None) => panic!("packetizer ran out of packets before depacketizer produced frame"),
+            Err(_) => return,
+        }
+    };
+    assert_eq!(&data[2..], &frame.data()[..]);
+    assert!(matches!(d.pull(), Ok(None)));
+    assert!(matches!(p.pull(), Ok(None)));
+});

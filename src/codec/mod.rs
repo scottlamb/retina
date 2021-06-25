@@ -16,7 +16,10 @@ use pretty_hex::PrettyHex;
 
 pub(crate) mod aac;
 pub(crate) mod g723;
-pub(crate) mod h264;
+
+#[doc(hidden)]
+pub mod h264;
+
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 

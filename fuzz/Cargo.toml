@@ -25,3 +25,10 @@ name = "depacketize_h264"
 path = "fuzz_targets/depacketize_h264.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "roundtrip_h264"
+path = "fuzz_targets/roundtrip_h264.rs"
+test = false
+doc = false
+
