@@ -10,7 +10,7 @@ use failure::{bail, format_err, Error};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::debug;
 
-use crate::{Timestamp, client::rtp::Packet};
+use crate::{client::rtp::Packet, Timestamp};
 
 use super::VideoFrame;
 
@@ -278,7 +278,12 @@ impl Depacketizer {
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
                 if data.len() < 2 {
-                    bail!("FU-A len {} too short at seq {:04x} {:#?}", data.len(), seq, &pkt.rtsp_ctx);
+                    bail!(
+                        "FU-A len {} too short at seq {:04x} {:#?}",
+                        data.len(),
+                        seq,
+                        &pkt.rtsp_ctx
+                    );
                 }
                 let fu_header = data[0];
                 let start = (fu_header & 0b10000000) != 0;
@@ -297,7 +302,11 @@ impl Depacketizer {
                     );
                 }
                 if !end && pkt.mark {
-                    bail!("FU-A pkt with MARK && !END at seq {:04x} {:#?}", seq, &pkt.rtsp_ctx);
+                    bail!(
+                        "FU-A pkt with MARK && !END at seq {:04x} {:#?}",
+                        seq,
+                        &pkt.rtsp_ctx
+                    );
                 }
                 let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
                 match (start, access_unit.in_fu_a) {
@@ -675,8 +684,13 @@ pub struct Packetizer {
 }
 
 impl Packetizer {
-    pub fn new(max_payload_size: u16, stream_id: usize, initial_sequence_number: u16) -> Result<Self, Error> {
-        if max_payload_size < 3 { // minimum size to make progress with FU-A packets.
+    pub fn new(
+        max_payload_size: u16,
+        stream_id: usize,
+        initial_sequence_number: u16,
+    ) -> Result<Self, Error> {
+        if max_payload_size < 3 {
+            // minimum size to make progress with FU-A packets.
             bail!("max_payload_size must be > 3");
         }
         Ok(Self {
@@ -689,10 +703,7 @@ impl Packetizer {
 
     pub fn push(&mut self, timestamp: Timestamp, data: Bytes) -> Result<(), Error> {
         assert!(matches!(self.state, PacketizerState::Idle));
-        self.state = PacketizerState::HaveData {
-            timestamp,
-            data,
-        };
+        self.state = PacketizerState::HaveData { timestamp, data };
         Ok(())
     }
 
@@ -700,9 +711,15 @@ impl Packetizer {
         let max_payload_size = usize::from(self.max_payload_size);
         match std::mem::replace(&mut self.state, PacketizerState::Idle) {
             PacketizerState::Idle => return Ok(None),
-            PacketizerState::HaveData { timestamp, mut data } => {
+            PacketizerState::HaveData {
+                timestamp,
+                mut data,
+            } => {
                 if data.len() < 5 {
-                    bail!("have only {} bytes; expected 4-byte length + non-empty NAL", data.len());
+                    bail!(
+                        "have only {} bytes; expected 4-byte length + non-empty NAL",
+                        data.len()
+                    );
                 }
                 let len = data.get_u32();
                 let usize_len = usize::try_from(len).expect("u32 fits in usize");
@@ -711,12 +728,14 @@ impl Packetizer {
                 }
                 let sequence_number = self.next_sequence_number;
                 self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
-                let hdr = NalHeader::new(data[0]).map_err(|_| format_err!("F bit in NAL header"))?;
+                let hdr =
+                    NalHeader::new(data[0]).map_err(|_| format_err!("F bit in NAL header"))?;
                 if matches!(hdr.nal_unit_type(), UnitType::Unspecified(_)) {
                     // This can clash with fragmentation/aggregation NAL types.
                     bail!("bad NAL header {:?}", hdr);
                 }
-                if usize_len > max_payload_size { // start a FU-A.
+                if usize_len > max_payload_size {
+                    // start a FU-A.
                     data.advance(1);
                     let mut payload = Vec::with_capacity(max_payload_size);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
@@ -740,7 +759,7 @@ impl Packetizer {
                         payload: Bytes::from(payload),
                     }));
                 }
-                
+
                 // Send a plain NAL packet. (TODO: consider using STAP-A.)
                 let mark;
                 if data.len() == usize_len {
@@ -761,8 +780,13 @@ impl Packetizer {
                     mark,
                     payload: data,
                 }))
-            },
-            PacketizerState::InFragment { timestamp, hdr, left, mut data } => {
+            }
+            PacketizerState::InFragment {
+                timestamp,
+                hdr,
+                left,
+                mut data,
+            } => {
                 let sequence_number = self.next_sequence_number;
                 self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
                 let mut payload;
@@ -794,10 +818,7 @@ impl Packetizer {
                     } else {
                         mark = false;
                         data.advance(usize_left);
-                        self.state = PacketizerState::HaveData {
-                            timestamp,
-                            data,
-                        };
+                        self.state = PacketizerState::HaveData { timestamp, data };
                     }
                 }
                 Ok(Some(Packet {
@@ -809,7 +830,7 @@ impl Packetizer {
                     mark,
                     payload: Bytes::from(payload),
                 }))
-            },
+            }
         }
     }
 }
