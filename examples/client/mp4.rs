@@ -485,16 +485,16 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn video(&mut self, mut frame: retina::codec::VideoFrame) -> Result<(), failure::Error> {
+    async fn video(&mut self, frame: retina::codec::VideoFrame) -> Result<(), failure::Error> {
         println!(
             "{}: {}-byte video frame",
             &frame.timestamp,
-            frame.remaining()
+            frame.data().remaining(),
         );
         if let Some(ref p) = frame.new_parameters {
             bail!("parameters change unimplemented. new parameters: {:#?}", p);
         }
-        let size = u32::try_from(frame.remaining())?;
+        let size = u32::try_from(frame.data().remaining())?;
         self.video_trak
             .add_sample(self.mdat_pos, size, frame.timestamp, frame.loss)?;
         self.mdat_pos = self
@@ -505,7 +505,8 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             self.video_sync_sample_nums
                 .push(u32::try_from(self.video_trak.samples)?);
         }
-        write_all_buf(&mut self.inner, &mut frame).await?;
+        let mut data = frame.into_data();
+        write_all_buf(&mut self.inner, &mut data).await?;
         Ok(())
     }
 

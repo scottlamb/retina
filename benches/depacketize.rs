@@ -3,7 +3,6 @@
 
 use std::num::NonZeroU16;
 
-use bytes::Buf;
 use criterion::{criterion_group, criterion_main, Criterion};
 use retina::client::{rtp::StrictSequenceChecker, Timeline};
 use retina::codec::{CodecItem, Depacketizer};
@@ -78,10 +77,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     CodecItem::VideoFrame(v) => v,
                     _ => return,
                 };
-                let mut slices = [std::io::IoSlice::new(b""); 2];
-                let n = v.chunks_vectored(&mut slices);
-                assert_eq!(n, 2);
-                assert_eq!(w.write_vectored(&slices[..]).unwrap(), v.remaining());
+                w.write_all(&v.data()[..]).unwrap();
             })
         })
     });

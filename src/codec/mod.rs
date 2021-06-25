@@ -259,24 +259,28 @@ pub struct VideoFrame {
     /// In H.264 terms, this is a frame with `nal_ref_idc == 0`.
     pub is_disposable: bool,
 
-    /// Position within `concat(data_prefix, data)`.
-    pos: u32,
-
-    data_prefix: [u8; 4],
-
-    /// Frame content in the requested format. Currently in a single [bytes::Bytes]
-    /// allocation, but this may change when supporting H.264 partitioned slices
-    /// or if we revise the fragmentation implementation.
     data: bytes::Bytes,
 }
 
 impl VideoFrame {
+    #[inline]
     pub fn start_ctx(&self) -> crate::Context {
         self.start_ctx
     }
 
+    #[inline]
     pub fn end_ctx(&self) -> crate::Context {
         self.end_ctx
+    }
+
+    #[inline]
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
+
+    #[inline]
+    pub fn into_data(self) -> Bytes {
+        self.data
     }
 }
 
@@ -291,49 +295,9 @@ impl std::fmt::Debug for VideoFrame {
             .field("new_parameters", &self.new_parameters)
             .field("is_random_access_point", &self.is_random_access_point)
             .field("is_disposable", &self.is_disposable)
-            .field("pos", &self.pos)
-            .field("data_len", &(self.data.len() + 4))
+            .field("data_len", &self.data.len())
             //.field("data", &self.data.hex_dump())
             .finish()
-    }
-}
-
-impl bytes::Buf for VideoFrame {
-    fn remaining(&self) -> usize {
-        self.data.len() + 4 - (self.pos as usize)
-    }
-
-    fn chunk(&self) -> &[u8] {
-        let pos = self.pos as usize;
-        if let Some(pos_within_data) = pos.checked_sub(4) {
-            &self.data[pos_within_data..]
-        } else {
-            &self.data_prefix[pos..]
-        }
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        assert!((self.pos as usize) + cnt <= 4 + self.data.len());
-        self.pos += cnt as u32;
-    }
-
-    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
-        match dst.len() {
-            0 => 0,
-            1 => {
-                dst[0] = std::io::IoSlice::new(self.chunk());
-                1
-            }
-            _ if self.pos < 4 => {
-                dst[0] = std::io::IoSlice::new(&self.data_prefix[self.pos as usize..]);
-                dst[1] = std::io::IoSlice::new(&self.data);
-                2
-            }
-            _ => {
-                dst[0] = std::io::IoSlice::new(&self.data[(self.pos - 4) as usize..]);
-                1
-            }
-        }
     }
 }
 
