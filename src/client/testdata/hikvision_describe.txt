@@ -1,5 +1,5 @@
 RTSP/1.0 200 OK
-CSeq: 2
+CSeq: 1
 Content-Type: application/sdp
 Content-Base: rtsp://192.168.5.106:554/Streaming/Channels/101/
 Content-Length: 902

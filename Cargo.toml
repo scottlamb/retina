@@ -25,7 +25,7 @@ once_cell = "1.7.2"
 pin-project = "1.0.7"
 pretty-hex = "0.2.1"
 rtcp = "0.2.1"
-rtp-rs = "0.5.0"
+rtp-rs = "0.6.0"
 rtsp-types = "0.0.2"
 sdp = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
@@ -35,13 +35,17 @@ tokio-util = { version = "0.6.6", features = ["codec"] }
 url = "2.2.1"
 
 [dev-dependencies]
-criterion = "0.3.4"
+criterion = { version = "0.3.4", features = ["async_tokio"] }
 mylog = { git = "https://github.com/scottlamb/mylog" }
 structopt = "0.3.21"
 tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal"] }
 
 [profile.bench]
 debug = true
+
+[[bench]]
+name = "client"
+harness = false
 
 [[bench]]
 name = "depacketize"

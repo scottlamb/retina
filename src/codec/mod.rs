@@ -23,6 +23,7 @@ pub mod h264;
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
+#[derive(Debug)]
 pub enum CodecItem {
     VideoFrame(VideoFrame),
     AudioFrame(AudioFrame),

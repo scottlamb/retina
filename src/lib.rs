@@ -4,6 +4,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use failure::{bail, format_err, Error};
 use once_cell::sync::Lazy;
+use pretty_hex::PrettyHex;
 use rtsp_types::Message;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
@@ -260,7 +261,14 @@ impl tokio_util::codec::Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         let (msg, len): (Message<&[u8]>, _) = match rtsp_types::Message::parse(src) {
             Ok((m, l)) => (m, l),
-            Err(rtsp_types::ParseError::Error) => bail!("RTSP parse error: {:#?}", &self.ctx),
+            Err(rtsp_types::ParseError::Error) => {
+                let snippet = &src[0..std::cmp::min(128, src.len())];
+                bail!(
+                    "RTSP parse error at {:#?}: next bytes are {:#?}",
+                    &self.ctx,
+                    snippet.hex_dump()
+                )
+            }
             Err(rtsp_types::ParseError::Incomplete) => return Ok(None),
         };
 
