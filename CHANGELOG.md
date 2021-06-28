@@ -1,3 +1,7 @@
+## unreleased
+
+*   Performance improvements.
+
 ## v0.0.2 (2021-06-25)
 
 *   Video frames are now provided as a single, contiguous `Bytes`, and
