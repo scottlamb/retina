@@ -767,6 +767,7 @@ impl futures::Stream for Session<Playing> {
                         if let Err(e) = Session::handle_response(&mut state, response) {
                             return Poll::Ready(Some(Err(e)));
                         }
+                        continue;
                     }
                     rtsp_types::Message::Request(request) => {
                         warn!("Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",

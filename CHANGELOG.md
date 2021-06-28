@@ -1,5 +1,9 @@
 ## unreleased
 
+## v0.0.4 (2021-06-28)
+
+*   bugfix: Retina stopped receiving packets after receiving a keepalive response.
+
 ## v0.0.3 (2021-06-28)
 
 *   BREAKING CHANGE: `Session<Playing>` now directly implements `Stream` instead of

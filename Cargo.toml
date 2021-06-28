@@ -1,6 +1,6 @@
 [package]
 name = "retina"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
 edition = "2018"
@@ -11,7 +11,6 @@ repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
 
 [dependencies]
-async-stream = "0.3.1"
 base64 = "0.13.0"
 bitreader = "0.3.3"
 bytes = "1.0.1"
