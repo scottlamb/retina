@@ -81,7 +81,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
     let mut pkt_buf = vec![0; 65536];
     for _ in 0..30 {
         for &f in &frame_sizes {
-            &dummy_frame[0..4].copy_from_slice(&f.to_be_bytes()[..]);
+            dummy_frame[0..4].copy_from_slice(&f.to_be_bytes()[..]);
             let frame = Bytes::copy_from_slice(&dummy_frame[..(usize::try_from(f).unwrap() + 4)]);
             p.push(timestamp, frame).unwrap();
             while let Some(pkt) = p.pull().unwrap() {

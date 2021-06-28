@@ -271,7 +271,10 @@ impl Codec {
             }
             let mut msg = src.split_to(len);
             msg.advance(4);
-            return Ok(Some((len, Message::Data(Data::new(channel_id, msg.freeze())))))
+            return Ok(Some((
+                len,
+                Message::Data(Data::new(channel_id, msg.freeze())),
+            )));
         }
 
         let (msg, len): (Message<&[u8]>, _) = match rtsp_types::Message::parse(src) {
