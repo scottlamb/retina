@@ -1,5 +1,7 @@
 ## unreleased
 
+## v0.0.3 (2021-06-28)
+
 *   BREAKING CHANGE: `Session<Playing>` now directly implements `Stream` instead of
     through `pkts()`.
 *   Performance improvements.

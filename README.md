@@ -33,7 +33,7 @@ Progress:
         ([RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
         *   [ ] SVC
         *   [ ] periodic infra refresh
-        *   [ ] multiple slices per picture
+        *   [x] multiple slices per picture
         *   [ ] multiple SPS/PPS
         *   [ ] interleaved mode
     *   audio
@@ -46,8 +46,8 @@ Progress:
         fields are exposed directly vs use an accessors, etc.)
 *   [ ] rich errors. (Currently uses untyped errors with the deprecated
         `failure` crate; some error messages are quite detailed, others aren't.)
-*   [ ] good functional testing coverage. (Currently lightly / unevenly tested.
-        The depacketizers have no tests.)
+*   [ ] good functional testing coverage. (Currently lightly / unevenly tested.)
+        Most depacketizers have no tests.)
 *   [ ] fuzz testing. (In progress.)
 *   [x] benchmark
 
