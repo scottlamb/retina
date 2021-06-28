@@ -623,9 +623,8 @@ pub enum PacketItem {
 }
 
 impl Session<Playing> {
-    pub fn demuxed(
-        mut self,
-    ) -> Result<impl futures::Stream<Item = Result<CodecItem, Error>>, Error> {
+    /// Returns a wrapper which demuxes/depacketizes into frames.
+    pub fn demuxed(mut self) -> Result<Demuxed, Error> {
         for s in &mut self.state.presentation.streams {
             if matches!(s.state, StreamState::Playing { .. }) {
                 if let Err(ref mut e) = s.depacketizer {
@@ -804,8 +803,9 @@ enum DemuxedState {
     Pulling(usize),
 }
 
+/// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
 #[pin_project]
-struct Demuxed {
+pub struct Demuxed {
     state: DemuxedState,
     #[pin]
     session: Session<Playing>,
