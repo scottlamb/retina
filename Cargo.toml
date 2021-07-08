@@ -1,6 +1,6 @@
 [package]
 name = "retina"
-version = "0.0.5-dev"
+version = "0.0.5"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
 edition = "2018"

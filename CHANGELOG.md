@@ -1,4 +1,4 @@
-## unreleased
+## v0.0.5 (2021-07-08)
 
 *   BREAKING CHANGE: New opaque error type with more uniform, richer error
     messages. No more `failure` dependency.
