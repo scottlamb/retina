@@ -114,8 +114,10 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters.generic_parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Video(
+            self.parameters.generic_parameters.clone(),
+        ))
     }
 
     pub(super) fn push(&mut self, pkt: Packet) -> Result<(), String> {
@@ -419,10 +421,7 @@ impl Depacketizer {
             let pps_nal = new_pps.as_deref().unwrap_or(&self.parameters.pps_nal);
             // TODO: could map this to a RtpPacketError more accurately.
             self.parameters = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
-            match self.parameters.generic_parameters {
-                super::Parameters::Video(ref p) => Some(p.clone()),
-                _ => unreachable!(),
-            }
+            Some(Box::new(self.parameters.generic_parameters.clone()))
         } else {
             None
         };
@@ -457,7 +456,7 @@ impl AccessUnit {
 
 #[derive(Clone, Debug)]
 struct InternalParameters {
-    generic_parameters: super::Parameters,
+    generic_parameters: super::VideoParameters,
 
     /// The (single) SPS NAL.
     sps_nal: Bytes,
@@ -599,13 +598,13 @@ impl InternalParameters {
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
         Ok(InternalParameters {
-            generic_parameters: super::Parameters::Video(super::VideoParameters {
+            generic_parameters: super::VideoParameters {
                 rfc6381_codec,
                 pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: avc_decoder_config,
-            }),
+            },
             sps_nal,
             pps_nal,
         })

@@ -26,9 +26,13 @@ use crate::{client::rtp::Packet, error::ErrorInt, ConnectionContext, Error};
 use super::CodecItem;
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
-/// Currently just a few fields of interest.
+///
+/// Currently stores the raw form and a few fields of interest.
 #[derive(Clone, Debug)]
-pub(super) struct AudioSpecificConfig {
+struct AudioSpecificConfig {
+    raw: Bytes,
+    sample_entry: Bytes,
+
     /// See ISO/IEC 14496-3 Table 1.3.
     audio_object_type: u8,
     frame_length: NonZeroU16,
@@ -63,8 +67,8 @@ const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
 
 impl AudioSpecificConfig {
     /// Parses from raw bytes.
-    fn parse(config: &[u8]) -> Result<Self, String> {
-        let mut r = bitreader::BitReader::new(config);
+    fn parse(raw: &[u8]) -> Result<Self, String> {
+        let mut r = bitreader::BitReader::new(&raw[..]);
         let audio_object_type = match r
             .read_u8(5)
             .map_err(|e| format!("unable to read audio_object_type: {}", e))?
@@ -153,11 +157,26 @@ impl AudioSpecificConfig {
         };
 
         Ok(AudioSpecificConfig {
+            raw: Bytes::copy_from_slice(raw),
+            sample_entry: make_sample_entry(channels, sampling_frequency, raw)?,
             audio_object_type,
             frame_length,
             sampling_frequency,
             channels,
         })
+    }
+
+    fn to_parameters(&self) -> super::AudioParameters {
+        // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
+        let rfc6381_codec = Some(format!("mp4a.40.{}", self.audio_object_type));
+        super::AudioParameters {
+            // See also TODO asking if clock_rate and sampling_frequency must match.
+            clock_rate: self.sampling_frequency,
+            rfc6381_codec,
+            frame_length: Some(NonZeroU32::from(self.frame_length)),
+            extra_data: self.raw.clone(),
+            sample_entry: Some(self.sample_entry.clone()),
+        }
     }
 }
 
@@ -239,13 +258,12 @@ macro_rules! write_descriptor {
 }
 
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
-/// `config` should be a raw AudioSpecificConfig (matching `parsed`).
-pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes, String> {
-    let parsed = match parameters.config {
-        super::AudioCodecConfig::Aac(ref c) => c,
-        _ => unreachable!(),
-    };
-    let config = &parameters.extra_data[..];
+/// `config` should be a raw AudioSpecificConfig.
+fn make_sample_entry(
+    channels: &ChannelConfig,
+    sampling_frequency: u32,
+    config: &[u8],
+) -> Result<Bytes, String> {
     let mut buf = BytesMut::new();
 
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -258,7 +276,7 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
             0, 0, 0, 0, // AudioSampleEntry.reserved
             0, 0, 0, 0, // AudioSampleEntry.reserved
         ]);
-        buf.put_u16(parsed.channels.channels);
+        buf.put_u16(channels.channels);
         buf.extend_from_slice(&[
             0x00, 0x10, // AudioSampleEntry.samplesize
             0x00, 0x00, 0x00, 0x00, // AudioSampleEntry.pre_defined, AudioSampleEntry.reserved
@@ -269,12 +287,8 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
         // use a SamplingRateBox. The latter also requires changing the
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
-        let sampling_frequency = u16::try_from(parsed.sampling_frequency).map_err(|_| {
-            format!(
-                "aac sampling_frequency={} unsupported",
-                parsed.sampling_frequency
-            )
-        })?;
+        let sampling_frequency = u16::try_from(sampling_frequency)
+            .map_err(|_| format!("aac sampling_frequency={} unsupported", sampling_frequency))?;
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -301,16 +315,15 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
                     // elementary stream in byte". ISO/IEC 13818-7 section
                     // 8.2.2.1 defines the total decoder input buffer size as
                     // 6144 bits per NCC.
-                    let buffer_size_bytes = (6144 / 8) * u32::from(parsed.channels.ncc);
+                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc);
                     debug_assert!(buffer_size_bytes <= 0xFF_FFFF);
 
                     // buffer_size_bytes as a 24-bit number
                     buf.put_u8((buffer_size_bytes >> 16) as u8);
                     buf.put_u16(buffer_size_bytes as u16);
 
-                    let max_bitrate = (6144 / 1024)
-                        * u32::from(parsed.channels.ncc)
-                        * u32::from(sampling_frequency);
+                    let max_bitrate =
+                        (6144 / 1024) * u32::from(channels.ncc) * u32::from(sampling_frequency);
                     buf.put_u32(max_bitrate);
 
                     // avg_bitrate. ISO/IEC 14496-1 section 7.2.6.6 says "for streams with
@@ -339,7 +352,7 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
 fn parse_format_specific_params(
     clock_rate: u32,
     format_specific_params: &str,
-) -> Result<super::AudioParameters, String> {
+) -> Result<AudioSpecificConfig, String> {
     let mut mode = None;
     let mut config = None;
     let mut size_length = None;
@@ -392,34 +405,22 @@ fn parse_format_specific_params(
         ));
     }
 
-    let parsed = AudioSpecificConfig::parse(&config[..])?;
+    let config = AudioSpecificConfig::parse(&config[..])?;
 
     // TODO: is this a requirement? I might have read somewhere one can be a multiple of the other.
-    if clock_rate != parsed.sampling_frequency {
+    if clock_rate != config.sampling_frequency {
         return Err(format!(
             "Expected RTP clock rate {} and AAC sampling frequency {} to match",
-            clock_rate, parsed.sampling_frequency
+            clock_rate, config.sampling_frequency
         ));
     }
 
-    // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
-    let rfc6381_codec = Some(format!("mp4a.40.{}", parsed.audio_object_type));
-    let frame_length = Some(parsed.frame_length);
-    Ok(super::AudioParameters {
-        config: super::AudioCodecConfig::Aac(parsed),
-        clock_rate,
-        rfc6381_codec,
-        frame_length: frame_length.map(NonZeroU32::from),
-        extra_data: Bytes::from(config),
-    })
+    Ok(config)
 }
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
-
-    /// This is in parameters but duplicated here to avoid destructuring.
-    frame_length: NonZeroU16,
+    config: AudioSpecificConfig,
     state: DepacketizerState,
 }
 
@@ -497,27 +498,21 @@ impl Depacketizer {
     ) -> Result<Self, String> {
         let format_specific_params = format_specific_params
             .ok_or_else(|| "AAC requires format specific params".to_string())?;
-        let parameters = parse_format_specific_params(clock_rate, format_specific_params)?;
-        let parsed = match parameters.config {
-            super::AudioCodecConfig::Aac(ref c) => c,
-            _ => unreachable!(),
-        };
-        if matches!(channels, Some(c) if c.get() != parsed.channels.channels) {
+        let config = parse_format_specific_params(clock_rate, format_specific_params)?;
+        if matches!(channels, Some(c) if c.get() != config.channels.channels) {
             return Err(format!(
                 "Expected RTP channels {:?} and AAC channels {:?} to match",
-                channels, parsed.channels
+                channels, config.channels
             ));
         }
-        let frame_length = parsed.frame_length;
         Ok(Self {
-            parameters: super::Parameters::Audio(parameters),
-            frame_length,
+            config,
             state: DepacketizerState::Idle { prev_loss: 0 },
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(self.config.to_parameters()))
     }
 
     pub(super) fn push(&mut self, mut pkt: Packet) -> Result<(), String> {
@@ -592,7 +587,7 @@ impl Depacketizer {
                         self.state = DepacketizerState::Ready(super::AudioFrame {
                             ctx: pkt.ctx,
                             loss: frag.loss,
-                            frame_length: NonZeroU32::from(self.frame_length),
+                            frame_length: NonZeroU32::from(self.config.frame_length),
                             stream_id: pkt.stream_id,
                             timestamp: pkt.timestamp,
                             data: std::mem::take(&mut frag.buf).freeze(),
@@ -691,13 +686,13 @@ impl Depacketizer {
                     ));
                 }
 
-                let delta = u32::from(agg.frame_i) * u32::from(self.frame_length.get());
+                let delta = u32::from(agg.frame_i) * u32::from(self.config.frame_length.get());
                 let agg_timestamp = agg.timestamp;
                 let frame = super::AudioFrame {
                     ctx: agg.ctx,
                     loss: agg.loss,
                     stream_id: agg.stream_id,
-                    frame_length: NonZeroU32::from(self.frame_length),
+                    frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
                     timestamp: match agg_timestamp.try_add(delta) {

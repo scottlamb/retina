@@ -191,7 +191,7 @@ impl Stream {
     ///
     /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't specified
     /// via SDP. Some codecs allow parameters to be specified in-band instead.
-    pub fn parameters(&self) -> Option<&crate::codec::Parameters> {
+    pub fn parameters(&self) -> Option<crate::codec::Parameters> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }
 }
@@ -1068,6 +1068,34 @@ impl futures::Stream for Demuxed {
                     return Poll::Ready(Some(Err(e)));
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // See with: cargo test -- --nocapture client::tests::print_sizes
+    #[test]
+    fn print_sizes() {
+        for (name, size) in [
+            ("RtspConnection", std::mem::size_of::<RtspConnection>()),
+            (
+                "Session<Described>",
+                std::mem::size_of::<Session<Described>>(),
+            ),
+            ("Session<Playing>", std::mem::size_of::<Session<Playing>>()),
+            ("Demuxed", std::mem::size_of::<Demuxed>()),
+            ("Stream", std::mem::size_of::<Stream>()),
+            ("PacketItem", std::mem::size_of::<PacketItem>()),
+            ("rtp::Packet", std::mem::size_of::<rtp::Packet>()),
+            (
+                "rtp::SenderReport",
+                std::mem::size_of::<rtp::SenderReport>(),
+            ),
+        ] {
+            println!("{:-40} {:4}", name, size);
         }
     }
 }

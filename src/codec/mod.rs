@@ -10,7 +10,6 @@
 use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::client::rtp;
-use crate::error::ErrorInt;
 use crate::ConnectionContext;
 use crate::Error;
 use bytes::{Buf, Bytes};
@@ -114,13 +113,7 @@ pub struct AudioParameters {
     frame_length: Option<NonZeroU32>,
     clock_rate: u32,
     extra_data: Bytes,
-    config: AudioCodecConfig,
-}
-
-#[derive(Clone)]
-enum AudioCodecConfig {
-    Aac(aac::AudioSpecificConfig),
-    Other,
+    sample_entry: Option<Bytes>,
 }
 
 impl std::fmt::Debug for AudioParameters {
@@ -153,13 +146,12 @@ impl AudioParameters {
         &self.extra_data
     }
 
-    /// Builds an `.mp4` `SimpleAudioEntry` box (as defined in ISO/IEC 14496-12) if possible.
+    /// An `.mp4` `SimpleAudioEntry` box (as defined in ISO/IEC 14496-12), if possible.
+    ///
     /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
     /// may be unsupported edge cases.
-    pub fn sample_entry(&self) -> Result<Bytes, Error> {
-        // TODO: InvalidArgument doesn't seem quite right. We probably should
-        // produce the mp4a eagerly anyway.
-        aac::get_mp4a_box(self).map_err(|description| wrap!(ErrorInt::InvalidArgument(description)))
+    pub fn sample_entry(&self) -> Option<&Bytes> {
+        self.sample_entry.as_ref()
     }
 }
 
@@ -240,7 +232,8 @@ impl std::fmt::Debug for MessageFrame {
 /// specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
 pub struct VideoFrame {
-    pub new_parameters: Option<VideoParameters>,
+    // New video parameters. Rarely populated and large, so boxed to reduce bloat.
+    pub new_parameters: Option<Box<VideoParameters>>,
 
     /// Number of lost RTP packets before this video frame. See [crate::client::rtp::Packet::loss].
     /// Note that if loss occurs during a fragmented frame, more than this number of packets' worth
@@ -318,10 +311,10 @@ pub struct Depacketizer(DepacketizerInner);
 #[derive(Debug)]
 enum DepacketizerInner {
     Aac(Box<aac::Depacketizer>),
-    SimpleAudio(simple_audio::Depacketizer),
-    G723(g723::Depacketizer),
+    SimpleAudio(Box<simple_audio::Depacketizer>),
+    G723(Box<g723::Depacketizer>),
     H264(Box<h264::Depacketizer>),
-    Onvif(onvif::Depacketizer),
+    Onvif(Box<onvif::Depacketizer>),
 }
 
 impl Depacketizer {
@@ -346,40 +339,44 @@ impl Depacketizer {
                 channels,
                 format_specific_params,
             )?)),
-            ("audio", "g726-16") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 2))
-            }
-            ("audio", "g726-24") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 3))
-            }
-            ("audio", "dvi4") | ("audio", "g726-32") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 4))
-            }
-            ("audio", "g726-40") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 5))
-            }
+            ("audio", "g726-16") => DepacketizerInner::SimpleAudio(Box::new(
+                simple_audio::Depacketizer::new(clock_rate, 2),
+            )),
+            ("audio", "g726-24") => DepacketizerInner::SimpleAudio(Box::new(
+                simple_audio::Depacketizer::new(clock_rate, 3),
+            )),
+            ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(Box::new(
+                simple_audio::Depacketizer::new(clock_rate, 4),
+            )),
+            ("audio", "g726-40") => DepacketizerInner::SimpleAudio(Box::new(
+                simple_audio::Depacketizer::new(clock_rate, 5),
+            )),
             ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 8))
+                DepacketizerInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
+                    clock_rate, 8,
+                )))
             }
-            ("audio", "l16") => {
-                DepacketizerInner::SimpleAudio(simple_audio::Depacketizer::new(clock_rate, 16))
-            }
+            ("audio", "l16") => DepacketizerInner::SimpleAudio(Box::new(
+                simple_audio::Depacketizer::new(clock_rate, 16),
+            )),
             // Dahua cameras when configured with G723 send packets with a
             // non-standard encoding-name "G723.1" and length 40, which doesn't
             // make sense. Don't try to depacketize these.
-            ("audio", "g723") => DepacketizerInner::G723(g723::Depacketizer::new(clock_rate)?),
-            ("application", "vnd.onvif.metadata") => {
-                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::Uncompressed))
+            ("audio", "g723") => {
+                DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
             }
-            ("application", "vnd.onvif.metadata.gzip") => {
-                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::GzipCompressed))
-            }
-            ("application", "vnd.onvif.metadata.exi.onvif") => {
-                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::ExiDefault))
-            }
-            ("application", "vnd.onvif.metadata.exi.ext") => {
-                DepacketizerInner::Onvif(onvif::Depacketizer::new(CompressionType::ExiInBand))
-            }
+            ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
+                onvif::Depacketizer::new(CompressionType::Uncompressed),
+            )),
+            ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
+                onvif::Depacketizer::new(CompressionType::GzipCompressed),
+            )),
+            ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(Box::new(
+                onvif::Depacketizer::new(CompressionType::ExiDefault),
+            )),
+            ("application", "vnd.onvif.metadata.exi.ext") => DepacketizerInner::Onvif(Box::new(
+                onvif::Depacketizer::new(CompressionType::ExiInBand),
+            )),
             (_, _) => {
                 log::info!(
                     "no depacketizer for media/encoding_name {}/{}",
@@ -394,7 +391,7 @@ impl Depacketizer {
         }))
     }
 
-    pub fn parameters(&self) -> Option<&Parameters> {
+    pub fn parameters(&self) -> Option<Parameters> {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
@@ -421,6 +418,56 @@ impl Depacketizer {
             DepacketizerInner::H264(d) => Ok(d.pull()),
             DepacketizerInner::Onvif(d) => Ok(d.pull()),
             DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // See with: cargo test -- --nocapture codec::tests::print_sizes
+    #[test]
+    fn print_sizes() {
+        for (name, size) in [
+            ("Depacketizer", std::mem::size_of::<Depacketizer>()),
+            (
+                "aac::Depacketizer",
+                std::mem::size_of::<aac::Depacketizer>(),
+            ),
+            (
+                "g723::Depacketizer",
+                std::mem::size_of::<g723::Depacketizer>(),
+            ),
+            (
+                "h264::Depacketizer",
+                std::mem::size_of::<h264::Depacketizer>(),
+            ),
+            (
+                "onvif::Depacketizer",
+                std::mem::size_of::<onvif::Depacketizer>(),
+            ),
+            (
+                "simple_audio::Depacketizer",
+                std::mem::size_of::<simple_audio::Depacketizer>(),
+            ),
+            ("CodecItem", std::mem::size_of::<CodecItem>()),
+            ("VideoFrame", std::mem::size_of::<VideoFrame>()),
+            ("AudioFrame", std::mem::size_of::<AudioFrame>()),
+            ("MessageFrame", std::mem::size_of::<MessageFrame>()),
+            (
+                "SenderReport",
+                std::mem::size_of::<crate::client::rtp::SenderReport>(),
+            ),
+            ("Parameters", std::mem::size_of::<Parameters>()),
+            ("VideoParameters", std::mem::size_of::<VideoParameters>()),
+            ("AudioParameters", std::mem::size_of::<AudioParameters>()),
+            (
+                "MessageParameters",
+                std::mem::size_of::<MessageParameters>(),
+            ),
+        ] {
+            println!("{:-40} {:4}", name, size);
         }
     }
 }

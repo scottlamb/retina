@@ -12,7 +12,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use super::CodecItem;
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum CompressionType {
     Uncompressed,
     GzipCompressed,
@@ -22,7 +22,7 @@ pub enum CompressionType {
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
+    compression_type: CompressionType,
     state: State,
     high_water_size: usize,
 }
@@ -45,14 +45,16 @@ struct InProgress {
 impl Depacketizer {
     pub(super) fn new(compression_type: CompressionType) -> Self {
         Depacketizer {
-            parameters: super::Parameters::Message(super::MessageParameters(compression_type)),
+            compression_type,
             state: State::Idle,
             high_water_size: 0,
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Message(super::MessageParameters(
+            self.compression_type,
+        )))
     }
 
     pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {

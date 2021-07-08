@@ -12,7 +12,7 @@ use super::CodecItem;
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
+    clock_rate: u32,
     pending: Option<super::AudioFrame>,
     bits_per_sample: u32,
 }
@@ -21,20 +21,20 @@ impl Depacketizer {
     /// Creates a new Depacketizer.
     pub(super) fn new(clock_rate: u32, bits_per_sample: u32) -> Self {
         Self {
-            parameters: super::Parameters::Audio(super::AudioParameters {
-                rfc6381_codec: None,
-                frame_length: None, // variable
-                clock_rate,
-                extra_data: Bytes::new(),
-                config: super::AudioCodecConfig::Other,
-            }),
+            clock_rate,
             bits_per_sample,
             pending: None,
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(super::AudioParameters {
+            rfc6381_codec: None,
+            frame_length: None, // variable
+            clock_rate: self.clock_rate,
+            extra_data: Bytes::new(),
+            sample_entry: None,
+        }))
     }
 
     fn frame_length(&self, payload_len: usize) -> Option<NonZeroU32> {

@@ -8,35 +8,33 @@ use std::num::NonZeroU32;
 use bytes::Bytes;
 use pretty_hex::PrettyHex;
 
+const FIXED_CLOCK_RATE: u32 = 8_000;
+
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
     pending: Option<super::AudioFrame>,
 }
 
 impl Depacketizer {
     /// Creates a new Depacketizer.
     pub(super) fn new(clock_rate: u32) -> Result<Self, String> {
-        if clock_rate != 8_000 {
+        if clock_rate != FIXED_CLOCK_RATE {
             return Err(format!(
-                "Expected clock rate of 8000 for G.723, got {}",
-                clock_rate
+                "Expected clock rate of {} for G.723, got {}",
+                FIXED_CLOCK_RATE, clock_rate
             ));
         }
-        Ok(Self {
-            parameters: super::Parameters::Audio(super::AudioParameters {
-                rfc6381_codec: None,
-                frame_length: NonZeroU32::new(240),
-                clock_rate,
-                extra_data: Bytes::new(),
-                config: super::AudioCodecConfig::Other,
-            }),
-            pending: None,
-        })
+        Ok(Self { pending: None })
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(super::AudioParameters {
+            rfc6381_codec: None,
+            frame_length: NonZeroU32::new(240),
+            clock_rate: FIXED_CLOCK_RATE,
+            extra_data: Bytes::new(),
+            sample_entry: None,
+        }))
     }
 
     fn validate(pkt: &crate::client::rtp::Packet) -> bool {
