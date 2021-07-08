@@ -429,7 +429,7 @@ mod tests {
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
     fn print_sizes() {
-        for (name, size) in [
+        for (name, size) in &[
             ("Depacketizer", std::mem::size_of::<Depacketizer>()),
             (
                 "aac::Depacketizer",

@@ -1079,7 +1079,7 @@ mod tests {
     // See with: cargo test -- --nocapture client::tests::print_sizes
     #[test]
     fn print_sizes() {
-        for (name, size) in [
+        for (name, size) in &[
             ("RtspConnection", std::mem::size_of::<RtspConnection>()),
             (
                 "Session<Described>",
