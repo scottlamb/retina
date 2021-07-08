@@ -80,8 +80,8 @@ async fn write_all_buf<W: AsyncWrite + Unpin, B: Buf>(
 pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
     mdat_start: u32,
     mdat_pos: u32,
-    video_params: Option<VideoParameters>,
-    audio_params: Option<AudioParameters>,
+    video_params: Option<Box<VideoParameters>>,
+    audio_params: Option<Box<AudioParameters>>,
 
     /// The (1-indexed) video sample (frame) number of each sync sample (random access point).
     video_sync_sample_nums: Vec<u32>,
@@ -199,8 +199,8 @@ impl TrakTracker {
 
 impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     pub async fn new(
-        video_params: Option<VideoParameters>,
-        audio_params: Option<AudioParameters>,
+        video_params: Option<Box<VideoParameters>>,
+        audio_params: Option<Box<AudioParameters>>,
         mut inner: W,
     ) -> Result<Self, Error> {
         let mut buf = BytesMut::new();
@@ -294,7 +294,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                 let dims = self
                     .video_params
                     .as_ref()
-                    .map(VideoParameters::pixel_dimensions)
+                    .map(|p| p.pixel_dimensions())
                     .unwrap_or((0, 0));
                 let width = u32::from(u16::try_from(dims.0)?) << 16;
                 let height = u32::from(u16::try_from(dims.1)?) << 16;
@@ -485,14 +485,17 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn video(&mut self, frame: retina::codec::VideoFrame) -> Result<(), Error> {
+    async fn video(&mut self, mut frame: retina::codec::VideoFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
             &frame.timestamp,
             frame.data().remaining(),
         );
-        if let Some(ref p) = frame.new_parameters {
-            bail!("parameters change unimplemented. new parameters: {:#?}", p);
+        if let Some(p) = frame.new_parameters.take() {
+            if self.video_trak.samples > 0 {
+                bail!("parameters change unimplemented. new parameters: {:#?}", p);
+            }
+            self.video_params = Some(p);
         }
         let size = u32::try_from(frame.data().remaining())?;
         self.video_trak
@@ -574,8 +577,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     // Read RTP data.
     let out = tokio::fs::File::create(opts.out).await?;
     let mut mp4 = Mp4Writer::new(
-        video_stream.map(|(_, p)| p),
-        audio_stream.map(|(_, p)| p),
+        video_stream.map(|(_, p)| Box::new(p)),
+        audio_stream.map(|(_, p)| Box::new(p)),
         out,
     )
     .await?;

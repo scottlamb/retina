@@ -7,6 +7,7 @@
 *   BREAKING CHANGE: `retina::codec::VideoFrame::new_parameters` is now boxed.
     This allows shrinking `VideoFrame` and `CodecItem` by 80 bytes each (on
     64-bit platforms). The box is only rarely populated.
+*   in `client mp4` example, handle an initial video parameter change correctly.
 
 ## v0.0.4 (2021-06-28)
 
