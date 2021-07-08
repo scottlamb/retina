@@ -7,8 +7,6 @@
 use std::num::NonZeroU32;
 
 use bytes::Bytes;
-use failure::format_err;
-use failure::Error;
 
 use super::CodecItem;
 
@@ -50,10 +48,10 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
         assert!(self.pending.is_none());
         let frame_length = self.frame_length(pkt.payload.len()).ok_or_else(|| {
-            format_err!(
+            format!(
                 "invalid length {} for payload of {}-bit audio samples",
                 pkt.payload.len(),
                 self.bits_per_sample
@@ -61,7 +59,7 @@ impl Depacketizer {
         })?;
         self.pending = Some(super::AudioFrame {
             loss: pkt.loss,
-            ctx: pkt.rtsp_ctx,
+            ctx: pkt.ctx,
             stream_id: pkt.stream_id,
             timestamp: pkt.timestamp,
             frame_length,
@@ -70,7 +68,7 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
-        Ok(self.pending.take().map(CodecItem::AudioFrame))
+    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
+        self.pending.take().map(CodecItem::AudioFrame)
     }
 }

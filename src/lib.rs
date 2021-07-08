@@ -1,17 +1,36 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use failure::{bail, format_err, Error};
+use bytes::Bytes;
+//use failure::{bail, format_err, Error};
 use once_cell::sync::Lazy;
-use pretty_hex::PrettyHex;
-use rtsp_types::{Data, Message};
-use std::convert::TryFrom;
+use rtsp_types::Message;
 use std::fmt::{Debug, Display};
 use std::num::NonZeroU32;
 
+mod error;
+
+pub use error::Error;
+
+/// Wraps the supplied `ErrorInt` and returns it as an `Err`.
+macro_rules! bail {
+    ($e:expr) => {
+        return Err(crate::error::Error(Box::new($e)))
+    };
+}
+
+macro_rules! wrap {
+    ($e:expr) => {
+        crate::error::Error(Box::new($e))
+    };
+}
+
 pub mod client;
 pub mod codec;
+//mod error;
+mod tokio;
+
+use error::ErrorInt;
 
 pub static X_ACCEPT_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> = Lazy::new(|| {
     rtsp_types::HeaderName::from_static_str("x-Accept-Dynamic-Rate").expect("is ascii")
@@ -19,10 +38,11 @@ pub static X_ACCEPT_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> = Lazy::new(|| {
 pub static X_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> =
     Lazy::new(|| rtsp_types::HeaderName::from_static_str("x-Dynamic-Rate").expect("is ascii"));
 
+/// A received RTSP message.
 #[derive(Debug)]
-pub struct ReceivedMessage {
-    pub ctx: Context,
-    pub msg: Message<Bytes>,
+struct ReceivedMessage {
+    ctx: RtspMessageContext,
+    msg: Message<Bytes>,
 }
 
 /// A monotonically increasing timestamp within an RTP stream.
@@ -47,16 +67,14 @@ pub struct Timestamp {
 }
 
 impl Timestamp {
-    /// Creates a new timestamp, ensuring `timestamp - start` doesn't underflow.
-    pub fn new(timestamp: i64, clock_rate: NonZeroU32, start: u32) -> Result<Self, Error> {
-        match timestamp.checked_sub(i64::from(start)) {
-            None => bail!("timestamp - start must not underflow"),
-            Some(_) => Ok(Timestamp {
-                timestamp,
-                clock_rate,
-                start,
-            }),
-        }
+    /// Creates a new timestamp unless `timestamp - start` underflows.
+    #[inline]
+    pub fn new(timestamp: i64, clock_rate: NonZeroU32, start: u32) -> Option<Self> {
+        timestamp.checked_sub(i64::from(start)).map(|_| Timestamp {
+            timestamp,
+            clock_rate,
+            start,
+        })
     }
 
     /// Returns time since some arbitrary point before the stream started.
@@ -90,17 +108,17 @@ impl Timestamp {
         (self.elapsed() as f64) / (self.clock_rate.get() as f64)
     }
 
-    pub fn try_add(&self, delta: u32) -> Result<Self, Error> {
+    /// Returns `self + delta` unless it would overflow.
+    pub fn try_add(&self, delta: u32) -> Option<Self> {
         // Check for `timestamp` overflow only. We don't need to check for
         // `timestamp - start` underflow because delta is non-negative.
-        Ok(Timestamp {
-            timestamp: self
-                .timestamp
-                .checked_add(i64::from(delta))
-                .ok_or_else(|| format_err!("overflow on {:?} + {}", &self, delta))?,
-            clock_rate: self.clock_rate,
-            start: self.start,
-        })
+        self.timestamp
+            .checked_add(i64::from(delta))
+            .map(|timestamp| Timestamp {
+                timestamp,
+                clock_rate: self.clock_rate,
+                start: self.start,
+            })
     }
 }
 
@@ -159,78 +177,106 @@ impl std::fmt::Debug for NtpTimestamp {
     }
 }
 
-/// Context of a received message within an RTSP stream.
-/// This is meant to help find the correct TCP stream and packet in a matching
-/// packet capture.
-#[derive(Copy, Clone)]
-pub struct Context {
-    conn_local_addr: std::net::SocketAddr,
-    conn_peer_addr: std::net::SocketAddr,
-    conn_established_wall: time::Timespec,
-    conn_established: std::time::Instant,
+/// A wall time taken from the local machine's realtime clock, used in error reporting.
+///
+/// Currently this just allows formatting via `Debug` and `Display`.
+#[derive(Copy, Clone, Debug)]
+pub struct WallTime(time::Timespec);
 
-    /// The byte position within the input stream. The bottom 32 bits can be
-    /// compared to the TCP sequence number.
-    msg_pos: u64,
-
-    /// Time when the application parsed the message. Caveat: this may not
-    /// closely match the time on a packet capture if the application is
-    /// overloaded (or `CLOCK_REALTIME` jumps).
-    msg_received_wall: time::Timespec,
-    msg_received: std::time::Instant,
+impl WallTime {
+    fn now() -> Self {
+        Self(time::get_time())
+    }
 }
 
-impl Context {
+impl Display for WallTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(
+            &time::at(self.0)
+                .strftime("%FT%T")
+                .map_err(|_| std::fmt::Error)?,
+            f,
+        )
+    }
+}
+
+/// RTSP connection context.
+///
+/// This gives enough information to pick out the flow in a packet capture.
+#[derive(Copy, Clone, Debug)]
+pub struct ConnectionContext {
+    local_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+    established_wall: WallTime,
+    established: std::time::Instant,
+}
+
+impl ConnectionContext {
     #[doc(hidden)]
     pub fn dummy() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         Self {
-            conn_local_addr: addr,
-            conn_peer_addr: addr,
-            conn_established_wall: time::get_time(),
-            conn_established: std::time::Instant::now(),
-            msg_pos: 0,
-            msg_received_wall: time::get_time(),
-            msg_received: std::time::Instant::now(),
+            local_addr: addr,
+            peer_addr: addr,
+            established_wall: WallTime::now(),
+            established: std::time::Instant::now(),
         }
-    }
-
-    pub fn conn_established(&self) -> std::time::Instant {
-        self.conn_established
-    }
-
-    pub fn msg_received(&self) -> std::time::Instant {
-        self.msg_received
-    }
-
-    pub fn msg_pos(&self) -> u64 {
-        self.msg_pos
     }
 }
 
-impl Debug for Context {
+impl Display for ConnectionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO: this current hardcodes the assumption we are the client.
         // Change if/when adding server code.
         write!(
             f,
-            "[{}(me)->{}@{} pos={}@{}]",
-            &self.conn_local_addr,
-            &self.conn_peer_addr,
-            time::at(self.conn_established_wall)
-                .strftime("%FT%T")
-                .map_err(|_| std::fmt::Error)?,
-            self.msg_pos,
-            time::at(self.msg_received_wall)
-                .strftime("%FT%T")
-                .map_err(|_| std::fmt::Error)?
+            "{}(me)->{}@{}",
+            &self.local_addr, &self.peer_addr, &self.established_wall,
         )
     }
 }
 
-struct Codec {
-    ctx: Context,
+/// Context of a received message (or read error) within an RTSP connection.
+///
+/// When paired with a [`ConnectionContext`], this should allow picking the
+/// message out of a packet capture.
+#[derive(Copy, Clone, Debug)]
+pub struct RtspMessageContext {
+    /// The starting byte position within the input stream. The bottom 32 bits
+    /// can be compared to the relative TCP sequence number.
+    pos: u64,
+
+    /// Time when the application parsed the message. Caveat: this may not
+    /// closely match the time on a packet capture if the application is
+    /// overloaded (or if `CLOCK_REALTIME` jumps).
+    received_wall: WallTime,
+    received: std::time::Instant,
+}
+
+impl RtspMessageContext {
+    #[doc(hidden)]
+    pub fn dummy() -> Self {
+        Self {
+            pos: 0,
+            received_wall: WallTime::now(),
+            received: std::time::Instant::now(),
+        }
+    }
+
+    pub fn received(&self) -> std::time::Instant {
+        self.received
+    }
+
+    pub fn pos(&self) -> u64 {
+        self.pos
+    }
+}
+
+impl Display for RtspMessageContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.pos, &self.received_wall)
+    }
 }
 
 /// Returns the range within `buf` that represents `subset`.
@@ -252,114 +298,4 @@ pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usiz
     let end = off + subset.len();
     assert!(end <= buf.len());
     Some(off..end)
-}
-
-impl Codec {
-    fn parse_msg(&self, src: &mut BytesMut) -> Result<Option<(usize, Message<Bytes>)>, Error> {
-        if !src.is_empty() && src[0] == b'$' {
-            // Fast path for interleaved data, avoiding MessageRef -> Message<&[u8]> ->
-            // Message<Bytes> conversion. This speeds things up quite a bit in practice,
-            // avoiding a bunch of memmove calls.
-            if src.len() < 4 {
-                return Ok(None);
-            }
-            let channel_id = src[1];
-            let len = 4 + usize::from(u16::from_be_bytes([src[2], src[3]]));
-            if src.len() < len {
-                src.reserve(len - src.len());
-                return Ok(None);
-            }
-            let mut msg = src.split_to(len);
-            msg.advance(4);
-            return Ok(Some((
-                len,
-                Message::Data(Data::new(channel_id, msg.freeze())),
-            )));
-        }
-
-        let (msg, len): (Message<&[u8]>, _) = match rtsp_types::Message::parse(src) {
-            Ok((m, l)) => (m, l),
-            Err(rtsp_types::ParseError::Error) => {
-                let snippet = &src[0..std::cmp::min(128, src.len())];
-                bail!(
-                    "RTSP parse error at {:#?}: next bytes are {:#?}",
-                    &self.ctx,
-                    snippet.hex_dump()
-                )
-            }
-            Err(rtsp_types::ParseError::Incomplete) => return Ok(None),
-        };
-
-        // Map msg's body to a Bytes representation and advance `src`. Awkward:
-        // 1.  lifetime concerns require mapping twice: first so the message
-        //     doesn't depend on the BytesMut, which needs to be split/advanced;
-        //     then to get the proper Bytes body in place post-split.
-        // 2.  rtsp_types messages must be AsRef<[u8]>, so we can't use the
-        //     range as an intermediate body.
-        // 3.  within a match because the rtsp_types::Message enum itself
-        //     doesn't have body/replace_body/map_body methods.
-        let msg = match msg {
-            Message::Request(msg) => {
-                let body_range = as_range(src, msg.body());
-                let msg = msg.replace_body(rtsp_types::Empty);
-                if let Some(r) = body_range {
-                    let mut raw_msg = src.split_to(len);
-                    raw_msg.advance(r.start);
-                    raw_msg.truncate(r.len());
-                    Message::Request(msg.replace_body(raw_msg.freeze()))
-                } else {
-                    src.advance(len);
-                    Message::Request(msg.replace_body(Bytes::new()))
-                }
-            }
-            Message::Response(msg) => {
-                let body_range = as_range(src, msg.body());
-                let msg = msg.replace_body(rtsp_types::Empty);
-                if let Some(r) = body_range {
-                    let mut raw_msg = src.split_to(len);
-                    raw_msg.advance(r.start);
-                    raw_msg.truncate(r.len());
-                    Message::Response(msg.replace_body(raw_msg.freeze()))
-                } else {
-                    src.advance(len);
-                    Message::Response(msg.replace_body(Bytes::new()))
-                }
-            }
-            Message::Data(_) => unreachable!(),
-        };
-        Ok(Some((len, msg)))
-    }
-}
-
-impl tokio_util::codec::Decoder for Codec {
-    type Item = ReceivedMessage;
-    type Error = failure::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let (len, msg) = match self.parse_msg(src) {
-            Err(e) => return Err(e),
-            Ok(None) => return Ok(None),
-            Ok(Some((len, msg))) => (len, msg),
-        };
-        self.ctx.msg_received_wall = time::get_time();
-        self.ctx.msg_received = std::time::Instant::now();
-        let msg = ReceivedMessage { ctx: self.ctx, msg };
-        self.ctx.msg_pos += u64::try_from(len).expect("usize fits in u64");
-        Ok(Some(msg))
-    }
-}
-
-impl tokio_util::codec::Encoder<rtsp_types::Message<bytes::Bytes>> for Codec {
-    type Error = failure::Error;
-
-    fn encode(
-        &mut self,
-        item: rtsp_types::Message<bytes::Bytes>,
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let mut w = std::mem::replace(dst, BytesMut::new()).writer();
-        item.write(&mut w).expect("bytes Writer is infallible");
-        *dst = w.into_inner();
-        Ok(())
-    }
 }

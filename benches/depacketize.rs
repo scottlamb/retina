@@ -31,7 +31,8 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         Depacketizer::new("audio", "mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap(),
         Depacketizer::new("video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap(),
     ];
-    let ctx = retina::Context::dummy();
+    let conn_ctx = retina::ConnectionContext::dummy();
+    let msg_ctx = retina::RtspMessageContext::dummy();
     while !remaining.is_empty() {
         assert!(remaining.len() > 4);
         assert_eq!(remaining[0], b'$');
@@ -46,12 +47,19 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
             1 | 3 => continue, // RTCP
             _ => unreachable!(),
         };
-        let pkt = match rtps[stream_id].rtp(ctx, &mut timelines[stream_id], stream_id, data) {
+        let pkt = match rtps[stream_id].rtp(
+            &conn_ctx,
+            &msg_ctx,
+            &mut timelines[stream_id],
+            channel_id,
+            stream_id,
+            data,
+        ) {
             Ok(retina::client::PacketItem::RtpPacket(rtp)) => rtp,
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();
-        while let Some(pkt) = depacketizers[stream_id].pull().unwrap() {
+        while let Some(pkt) = depacketizers[stream_id].pull(&conn_ctx).unwrap() {
             f(pkt);
         }
     }

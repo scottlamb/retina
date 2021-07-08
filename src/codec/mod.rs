@@ -10,8 +10,10 @@
 use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::client::rtp;
+use crate::error::ErrorInt;
+use crate::ConnectionContext;
+use crate::Error;
 use bytes::{Buf, Bytes};
-use failure::{bail, Error};
 use pretty_hex::PrettyHex;
 
 pub(crate) mod aac;
@@ -155,13 +157,15 @@ impl AudioParameters {
     /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
     /// may be unsupported edge cases.
     pub fn sample_entry(&self) -> Result<Bytes, Error> {
-        aac::get_mp4a_box(self)
+        // TODO: InvalidArgument doesn't seem quite right. We probably should
+        // produce the mp4a eagerly anyway.
+        aac::get_mp4a_box(self).map_err(|description| wrap!(ErrorInt::InvalidArgument(description)))
     }
 }
 
 /// An audio frame, which consists of one or more samples.
 pub struct AudioFrame {
-    pub ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
     pub frame_length: NonZeroU32,
@@ -206,7 +210,7 @@ impl Buf for AudioFrame {
 pub struct MessageParameters(onvif::CompressionType);
 
 pub struct MessageFrame {
-    pub ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
     pub timestamp: crate::Timestamp,
     pub stream_id: usize,
 
@@ -245,8 +249,8 @@ pub struct VideoFrame {
 
     // A pair of contexts: for the start and for the end.
     // Having both can be useful to measure the total time elapsed while receiving the frame.
-    start_ctx: crate::Context,
-    end_ctx: crate::Context,
+    start_ctx: crate::RtspMessageContext,
+    end_ctx: crate::RtspMessageContext,
 
     /// This picture's timestamp in the time base associated with the stream.
     pub timestamp: crate::Timestamp,
@@ -268,12 +272,12 @@ pub struct VideoFrame {
 
 impl VideoFrame {
     #[inline]
-    pub fn start_ctx(&self) -> crate::Context {
+    pub fn start_ctx(&self) -> crate::RtspMessageContext {
         self.start_ctx
     }
 
     #[inline]
-    pub fn end_ctx(&self) -> crate::Context {
+    pub fn end_ctx(&self) -> crate::RtspMessageContext {
         self.end_ctx
     }
 
@@ -327,7 +331,7 @@ impl Depacketizer {
         clock_rate: u32,
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, String> {
         use onvif::CompressionType;
 
         // RTP Payload Format Media Types
@@ -382,11 +386,10 @@ impl Depacketizer {
                     media,
                     encoding_name
                 );
-                bail!(
+                return Err(format!(
                     "no depacketizer for media/encoding_name {}/{}",
-                    media,
-                    encoding_name
-                );
+                    media, encoding_name
+                ));
             }
         }))
     }
@@ -401,7 +404,7 @@ impl Depacketizer {
         }
     }
 
-    pub fn push(&mut self, input: rtp::Packet) -> Result<(), Error> {
+    pub fn push(&mut self, input: rtp::Packet) -> Result<(), String> {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.push(input),
             DepacketizerInner::G723(d) => d.push(input),
@@ -411,13 +414,13 @@ impl Depacketizer {
         }
     }
 
-    pub fn pull(&mut self) -> Result<Option<CodecItem>, Error> {
+    pub fn pull(&mut self, conn_ctx: &ConnectionContext) -> Result<Option<CodecItem>, Error> {
         match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.pull(),
-            DepacketizerInner::G723(d) => d.pull(),
-            DepacketizerInner::H264(d) => d.pull(),
-            DepacketizerInner::Onvif(d) => d.pull(),
-            DepacketizerInner::SimpleAudio(d) => d.pull(),
+            DepacketizerInner::Aac(d) => d.pull(conn_ctx),
+            DepacketizerInner::G723(d) => Ok(d.pull()),
+            DepacketizerInner::H264(d) => Ok(d.pull()),
+            DepacketizerInner::Onvif(d) => Ok(d.pull()),
+            DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
         }
     }
 }

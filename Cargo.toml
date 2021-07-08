@@ -1,6 +1,6 @@
 [package]
 name = "retina"
-version = "0.0.4"
+version = "0.0.5-dev"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
 edition = "2018"
@@ -15,7 +15,6 @@ base64 = "0.13.0"
 bitreader = "0.3.3"
 bytes = "1.0.1"
 digest_auth = "0.3.0"
-failure = "0.1.8"
 futures = "0.3.14"
 hex = "0.4.3"
 h264-reader = "0.5.0"
@@ -28,12 +27,14 @@ rtp-rs = "0.6.0"
 rtsp-types = "0.0.2"
 sdp = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
+thiserror = "1.0.25"
 time = "0.1.43"
 tokio = { version = "1.5.0", features = ["macros", "net", "time"] }
 tokio-util = { version = "0.6.6", features = ["codec"] }
 url = "2.2.1"
 
 [dev-dependencies]
+anyhow = "1.0.41"
 criterion = { version = "0.3.4", features = ["async_tokio"] }
 mylog = { git = "https://github.com/scottlamb/mylog" }
 structopt = "0.3.21"

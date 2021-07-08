@@ -8,16 +8,15 @@ use std::{borrow::Cow, fmt::Debug, num::NonZeroU16, pin::Pin};
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
 use bytes::Bytes;
-use failure::{bail, format_err, Error};
 use futures::{ready, Future, SinkExt, StreamExt};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
 use sdp::session_description::SessionDescription;
 use tokio::pin;
-use tokio_util::codec::Framed;
 use url::Url;
 
-use crate::{codec::CodecItem, Context};
+use crate::codec::CodecItem;
+use crate::{Error, ErrorInt, RtspMessageContext};
 
 mod channel_mapping;
 mod parse;
@@ -59,12 +58,12 @@ impl Default for InitialTimestampPolicy {
 
 impl std::fmt::Display for InitialTimestampPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InitialTimestampPolicy::Default => f.pad("default"),
-            InitialTimestampPolicy::Require => f.pad("require"),
-            InitialTimestampPolicy::Ignore => f.pad("ignore"),
-            InitialTimestampPolicy::Permissive => f.pad("permissive"),
-        }
+        f.pad(match self {
+            InitialTimestampPolicy::Default => "default",
+            InitialTimestampPolicy::Require => "require",
+            InitialTimestampPolicy::Ignore => "ignore",
+            InitialTimestampPolicy::Permissive => "permissive",
+        })
     }
 }
 
@@ -77,7 +76,11 @@ impl std::str::FromStr for InitialTimestampPolicy {
             "require" => InitialTimestampPolicy::Require,
             "ignore" => InitialTimestampPolicy::Ignore,
             "permissive" => InitialTimestampPolicy::Permissive,
-            _ => bail!("Initial timestamp mode {:?} not understood", s),
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad InitialTimestampPolicy {}; \
+                 expected default, require, ignore or permissive",
+                s
+            ))),
         })
     }
 }
@@ -165,7 +168,7 @@ pub struct Stream {
     /// Number of audio channels, if applicable (`media` is `audio`) and known.
     pub channels: Option<NonZeroU16>,
 
-    depacketizer: Result<crate::codec::Depacketizer, Error>,
+    depacketizer: Result<crate::codec::Depacketizer, String>,
 
     /// The specified control URL.
     /// This is needed with multiple streams to send `SETUP` requests and
@@ -240,15 +243,26 @@ pub struct Credentials {
 /// `DESCRIBE` changes the connection's state such that another one will fail,
 /// before assigning a session id. Thus [Session] represents something more like
 /// an RTSP connection than an RTSP session.
+#[doc(hidden)]
 pub trait State {}
 
-/// Initial state after a `DESCRIBE`.
+/// Initial state after a `DESCRIBE`; use via `Session<Described>`.
 /// One or more `SETUP`s may have also been issued, in which case a `session_id`
 /// will be assigned.
+#[doc(hidden)]
 pub struct Described {
     presentation: Presentation,
     session_id: Option<String>,
     channels: ChannelMappings,
+
+    // Keep some information about the DESCRIBE response. If a depacketizer
+    // couldn't be constructed correctly for one or more streams, this will be
+    // used to create a RtspResponseError on `State<Playing>::demuxed()`.
+    // We defer such errors from DESCRIBE time until then because they only
+    // matter if the stream is setup and the caller wants depacketization.
+    describe_ctx: RtspMessageContext,
+    describe_cseq: u32,
+    describe_status: rtsp_types::StatusCode,
 }
 impl State for Described {}
 
@@ -258,13 +272,17 @@ enum KeepaliveState {
     Waiting(u32),
 }
 
-/// State after a `PLAY`.
+/// State after a `PLAY`; use via `Session<Playing>`.
+#[doc(hidden)]
 #[pin_project(project = PlayingProj)]
 pub struct Playing {
     presentation: Presentation,
     session_id: String,
     channels: ChannelMappings,
     keepalive_state: KeepaliveState,
+    describe_ctx: RtspMessageContext,
+    describe_cseq: u32,
+    describe_status: rtsp_types::StatusCode,
 
     #[pin]
     keepalive_timer: tokio::time::Sleep,
@@ -275,7 +293,7 @@ impl State for Playing {}
 struct RtspConnection {
     creds: Option<Credentials>,
     requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
-    stream: Framed<tokio::net::TcpStream, crate::Codec>,
+    inner: crate::tokio::Connection,
     user_agent: String,
 
     /// The next `CSeq` header value to use when sending an RTSP request.
@@ -294,44 +312,36 @@ pub struct Session<S: State> {
 
 impl RtspConnection {
     async fn connect(url: &Url, creds: Option<Credentials>) -> Result<Self, Error> {
+        let host =
+            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let port = url.port().unwrap_or(554);
+        let inner = crate::tokio::Connection::connect(host, port)
+            .await
+            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        Ok(Self {
+            inner,
+            creds,
+            requested_auth: None,
+            user_agent: "moonfire-rtsp test".to_string(),
+            next_cseq: 1,
+        })
+    }
+
+    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
         if url.scheme() != "rtsp" {
-            bail!("Only rtsp urls supported (no rtsps yet)");
+            return Err(format!(
+                "Bad URL {}; only scheme rtsp supported",
+                url.as_str()
+            ));
         }
         if url.username() != "" || url.password().is_some() {
             // Url apparently doesn't even have a way to clear the credentials,
             // so this has to be an error.
-            bail!("URL must not contain credentials");
+            // TODO: that's not true; revisit this.
+            return Err("URL must not contain credentials".to_owned());
         }
-        let host = url
-            .host_str()
-            .ok_or_else(|| format_err!("Must specify host in rtsp url {}", &url))?;
-        let port = url.port().unwrap_or(554);
-        let stream = tokio::net::TcpStream::connect((host, port)).await?;
-        let conn_established_wall = time::get_time();
-        let conn_established = std::time::Instant::now();
-        let conn_local_addr = stream.local_addr()?;
-        let conn_peer_addr = stream.peer_addr()?;
-        let stream = Framed::new(
-            stream,
-            crate::Codec {
-                ctx: crate::Context {
-                    conn_established_wall,
-                    conn_established,
-                    conn_local_addr,
-                    conn_peer_addr,
-                    msg_pos: 0,
-                    msg_received_wall: conn_established_wall,
-                    msg_received: conn_established,
-                },
-            },
-        );
-        Ok(Self {
-            creds,
-            requested_auth: None,
-            stream,
-            user_agent: "moonfire-rtsp test".to_string(),
-            next_cseq: 1,
-        })
+        url.host()
+            .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
     }
 
     /// Sends a request and expects the next message from the peer to be its response.
@@ -339,63 +349,111 @@ impl RtspConnection {
     async fn send(
         &mut self,
         req: &mut rtsp_types::Request<Bytes>,
-    ) -> Result<rtsp_types::Response<Bytes>, Error> {
+    ) -> Result<(RtspMessageContext, u32, rtsp_types::Response<Bytes>), Error> {
         loop {
             let cseq = self.fill_req(req)?;
-            self.stream
+            self.inner
                 .send(rtsp_types::Message::Request(req.clone()))
-                .await?;
-            let msg = self
-                .stream
-                .next()
                 .await
-                .ok_or_else(|| format_err!("unexpected EOF while waiting for reply"))??;
+                .map_err(|e| wrap!(e))?;
+            let method: &str = req.method().into();
+            let msg = self.inner.next().await.unwrap_or_else(|| {
+                bail!(ErrorInt::ReadError {
+                    conn_ctx: *self.inner.ctx(),
+                    msg_ctx: self.inner.eof_ctx(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("EOF while expecting reply to {} CSeq {}", method, cseq),
+                    ),
+                })
+            })?;
             let resp = match msg.msg {
-                rtsp_types::Message::Response(r) => r,
-                o => bail!("Unexpected RTSP message {:?}", &o),
+                rtsp_types::Message::Response(r) if parse::get_cseq(&r) == Some(cseq) => r,
+                o => bail!(ErrorInt::RtspFramingError {
+                    conn_ctx: *self.inner.ctx(),
+                    msg_ctx: msg.ctx,
+                    description: format!("Expected reply to {} CSeq {}, got {:?}", method, cseq, o,),
+                }),
             };
-            if parse::get_cseq(&resp) != Some(cseq) {
-                bail!(
-                    "didn't get expected CSeq {:?} on {:?} at {:#?}",
-                    &cseq,
-                    &resp,
-                    &msg.ctx
-                );
-            }
             if resp.status() == rtsp_types::StatusCode::Unauthorized {
                 if self.requested_auth.is_some() {
-                    bail!(
-                        "Received Unauthorized after trying digest auth at {:#?}",
-                        &msg.ctx
-                    );
+                    // TODO: the WWW-Authenticate might indicate a new domain or nonce.
+                    // In that case, we should retry rather than returning error.
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Received Unauthorized after trying digest auth".into(),
+                    })
                 }
                 let www_authenticate = match resp.header(&rtsp_types::headers::WWW_AUTHENTICATE) {
-                    None => bail!(
-                        "Unauthorized without WWW-Authenticate header at {:#?}",
-                        &msg.ctx
-                    ),
+                    None => bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Unauthorized without WWW-Authenticate header".into(),
+                    }),
                     Some(h) => h,
                 };
                 let www_authenticate = www_authenticate.as_str();
                 if !www_authenticate.starts_with("Digest ") {
-                    bail!(
-                        "Non-digest authentication requested at {:#?}: {}",
-                        &msg.ctx,
-                        www_authenticate
-                    );
+                    // TODO: the header(s) might also indicate both Basic and Digest; we shouldn't
+                    // error or not based on ordering.
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: format!(
+                            "Non-digest authentication requested: {}",
+                            www_authenticate
+                        ),
+                    })
                 }
-                let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)?;
+                if self.creds.is_none() {
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Authentication requested and no credentials supplied"
+                            .to_owned(),
+                    })
+                }
+                let msg_ctx = msg.ctx;
+                let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)
+                    .map_err(|e| {
+                        wrap!(ErrorInt::RtspResponseError {
+                            conn_ctx: *self.inner.ctx(),
+                            msg_ctx,
+                            method: req.method().clone(),
+                            cseq,
+                            status: resp.status(),
+                            description: format!(
+                                "Bad WWW-Authenticate header {:?}: {}",
+                                www_authenticate, e
+                            ),
+                        })
+                    })?;
                 self.requested_auth = Some(www_authenticate);
                 continue;
             } else if !resp.status().is_success() {
-                bail!(
-                    "RTSP {:?} request returned {} at {:#?}",
-                    req.method(),
-                    resp.status(),
-                    &msg.ctx
-                );
+                bail!(ErrorInt::RtspResponseError {
+                    conn_ctx: *self.inner.ctx(),
+                    msg_ctx: msg.ctx,
+                    method: req.method().clone(),
+                    cseq,
+                    status: resp.status(),
+                    description: "Unexpected RTSP response status".into(),
+                });
             }
-            return Ok(resp);
+            return Ok((msg.ctx, cseq, resp));
         }
     }
 
@@ -403,22 +461,27 @@ impl RtspConnection {
     fn fill_req(&mut self, req: &mut rtsp_types::Request<Bytes>) -> Result<u32, Error> {
         let cseq = self.next_cseq;
         self.next_cseq += 1;
-        match (self.requested_auth.as_mut(), self.creds.as_ref()) {
-            (None, _) => {}
-            (Some(auth), Some(creds)) => {
-                let uri = req.request_uri().map(|u| u.as_str()).unwrap_or("*");
-                let method = digest_auth::HttpMethod(Cow::Borrowed(req.method().into()));
-                let ctx = digest_auth::AuthContext::new_with_method(
-                    &creds.username,
-                    &creds.password,
-                    uri,
-                    Option::<&'static [u8]>::None,
-                    method,
-                );
-                let authorization = auth.respond(&ctx)?.to_string();
-                req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
-            }
-            (Some(_), None) => bail!("Authentication required; no credentials supplied"),
+        if let Some(ref mut auth) = self.requested_auth {
+            let creds = self
+                .creds
+                .as_ref()
+                .expect("creds were checked when filling request_auth");
+            let uri = req.request_uri().map(|u| u.as_str()).unwrap_or("*");
+            let method = digest_auth::HttpMethod(Cow::Borrowed(req.method().into()));
+            let ctx = digest_auth::AuthContext::new_with_method(
+                &creds.username,
+                &creds.password,
+                uri,
+                Option::<&'static [u8]>::None,
+                method,
+            );
+
+            // digest_auth's comments seem to say 'respond' failing means a parser bug.
+            let authorization = auth
+                .respond(&ctx)
+                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?
+                .to_string();
+            req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
         }
         req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());
         req.insert_header(rtsp_types::headers::USER_AGENT, self.user_agent.clone());
@@ -427,6 +490,13 @@ impl RtspConnection {
 }
 
 impl Session<Described> {
+    /// Creates a new session from a `DESCRIBE` request on the given URL.
+    ///
+    /// This method is permissive; it will return success even if there are
+    /// errors in the SDP that would prevent one or more streams from being
+    /// depacketized correctly. If those streams are setup via
+    /// `Session<Described>::setup`, the erorrs in question will be ultimately
+    /// returned from `Stream<Playing>::demuxed`.
     pub async fn describe(url: Url, creds: Option<Credentials>) -> Result<Self, Error> {
         let mut conn = RtspConnection::connect(&url, creds).await?;
         let mut req =
@@ -434,14 +504,26 @@ impl Session<Described> {
                 .header(rtsp_types::headers::ACCEPT, "application/sdp")
                 .request_uri(url.clone())
                 .build(Bytes::new());
-        let response = conn.send(&mut req).await?;
-        let presentation = parse::parse_describe(url, response)?;
+        let (msg_ctx, cseq, response) = conn.send(&mut req).await?;
+        let presentation = parse::parse_describe(url, &response).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx,
+                method: rtsp_types::Method::Describe,
+                cseq,
+                status: response.status(),
+                description,
+            })
+        })?;
         Ok(Session {
             conn,
             state: Described {
                 presentation,
                 session_id: None,
                 channels: ChannelMappings::default(),
+                describe_ctx: msg_ctx,
+                describe_cseq: cseq,
+                describe_status: response.status(),
             },
         })
     }
@@ -451,6 +533,7 @@ impl Session<Described> {
     }
 
     /// Sends a `SETUP` request for a stream.
+    ///
     /// Note these can't reasonably be pipelined because subsequent requests
     /// are expected to adopt the previous response's `Session`. Likewise,
     /// the server may override the preferred interleaved channel id and it
@@ -461,9 +544,13 @@ impl Session<Described> {
     pub async fn setup(&mut self, stream_i: usize) -> Result<(), Error> {
         let stream = &mut self.state.presentation.streams[stream_i];
         if !matches!(stream.state, StreamState::Uninit) {
-            bail!("stream already set up");
+            bail!(ErrorInt::FailedPrecondition("stream already set up".into()));
         }
-        let proposed_channel_id = self.state.channels.next_unassigned()?;
+        let proposed_channel_id = self.state.channels.next_unassigned().ok_or_else(|| {
+            wrap!(ErrorInt::FailedPrecondition(
+                "no unassigned channels".into()
+            ))
+        })?;
         let url = stream
             .control
             .as_ref()
@@ -484,21 +571,51 @@ impl Session<Described> {
         if let Some(ref s) = self.state.session_id {
             req = req.header(rtsp_types::headers::SESSION, s.clone());
         }
-        let response = self.conn.send(&mut req.build(Bytes::new())).await?;
+        let (msg_ctx, cseq, response) = self.conn.send(&mut req.build(Bytes::new())).await?;
         debug!("SETUP response: {:#?}", &response);
-        let response = parse::parse_setup(&response)?;
+        let conn_ctx = self.conn.inner.ctx();
+        let status = response.status();
+        let response = parse::parse_setup(&response).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *conn_ctx,
+                msg_ctx,
+                method: rtsp_types::Method::Setup,
+                cseq,
+                status,
+                description,
+            })
+        })?;
         match self.state.session_id.as_ref() {
             Some(old) if old != response.session_id => {
-                bail!(
-                    "SETUP response changed session id from {:?} to {:?}",
-                    old,
-                    response.session_id
-                );
+                bail!(ErrorInt::RtspResponseError {
+                    conn_ctx: *self.conn.inner.ctx(),
+                    msg_ctx,
+                    method: rtsp_types::Method::Setup,
+                    cseq,
+                    status,
+                    description: format!(
+                        "session id changed from {:?} to {:?}",
+                        old, response.session_id,
+                    ),
+                });
             }
             Some(_) => {}
             None => self.state.session_id = Some(response.session_id.to_owned()),
         };
-        self.state.channels.assign(response.channel_id, stream_i)?;
+        let conn_ctx = self.conn.inner.ctx();
+        self.state
+            .channels
+            .assign(response.channel_id, stream_i)
+            .map_err(|description| {
+                wrap!(ErrorInt::RtspResponseError {
+                    conn_ctx: *conn_ctx,
+                    msg_ctx,
+                    method: rtsp_types::Method::Setup,
+                    cseq,
+                    status,
+                    description,
+                })
+            })?;
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
@@ -508,16 +625,17 @@ impl Session<Described> {
     }
 
     /// Sends a `PLAY` request for the entire presentation.
+    ///
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
     pub async fn play(mut self, policy: PlayPolicy) -> Result<Session<Playing>, Error> {
-        let session_id = self
-            .state
-            .session_id
-            .take()
-            .ok_or_else(|| format_err!("must SETUP before PLAY"))?;
+        let session_id = self.state.session_id.take().ok_or_else(|| {
+            wrap!(ErrorInt::FailedPrecondition(
+                "must SETUP before PLAY".into()
+            ))
+        })?;
         trace!("PLAY with channel mappings: {:#?}", &self.state.channels);
-        let response = self
+        let (msg_ctx, cseq, response) = self
             .conn
             .send(
                 &mut rtsp_types::Request::builder(
@@ -530,7 +648,16 @@ impl Session<Described> {
                 .build(Bytes::new()),
             )
             .await?;
-        parse::parse_play(response, &mut self.state.presentation)?;
+        parse::parse_play(&response, &mut self.state.presentation).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *self.conn.inner.ctx(),
+                msg_ctx,
+                method: rtsp_types::Method::Play,
+                cseq,
+                status: response.status(),
+                description,
+            })
+        })?;
 
         // Count how many streams have been setup (not how many are in the presentation).
         let setup_streams = self
@@ -563,27 +690,34 @@ impl Session<Described> {
                     ssrc,
                     ..
                 }) => {
-                    let initial_rtptime =
-                        match policy.initial_timestamp {
-                            InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
-                                if setup_streams > 1 =>
-                            {
-                                if initial_rtptime.is_none() {
-                                    bail!(
-                                    "Expected rtptime on PLAY with mode {:?}, missing on stream \
-                                     {} ({:?}). Consider setting initial timestamp mode \
-                                     use-if-all-present.",
-                                    policy.initial_timestamp, i, &s.control);
-                                }
-                                initial_rtptime
+                    let initial_rtptime = match policy.initial_timestamp {
+                        InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
+                            if setup_streams > 1 =>
+                        {
+                            if initial_rtptime.is_none() {
+                                bail!(ErrorInt::RtspResponseError {
+                                    conn_ctx: *self.conn.inner.ctx(),
+                                    msg_ctx,
+                                    method: rtsp_types::Method::Play,
+                                    cseq,
+                                    status: response.status(),
+                                    description: format!(
+                                        "Expected rtptime on PLAY with mode {:?}, missing on \
+                                             stream {} ({:?}). Consider setting initial timestamp \
+                                             mode use-if-all-present.",
+                                        policy.initial_timestamp, i, &s.control
+                                    ),
+                                });
                             }
-                            InitialTimestampPolicy::Permissive
-                                if setup_streams > 1 && all_have_time =>
-                            {
-                                initial_rtptime
-                            }
-                            _ => None,
-                        };
+                            initial_rtptime
+                        }
+                        InitialTimestampPolicy::Permissive
+                            if setup_streams > 1 && all_have_time =>
+                        {
+                            initial_rtptime
+                        }
+                        _ => None,
+                    };
                     let initial_seq = match initial_seq {
                         Some(0) if policy.ignore_zero_seq => {
                             log::info!("Ignoring seq=0 on stream {}", i);
@@ -591,12 +725,23 @@ impl Session<Described> {
                         }
                         o => o,
                     };
+                    let conn_ctx = self.conn.inner.ctx();
                     s.state = StreamState::Playing {
                         timeline: Timeline::new(
                             initial_rtptime,
                             s.clock_rate,
                             policy.enforce_timestamps_with_max_jump_secs,
-                        )?,
+                        )
+                        .map_err(|description| {
+                            wrap!(ErrorInt::RtspResponseError {
+                                conn_ctx: *conn_ctx,
+                                msg_ctx,
+                                method: rtsp_types::Method::Play,
+                                cseq,
+                                status: response.status(),
+                                description,
+                            })
+                        })?,
                         rtp_handler: rtp::StrictSequenceChecker::new(ssrc, initial_seq),
                     };
                 }
@@ -612,6 +757,9 @@ impl Session<Described> {
                 channels: self.state.channels,
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: tokio::time::sleep(KEEPALIVE_DURATION),
+                describe_ctx: self.state.describe_ctx,
+                describe_cseq: self.state.describe_cseq,
+                describe_status: self.state.describe_status,
             },
         })
     }
@@ -624,11 +772,20 @@ pub enum PacketItem {
 
 impl Session<Playing> {
     /// Returns a wrapper which demuxes/depacketizes into frames.
+    ///
+    /// Fails if a stream that has been setup can't be depacketized.
     pub fn demuxed(mut self) -> Result<Demuxed, Error> {
         for s in &mut self.state.presentation.streams {
             if matches!(s.state, StreamState::Playing { .. }) {
-                if let Err(ref mut e) = s.depacketizer {
-                    return Err(std::mem::replace(e, format_err!("(placeholder)")));
+                if let Err(ref description) = s.depacketizer {
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.conn.inner.ctx(),
+                        msg_ctx: self.state.describe_ctx,
+                        method: rtsp_types::Method::Describe,
+                        cseq: self.state.describe_cseq,
+                        status: self.state.describe_status,
+                        description: description.clone(),
+                    });
                 }
             }
         }
@@ -645,23 +802,36 @@ impl Session<Playing> {
     ) -> Result<(), Error> {
         // Expect the previous keepalive request to have finished.
         match state.keepalive_state {
-            KeepaliveState::Flushing(cseq) => bail!(
-                "Unable to write keepalive {} within {:?}",
-                cseq,
-                KEEPALIVE_DURATION,
-            ),
-            KeepaliveState::Waiting(cseq) => bail!(
-                "Server failed to respond to keepalive {} within {:?}",
-                cseq,
-                KEEPALIVE_DURATION,
-            ),
+            KeepaliveState::Flushing(cseq) => bail!(ErrorInt::WriteError {
+                conn_ctx: *conn.inner.ctx(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Unable to write keepalive {} within {:?}",
+                        cseq, KEEPALIVE_DURATION,
+                    ),
+                ),
+            }),
+            KeepaliveState::Waiting(cseq) => bail!(ErrorInt::ReadError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx: conn.inner.eof_ctx(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Server failed to respond to keepalive {} within {:?}",
+                        cseq, KEEPALIVE_DURATION,
+                    ),
+                ),
+            }),
             KeepaliveState::Idle => {}
         }
 
         // Currently the only outbound data should be keepalives, and the previous one
         // has already been flushed, so there's no reason the Sink shouldn't be ready.
-        if matches!(conn.stream.poll_ready_unpin(cx), Poll::Pending) {
-            bail!("Unexpectedly not ready to send keepalive");
+        if matches!(conn.inner.poll_ready_unpin(cx), Poll::Pending) {
+            bail!(ErrorInt::Internal(
+                "Unexpectedly not ready to send keepalive".into()
+            ));
         }
 
         // Send a new one and reset the timer.
@@ -673,12 +843,12 @@ impl Session<Playing> {
         .header(rtsp_types::headers::SESSION, state.session_id.clone())
         .build(Bytes::new());
         let cseq = conn.fill_req(&mut req)?;
-        conn.stream
+        conn.inner
             .start_send_unpin(rtsp_types::Message::Request(req))
             .expect("encoding is infallible");
-        *state.keepalive_state = match conn.stream.poll_flush_unpin(cx) {
+        *state.keepalive_state = match conn.inner.poll_flush_unpin(cx) {
             Poll::Ready(Ok(())) => KeepaliveState::Waiting(cseq),
-            Poll::Ready(Err(e)) => return Err(e),
+            Poll::Ready(Err(e)) => bail!(e),
             Poll::Pending => KeepaliveState::Flushing(cseq),
         };
 
@@ -691,6 +861,8 @@ impl Session<Playing> {
 
     fn handle_response(
         state: &mut PlayingProj<'_>,
+        conn: &RtspConnection,
+        msg_ctx: &crate::RtspMessageContext,
         response: rtsp_types::Response<Bytes>,
     ) -> Result<(), Error> {
         if matches!(*state.keepalive_state,
@@ -702,18 +874,27 @@ impl Session<Playing> {
         }
 
         // The only response we expect in this state is to our keepalive request.
-        bail!("Unexpected RTSP response {:#?}", response);
+        bail!(ErrorInt::RtspFramingError {
+            conn_ctx: *conn.inner.ctx(),
+            msg_ctx: *msg_ctx,
+            description: format!("Unexpected RTSP response {:#?}", response),
+        })
     }
 
     fn handle_data(
         state: &mut PlayingProj<'_>,
-        ctx: Context,
+        conn: &RtspConnection,
+        msg_ctx: &RtspMessageContext,
         data: rtsp_types::Data<Bytes>,
     ) -> Result<Option<PacketItem>, Error> {
-        let c = data.channel_id();
-        let m = match state.channels.lookup(c) {
+        let channel_id = data.channel_id();
+        let m = match state.channels.lookup(channel_id) {
             Some(m) => m,
-            None => bail!("Data message on unexpected channel {} at {:#?}", c, &ctx),
+            None => bail!(ErrorInt::RtspUnassignedChannelError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx: *msg_ctx,
+                channel_id,
+            }),
         };
         let stream = &mut state.presentation.streams[m.stream_i];
         let (mut timeline, rtp_handler) = match &mut stream.state {
@@ -721,18 +902,31 @@ impl Session<Playing> {
                 timeline,
                 rtp_handler,
             } => (timeline, rtp_handler),
-            _ => unreachable!("Session<Playing>'s {}->{:?} not in Playing state", c, m),
+            _ => unreachable!(
+                "Session<Playing>'s {}->{:?} not in Playing state",
+                channel_id, m
+            ),
         };
         match m.channel_type {
             ChannelType::Rtp => Ok(Some(rtp_handler.rtp(
-                ctx,
+                conn.inner.ctx(),
+                msg_ctx,
                 &mut timeline,
+                channel_id,
                 m.stream_i,
                 data.into_body(),
             )?)),
-            ChannelType::Rtcp => {
-                Ok(rtp_handler.rtcp(ctx, &mut timeline, m.stream_i, data.into_body())?)
-            }
+            ChannelType::Rtcp => rtp_handler
+                .rtcp(msg_ctx, &mut timeline, m.stream_i, data.into_body())
+                .map_err(|description| {
+                    wrap!(ErrorInt::RtspDataMessageError {
+                        conn_ctx: *conn.inner.ctx(),
+                        msg_ctx: *msg_ctx,
+                        channel_id,
+                        stream_id: m.stream_i,
+                        description,
+                    })
+                }),
         }
     }
 
@@ -753,17 +947,19 @@ impl futures::Stream for Session<Playing> {
         loop {
             // First try receiving data. Let this starve keepalive handling; if we can't keep up,
             // the server should probably drop us.
-            match Pin::new(&mut this.conn.stream).poll_next(cx) {
+            match Pin::new(&mut this.conn.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => match msg.msg {
                     rtsp_types::Message::Data(data) => {
-                        match Session::handle_data(&mut state, msg.ctx, data) {
+                        match Session::handle_data(&mut state, &this.conn, &msg.ctx, data) {
                             Err(e) => return Poll::Ready(Some(Err(e))),
                             Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
                             Ok(None) => continue,
                         };
                     }
                     rtsp_types::Message::Response(response) => {
-                        if let Err(e) = Session::handle_response(&mut state, response) {
+                        if let Err(e) =
+                            Session::handle_response(&mut state, &this.conn, &msg.ctx, response)
+                        {
                             return Poll::Ready(Some(Err(e)));
                         }
                         continue;
@@ -785,9 +981,9 @@ impl futures::Stream for Session<Playing> {
 
             // Then finish flushing the current keepalive if necessary.
             if let KeepaliveState::Flushing(cseq) = state.keepalive_state {
-                match this.conn.stream.poll_flush_unpin(cx) {
+                match this.conn.inner.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => *state.keepalive_state = KeepaliveState::Waiting(*cseq),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Box::new(e))))),
                     Poll::Pending => {}
                 }
             }
@@ -801,6 +997,7 @@ impl futures::Stream for Session<Playing> {
 enum DemuxedState {
     Waiting,
     Pulling(usize),
+    Fused,
 }
 
 /// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
@@ -830,6 +1027,7 @@ impl futures::Stream for Demuxed {
                     None => return Poll::Ready(None),
                 },
                 DemuxedState::Pulling(stream_id) => (*stream_id, None),
+                DemuxedState::Fused => return Poll::Ready(None),
             };
             let session = this.session.as_mut().project();
             let playing = session.state.project();
@@ -837,10 +1035,26 @@ impl futures::Stream for Demuxed {
                 Ok(d) => d,
                 Err(_) => unreachable!("depacketizer was Ok"),
             };
+            let conn_ctx = session.conn.inner.ctx();
             if let Some(p) = pkt {
-                depacketizer.push(p)?;
+                let msg_ctx = p.ctx;
+                let channel_id = p.channel_id;
+                let stream_id = p.stream_id;
+                let ssrc = p.ssrc;
+                let sequence_number = p.sequence_number;
+                depacketizer.push(p).map_err(|description| {
+                    wrap!(ErrorInt::RtpPacketError {
+                        conn_ctx: *conn_ctx,
+                        msg_ctx,
+                        channel_id,
+                        stream_id,
+                        ssrc,
+                        sequence_number,
+                        description,
+                    })
+                })?;
             }
-            match depacketizer.pull() {
+            match depacketizer.pull(conn_ctx) {
                 Ok(Some(item)) => {
                     *this.state = DemuxedState::Pulling(stream_id);
                     return Poll::Ready(Some(Ok(item)));
@@ -849,7 +1063,10 @@ impl futures::Stream for Demuxed {
                     *this.state = DemuxedState::Waiting;
                     continue;
                 }
-                Err(e) => return Poll::Ready(Some(Err(e))),
+                Err(e) => {
+                    *this.state = DemuxedState::Fused;
+                    return Poll::Ready(Some(Err(e)));
+                }
             }
         }
     }

@@ -1,5 +1,8 @@
 ## unreleased
 
+*   New opaque error type with more uniform, richer error messages. No more
+    `failure` dependency.
+
 ## v0.0.4 (2021-06-28)
 
 *   bugfix: Retina stopped receiving packets after receiving a keepalive response.

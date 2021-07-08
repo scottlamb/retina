@@ -5,8 +5,6 @@
 
 use std::num::NonZeroU8;
 
-use failure::{bail, Error};
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChannelType {
     Rtp,
@@ -39,27 +37,27 @@ pub struct ChannelMapping {
 pub struct ChannelMappings(smallvec::SmallVec<[Option<NonZeroU8>; 16]>);
 
 impl ChannelMappings {
-    /// Returns the next unassigned even channel id, or errors.
-    pub fn next_unassigned(&self) -> Result<u8, Error> {
+    /// Returns the next unassigned even channel id, or `None` if all assigned.
+    pub fn next_unassigned(&self) -> Option<u8> {
         if let Some(i) = self.0.iter().position(Option::is_none) {
-            return Ok((i as u8) << 1);
+            return Some((i as u8) << 1);
         }
         if self.0.len() < 128 {
-            return Ok((self.0.len() as u8) << 1);
+            return Some((self.0.len() as u8) << 1);
         }
-        bail!("all RTSP channels have been assigned");
+        None
     }
 
     /// Assigns an even channel id (to RTP) and its odd successor (to RTCP) or errors.
-    pub fn assign(&mut self, channel_id: u8, stream_i: usize) -> Result<(), Error> {
+    pub fn assign(&mut self, channel_id: u8, stream_i: usize) -> Result<(), String> {
         if (channel_id & 1) != 0 {
-            bail!("Can't assign odd channel id {}", channel_id);
+            return Err(format!("Can't assign odd channel id {}", channel_id));
         }
         if stream_i >= 255 {
-            bail!(
+            return Err(format!(
                 "Can't assign channel to stream id {} because it's >= 255",
                 stream_i
-            );
+            ));
         }
         let i = usize::from(channel_id >> 1);
         if i >= self.0.len() {
@@ -67,12 +65,12 @@ impl ChannelMappings {
         }
         let c = &mut self.0[i];
         if let Some(c) = c {
-            bail!(
+            return Err(format!(
                 "Channel id {} is already assigned to stream {}; won't reassign to stream {}",
                 channel_id,
                 c.get() - 1,
                 channel_id
-            );
+            ));
         }
         *c = Some(NonZeroU8::new((stream_i + 1) as u8).expect("[0, 255) + 1 is non-zero"));
         Ok(())

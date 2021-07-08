@@ -4,17 +4,19 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::{Buf, Bytes};
-use failure::{bail, format_err, Error};
-use log::{debug, trace};
+use log::debug;
 use pretty_hex::PrettyHex;
 
 use crate::client::PacketItem;
+use crate::{Error, ErrorInt};
 
-/// An RTP packet.
+/// A received RTP packet.
 pub struct Packet {
-    pub rtsp_ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
+    pub channel_id: u8,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
+    pub ssrc: u32,
     pub sequence_number: u16,
 
     /// Number of skipped sequence numbers since the last packet.
@@ -22,7 +24,7 @@ pub struct Packet {
     /// In the case of the first packet on the stream, this may also report loss
     /// packets since the `RTP-Info` header's `seq` value. However, currently
     /// that header is not required to be present and may be ignored (see
-    /// [`crate::client::PlayPolicy::ignore_zero_seq()`].)
+    /// [`retina::client::PlayPolicy::ignore_zero_seq()`].)
     pub loss: u16,
 
     pub mark: bool,
@@ -34,9 +36,11 @@ pub struct Packet {
 impl std::fmt::Debug for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Packet")
-            .field("rtsp_ctx", &self.rtsp_ctx)
+            .field("ctx", &self.ctx)
+            .field("channel_id", &self.channel_id)
             .field("stream_id", &self.stream_id)
             .field("timestamp", &self.timestamp)
+            .field("ssrc", &self.ssrc)
             .field("sequence_number", &self.sequence_number)
             .field("loss", &self.loss)
             .field("mark", &self.mark)
@@ -49,7 +53,7 @@ impl std::fmt::Debug for Packet {
 #[derive(Debug)]
 pub struct SenderReport {
     pub stream_id: usize,
-    pub rtsp_ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
     pub timestamp: crate::Timestamp,
     pub ntp_timestamp: crate::NtpTimestamp,
 }
@@ -83,8 +87,10 @@ impl StrictSequenceChecker {
 
     pub fn rtp(
         &mut self,
-        rtsp_ctx: crate::Context,
+        conn_ctx: &crate::ConnectionContext,
+        msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
+        channel_id: u8,
         stream_id: usize,
         mut data: Bytes,
     ) -> Result<PacketItem, Error> {
@@ -102,58 +108,70 @@ impl StrictSequenceChecker {
         }
 
         let reader = rtp_rs::RtpReader::new(&data[..]).map_err(|e| {
-            format_err!(
-                "corrupt RTP header while expecting seq={:04x?} at {:#?}: {:?}\n{:#?}",
-                self.next_seq,
-                &rtsp_ctx,
-                e,
-                data.hex_dump()
-            )
+            wrap!(ErrorInt::RtspDataMessageError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                description: format!(
+                    "corrupt RTP header while expecting seq={:04x?}: {:?}\n{:#?}",
+                    &self.next_seq,
+                    e,
+                    data.hex_dump(),
+                ),
+            })
         })?;
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
+        let ssrc = reader.ssrc();
         let timestamp = match timeline.advance_to(reader.timestamp()) {
             Ok(ts) => ts,
-            Err(e) => {
-                return Err(e
-                    .context(format!(
-                        "timestamp error in stream {} seq={:04x} {:#?}",
-                        stream_id, sequence_number, &rtsp_ctx
-                    ))
-                    .into())
-            }
-        };
-        let ssrc = reader.ssrc();
-        let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s != ssrc) || loss > 0x80_00 {
-            bail!(
-                "Expected ssrc={:08x?} seq={:04x?} got ssrc={:08x} seq={:04x} ts={} at {:#?}",
-                self.ssrc,
-                self.next_seq,
+            Err(description) => bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
                 ssrc,
                 sequence_number,
-                timestamp,
-                &rtsp_ctx
-            );
+                description,
+            }),
+        };
+        let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
+        if matches!(self.ssrc, Some(s) if s != ssrc) || loss > 0x80_00 {
+            bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: format!(
+                    "Expected ssrc={:08x?} seq={:04x?}",
+                    self.ssrc, self.next_seq
+                ),
+            });
         }
         self.ssrc = Some(ssrc);
         let mark = reader.mark();
-        let payload_range = crate::as_range(&data, reader.payload())
-            .ok_or_else(|| format_err!("empty payload at {:#?}", &rtsp_ctx))?;
-        trace!(
-            "{:?} pkt {:04x}{} ts={} len={}",
-            &rtsp_ctx,
-            sequence_number,
-            if mark { "   " } else { "(M)" },
-            &timestamp,
-            payload_range.len()
-        );
+        let payload_range = crate::as_range(&data, reader.payload()).ok_or_else(|| {
+            wrap!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: "empty payload".into(),
+            })
+        })?;
         data.truncate(payload_range.end);
         data.advance(payload_range.start);
         self.next_seq = Some(sequence_number.wrapping_add(1));
         Ok(PacketItem::RtpPacket(Packet {
+            ctx: *msg_ctx,
+            channel_id,
             stream_id,
-            rtsp_ctx,
             timestamp,
+            ssrc,
             sequence_number,
             loss,
             mark,
@@ -163,56 +181,45 @@ impl StrictSequenceChecker {
 
     pub fn rtcp(
         &mut self,
-        rtsp_ctx: crate::Context,
+        msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
         stream_id: usize,
         mut data: Bytes,
-    ) -> Result<Option<PacketItem>, Error> {
+    ) -> Result<Option<PacketItem>, String> {
         use rtcp::packet::Packet;
         let mut sr = None;
         let mut i = 0;
         while !data.is_empty() {
             let h = match rtcp::header::Header::unmarshal(&data) {
-                Err(e) => bail!("corrupt RTCP header at {:#?}: {}", &rtsp_ctx, e),
+                Err(e) => return Err(format!("corrupt RTCP header: {}", e)),
                 Ok(h) => h,
             };
             let pkt_len = (usize::from(h.length) + 1) * 4;
             if pkt_len > data.len() {
-                bail!(
-                    "rtcp pkt len {} vs remaining body len {} at {:#?}",
+                return Err(format!(
+                    "RTCP packet length {} exceeds remaining data message length {}",
                     pkt_len,
                     data.len(),
-                    &rtsp_ctx
-                );
+                ));
             }
             let pkt = data.split_to(pkt_len);
             match h.packet_type {
                 rtcp::header::PacketType::SenderReport => {
                     if i > 0 {
-                        bail!("RTCP SR must be first in packet");
+                        return Err("RTCP SR must be first in packet".into());
                     }
-                    let pkt = match rtcp::sender_report::SenderReport::unmarshal(&pkt) {
-                        Err(e) => bail!("corrupt RTCP SR at {:#?}: {}", &rtsp_ctx, e),
-                        Ok(p) => p,
-                    };
-
-                    let timestamp = match timeline.place(pkt.rtp_time) {
-                        Ok(ts) => ts,
-                        Err(e) => {
-                            return Err(e
-                                .context(format!(
-                                    "bad RTP timestamp in RTCP SR {:#?} at {:#?}",
-                                    &pkt, &rtsp_ctx
-                                ))
-                                .into())
-                        }
-                    };
+                    let pkt = rtcp::sender_report::SenderReport::unmarshal(&pkt)
+                        .map_err(|e| format!("corrupt RTCP SR: {}", e))?;
+                    let timestamp = timeline.place(pkt.rtp_time).map_err(|mut description| {
+                        description.push_str(" in RTCP SR");
+                        description
+                    })?;
 
                     // TODO: verify ssrc.
 
                     sr = Some(SenderReport {
                         stream_id,
-                        rtsp_ctx,
+                        ctx: *msg_ctx,
                         timestamp,
                         ntp_timestamp: crate::NtpTimestamp(pkt.ntp_time),
                     });

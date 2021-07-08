@@ -6,9 +6,9 @@
 mod metadata;
 mod mp4;
 
-use failure::Error;
+use anyhow::Error;
 use log::{error, info};
-use std::{fmt::Write, str::FromStr};
+use std::str::FromStr;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -27,24 +27,6 @@ struct Source {
 enum Cmd {
     Mp4(mp4::Opts),
     Metadata(metadata::Opts),
-}
-
-/// Returns a pretty-and-informative version of `e`.
-pub fn prettify_failure(e: &failure::Error) -> String {
-    let mut msg = e.to_string();
-    for cause in e.iter_causes() {
-        write!(&mut msg, "\ncaused by: {}", cause).unwrap();
-    }
-    if e.backtrace().is_empty() {
-        write!(
-            &mut msg,
-            "\n\n(set environment variable RUST_BACKTRACE=1 to see backtraces)"
-        )
-        .unwrap();
-    } else {
-        write!(&mut msg, "\n\nBacktrace:\n{}", e.backtrace()).unwrap();
-    }
-    msg
 }
 
 fn init_logging() -> mylog::Handle {
@@ -68,7 +50,7 @@ async fn main() {
         let _a = h.async_scope();
         main_inner().await
     } {
-        error!("Fatal: {}", prettify_failure(&e));
+        error!("Fatal: {}", e);
         std::process::exit(1);
     }
     info!("Done");

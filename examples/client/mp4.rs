@@ -17,8 +17,8 @@
 //! https://github.com/scottlamb/moonfire-nvr/wiki/Standards-and-specifications
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
+use anyhow::{anyhow, bail, Error};
 use bytes::{Buf, BufMut, BytesMut};
-use failure::{bail, format_err, Error};
 use futures::StreamExt;
 use log::info;
 use retina::codec::{AudioParameters, CodecItem, VideoParameters};
@@ -485,7 +485,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn video(&mut self, frame: retina::codec::VideoFrame) -> Result<(), failure::Error> {
+    async fn video(&mut self, frame: retina::codec::VideoFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
             &frame.timestamp,
@@ -500,7 +500,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
-            .ok_or_else(|| format_err!("mdat_pos overflow"))?;
+            .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
         if frame.is_random_access_point {
             self.video_sync_sample_nums
                 .push(u32::try_from(self.video_trak.samples)?);
@@ -510,7 +510,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn audio(&mut self, mut frame: retina::codec::AudioFrame) -> Result<(), failure::Error> {
+    async fn audio(&mut self, mut frame: retina::codec::AudioFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte audio frame",
             &frame.timestamp,
@@ -522,7 +522,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
-            .ok_or_else(|| format_err!("mdat_pos overflow"))?;
+            .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
         write_all_buf(&mut self.inner, &mut frame.data).await?;
         Ok(())
     }
@@ -585,7 +585,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     loop {
         tokio::select! {
             pkt = session.next() => {
-                match pkt.ok_or_else(|| format_err!("EOF"))?? {
+                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => mp4.video(f).await?,
                     CodecItem::AudioFrame(f) => mp4.audio(f).await?,
                     _ => continue,

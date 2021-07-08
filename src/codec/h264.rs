@@ -6,11 +6,10 @@
 use std::convert::TryFrom;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use failure::{bail, format_err, Error};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::debug;
 
-use crate::{client::rtp::Packet, Timestamp};
+use crate::{client::rtp::Packet, Error, Timestamp};
 
 use super::VideoFrame;
 
@@ -56,8 +55,8 @@ struct Nal {
 /// An access unit that is currently being accumulated during `PreMark` state.
 #[derive(Debug)]
 struct AccessUnit {
-    start_ctx: crate::Context,
-    end_ctx: crate::Context,
+    start_ctx: crate::RtspMessageContext,
+    end_ctx: crate::RtspMessageContext,
     timestamp: crate::Timestamp,
     stream_id: usize,
 
@@ -69,7 +68,7 @@ struct AccessUnit {
 }
 
 #[derive(Debug)]
-#[allow(clippy::clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
 enum DepacketizerInputState {
     /// Not yet processing an access unit.
     New,
@@ -95,14 +94,17 @@ impl Depacketizer {
     pub(super) fn new(
         clock_rate: u32,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, String> {
         if clock_rate != 90_000 {
-            bail!("H.264 clock rate must always be 90000");
+            return Err(format!(
+                "invalid H.264 clock rate {}; must always be 90000",
+                clock_rate
+            ));
         }
 
         // TODO: the spec doesn't require out-of-band parameters, so we shouldn't either.
         let format_specific_params = format_specific_params
-            .ok_or_else(|| format_err!("H.264 depacketizer expects out-of-band parameters"))?;
+            .ok_or_else(|| "H.264 depacketizer expects out-of-band parameters".to_owned())?;
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             pending: None,
@@ -116,105 +118,100 @@ impl Depacketizer {
         Some(&self.parameters.generic_parameters)
     }
 
-    pub(super) fn push(&mut self, pkt: Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, pkt: Packet) -> Result<(), String> {
         // Push shouldn't be called until pull is exhausted.
         if let Some(p) = self.pending.as_ref() {
             panic!("push with data already pending: {:?}", p);
         }
 
-        let seq = pkt.sequence_number;
-        let mut access_unit = match std::mem::replace(
-            &mut self.input_state,
-            DepacketizerInputState::New,
-        ) {
-            DepacketizerInputState::New => {
-                debug_assert!(self.nals.is_empty());
-                debug_assert!(self.pieces.is_empty());
-                AccessUnit::start(&pkt, 0)
-            }
-            DepacketizerInputState::PreMark(mut access_unit) => {
-                if pkt.loss > 0 {
-                    self.nals.clear();
-                    self.pieces.clear();
-                    if access_unit.timestamp.timestamp == pkt.timestamp.timestamp {
-                        // Loss within this access unit. Ignore until mark or new timestamp.
-                        self.input_state = if pkt.mark {
-                            DepacketizerInputState::PostMark {
-                                timestamp: pkt.timestamp,
-                                loss: pkt.loss,
-                            }
-                        } else {
-                            self.pieces.clear();
-                            self.nals.clear();
-                            DepacketizerInputState::Loss {
-                                timestamp: pkt.timestamp,
-                                pkts: pkt.loss,
-                            }
-                        };
+        let mut access_unit =
+            match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
+                DepacketizerInputState::New => {
+                    debug_assert!(self.nals.is_empty());
+                    debug_assert!(self.pieces.is_empty());
+                    AccessUnit::start(&pkt, 0)
+                }
+                DepacketizerInputState::PreMark(mut access_unit) => {
+                    if pkt.loss > 0 {
+                        self.nals.clear();
+                        self.pieces.clear();
+                        if access_unit.timestamp.timestamp == pkt.timestamp.timestamp {
+                            // Loss within this access unit. Ignore until mark or new timestamp.
+                            self.input_state = if pkt.mark {
+                                DepacketizerInputState::PostMark {
+                                    timestamp: pkt.timestamp,
+                                    loss: pkt.loss,
+                                }
+                            } else {
+                                self.pieces.clear();
+                                self.nals.clear();
+                                DepacketizerInputState::Loss {
+                                    timestamp: pkt.timestamp,
+                                    pkts: pkt.loss,
+                                }
+                            };
+                            return Ok(());
+                        }
+                        // A suffix of a previous access unit was lost; discard it.
+                        // A prefix of the new one may have been lost; try parsing.
+                        AccessUnit::start(&pkt, 0)
+                    } else if access_unit.timestamp.timestamp != pkt.timestamp.timestamp {
+                        if access_unit.in_fu_a {
+                            return Err(format!(
+                                "Timestamp changed from {} to {} in the middle of a fragmented NAL",
+                                access_unit.timestamp, pkt.timestamp
+                            ));
+                        }
+                        access_unit.end_ctx = pkt.ctx;
+                        self.pending = Some(self.finalize_access_unit(access_unit)?);
+                        AccessUnit::start(&pkt, 0)
+                    } else {
+                        access_unit
+                    }
+                }
+                DepacketizerInputState::PostMark {
+                    timestamp: state_ts,
+                    loss,
+                } => {
+                    debug_assert!(self.nals.is_empty());
+                    debug_assert!(self.pieces.is_empty());
+                    if state_ts.timestamp == pkt.timestamp.timestamp {
+                        return Err("packet follows marked packet with same timestamp".into());
+                    }
+                    AccessUnit::start(&pkt, loss)
+                }
+                DepacketizerInputState::Loss {
+                    timestamp,
+                    mut pkts,
+                } => {
+                    debug_assert!(self.nals.is_empty());
+                    debug_assert!(self.pieces.is_empty());
+                    if pkt.timestamp.timestamp == timestamp.timestamp {
+                        pkts += pkt.loss;
+                        self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
                     }
-                    // A suffix of a previous access unit was lost; discard it.
-                    // A prefix of the new one may have been lost; try parsing.
-                    AccessUnit::start(&pkt, 0)
-                } else if access_unit.timestamp.timestamp != pkt.timestamp.timestamp {
-                    if access_unit.in_fu_a {
-                        bail!("Timestamp changed from {} to {} in the middle of a fragmented NAL at seq={:04x} {:#?}", access_unit.timestamp, pkt.timestamp, seq, &pkt.rtsp_ctx);
-                    }
-                    access_unit.end_ctx = pkt.rtsp_ctx;
-                    self.pending = Some(self.finalize_access_unit(access_unit)?);
-                    AccessUnit::start(&pkt, 0)
-                } else {
-                    access_unit
+                    AccessUnit::start(&pkt, pkts)
                 }
-            }
-            DepacketizerInputState::PostMark {
-                timestamp: state_ts,
-                loss,
-            } => {
-                debug_assert!(self.nals.is_empty());
-                debug_assert!(self.pieces.is_empty());
-                if state_ts.timestamp == pkt.timestamp.timestamp {
-                    bail!("Received packet with timestamp {} after marked packet with same timestamp at seq={:04x} {:#?}", pkt.timestamp, seq, &pkt.rtsp_ctx);
-                }
-                AccessUnit::start(&pkt, loss)
-            }
-            DepacketizerInputState::Loss {
-                timestamp,
-                mut pkts,
-            } => {
-                debug_assert!(self.nals.is_empty());
-                debug_assert!(self.pieces.is_empty());
-                if pkt.timestamp.timestamp == timestamp.timestamp {
-                    pkts += pkt.loss;
-                    self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
-                    return Ok(());
-                }
-                AccessUnit::start(&pkt, pkts)
-            }
-        };
+            };
 
         let mut data = pkt.payload;
         if data.is_empty() {
-            bail!("Empty NAL at RTP seq {:04x}, {:#?}", seq, &pkt.rtsp_ctx);
+            return Err("Empty NAL".into());
         }
         // https://tools.ietf.org/html/rfc6184#section-5.2
         let nal_header = data[0];
         if (nal_header >> 7) != 0 {
-            bail!(
-                "NAL header has F bit set at seq {:04x} {:#?}",
-                seq,
-                &pkt.rtsp_ctx
-            );
+            return Err(format!("NAL header {:02x} has F bit set", nal_header));
         }
         data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
                 if access_unit.in_fu_a {
-                    bail!(
-                        "Non-fragmented NAL while fragment in progress seq {:04x} {:#?}",
-                        seq,
-                        &pkt.rtsp_ctx
-                    );
+                    return Err(format!(
+                        "Non-fragmented NAL {:02x} while fragment in progress",
+                        nal_header
+                    ));
                 }
                 let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
                 let next_piece_idx = self.add_piece(data)?;
@@ -228,24 +225,25 @@ impl Depacketizer {
                 // STAP-A. https://tools.ietf.org/html/rfc6184#section-5.7.1
                 loop {
                     if data.remaining() < 3 {
-                        bail!(
+                        return Err(format!(
                             "STAP-A has {} remaining bytes; expecting 2-byte length, non-empty NAL",
                             data.remaining()
-                        );
+                        ));
                     }
                     let len = data.get_u16();
-                    //let len = usize::from(data.get_u16());
                     if len == 0 {
-                        bail!("zero length in STAP-A");
+                        return Err("zero length in STAP-A".into());
                     }
-                    let hdr =
-                        NalHeader::new(data[0]).map_err(|_| format_err!("bad header in STAP-A"))?;
+                    let hdr = NalHeader::new(data[0])
+                        .map_err(|_| format!("bad header {:02x} in STAP-A", data[0]))?;
                     match data.remaining().cmp(&usize::from(len)) {
-                        std::cmp::Ordering::Less => bail!(
-                            "STAP-A too short: {} bytes remaining, expecting {}-byte NAL",
-                            data.remaining(),
-                            len
-                        ),
+                        std::cmp::Ordering::Less => {
+                            return Err(format!(
+                                "STAP-A too short: {} bytes remaining, expecting {}-byte NAL",
+                                data.remaining(),
+                                len
+                            ))
+                        }
                         std::cmp::Ordering::Equal => {
                             data.advance(1);
                             let next_piece_idx = self.add_piece(data)?;
@@ -269,21 +267,16 @@ impl Depacketizer {
                     }
                 }
             }
-            25..=27 | 29 => bail!(
-                "unimplemented NAL (header 0x{:02x}) at seq {:04x} {:#?}",
-                nal_header,
-                seq,
-                &pkt.rtsp_ctx
-            ),
+            25..=27 | 29 => {
+                return Err(format!(
+                    "unimplemented/unexpected interleaved mode NAL ({:02x})",
+                    nal_header,
+                ))
+            }
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
                 if data.len() < 2 {
-                    bail!(
-                        "FU-A len {} too short at seq {:04x} {:#?}",
-                        data.len(),
-                        seq,
-                        &pkt.rtsp_ctx
-                    );
+                    return Err(format!("FU-A len {} too short", data.len()));
                 }
                 let fu_header = data[0];
                 let start = (fu_header & 0b10000000) != 0;
@@ -294,27 +287,14 @@ impl Depacketizer {
                         .expect("NalHeader is valid");
                 data.advance(1);
                 if (start && end) || reserved {
-                    bail!(
-                        "Invalid FU-A header {:08b} at seq {:04x} {:#?}",
-                        fu_header,
-                        seq,
-                        &pkt.rtsp_ctx
-                    );
+                    return Err(format!("Invalid FU-A header {:02x}", fu_header));
                 }
                 if !end && pkt.mark {
-                    bail!(
-                        "FU-A pkt with MARK && !END at seq {:04x} {:#?}",
-                        seq,
-                        &pkt.rtsp_ctx
-                    );
+                    return Err("FU-A pkt with MARK && !END".into());
                 }
                 let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
                 match (start, access_unit.in_fu_a) {
-                    (true, true) => bail!(
-                        "FU-A with start bit while frag in progress at seq {:04x} {:#?}",
-                        seq,
-                        &pkt.rtsp_ctx
-                    ),
+                    (true, true) => return Err("FU-A with start bit while frag in progress".into()),
                     (true, false) => {
                         self.add_piece(data)?;
                         self.nals.push(Nal {
@@ -328,24 +308,17 @@ impl Depacketizer {
                         let pieces = self.add_piece(data)?;
                         let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
                         if u8::from(nal_header) != u8::from(nal.hdr) {
-                            bail!(
-                                "FU-A has inconsistent NAL type: {:?} then {:?} at {:02x} {:?}",
-                                nal.hdr,
-                                nal_header,
-                                seq,
-                                &pkt.rtsp_ctx
-                            );
+                            return Err(format!(
+                                "FU-A has inconsistent NAL type: {:?} then {:?}",
+                                nal.hdr, nal_header,
+                            ));
                         }
                         nal.len += u32_len;
                         if end {
                             nal.next_piece_idx = pieces;
                             access_unit.in_fu_a = false;
                         } else if pkt.mark {
-                            bail!(
-                                "FU-A with MARK and no END at seq {:04x} {:#?}",
-                                seq,
-                                pkt.rtsp_ctx
-                            );
+                            return Err("FU-A has MARK and no END".into());
                         }
                     }
                     (false, false) => {
@@ -358,23 +331,14 @@ impl Depacketizer {
                             };
                             return Ok(());
                         }
-                        bail!(
-                            "FU-A with start bit unset while no frag in progress at {:04x} {:#?}",
-                            seq,
-                            &pkt.rtsp_ctx
-                        );
+                        return Err("FU-A has start bit unset while no frag in progress".into());
                     }
                 }
             }
-            _ => bail!(
-                "bad nal header {:0x} at seq {:04x} {:#?}",
-                nal_header,
-                seq,
-                &pkt.rtsp_ctx
-            ),
+            _ => return Err(format!("bad nal header {:02x}", nal_header)),
         }
         self.input_state = if pkt.mark {
-            access_unit.end_ctx = pkt.rtsp_ctx;
+            access_unit.end_ctx = pkt.ctx;
             self.pending = Some(self.finalize_access_unit(access_unit)?);
             DepacketizerInputState::PostMark {
                 timestamp: pkt.timestamp,
@@ -386,17 +350,17 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
-        Ok(self.pending.take().map(super::CodecItem::VideoFrame))
+    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
+        self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
     /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
-    fn add_piece(&mut self, piece: Bytes) -> Result<u32, Error> {
+    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
         self.pieces.push(piece);
-        u32::try_from(self.pieces.len()).map_err(|_| format_err!("more than u32::MAX pieces!"))
+        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
     }
 
-    fn finalize_access_unit(&mut self, au: AccessUnit) -> Result<VideoFrame, Error> {
+    fn finalize_access_unit(&mut self, au: AccessUnit) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
         let mut is_random_access_point = false;
@@ -453,6 +417,7 @@ impl Depacketizer {
         let new_parameters = if new_sps.is_some() || new_pps.is_some() {
             let sps_nal = new_sps.as_deref().unwrap_or(&self.parameters.sps_nal);
             let pps_nal = new_pps.as_deref().unwrap_or(&self.parameters.pps_nal);
+            // TODO: could map this to a RtpPacketError more accurately.
             self.parameters = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
             match self.parameters.generic_parameters {
                 super::Parameters::Video(ref p) => Some(p.clone()),
@@ -478,8 +443,8 @@ impl Depacketizer {
 impl AccessUnit {
     fn start(pkt: &crate::client::rtp::Packet, additional_loss: u16) -> Self {
         AccessUnit {
-            start_ctx: pkt.rtsp_ctx,
-            end_ctx: pkt.rtsp_ctx,
+            start_ctx: pkt.ctx,
+            end_ctx: pkt.ctx,
             timestamp: pkt.timestamp,
             stream_id: pkt.stream_id,
             in_fu_a: false,
@@ -503,7 +468,7 @@ struct InternalParameters {
 
 impl InternalParameters {
     /// Parses metadata from the `format-specific-params` of a SDP `fmtp` media attribute.
-    fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, Error> {
+    fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
         let mut sprop_parameter_sets = None;
         for p in format_specific_params.split(';') {
             let (key, value) = p.trim().split_once('=').unwrap();
@@ -511,38 +476,37 @@ impl InternalParameters {
                 sprop_parameter_sets = Some(value);
             }
         }
-        let sprop_parameter_sets = sprop_parameter_sets.ok_or_else(|| {
-            format_err!("no sprop-parameter-sets in H.264 format-specific-params")
-        })?;
+        let sprop_parameter_sets = sprop_parameter_sets
+            .ok_or_else(|| "no sprop-parameter-sets in H.264 format-specific-params".to_string())?;
 
         let mut sps_nal = None;
         let mut pps_nal = None;
         for nal in sprop_parameter_sets.split(',') {
             let nal =
-                base64::decode(nal).map_err(|_| format_err!("NAL has invalid base64 encoding"))?;
+                base64::decode(nal).map_err(|_| "NAL has invalid base64 encoding".to_string())?;
             if nal.is_empty() {
-                bail!("empty NAL");
+                return Err("empty NAL".into());
             }
             let header = h264_reader::nal::NalHeader::new(nal[0])
-                .map_err(|_| format_err!("bad NAL header {:0x}", nal[0]))?;
+                .map_err(|_| format!("bad NAL header {:0x}", nal[0]))?;
             match header.nal_unit_type() {
                 UnitType::SeqParameterSet => {
                     if sps_nal.is_some() {
-                        bail!("multiple SPSs");
+                        return Err("multiple SPSs".into());
                     }
                     sps_nal = Some(nal);
                 }
                 UnitType::PicParameterSet => {
                     if pps_nal.is_some() {
-                        bail!("multiple PPSs");
+                        return Err("multiple PPSs".into());
                     }
                     pps_nal = Some(nal);
                 }
-                _ => bail!("only SPS and PPS expected in parameter sets"),
+                _ => return Err("only SPS and PPS expected in parameter sets".into()),
             }
         }
-        let sps_nal = sps_nal.ok_or_else(|| format_err!("no sps"))?;
-        let pps_nal = pps_nal.ok_or_else(|| format_err!("no pps"))?;
+        let sps_nal = sps_nal.ok_or_else(|| "no sps".to_string())?;
+        let pps_nal = pps_nal.ok_or_else(|| "no pps".to_string())?;
 
         // GW security GW4089IP leaves Annex B start codes at the end of both
         // SPS and PPS in the sprop-parameter-sets. Leaving them in means
@@ -557,22 +521,22 @@ impl InternalParameters {
         Self::parse_sps_and_pps(sps_nal, pps_nal)
     }
 
-    fn parse_sps_and_pps(sps_nal: &[u8], pps_nal: &[u8]) -> Result<InternalParameters, Error> {
+    fn parse_sps_and_pps(sps_nal: &[u8], pps_nal: &[u8]) -> Result<InternalParameters, String> {
         let sps_rbsp = h264_reader::rbsp::decode_nal(&sps_nal[1..]);
         if sps_rbsp.len() < 4 {
-            bail!("bad sps");
+            return Err("bad sps".into());
         }
         let rfc6381_codec = format!(
             "avc1.{:02X}{:02X}{:02X}",
             sps_rbsp[0], sps_rbsp[1], sps_rbsp[2]
         );
         let sps = h264_reader::nal::sps::SeqParameterSet::from_bytes(&sps_rbsp)
-            .map_err(|e| format_err!("Bad SPS: {:?}", e))?;
+            .map_err(|e| format!("Bad SPS: {:?}", e))?;
         debug!("sps: {:#?}", &sps);
 
         let pixel_dimensions = sps
             .pixel_dimensions()
-            .map_err(|e| format_err!("SPS has invalid pixel dimensions: {:?}", e))?;
+            .map_err(|e| format!("SPS has invalid pixel dimensions: {:?}", e))?;
 
         // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
         // The beginning of the AVCDecoderConfiguration takes a few values from
@@ -591,12 +555,20 @@ impl InternalParameters {
         // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
         // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
         avc_decoder_config.put_u8(0xe1);
-        avc_decoder_config.extend(&u16::try_from(sps_nal.len())?.to_be_bytes()[..]);
+        avc_decoder_config.extend(
+            &u16::try_from(sps_nal.len())
+                .map_err(|_| format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len()))?
+                .to_be_bytes()[..],
+        );
         let sps_nal_start = avc_decoder_config.len();
         avc_decoder_config.extend_from_slice(sps_nal);
         let sps_nal_end = avc_decoder_config.len();
         avc_decoder_config.put_u8(1); // # of PPSs.
-        avc_decoder_config.extend(&u16::try_from(pps_nal.len())?.to_be_bytes()[..]);
+        avc_decoder_config.extend(
+            &u16::try_from(pps_nal.len())
+                .map_err(|_| format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len()))?
+                .to_be_bytes()[..],
+        );
         let pps_nal_start = avc_decoder_config.len();
         avc_decoder_config.extend_from_slice(pps_nal);
         let pps_nal_end = avc_decoder_config.len();
@@ -651,7 +623,7 @@ fn matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
         if nal.len() < new_pos {
             return false;
         }
-        if &piece[..] != &nal[nal_pos..new_pos] {
+        if piece[..] != nal[nal_pos..new_pos] {
             return false;
         }
         nal_pos = new_pos;
@@ -688,10 +660,10 @@ impl Packetizer {
         max_payload_size: u16,
         stream_id: usize,
         initial_sequence_number: u16,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, String> {
         if max_payload_size < 3 {
             // minimum size to make progress with FU-A packets.
-            bail!("max_payload_size must be > 3");
+            return Err("max_payload_size must be > 3".into());
         }
         Ok(Self {
             max_payload_size,
@@ -707,39 +679,43 @@ impl Packetizer {
         Ok(())
     }
 
-    pub fn pull(&mut self) -> Result<Option<Packet>, Error> {
+    // TODO: better error type?
+    pub fn pull(&mut self) -> Result<Option<Packet>, String> {
         let max_payload_size = usize::from(self.max_payload_size);
         match std::mem::replace(&mut self.state, PacketizerState::Idle) {
-            PacketizerState::Idle => return Ok(None),
+            PacketizerState::Idle => Ok(None),
             PacketizerState::HaveData {
                 timestamp,
                 mut data,
             } => {
                 if data.len() < 5 {
-                    bail!(
+                    return Err(format!(
                         "have only {} bytes; expected 4-byte length + non-empty NAL",
                         data.len()
-                    );
+                    ));
                 }
                 let len = data.get_u32();
                 let usize_len = usize::try_from(len).expect("u32 fits in usize");
                 if data.len() < usize_len || len == 0 {
-                    bail!("bad length of {} bytes; expected [1, {}]", len, data.len());
+                    return Err(format!(
+                        "bad length of {} bytes; expected [1, {}]",
+                        len,
+                        data.len()
+                    ));
                 }
                 let sequence_number = self.next_sequence_number;
                 self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
-                let hdr =
-                    NalHeader::new(data[0]).map_err(|_| format_err!("F bit in NAL header"))?;
+                let hdr = NalHeader::new(data[0]).map_err(|_| "F bit in NAL header".to_owned())?;
                 if matches!(hdr.nal_unit_type(), UnitType::Unspecified(_)) {
                     // This can clash with fragmentation/aggregation NAL types.
-                    bail!("bad NAL header {:?}", hdr);
+                    return Err(format!("bad NAL header {:?}", hdr));
                 }
                 if usize_len > max_payload_size {
                     // start a FU-A.
                     data.advance(1);
                     let mut payload = Vec::with_capacity(max_payload_size);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
-                    let fu_header = 0b100_00000 | hdr.nal_unit_type().id(); // START bit set.
+                    let fu_header = 0b1000_0000 | hdr.nal_unit_type().id(); // START bit set.
                     payload.extend_from_slice(&[fu_indicator, fu_header]);
                     payload.extend_from_slice(&data[..max_payload_size - 2]);
                     data.advance(max_payload_size - 2);
@@ -749,10 +725,13 @@ impl Packetizer {
                         left: len + 1 - u32::from(self.max_payload_size),
                         data,
                     };
+                    // TODO: ctx, channel_id, and ssrc are placeholders.
                     return Ok(Some(Packet {
-                        rtsp_ctx: crate::Context::dummy(),
+                        ctx: crate::RtspMessageContext::dummy(),
+                        channel_id: 0,
                         stream_id: self.stream_id,
                         timestamp,
+                        ssrc: 0,
                         sequence_number,
                         loss: 0,
                         mark: false,
@@ -772,9 +751,11 @@ impl Packetizer {
                     mark = false;
                 }
                 Ok(Some(Packet {
-                    rtsp_ctx: crate::Context::dummy(),
+                    ctx: crate::RtspMessageContext::dummy(),
+                    channel_id: 0,
                     stream_id: self.stream_id,
                     timestamp,
+                    ssrc: 0,
                     sequence_number,
                     loss: 0,
                     mark,
@@ -809,7 +790,7 @@ impl Packetizer {
                     let usize_left = usize::try_from(left).expect("u32 fits in usize");
                     payload = Vec::with_capacity(usize_left + 2);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
-                    let fu_header = 0b010_00000 | hdr.nal_unit_type().id(); // END bit set.
+                    let fu_header = 0b0100_0000 | hdr.nal_unit_type().id(); // END bit set.
                     payload.extend_from_slice(&[fu_indicator, fu_header]);
                     payload.extend_from_slice(&data[..usize_left]);
                     if data.len() == usize_left {
@@ -821,10 +802,13 @@ impl Packetizer {
                         self.state = PacketizerState::HaveData { timestamp, data };
                     }
                 }
+                // TODO: placeholders.
                 Ok(Some(Packet {
-                    rtsp_ctx: crate::Context::dummy(),
+                    ctx: crate::RtspMessageContext::dummy(),
+                    channel_id: 0,
                     stream_id: self.stream_id,
                     timestamp,
+                    ssrc: 0,
                     sequence_number,
                     loss: 0,
                     mark,
@@ -927,57 +911,67 @@ mod tests {
         };
         d.push(Packet {
             // plain SEI packet.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 0,
             loss: 0,
             mark: false,
             payload: Bytes::from_static(b"\x06plain"),
         })
         .unwrap();
-        assert!(d.pull().unwrap().is_none());
+        assert!(d.pull().is_none());
         d.push(Packet {
             // STAP-A packet.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 1,
             loss: 0,
             mark: false,
             payload: Bytes::from_static(b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2"),
         })
         .unwrap();
-        assert!(d.pull().unwrap().is_none());
+        assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, start.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 2,
             loss: 0,
             mark: false,
             payload: Bytes::from_static(b"\x7c\x86fu-a start, "),
         })
         .unwrap();
-        assert!(d.pull().unwrap().is_none());
+        assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, middle.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 3,
             loss: 0,
             mark: false,
             payload: Bytes::from_static(b"\x7c\x06fu-a middle, "),
         })
         .unwrap();
-        assert!(d.pull().unwrap().is_none());
+        assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, end.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 4,
             loss: 0,
             mark: true,
@@ -985,7 +979,7 @@ mod tests {
         })
         .unwrap();
         let frame = match d.pull() {
-            Ok(Some(CodecItem::VideoFrame(frame))) => frame,
+            Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
         assert_eq!(
@@ -1012,20 +1006,24 @@ mod tests {
             start: 0,
         };
         d.push(Packet { // new SPS.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 0,
             loss: 0,
             mark: false,
             payload: Bytes::from_static(b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10"),
         }).unwrap();
-        assert!(d.pull().unwrap().is_none());
+        assert!(d.pull().is_none());
         d.push(Packet {
             // same PPS again.
-            rtsp_ctx: crate::Context::dummy(),
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number: 1,
             loss: 0,
             mark: true,
@@ -1033,7 +1031,7 @@ mod tests {
         })
         .unwrap();
         let frame = match d.pull() {
-            Ok(Some(CodecItem::VideoFrame(frame))) => frame,
+            Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
         assert!(frame.new_parameters.is_some());

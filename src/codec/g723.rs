@@ -6,7 +6,6 @@
 use std::num::NonZeroU32;
 
 use bytes::Bytes;
-use failure::{bail, Error};
 use pretty_hex::PrettyHex;
 
 #[derive(Debug)]
@@ -17,9 +16,12 @@ pub(crate) struct Depacketizer {
 
 impl Depacketizer {
     /// Creates a new Depacketizer.
-    pub(super) fn new(clock_rate: u32) -> Result<Self, Error> {
+    pub(super) fn new(clock_rate: u32) -> Result<Self, String> {
         if clock_rate != 8_000 {
-            bail!("Expected clock rate of 8000 for G.723, got {}", clock_rate);
+            return Err(format!(
+                "Expected clock rate of 8000 for G.723, got {}",
+                clock_rate
+            ));
         }
         Ok(Self {
             parameters: super::Parameters::Audio(super::AudioParameters {
@@ -48,13 +50,16 @@ impl Depacketizer {
         actual_hdr_bits == expected_hdr_bits
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
         assert!(self.pending.is_none());
         if !Self::validate(&pkt) {
-            bail!("Invalid G.723 packet: {:#?}", pkt.payload.hex_dump());
+            return Err(format!(
+                "Invalid G.723 packet: {:#?}",
+                pkt.payload.hex_dump()
+            ));
         }
         self.pending = Some(super::AudioFrame {
-            ctx: pkt.rtsp_ctx,
+            ctx: pkt.ctx,
             loss: pkt.loss,
             stream_id: pkt.stream_id,
             timestamp: pkt.timestamp,
@@ -64,7 +69,7 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
-        Ok(self.pending.take().map(super::CodecItem::AudioFrame))
+    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
+        self.pending.take().map(super::CodecItem::AudioFrame)
     }
 }
