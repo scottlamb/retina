@@ -1,3 +1,6 @@
+// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::fmt::Display;
 
 use crate::{ConnectionContext, RtspMessageContext};
