@@ -835,8 +835,10 @@ impl Session<Playing> {
         }
 
         // Send a new one and reset the timer.
+        // Use a SET_PARAMETER with no body for keepalives, as recommended in the
+        // ONVIF Streaming Specification version version 21.06 section 5.2.2.2.
         let mut req = rtsp_types::Request::builder(
-            rtsp_types::Method::GetParameter,
+            rtsp_types::Method::SetParameter,
             rtsp_types::Version::V1_0,
         )
         .request_uri(state.presentation.base_url.clone())

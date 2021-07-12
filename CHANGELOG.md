@@ -1,3 +1,8 @@
+## unreleased
+
+*   use `SET_PARAMETERS` rather than `GET_PARAMETERS` for keepalives.
+    The latter doesn't work with GW Security GW4089IP cameras.
+
 ## v0.0.5 (2021-07-08)
 
 *   BREAKING CHANGE: New opaque error type with more uniform, richer error
