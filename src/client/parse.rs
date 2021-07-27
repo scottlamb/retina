@@ -253,7 +253,6 @@ fn parse_media(
     let mut rtpmap = None;
     let mut fmtp = None;
     let mut control = None;
-    let mut alt_control = None;
     for a in &media_description.attributes {
         if a.key == "rtpmap" {
             let v = a
@@ -287,12 +286,10 @@ fn parse_media(
                 fmtp = Some(v);
             }
         } else if a.key == "control" {
+            // We use the url ending with `/` because lots of clients on
+            // the market and lots of cameras seem to rely on this wrong 
+            // assumption that the url should end in `/`
             control = a
-                .value
-                .as_deref()
-                .map(|c| join_control(base_url, c))
-                .transpose()?;
-            alt_control = a
                 .value
                 .as_deref()
                 .map(|c| join_control(alt_base_url, c))
@@ -357,7 +354,6 @@ fn parse_media(
         rtp_payload_type,
         depacketizer,
         control,
-        alt_control,
         channels,
         state: super::StreamState::Uninit,
     })
@@ -406,7 +402,7 @@ pub(crate) fn parse_describe(
                 .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
         })
         .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
-        .unwrap_or(Ok(request_url))?;
+        .unwrap_or(Ok(request_url.clone()))?;
     let mut alt_base_url = base_url.clone();
     alt_base_url.set_path(&format!("{}/", base_url.path()));
 
@@ -421,7 +417,7 @@ pub(crate) fn parse_describe(
             break;
         }
     }
-    let control = control.ok_or_else(|| "no control url".to_string())?;
+    let control = control.unwrap_or(request_url);
 
     let streams = sdp
         .media_descriptions
@@ -530,16 +526,6 @@ pub(crate) fn parse_play(
                 .streams
                 .iter_mut()
                 .find(|s| matches!(&s.control, Some(u) if u == &url));
-
-            // If we didn't find a stream, try again with alt_control. Don't do
-            // this on the first pass because we should check all of the
-            // proper control URLs first.
-            if stream.is_none() {
-                stream = presentation
-                    .streams
-                    .iter_mut()
-                    .find(|s| matches!(&s.alt_control, Some(u) if u == &url));
-            }
         }
         let stream = stream.ok_or_else(|| format!("RTP-Info contains unknown stream {}", url))?;
         let state = match &mut stream.state {
