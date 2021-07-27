@@ -403,7 +403,9 @@ pub(crate) fn parse_describe(
         .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
         .unwrap_or(Ok(request_url.clone()))?;
     let mut alt_base_url = base_url.clone();
-    alt_base_url.set_path(&format!("{}/", base_url.path()));
+    if !base_url.path().ends_with("/") {
+        alt_base_url.set_path(&format!("{}/", base_url.path()));
+    }
 
     let mut control = None;
     for a in &sdp.attributes {
@@ -970,6 +972,55 @@ mod tests {
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "pcmu");
         assert_eq!(p.streams[1].rtp_payload_type, 0);
+        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
+        match p.streams[1].parameters().unwrap() {
+            Parameters::Audio(_) => {}
+            _ => panic!(),
+        };
+    }
+
+    #[test]
+    fn vstarcam() {
+        // DESCRIBE.
+        let prefix = "rtsp://192.168.1.198:10554/tcp/av0_0";
+        let p = parse_describe(prefix, include_bytes!("testdata/vstarcam_describe.txt")).unwrap();
+        assert_eq!(p.control.as_str(), &(prefix.to_string()));
+
+        assert!(!p.accept_dynamic_rate);
+
+        assert_eq!(p.streams.len(), 2);
+
+        // H.264 video stream.
+        assert_eq!(
+            p.streams[0].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track0")
+        );
+
+        assert_eq!(p.streams[0].media, "video");
+
+        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].rtp_payload_type, 96);
+        assert_eq!(p.streams[0].clock_rate, 90_000);
+
+        match p.streams[0].parameters().unwrap() {
+            Parameters::Video(v) => {
+                assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
+                assert_eq!(v.pixel_dimensions(), (1920, 1080));
+                assert_eq!(v.pixel_aspect_ratio(), None);
+                assert_eq!(v.frame_rate(), Some((2, 15)));
+            }
+            _ => panic!(),
+        }
+
+        // audio stream
+        assert_eq!(
+            p.streams[1].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track1")
+        );
+        assert_eq!(p.streams[1].media, "audio");
+        assert_eq!(p.streams[1].encoding_name, "pcma");
+        assert_eq!(p.streams[1].rtp_payload_type, 8);
         assert_eq!(p.streams[1].clock_rate, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
