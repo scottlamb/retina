@@ -230,12 +230,6 @@ pub struct Stream {
     /// says the server is allowed to omit it when there is only a single stream.
     pub control: Option<Url>,
 
-    /// Some buggy cameras expect the base URL to be interpreted as if it had an
-    /// implicit trailing slash. (This is approximately what ffmpeg 4.3.1 does
-    /// when the base URL has a query string.) If `RTP-Info` matching fails, try
-    /// again with this URL.
-    alt_control: Option<Url>,
-
     state: StreamState,
 }
 
