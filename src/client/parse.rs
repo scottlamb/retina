@@ -498,9 +498,11 @@ pub(crate) fn parse_play(
     presentation: &mut Presentation,
 ) -> Result<(), String> {
     // https://tools.ietf.org/html/rfc2326#section-12.33
-    let rtp_info = response
-        .header(&rtsp_types::headers::RTP_INFO)
-        .ok_or_else(|| "PLAY response has no RTP-Info header".to_string())?;
+    let rtp_info = match  response
+    .header(&rtsp_types::headers::RTP_INFO) {
+        Some(rtsp_info) => rtsp_info,
+        None => return Ok(())
+    };
     for s in rtp_info.as_str().split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
