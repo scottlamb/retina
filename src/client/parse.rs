@@ -207,7 +207,6 @@ pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
 fn parse_media(
-    base_url: &Url,
     alt_base_url: &Url,
     media_description: &MediaDescription,
 ) -> Result<Stream, String> {
@@ -424,7 +423,7 @@ pub(crate) fn parse_describe(
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            parse_media(&base_url, &alt_base_url, &m)
+            parse_media(&alt_base_url, &m)
                 .map_err(|e| format!("Unable to parse stream {}: {}\n\n{:#?}", i, &e, &m))
         })
         .collect::<Result<Vec<Stream>, String>>()?;
@@ -512,7 +511,7 @@ pub(crate) fn parse_play(
             .strip_prefix("url=")
             .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
         let url = join_control(&presentation.base_url, url)?;
-        let mut stream;
+        let stream;
         if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
             // single-stream presentations. Additionally, some buggy
