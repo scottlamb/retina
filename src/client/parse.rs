@@ -1125,17 +1125,17 @@ mod tests {
     #[test]
     fn gw_sub() {
         // DESCRIBE.
-        let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
+        let base = "rtsp://192.168.5.112/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif/";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), base);
-        assert!(!p.accept_dynamic_rate);
+        assert!(p.accept_dynamic_rate);
 
-        assert_eq!(p.streams.len(), 1);
+        assert_eq!(p.streams.len(), 3);
 
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5049/video"
+            "rtsp://192.168.5.112/cam/realmonitor/trackID=0"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1143,10 +1143,10 @@ mod tests {
         assert_eq!(p.streams[0].clock_rate, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
-                assert_eq!(v.rfc6381_codec(), "avc1.4D001E");
-                assert_eq!(v.pixel_dimensions(), (720, 480));
+                assert_eq!(v.rfc6381_codec(), "avc1.640032");
+                assert_eq!(v.pixel_dimensions(), (1520, 2688));
                 assert_eq!(v.pixel_aspect_ratio(), None);
-                assert_eq!(v.frame_rate(), None);
+                assert_eq!(v.frame_rate(), Some((2,60)));
             }
             _ => panic!(),
         }
