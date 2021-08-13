@@ -1,7 +1,12 @@
-## unreleased
+## v0.1.0 (2021-08-13)
 
 *   use `SET_PARAMETERS` rather than `GET_PARAMETERS` for keepalives.
     The latter doesn't work with GW Security GW4089IP cameras.
+*   removed `rtcp` dependency. Fixes
+    [#8](https://github.com/scottlamb/retina/issues/8). Avoids picking up
+    various transitive dependencies needed by later versions of the `rtcp`
+    crate, including `tokio`. (`retina`'s own `tokio` dependency will likely
+    become optional in a future version.)
 
 ## v0.0.5 (2021-07-08)
 

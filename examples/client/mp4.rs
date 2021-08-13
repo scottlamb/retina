@@ -591,6 +591,9 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => mp4.video(f).await?,
                     CodecItem::AudioFrame(f) => mp4.audio(f).await?,
+                    CodecItem::SenderReport(sr) => {
+                        println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
+                    },
                     _ => continue,
                 };
             },

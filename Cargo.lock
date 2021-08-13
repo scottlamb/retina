@@ -989,7 +989,7 @@ checksum = "f497285884f3fcff424ffc933e56d7cbca511def0c9831a7f9b5f6153e3cc89b"
 
 [[package]]
 name = "retina"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1005,7 +1005,6 @@ dependencies = [
  "once_cell",
  "pin-project",
  "pretty-hex",
- "rtcp",
  "rtp-rs",
  "rtsp-types",
  "sdp",
@@ -1027,16 +1026,6 @@ dependencies = [
  "four-cc",
  "mp4ra-rust",
  "mpeg4-audio-const",
-]
-
-[[package]]
-name = "rtcp"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5fb4431b04a948fd91622a75d65a95da3ed2f0be26c902f3d027a23b78fbc96"
-dependencies = [
- "bytes",
- "thiserror",
 ]
 
 [[package]]

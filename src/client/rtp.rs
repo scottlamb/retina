@@ -184,51 +184,44 @@ impl StrictSequenceChecker {
         msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
         stream_id: usize,
-        mut data: Bytes,
+        data: Bytes,
     ) -> Result<Option<PacketItem>, String> {
-        use rtcp::packet::Packet;
         let mut sr = None;
         let mut i = 0;
+        let mut data = &data[..];
         while !data.is_empty() {
-            let h = match rtcp::header::Header::unmarshal(&data) {
-                Err(e) => return Err(format!("corrupt RTCP header: {}", e)),
-                Ok(h) => h,
-            };
-            let pkt_len = (usize::from(h.length) + 1) * 4;
-            if pkt_len > data.len() {
-                return Err(format!(
-                    "RTCP packet length {} exceeds remaining data message length {}",
-                    pkt_len,
-                    data.len(),
-                ));
-            }
-            let pkt = data.split_to(pkt_len);
-            match h.packet_type {
-                rtcp::header::PacketType::SenderReport => {
+            let (pkt, rest) = crate::rtcp::Packet::parse(data)?;
+            data = rest;
+            match pkt {
+                crate::rtcp::Packet::SenderReport(pkt) => {
                     if i > 0 {
                         return Err("RTCP SR must be first in packet".into());
                     }
-                    let pkt = rtcp::sender_report::SenderReport::unmarshal(&pkt)
-                        .map_err(|e| format!("corrupt RTCP SR: {}", e))?;
-                    let timestamp = timeline.place(pkt.rtp_time).map_err(|mut description| {
-                        description.push_str(" in RTCP SR");
-                        description
-                    })?;
+                    let timestamp =
+                        timeline
+                            .place(pkt.rtp_timestamp())
+                            .map_err(|mut description| {
+                                description.push_str(" in RTCP SR");
+                                description
+                            })?;
 
-                    // TODO: verify ssrc.
+                    let ssrc = pkt.ssrc();
+                    if matches!(self.ssrc, Some(s) if s != ssrc) {
+                        return Err(format!(
+                            "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                            self.ssrc, ssrc
+                        ));
+                    }
+                    self.ssrc = Some(ssrc);
 
                     sr = Some(SenderReport {
                         stream_id,
                         ctx: *msg_ctx,
                         timestamp,
-                        ntp_timestamp: crate::NtpTimestamp(pkt.ntp_time),
+                        ntp_timestamp: pkt.ntp_timestamp(),
                     });
                 }
-                /*rtcp::header::PacketType::SourceDescription => {
-                    let pkt = rtcp::source_description::SourceDescription::unmarshal(&pkt)?;
-                    debug!("rtcp source description: {:#?}", &pkt);
-                },*/
-                _ => debug!("rtcp: {:?}", h.packet_type),
+                crate::rtcp::Packet::Unknown(pkt) => debug!("rtcp: {:?}", pkt.payload_type()),
             }
             i += 1;
         }
