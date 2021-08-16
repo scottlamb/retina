@@ -75,8 +75,8 @@ pub(crate) enum ErrorInt {
     },
 
     #[error(
-        "[{conn_ctx}, {msg_ctx}, channel={channel_id}, stream={stream_id}, ssrc={ssrc:08x}] \
-              {description}"
+        "[{conn_ctx}, {msg_ctx}, channel={channel_id}, stream={stream_id}, ssrc={ssrc:08x}, \
+         seq={sequence_number:08x}] {description}"
     )]
     RtpPacketError {
         conn_ctx: ConnectionContext,
