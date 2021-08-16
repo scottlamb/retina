@@ -4,10 +4,11 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video.
 
 use std::convert::TryFrom;
+use std::fmt::Write;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h264_reader::nal::{NalHeader, UnitType};
-use log::debug;
+use log::{debug, log_enabled, trace, warn};
 
 use crate::{client::rtp::Packet, Error, Timestamp};
 
@@ -65,6 +66,8 @@ struct AccessUnit {
 
     /// RTP packets lost as this access unit was starting.
     loss: u16,
+
+    same_ts_as_prev: bool,
 }
 
 #[derive(Debug)]
@@ -87,7 +90,7 @@ enum DepacketizerInputState {
     PostMark {
         timestamp: crate::Timestamp,
         loss: u16,
-    },
+    }
 }
 
 impl Depacketizer {
@@ -131,7 +134,7 @@ impl Depacketizer {
                 DepacketizerInputState::New => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&pkt, 0)
+                    AccessUnit::start(&pkt, 0, false)
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
                     if pkt.loss > 0 {
@@ -156,7 +159,7 @@ impl Depacketizer {
                         }
                         // A suffix of a previous access unit was lost; discard it.
                         // A prefix of the new one may have been lost; try parsing.
-                        AccessUnit::start(&pkt, 0)
+                        AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp.timestamp {
                         if access_unit.in_fu_a {
                             return Err(format!(
@@ -165,8 +168,8 @@ impl Depacketizer {
                             ));
                         }
                         access_unit.end_ctx = pkt.ctx;
-                        self.pending = Some(self.finalize_access_unit(access_unit)?);
-                        AccessUnit::start(&pkt, 0)
+                        self.pending = Some(self.finalize_access_unit(access_unit, "ts change")?);
+                        AccessUnit::start(&pkt, 0, false)
                     } else {
                         access_unit
                     }
@@ -177,10 +180,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    if state_ts.timestamp == pkt.timestamp.timestamp {
-                        return Err("packet follows marked packet with same timestamp".into());
-                    }
-                    AccessUnit::start(&pkt, loss)
+                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp.timestamp)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
@@ -193,7 +193,7 @@ impl Depacketizer {
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
                     }
-                    AccessUnit::start(&pkt, pkts)
+                    AccessUnit::start(&pkt, pkts, false)
                 }
             };
 
@@ -341,7 +341,7 @@ impl Depacketizer {
         }
         self.input_state = if pkt.mark {
             access_unit.end_ctx = pkt.ctx;
-            self.pending = Some(self.finalize_access_unit(access_unit)?);
+            self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
             DepacketizerInputState::PostMark {
                 timestamp: pkt.timestamp,
                 loss: 0,
@@ -362,13 +362,43 @@ impl Depacketizer {
         u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
     }
 
-    fn finalize_access_unit(&mut self, au: AccessUnit) -> Result<VideoFrame, String> {
+    /// Logs information about each access unit.
+    /// Currently, "bad" access units (violating certain specification rules)
+    /// are logged at debug priority, and others are logged at trace priority.
+    fn log_access_unit(&self, au: &AccessUnit, reason: &str) {
+        let mut errs = String::new();
+        if au.same_ts_as_prev {
+            errs.push_str("\n* same timestamp as previous access unit");
+        }
+        validate_order(&self.nals, &mut errs);
+        if !errs.is_empty() {
+            let mut nals = String::new();
+            for (i, nal) in self.nals.iter().enumerate() {
+                let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
+            }
+            warn!("bad access unit (ended by {}) at ts {}\nerrors are:{}\nNALs are:{}",
+                  reason, au.timestamp, errs, nals);
+        } else if log_enabled!(log::Level::Trace) {
+            let mut nals = String::new();
+            for (i, nal) in self.nals.iter().enumerate() {
+                let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
+            }
+            trace!("access unit (ended by {}) at ts {}; NALS are:{}",
+                   reason, au.timestamp, nals);
+        }
+    }
+
+    fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
         let mut is_random_access_point = false;
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
+
+        if log_enabled!(log::Level::Debug) {
+            self.log_access_unit(&au, reason);
+        }
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
@@ -440,7 +470,7 @@ impl Depacketizer {
 }
 
 impl AccessUnit {
-    fn start(pkt: &crate::client::rtp::Packet, additional_loss: u16) -> Self {
+    fn start(pkt: &crate::client::rtp::Packet, additional_loss: u16, same_ts_as_prev: bool) -> Self {
         AccessUnit {
             start_ctx: pkt.ctx,
             end_ctx: pkt.ctx,
@@ -450,7 +480,52 @@ impl AccessUnit {
 
             // TODO: overflow?
             loss: pkt.loss + additional_loss,
+            same_ts_as_prev,
         }
+    }
+}
+
+/// Checks NAL unit type ordering against rules of H.264 section 7.4.1.2.3.
+///
+/// This doesn't precisely check every rule there but enough to diagnose some
+/// problems.
+fn validate_order(nals: &[Nal], errs: &mut String) {
+    let mut seen_vcl = false;
+    for (i, nal) in nals.iter().enumerate() {
+        match nal.hdr.nal_unit_type() {
+            /* 1 */ UnitType::SliceLayerWithoutPartitioningNonIdr |
+            /* 2 */ UnitType::SliceDataPartitionALayer |
+            /* 3 */ UnitType::SliceDataPartitionBLayer |
+            /* 4 */ UnitType::SliceDataPartitionCLayer |
+            /* 5 */ UnitType::SliceLayerWithoutPartitioningIdr => {
+                seen_vcl = true;
+            }
+            /* 6 */ UnitType::SEI => {
+                if seen_vcl {
+                    errs.push_str("\n* SEI after VCL");
+                }
+            }
+            /* 9 */ UnitType::AccessUnitDelimiter => {
+                if i != 0 {
+                    let _ = write!(errs, "access unit delimiter must be first in AU; was preceded by {:?}",
+                                nals[i-1].hdr);
+                }
+            }
+            /* 10 */ UnitType::EndOfSeq => {
+                if !seen_vcl {
+                    errs.push_str("\n* end of sequence without VCL");
+                }
+            }
+            /* 11 */ UnitType::EndOfStream => {
+                if i != nals.len() - 1 {
+                    errs.push_str("\n* end of stream NAL isn't last");
+                }
+            }
+            _ => {}
+        }
+    }
+    if !seen_vcl {
+        errs.push_str("\n* missing VCL");
     }
 }
 
