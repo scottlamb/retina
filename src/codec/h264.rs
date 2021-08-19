@@ -376,7 +376,7 @@ impl Depacketizer {
             for (i, nal) in self.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
-            warn!(
+            debug!(
                 "bad access unit (ended by {}) at ts {}\nerrors are:{}\nNALs are:{}",
                 reason, au.timestamp, errs, nals
             );
