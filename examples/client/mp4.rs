@@ -43,6 +43,9 @@ pub struct Opts {
     #[structopt(long)]
     no_audio: bool,
 
+    #[structopt(long)]
+    ignore_spurious_data: bool,
+
     #[structopt(parse(try_from_str))]
     out: PathBuf,
 }
@@ -534,7 +537,14 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 pub async fn run(opts: Opts) -> Result<(), Error> {
     let creds = super::creds(opts.src.username, opts.src.password);
     let stop = tokio::signal::ctrl_c();
-    let mut session = retina::client::Session::describe(opts.src.url, creds).await?;
+    let mut session = retina::client::Session::describe(
+        opts.src.url,
+        retina::client::SessionOptions::default()
+            .creds(creds)
+            .user_agent("Retina mp4 example".to_owned())
+            .ignore_spurious_data(opts.ignore_spurious_data),
+    )
+    .await?;
     let video_stream = if !opts.no_video {
         session
             .streams()
@@ -567,7 +577,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     }
     let session = session
         .play(
-            retina::client::PlayPolicy::default()
+            retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
                 .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
         )

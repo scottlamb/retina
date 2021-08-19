@@ -1,3 +1,11 @@
+## `v0.2.0` (unreleased)
+
+*   BREAKING CHANGE: `retina::client::Session::describe` now takes a new
+    `options: SessionOptions`. The `creds` has moved into the `options`, along
+    with some new options.
+*   BREAKING CHANGE: renamed `PlayPolicy` to `PlayOptions` for consistency.
+*   Added options to work around bugs found in Reolink cameras.
+
 ## v0.1.0 (2021-08-13)
 
 *   use `SET_PARAMETERS` rather than `GET_PARAMETERS` for keepalives.

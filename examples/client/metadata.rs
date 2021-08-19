@@ -16,7 +16,13 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let stop = tokio::signal::ctrl_c();
 
     let creds = super::creds(opts.src.username, opts.src.password);
-    let mut session = retina::client::Session::describe(opts.src.url, creds).await?;
+    let mut session = retina::client::Session::describe(
+        opts.src.url,
+        retina::client::SessionOptions::default()
+            .creds(creds)
+            .user_agent("Retina metadata example".to_owned()),
+    )
+    .await?;
     let onvif_stream_i = session
         .streams()
         .iter()
@@ -24,7 +30,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         .ok_or_else(|| anyhow!("couldn't find onvif stream"))?;
     session.setup(onvif_stream_i).await?;
     let session = session
-        .play(retina::client::PlayPolicy::default().ignore_zero_seq(true))
+        .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
         .await?
         .demuxed()?;
 

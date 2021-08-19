@@ -8,7 +8,7 @@ use std::{io::ErrorKind, net::SocketAddr, num::NonZeroU32};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::StreamExt;
-use retina::{client::PlayPolicy, codec::CodecItem};
+use retina::{client::PlayOptions, codec::CodecItem};
 use std::convert::TryFrom;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -107,10 +107,13 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
 
 async fn read_to_eof(addr: SocketAddr) {
     let url = Url::parse(&format!("rtsp://{}/", &addr)).unwrap();
-    let mut session = retina::client::Session::describe(url, None).await.unwrap();
+    let mut session =
+        retina::client::Session::describe(url, retina::client::SessionOptions::default())
+            .await
+            .unwrap();
     session.setup(0).await.unwrap();
     let session = session
-        .play(PlayPolicy::default())
+        .play(PlayOptions::default())
         .await
         .unwrap()
         .demuxed()

@@ -48,6 +48,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
             _ => unreachable!(),
         };
         let pkt = match rtps[stream_id].rtp(
+            &retina::client::SessionOptions::default(),
             &conn_ctx,
             &msg_ctx,
             &mut timelines[stream_id],
@@ -55,7 +56,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
             stream_id,
             data,
         ) {
-            Ok(retina::client::PacketItem::RtpPacket(rtp)) => rtp,
+            Ok(Some(retina::client::PacketItem::RtpPacket(rtp))) => rtp,
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();

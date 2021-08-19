@@ -87,13 +87,14 @@ impl StrictSequenceChecker {
 
     pub fn rtp(
         &mut self,
+        session_options: &super::SessionOptions,
         conn_ctx: &crate::ConnectionContext,
         msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
         channel_id: u8,
         stream_id: usize,
         mut data: Bytes,
-    ) -> Result<PacketItem, Error> {
+    ) -> Result<Option<PacketItem>, Error> {
         // Terrible hack to try to make sense of the GW Security GW4089IP's audio stream.
         // It appears to have one RTSP interleaved message wrapped in another. RTP and RTCP
         // packets can never start with '$', so this shouldn't interfere with well-behaved
@@ -123,6 +124,47 @@ impl StrictSequenceChecker {
         })?;
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
         let ssrc = reader.ssrc();
+        let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
+        if matches!(self.ssrc, Some(s) if s != ssrc) {
+            if session_options.ignore_spurious_data {
+                log::debug!(
+                    "Ignoring spurious RTP data with ssrc={:08x} seq={:04x} while expecting \
+                             ssrc={:08x?} seq={:04x?}",
+                    ssrc,
+                    sequence_number,
+                    self.ssrc,
+                    self.next_seq
+                );
+                return Ok(None);
+            } else {
+                bail!(ErrorInt::RtpPacketError {
+                    conn_ctx: *conn_ctx,
+                    msg_ctx: *msg_ctx,
+                    channel_id,
+                    stream_id,
+                    ssrc,
+                    sequence_number,
+                    description: format!(
+                        "Wrong ssrc; expecting ssrc={:08x?} seq={:04x?}",
+                        self.ssrc, self.next_seq
+                    ),
+                });
+            }
+        }
+        if loss > 0x80_00 {
+            bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: format!(
+                    "Out-of-order packet or large loss; expecting ssrc={:08x?} seq={:04x?}",
+                    self.ssrc, self.next_seq
+                ),
+            });
+        }
         let timestamp = match timeline.advance_to(reader.timestamp()) {
             Ok(ts) => ts,
             Err(description) => bail!(ErrorInt::RtpPacketError {
@@ -135,21 +177,6 @@ impl StrictSequenceChecker {
                 description,
             }),
         };
-        let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s != ssrc) || loss > 0x80_00 {
-            bail!(ErrorInt::RtpPacketError {
-                conn_ctx: *conn_ctx,
-                msg_ctx: *msg_ctx,
-                channel_id,
-                stream_id,
-                ssrc,
-                sequence_number,
-                description: format!(
-                    "Expected ssrc={:08x?} seq={:04x?}",
-                    self.ssrc, self.next_seq
-                ),
-            });
-        }
         self.ssrc = Some(ssrc);
         let mark = reader.mark();
         let payload_range = crate::as_range(&data, reader.payload()).ok_or_else(|| {
@@ -166,7 +193,7 @@ impl StrictSequenceChecker {
         data.truncate(payload_range.end);
         data.advance(payload_range.start);
         self.next_seq = Some(sequence_number.wrapping_add(1));
-        Ok(PacketItem::RtpPacket(Packet {
+        Ok(Some(PacketItem::RtpPacket(Packet {
             ctx: *msg_ctx,
             channel_id,
             stream_id,
@@ -176,11 +203,12 @@ impl StrictSequenceChecker {
             loss,
             mark,
             payload: data,
-        }))
+        })))
     }
 
     pub fn rtcp(
         &mut self,
+        session_options: &super::SessionOptions,
         msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
         stream_id: usize,
@@ -207,10 +235,20 @@ impl StrictSequenceChecker {
 
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
-                        return Err(format!(
-                            "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
-                            self.ssrc, ssrc
-                        ));
+                        if session_options.ignore_spurious_data {
+                            log::debug!(
+                                "Ignoring spurious RTCP data with ssrc={:08x} while \
+                                         expecting ssrc={:08x?}",
+                                ssrc,
+                                self.ssrc
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(format!(
+                                "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                                self.ssrc, ssrc
+                            ));
+                        }
                     }
                     self.ssrc = Some(ssrc);
 

@@ -85,17 +85,70 @@ impl std::str::FromStr for InitialTimestampPolicy {
     }
 }
 
-/// Policy decisions to make on `PLAY`.
+/// Options which must be known right as a session is created.
+///
+/// Decisions which can be deferred are in [PlayOptions] instead.
+#[derive(Default)]
+pub struct SessionOptions {
+    creds: Option<Credentials>,
+    user_agent: String,
+    ignore_spurious_data: bool,
+}
+
+impl SessionOptions {
+    /// Ignores RTSP interleaved data packets for channels that aren't assigned,
+    /// aren't in PLAY state, or already have a different SSRC in use.
+    ///
+    /// This still assumes that for assigned channels, the packet's protocol
+    /// (RTP or RTCP) matches the assignment. All known RTSP implementations
+    /// only use RTP on even channels and RTCP on odd channels, so this seems
+    /// reasonably safe.
+    ///
+    /// ``ignore_spurious_data` is necessary with some Reolink cameras for at
+    /// least two reasons:
+    /// *  Reolink RLC-410 (IPC_3816M) firmware version v2.0.0.1441_19032101:
+    ///    the camera sent interleaved data that apparently belonged to a
+    ///    previous RTSP session. This happened immediately on connection
+    ///    establishment and continued for some time after the following PLAY
+    ///    request.
+    /// *  Reolink RLC-822A (IPC_523128M8MP) firmware v3.0.0.124_20112601):
+    ///    the camera sent RTCP SR packets immediately *before* its PLAY
+    ///    response rather than afterward. It's easiest to treat them similarly
+    ///    to the above case and discard them. (An alternative workaround would
+    ///    be to buffer them until after Retina has examined the server's
+    ///    PLAY response.)
+    ///
+    /// Currently each packet is logged at debug priority. This may change.
+    pub fn ignore_spurious_data(mut self, ignore_spurious_data: bool) -> Self {
+        self.ignore_spurious_data = ignore_spurious_data;
+        self
+    }
+
+    /// Use the given credentials when/if the server requests digest authentication.
+    pub fn creds(mut self, creds: Option<Credentials>) -> Self {
+        self.creds = creds;
+        self
+    }
+
+    /// Sends the given user agent string with each request.
+    pub fn user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+}
+
+/// Options which must be decided at `PLAY` time.
 ///
 /// These are mostly adjustments for non-compliant server implementations.
+/// See also [SessionOptions] for options which must be decided earlier.
 #[derive(Default)]
-pub struct PlayPolicy {
+pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
     ignore_zero_seq: bool,
     enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
 }
 
-impl PlayPolicy {
+impl PlayOptions {
     pub fn initial_timestamp(self, initial_timestamp: InitialTimestampPolicy) -> Self {
         Self {
             initial_timestamp,
@@ -291,10 +344,9 @@ impl State for Playing {}
 
 /// The raw connection, without tracking session state.
 struct RtspConnection {
-    creds: Option<Credentials>,
+    options: SessionOptions,
     requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
     inner: crate::tokio::Connection,
-    user_agent: String,
 
     /// The next `CSeq` header value to use when sending an RTSP request.
     next_cseq: u32,
@@ -311,7 +363,7 @@ pub struct Session<S: State> {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url, creds: Option<Credentials>) -> Result<Self, Error> {
+    async fn connect(url: &Url, options: SessionOptions) -> Result<Self, Error> {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
@@ -320,9 +372,8 @@ impl RtspConnection {
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
             inner,
-            creds,
+            options,
             requested_auth: None,
-            user_agent: "moonfire-rtsp test".to_string(),
             next_cseq: 1,
         })
     }
@@ -357,23 +408,40 @@ impl RtspConnection {
                 .await
                 .map_err(|e| wrap!(e))?;
             let method: &str = req.method().into();
-            let msg = self.inner.next().await.unwrap_or_else(|| {
-                bail!(ErrorInt::ReadError {
-                    conn_ctx: *self.inner.ctx(),
-                    msg_ctx: self.inner.eof_ctx(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!("EOF while expecting reply to {} CSeq {}", method, cseq),
-                    ),
-                })
-            })?;
-            let resp = match msg.msg {
-                rtsp_types::Message::Response(r) if parse::get_cseq(&r) == Some(cseq) => r,
-                o => bail!(ErrorInt::RtspFramingError {
-                    conn_ctx: *self.inner.ctx(),
-                    msg_ctx: msg.ctx,
-                    description: format!("Expected reply to {} CSeq {}, got {:?}", method, cseq, o,),
-                }),
+            let (resp, msg_ctx) = loop {
+                let msg = self.inner.next().await.unwrap_or_else(|| {
+                    bail!(ErrorInt::ReadError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: self.inner.eof_ctx(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("EOF while expecting reply to {} CSeq {}", method, cseq),
+                        ),
+                    })
+                })?;
+                match msg.msg {
+                    rtsp_types::Message::Response(r) if parse::get_cseq(&r) == Some(cseq) => {
+                        break (r, msg.ctx)
+                    }
+                    rtsp_types::Message::Data(d) if self.options.ignore_spurious_data => {
+                        debug!(
+                            "ignoring interleaved data message on channel {} while waiting \
+                                for reply to {} CSeq {}",
+                            d.channel_id(),
+                            method,
+                            cseq
+                        );
+                        continue;
+                    }
+                    o => bail!(ErrorInt::RtspFramingError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        description: format!(
+                            "Expected reply to {} CSeq {}, got {:?}",
+                            method, cseq, o,
+                        ),
+                    }),
+                };
             };
             if resp.status() == rtsp_types::StatusCode::Unauthorized {
                 if self.requested_auth.is_some() {
@@ -381,7 +449,7 @@ impl RtspConnection {
                     // In that case, we should retry rather than returning error.
                     bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
-                        msg_ctx: msg.ctx,
+                        msg_ctx,
                         method: req.method().clone(),
                         cseq,
                         status: resp.status(),
@@ -391,7 +459,7 @@ impl RtspConnection {
                 let www_authenticate = match resp.header(&rtsp_types::headers::WWW_AUTHENTICATE) {
                     None => bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
-                        msg_ctx: msg.ctx,
+                        msg_ctx,
                         method: req.method().clone(),
                         cseq,
                         status: resp.status(),
@@ -405,7 +473,7 @@ impl RtspConnection {
                     // error or not based on ordering.
                     bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
-                        msg_ctx: msg.ctx,
+                        msg_ctx,
                         method: req.method().clone(),
                         cseq,
                         status: resp.status(),
@@ -415,10 +483,10 @@ impl RtspConnection {
                         ),
                     })
                 }
-                if self.creds.is_none() {
+                if self.options.creds.is_none() {
                     bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
-                        msg_ctx: msg.ctx,
+                        msg_ctx,
                         method: req.method().clone(),
                         cseq,
                         status: resp.status(),
@@ -426,7 +494,6 @@ impl RtspConnection {
                             .to_owned(),
                     })
                 }
-                let msg_ctx = msg.ctx;
                 let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)
                     .map_err(|e| {
                         wrap!(ErrorInt::RtspResponseError {
@@ -446,14 +513,14 @@ impl RtspConnection {
             } else if !resp.status().is_success() {
                 bail!(ErrorInt::RtspResponseError {
                     conn_ctx: *self.inner.ctx(),
-                    msg_ctx: msg.ctx,
+                    msg_ctx,
                     method: req.method().clone(),
                     cseq,
                     status: resp.status(),
                     description: "Unexpected RTSP response status".into(),
                 });
             }
-            return Ok((msg.ctx, cseq, resp));
+            return Ok((msg_ctx, cseq, resp));
         }
     }
 
@@ -463,6 +530,7 @@ impl RtspConnection {
         self.next_cseq += 1;
         if let Some(ref mut auth) = self.requested_auth {
             let creds = self
+                .options
                 .creds
                 .as_ref()
                 .expect("creds were checked when filling request_auth");
@@ -484,7 +552,12 @@ impl RtspConnection {
             req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
         }
         req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());
-        req.insert_header(rtsp_types::headers::USER_AGENT, self.user_agent.clone());
+        if !self.options.user_agent.is_empty() {
+            req.insert_header(
+                rtsp_types::headers::USER_AGENT,
+                self.options.user_agent.clone(),
+            );
+        }
         Ok(cseq)
     }
 }
@@ -497,8 +570,8 @@ impl Session<Described> {
     /// depacketized correctly. If those streams are setup via
     /// `Session<Described>::setup`, the erorrs in question will be ultimately
     /// returned from `Stream<Playing>::demuxed`.
-    pub async fn describe(url: Url, creds: Option<Credentials>) -> Result<Self, Error> {
-        let mut conn = RtspConnection::connect(&url, creds).await?;
+    pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
+        let mut conn = RtspConnection::connect(&url, options).await?;
         let mut req =
             rtsp_types::Request::builder(rtsp_types::Method::Describe, rtsp_types::Version::V1_0)
                 .header(rtsp_types::headers::ACCEPT, "application/sdp")
@@ -628,7 +701,7 @@ impl Session<Described> {
     ///
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
-    pub async fn play(mut self, policy: PlayPolicy) -> Result<Session<Playing>, Error> {
+    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
         let session_id = self.state.session_id.take().ok_or_else(|| {
             wrap!(ErrorInt::FailedPrecondition(
                 "must SETUP before PLAY".into()
@@ -892,6 +965,13 @@ impl Session<Playing> {
         let channel_id = data.channel_id();
         let m = match state.channels.lookup(channel_id) {
             Some(m) => m,
+            None if conn.options.ignore_spurious_data => {
+                log::debug!(
+                    "Ignoring interleaved data on unassigned channel id {}",
+                    channel_id
+                );
+                return Ok(None);
+            }
             None => bail!(ErrorInt::RtspUnassignedChannelError {
                 conn_ctx: *conn.inner.ctx(),
                 msg_ctx: *msg_ctx,
@@ -910,16 +990,23 @@ impl Session<Playing> {
             ),
         };
         match m.channel_type {
-            ChannelType::Rtp => Ok(Some(rtp_handler.rtp(
+            ChannelType::Rtp => Ok(rtp_handler.rtp(
+                &conn.options,
                 conn.inner.ctx(),
                 msg_ctx,
                 &mut timeline,
                 channel_id,
                 m.stream_i,
                 data.into_body(),
-            )?)),
+            )?),
             ChannelType::Rtcp => rtp_handler
-                .rtcp(msg_ctx, &mut timeline, m.stream_i, data.into_body())
+                .rtcp(
+                    &conn.options,
+                    msg_ctx,
+                    &mut timeline,
+                    m.stream_i,
+                    data.into_body(),
+                )
                 .map_err(|description| {
                     wrap!(ErrorInt::RtspDataMessageError {
                         conn_ctx: *conn.inner.ctx(),
@@ -1077,6 +1164,8 @@ impl futures::Stream for Demuxed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TODO: tests of Reolink ignore_spurious_data scenarios.
 
     // See with: cargo test -- --nocapture client::tests::print_sizes
     #[test]
