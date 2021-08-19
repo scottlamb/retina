@@ -603,15 +603,15 @@ mod tests {
     #[test]
     fn dahua_h264_aac_onvif() {
         // DESCRIBE.
-        let prefix = "rtsp://192.168.5.111:554/cam/";
+        let prefix = "rtsp://192.168.5.111:554/cam/realmonitor";
         let mut p = parse_describe(
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"),
+            &(prefix.to_string() + "?channel=1&subtype=1&unicast=true&proto=Onvif"),
             include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
         )
         .unwrap();
         assert_eq!(
             p.control.as_str(),
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif/")
+            &(prefix.to_string() + "?channel=1&subtype=1&unicast=true&proto=Onvif/")
         );
         assert!(p.accept_dynamic_rate);
 
@@ -620,7 +620,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=0")
+            &(prefix.to_string() + "/trackID=0")
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -639,7 +639,7 @@ mod tests {
         // .mp4 audio stream.
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=1")
+            &(prefix.to_string() + "/trackID=1")
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "mpeg4-generic");
@@ -649,11 +649,10 @@ mod tests {
             Some(Parameters::Audio(_)) => {}
             _ => panic!(),
         }
-
         // ONVIF parameters stream.
         assert_eq!(
             p.streams[2].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=4")
+            &(prefix.to_string() + "/trackID=4")
         );
         assert_eq!(p.streams[2].media, "application");
         assert_eq!(p.streams[2].encoding_name, "vnd.onvif.metadata");
@@ -663,7 +662,6 @@ mod tests {
             p.streams[2].parameters(),
             Some(Parameters::Message(_))
         ));
-
         // SETUP.
         let setup_response = response(include_bytes!("testdata/dahua_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
@@ -675,7 +673,6 @@ mod tests {
             initial_seq: None,
             initial_rtptime: None,
         });
-
         // PLAY.
         super::parse_play(&response(include_bytes!("testdata/dahua_play.txt")), &mut p).unwrap();
         match &p.streams[0].state {
@@ -1044,7 +1041,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/video"
+            "rtsp://192.168.1.110:5050/H264/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1063,7 +1060,7 @@ mod tests {
         // audio stream
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/audio"
+            "rtsp://192.168.1.110:5050/H264/audio"
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "pcmu"); // rtpmap wins over static list.
@@ -1125,17 +1122,17 @@ mod tests {
     #[test]
     fn gw_sub() {
         // DESCRIBE.
-        let base = "rtsp://192.168.5.112/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif/";
+        let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), base);
-        assert!(p.accept_dynamic_rate);
+        assert!(!p.accept_dynamic_rate);
 
-        assert_eq!(p.streams.len(), 3);
+        assert_eq!(p.streams.len(), 1);
 
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.5.112/cam/realmonitor/trackID=0"
+            "rtsp://192.168.1.110:5049/H264/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1143,10 +1140,10 @@ mod tests {
         assert_eq!(p.streams[0].clock_rate, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
-                assert_eq!(v.rfc6381_codec(), "avc1.640032");
-                assert_eq!(v.pixel_dimensions(), (1520, 2688));
+                assert_eq!(v.rfc6381_codec(), "avc1.4D001E");
+                assert_eq!(v.pixel_dimensions(), (720, 480));
                 assert_eq!(v.pixel_aspect_ratio(), None);
-                assert_eq!(v.frame_rate(), Some((2,60)));
+                assert_eq!(v.frame_rate(), None);
             }
             _ => panic!(),
         }
