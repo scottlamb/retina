@@ -37,9 +37,12 @@ jobs:
         components: ${{ matrix.extra_components }}
     - name: Test
       run: cargo test --all-features
+    - name: Check fuzz tests
+      run: cd fuzz && cargo check
     - name: Check formatting
       if: matrix.rust == 'stable'
       run: cargo fmt -- --check
+      run: cd fuzz && cargo fmt -- --check
   license:
     name: Check copyright/license headers
     runs-on: ubuntu-20.04

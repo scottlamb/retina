@@ -15,17 +15,24 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {
         return;
     }
+    let conn_ctx = retina::ConnectionContext::dummy();
     let max_payload_size = u16::from_be_bytes([data[0], data[1]]);
     let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0) {
         Ok(p) => p,
         Err(_) => return,
     };
     let mut d = retina::codec::Depacketizer::new(
-        "video", "h264", 90_000, None,
+        "video",
+        "h264",
+        90_000,
+        None,
         Some("packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4"),
-    ).unwrap();
+    )
+    .unwrap();
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
-    if p.push(timestamp, Bytes::copy_from_slice(&data[2..])).is_err() {
+    if p.push(timestamp, Bytes::copy_from_slice(&data[2..]))
+        .is_err()
+    {
         return;
     }
     let frame = loop {
@@ -35,12 +42,12 @@ fuzz_target!(|data: &[u8]| {
                 if d.push(pkt).is_err() {
                     return;
                 }
-                match d.pull() {
+                match d.pull(&conn_ctx) {
                     Err(_) => return,
                     Ok(Some(retina::codec::CodecItem::VideoFrame(f))) => {
                         assert!(mark);
-                        break f
-                    },
+                        break f;
+                    }
                     Ok(Some(_)) => panic!(),
                     Ok(None) => assert!(!mark),
                 }
@@ -50,6 +57,6 @@ fuzz_target!(|data: &[u8]| {
         }
     };
     assert_eq!(&data[2..], &frame.data()[..]);
-    assert!(matches!(d.pull(), Ok(None)));
+    assert!(matches!(d.pull(&conn_ctx), Ok(None)));
     assert!(matches!(p.pull(), Ok(None)));
 });

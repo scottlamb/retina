@@ -12,7 +12,8 @@ fuzz_target!(|data: &[u8]| {
         "video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
-    let ctx = retina::Context::dummy();
+    let conn_ctx = retina::ConnectionContext::dummy();
+    let msg_ctx = retina::RtspMessageContext::dummy();
     while data.has_remaining() {
         let hdr = data.get_u8();
         let ts_change = (hdr & 0b001) != 0;
@@ -29,9 +30,11 @@ fuzz_target!(|data: &[u8]| {
             timestamp = timestamp.try_add(1).unwrap();
         }
         let pkt = retina::client::rtp::Packet {
-            rtsp_ctx: ctx,
+            ctx: msg_ctx,
+            channel_id: 0,
             stream_id: 0,
             timestamp,
+            ssrc: 0,
             sequence_number,
             loss: u16::from(loss),
             mark,
@@ -41,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
         if depacketizer.push(pkt).is_err() {
             return;
         }
-        while let Some(item) = depacketizer.pull().transpose() {
+        while let Some(item) = depacketizer.pull(&conn_ctx).transpose() {
             if item.is_err() {
                 return;
             }
