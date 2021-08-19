@@ -167,9 +167,20 @@ impl Depacketizer {
                                 access_unit.timestamp, pkt.timestamp
                             ));
                         }
-                        access_unit.end_ctx = pkt.ctx;
-                        self.pending = Some(self.finalize_access_unit(access_unit, "ts change")?);
-                        AccessUnit::start(&pkt, 0, false)
+                        let last_nal_hdr = self.nals.last().unwrap().hdr;
+                        if can_end_au(last_nal_hdr.nal_unit_type()) {
+                            access_unit.end_ctx = pkt.ctx;
+                            self.pending =
+                                Some(self.finalize_access_unit(access_unit, "ts change")?);
+                            AccessUnit::start(&pkt, 0, false)
+                        } else {
+                            log::debug!(
+                                "Bogus mid-access unit timestamp change after {:?}",
+                                last_nal_hdr
+                            );
+                            access_unit.timestamp.timestamp = pkt.timestamp.timestamp;
+                            access_unit
+                        }
                     } else {
                         access_unit
                     }
@@ -340,11 +351,21 @@ impl Depacketizer {
             _ => return Err(format!("bad nal header {:02x}", nal_header)),
         }
         self.input_state = if pkt.mark {
-            access_unit.end_ctx = pkt.ctx;
-            self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
-            DepacketizerInputState::PostMark {
-                timestamp: pkt.timestamp,
-                loss: 0,
+            let last_nal_hdr = self.nals.last().unwrap().hdr;
+            if can_end_au(last_nal_hdr.nal_unit_type()) {
+                access_unit.end_ctx = pkt.ctx;
+                self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
+                DepacketizerInputState::PostMark {
+                    timestamp: pkt.timestamp,
+                    loss: 0,
+                }
+            } else {
+                log::debug!(
+                    "Bogus mid-access unit timestamp change after {:?}",
+                    last_nal_hdr
+                );
+                access_unit.timestamp.timestamp = pkt.timestamp.timestamp;
+                DepacketizerInputState::PreMark(access_unit)
             }
         } else {
             DepacketizerInputState::PreMark(access_unit)
@@ -473,6 +494,20 @@ impl Depacketizer {
             data,
         })
     }
+}
+
+/// Returns true if we allow the given NAL unit type to end an access unit.
+///
+/// We specifically prohibit this for the SPS and PPS. Reolink cameras sometimes
+/// incorrectly set the RTP marker bit and/or change the timestamp after these.
+fn can_end_au(nal_unit_type: UnitType) -> bool {
+    // H.264 section 7.4.1.2.3 Order of NAL units and coded pictures and
+    // association to access units says "Sequence parameter set NAL units or
+    // picture parameter set NAL units may be present in an access unit, but
+    // cannot follow the last VCL NAL unit of the primary coded picture within
+    // the access unit, as this condition would specify the start of a new
+    // access unit."
+    nal_unit_type != UnitType::SeqParameterSet && nal_unit_type != UnitType::PicParameterSet
 }
 
 impl AccessUnit {
@@ -1075,6 +1110,170 @@ mod tests {
         );
     }
 
+    /// Test bad framing at the start of stream from a Reolink RLC-822A
+    /// Reolink RLC-822A (IPC_523128M8MP) running firmware v3.0.0.177_21012101:
+    /// suppress incorrect access unit changes after the SPS and PPS.
+    #[test]
+    fn depacketize_reolink_bad_framing_at_start() {
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
+        let ts1 = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let ts2 = crate::Timestamp {
+            timestamp: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(Packet {
+            // SPS with (incorrect) mark
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts1,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // PPS
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts1,
+            ssrc: 0,
+            sequence_number: 1,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(b"\x68\xee\x3c\xb0"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // Slice layer without partitioning IDR.
+            // This has a different timestamp than the SPS and PPS, even though
+            // RFC 6184 section 5.1 says that "the timestamp must match that of
+            // the primary coded picture of the access unit and that the marker
+            // bit can only be set on the final packet of the access unit.""
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts2,
+            ssrc: 0,
+            sequence_number: 2,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x65slice"),
+        })
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            o => panic!("unexpected pull result {:#?}", o),
+        };
+        assert_eq!(
+            &frame.data()[..],
+            b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
+              \x00\x00\x00\x04\x68\xee\x3c\xb0\
+              \x00\x00\x00\x06\x65slice"
+        );
+        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+    }
+
+    /// Test bad framing at a GOP boundary in a stream from a Reolink RLC-822A
+    /// Reolink RLC-822A (IPC_523128M8MP) running firmware v3.0.0.177_21012101:
+    /// suppress incorrect access unit changes after the SPS and PPS.
+    #[test]
+    fn depacketize_reolink_gop_boundary() {
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
+        let ts1 = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let ts2 = crate::Timestamp {
+            timestamp: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(Packet {
+            // Slice layer without partitioning non-IDR, representing the
+            // last frame of the previous GOP.
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts1,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x01slice"),
+        })
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            o => panic!("unexpected pull result {:#?}", o),
+        };
+        assert_eq!(&frame.data()[..], b"\x00\x00\x00\x06\x01slice");
+        assert_eq!(frame.timestamp, ts1);
+        d.push(Packet {
+            // SPS with (incorrect) timestamp matching last frame.
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts1,
+            ssrc: 0,
+            sequence_number: 1,
+            loss: 0,
+            mark: false, // correctly has no mark, unlike first SPS in stream.
+            payload: Bytes::from_static(b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // PPS, again with timestamp matching last frame.
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts1,
+            ssrc: 0,
+            sequence_number: 2,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(b"\x68\xee\x3c\xb0"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // Slice layer without partitioning IDR. Now correct timestamp.
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp: ts2,
+            ssrc: 0,
+            sequence_number: 3,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x65slice"),
+        })
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            o => panic!("unexpected pull result {:#?}", o),
+        };
+        assert_eq!(
+            &frame.data()[..],
+            b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
+              \x00\x00\x00\x04\x68\xee\x3c\xb0\
+              \x00\x00\x00\x06\x65slice"
+        );
+        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+    }
+
     #[test]
     fn depacketize_parameter_change() {
         let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 profile-level-id=420029; packetization-mode=1; sprop-parameter-sets=Z01AHppkBYHv/lBgYGQAAA+gAAE4gBA=,aO48gA==")).unwrap();
@@ -1110,13 +1309,27 @@ mod tests {
             ssrc: 0,
             sequence_number: 1,
             loss: 0,
-            mark: true,
+            mark: false,
             payload: Bytes::from_static(b"\x68\xee\x3c\x80"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // dummy slice NAL to end the AU.
+            ctx: crate::RtspMessageContext::dummy(),
+            channel_id: 0,
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 2,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x65slice"),
         })
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
-            _ => panic!(),
+            o => panic!("unexpected pull result {:#?}", o),
         };
         assert!(frame.new_parameters.is_some());
         let p = frame.new_parameters.unwrap();

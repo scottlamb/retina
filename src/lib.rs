@@ -52,7 +52,7 @@ struct ReceivedMessage {
 ///     codec-specified clock rate.
 /// *   the full timestamp, with top bits accumulated as RTP packet timestamps wrap around.
 /// *   a conversion to RTSP "normal play time" (NPT): zero-based and normalized to seconds.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Timestamp {
     /// A timestamp which must be compared to `start`. The top bits are inferred
     /// from wraparounds of 32-bit RTP timestamps. The `i64` itself is not

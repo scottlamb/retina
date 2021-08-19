@@ -111,7 +111,7 @@ impl SessionOptions {
     ///    previous RTSP session. This happened immediately on connection
     ///    establishment and continued for some time after the following PLAY
     ///    request.
-    /// *  Reolink RLC-822A (IPC_523128M8MP) firmware v3.0.0.124_20112601):
+    /// *  Reolink RLC-822A (IPC_523128M8MP) firmware v3.0.0.177_21012101):
     ///    the camera sent RTCP SR packets immediately *before* its PLAY
     ///    response rather than afterward. It's easiest to treat them similarly
     ///    to the above case and discard them. (An alternative workaround would
