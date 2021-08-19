@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h264_reader::nal::{NalHeader, UnitType};
-use log::{debug, log_enabled, trace, warn};
+use log::{debug, log_enabled, trace};
 
 use crate::{client::rtp::Packet, Error, Timestamp};
 
