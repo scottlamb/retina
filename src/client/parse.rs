@@ -530,7 +530,14 @@ pub(crate) fn parse_play(
                 .iter_mut()
                 .find(|s| matches!(&s.control, Some(u) if u == &url));
         }
-        let stream = stream.ok_or_else(|| format!("RTP-Info contains unknown stream {}", url))?;
+        //let stream = stream.ok_or_else(|| format!("RTP-Info contains unknown stream {}", url))?;
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                log::warn!("RTP-Info contains unknown stream {}", url);
+                continue
+            }
+        };
         let state = match &mut stream.state {
             super::StreamState::Uninit => {
                 // This appears to happen for Reolink devices when we did not send a SETUP request
