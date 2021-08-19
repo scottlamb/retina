@@ -90,7 +90,7 @@ enum DepacketizerInputState {
     PostMark {
         timestamp: crate::Timestamp,
         loss: u16,
-    }
+    },
 }
 
 impl Depacketizer {
@@ -376,15 +376,21 @@ impl Depacketizer {
             for (i, nal) in self.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
-            warn!("bad access unit (ended by {}) at ts {}\nerrors are:{}\nNALs are:{}",
-                  reason, au.timestamp, errs, nals);
+            warn!(
+                "bad access unit (ended by {}) at ts {}\nerrors are:{}\nNALs are:{}",
+                reason, au.timestamp, errs, nals
+            );
         } else if log_enabled!(log::Level::Trace) {
             let mut nals = String::new();
             for (i, nal) in self.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
-            trace!("access unit (ended by {}) at ts {}; NALS are:{}",
-                   reason, au.timestamp, nals);
+            trace!(
+                "access unit (ended by {}) at ts {}; NALS are:{}",
+                reason,
+                au.timestamp,
+                nals
+            );
         }
     }
 
@@ -470,7 +476,11 @@ impl Depacketizer {
 }
 
 impl AccessUnit {
-    fn start(pkt: &crate::client::rtp::Packet, additional_loss: u16, same_ts_as_prev: bool) -> Self {
+    fn start(
+        pkt: &crate::client::rtp::Packet,
+        additional_loss: u16,
+        same_ts_as_prev: bool,
+    ) -> Self {
         AccessUnit {
             start_ctx: pkt.ctx,
             end_ctx: pkt.ctx,
