@@ -5,6 +5,10 @@
     with some new options.
 *   BREAKING CHANGE: renamed `PlayPolicy` to `PlayOptions` for consistency.
 *   Added options to work around bugs found in Reolink cameras.
+*   [#9](https://github.com/scottlamb/retina/issues/9). Improve compatibility
+    with how some cameras handle the `control` and `RTP-Info` urls. This
+    adopts a URL joining behavior which isn't RFC-compliant but seems to
+    be more compatible in practice.
 
 ## v0.1.0 (2021-08-13)
 

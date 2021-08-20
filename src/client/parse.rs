@@ -184,11 +184,29 @@ static STATIC_PAYLOAD_TYPES: [Option<StaticPayloadType>; 35] = [
     }),
 ];
 
+/// Joins a control URL to a base URL in a non-RFC-compliant but common way.
+/// This matches what live555 and ffmpeg do.
+///
+/// See discussion at [#9](https://github.com/scottlamb/retina/issues/9).
 fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
     if control == "*" {
         return Ok(base_url.clone());
     }
-    base_url.join(control).map_err(|e| {
+    if let Ok(absolute_url) = Url::parse(control) {
+        return Ok(absolute_url);
+    }
+
+    Url::parse(&format!(
+        "{}{}{}",
+        base_url.as_str(),
+        if base_url.as_str().ends_with('/') {
+            ""
+        } else {
+            "/"
+        },
+        control
+    ))
+    .map_err(|e| {
         format!(
             "unable to join base url {} with control url {:?}: {}",
             base_url, control, e
@@ -206,11 +224,7 @@ pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
 /// Parses a [MediaDescription] to a [Stream].
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
-fn parse_media(
-    base_url: &Url,
-    alt_base_url: &Url,
-    media_description: &MediaDescription,
-) -> Result<Stream, String> {
+fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<Stream, String> {
     let media = media_description.media_name.media.clone();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
@@ -253,7 +267,6 @@ fn parse_media(
     let mut rtpmap = None;
     let mut fmtp = None;
     let mut control = None;
-    let mut alt_control = None;
     for a in &media_description.attributes {
         if a.key == "rtpmap" {
             let v = a
@@ -291,11 +304,6 @@ fn parse_media(
                 .value
                 .as_deref()
                 .map(|c| join_control(base_url, c))
-                .transpose()?;
-            alt_control = a
-                .value
-                .as_deref()
-                .map(|c| join_control(alt_base_url, c))
                 .transpose()?;
         }
     }
@@ -357,7 +365,6 @@ fn parse_media(
         rtp_payload_type,
         depacketizer,
         control,
-        alt_control,
         channels,
         state: super::StreamState::Uninit,
     })
@@ -406,9 +413,7 @@ pub(crate) fn parse_describe(
                 .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
         })
         .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
-        .unwrap_or(Ok(request_url))?;
-    let mut alt_base_url = base_url.clone();
-    alt_base_url.set_path(&format!("{}/", base_url.path()));
+        .unwrap_or(Ok(request_url.clone()))?;
 
     let mut control = None;
     for a in &sdp.attributes {
@@ -421,14 +426,14 @@ pub(crate) fn parse_describe(
             break;
         }
     }
-    let control = control.ok_or_else(|| "no control url".to_string())?;
+    let control = control.unwrap_or(request_url);
 
     let streams = sdp
         .media_descriptions
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            parse_media(&base_url, &alt_base_url, &m)
+            parse_media(&base_url, &m)
                 .map_err(|e| format!("Unable to parse stream {}: {}\n\n{:#?}", i, &e, &m))
         })
         .collect::<Result<Vec<Stream>, String>>()?;
@@ -502,9 +507,10 @@ pub(crate) fn parse_play(
     presentation: &mut Presentation,
 ) -> Result<(), String> {
     // https://tools.ietf.org/html/rfc2326#section-12.33
-    let rtp_info = response
-        .header(&rtsp_types::headers::RTP_INFO)
-        .ok_or_else(|| "PLAY response has no RTP-Info header".to_string())?;
+    let rtp_info = match response.header(&rtsp_types::headers::RTP_INFO) {
+        Some(rtsp_info) => rtsp_info,
+        None => return Ok(()),
+    };
     for s in rtp_info.as_str().split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
@@ -514,7 +520,7 @@ pub(crate) fn parse_play(
             .strip_prefix("url=")
             .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
         let url = join_control(&presentation.base_url, url)?;
-        let mut stream;
+        let stream;
         if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
             // single-stream presentations. Additionally, some buggy
@@ -530,18 +536,14 @@ pub(crate) fn parse_play(
                 .streams
                 .iter_mut()
                 .find(|s| matches!(&s.control, Some(u) if u == &url));
-
-            // If we didn't find a stream, try again with alt_control. Don't do
-            // this on the first pass because we should check all of the
-            // proper control URLs first.
-            if stream.is_none() {
-                stream = presentation
-                    .streams
-                    .iter_mut()
-                    .find(|s| matches!(&s.alt_control, Some(u) if u == &url));
-            }
         }
-        let stream = stream.ok_or_else(|| format!("RTP-Info contains unknown stream {}", url))?;
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                log::warn!("RTP-Info contains unknown stream {}", url);
+                continue;
+            }
+        };
         let state = match &mut stream.state {
             super::StreamState::Uninit => {
                 // This appears to happen for Reolink devices when we did not send a SETUP request
@@ -605,16 +607,14 @@ mod tests {
     #[test]
     fn dahua_h264_aac_onvif() {
         // DESCRIBE.
-        let prefix = "rtsp://192.168.5.111:554/cam/";
+        let prefix =
+            "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"),
+            prefix,
             include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
         )
         .unwrap();
-        assert_eq!(
-            p.control.as_str(),
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif/")
-        );
+        assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
         assert!(p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 3);
@@ -622,7 +622,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=0")
+            &(prefix.to_string() + "/trackID=0")
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -641,7 +641,7 @@ mod tests {
         // .mp4 audio stream.
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=1")
+            &(prefix.to_string() + "/trackID=1")
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "mpeg4-generic");
@@ -655,7 +655,7 @@ mod tests {
         // ONVIF parameters stream.
         assert_eq!(
             p.streams[2].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=4")
+            &(prefix.to_string() + "/trackID=4")
         );
         assert_eq!(p.streams[2].media, "application");
         assert_eq!(p.streams[2].encoding_name, "vnd.onvif.metadata");
@@ -982,6 +982,55 @@ mod tests {
         };
     }
 
+    #[test]
+    fn vstarcam() {
+        // DESCRIBE.
+        let prefix = "rtsp://192.168.1.198:10554/tcp/av0_0";
+        let p = parse_describe(prefix, include_bytes!("testdata/vstarcam_describe.txt")).unwrap();
+        assert_eq!(p.control.as_str(), &(prefix.to_string()));
+
+        assert!(!p.accept_dynamic_rate);
+
+        assert_eq!(p.streams.len(), 2);
+
+        // H.264 video stream.
+        assert_eq!(
+            p.streams[0].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track0")
+        );
+
+        assert_eq!(p.streams[0].media, "video");
+
+        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].rtp_payload_type, 96);
+        assert_eq!(p.streams[0].clock_rate, 90_000);
+
+        match p.streams[0].parameters().unwrap() {
+            Parameters::Video(v) => {
+                assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
+                assert_eq!(v.pixel_dimensions(), (1920, 1080));
+                assert_eq!(v.pixel_aspect_ratio(), None);
+                assert_eq!(v.frame_rate(), Some((2, 15)));
+            }
+            _ => panic!(),
+        }
+
+        // audio stream
+        assert_eq!(
+            p.streams[1].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track1")
+        );
+        assert_eq!(p.streams[1].media, "audio");
+        assert_eq!(p.streams[1].encoding_name, "pcma");
+        assert_eq!(p.streams[1].rtp_payload_type, 8);
+        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
+        match p.streams[1].parameters().unwrap() {
+            Parameters::Audio(_) => {}
+            _ => panic!(),
+        };
+    }
+
     /// [GW Security GW4089IP](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-GW-Security#gw4089ip),
     /// main stream (high-res, audio).
     #[test]
@@ -997,7 +1046,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/video"
+            "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1016,7 +1065,7 @@ mod tests {
         // audio stream
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/audio"
+            "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/audio"
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "pcmu"); // rtpmap wins over static list.
@@ -1057,10 +1106,11 @@ mod tests {
             &mut p,
         )
         .unwrap();
+        // The RTP-Info url= isn't in the expected format, so its contents are skipped.
         match &p.streams[0].state {
             StreamState::Init(s) => {
-                assert_eq!(s.initial_seq, Some(271));
-                assert_eq!(s.initial_rtptime, Some(1621990950));
+                assert_eq!(s.initial_seq, None);
+                assert_eq!(s.initial_rtptime, None);
             }
             _ => panic!(),
         };
@@ -1080,7 +1130,10 @@ mod tests {
         // DESCRIBE.
         let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
-        assert_eq!(p.control.as_str(), base);
+        assert_eq!(
+            p.control.as_str(),
+            "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif"
+        );
         assert!(!p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 1);
@@ -1088,7 +1141,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5049/video"
+            "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
