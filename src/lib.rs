@@ -11,6 +11,9 @@ use std::num::NonZeroU32;
 mod error;
 mod rtcp;
 
+#[cfg(test)]
+mod testutil;
+
 pub use error::Error;
 
 /// Wraps the supplied `ErrorInt` and returns it as an `Err`.

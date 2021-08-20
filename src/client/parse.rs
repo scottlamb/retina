@@ -587,21 +587,12 @@ pub(crate) fn parse_play(
 mod tests {
     use std::num::NonZeroU16;
 
-    use bytes::Bytes;
     use url::Url;
 
     use crate::{client::StreamStateInit, codec::Parameters};
 
     use super::super::StreamState;
-
-    fn response(raw: &'static [u8]) -> rtsp_types::Response<Bytes> {
-        let (msg, len) = rtsp_types::Message::parse(raw).unwrap();
-        assert_eq!(len, raw.len());
-        match msg {
-            rtsp_types::Message::Response(r) => r.map_body(|b| Bytes::from_static(b)),
-            _ => panic!("unexpected message type"),
-        }
-    }
+    use crate::testutil::response;
 
     fn parse_describe(
         raw_url: &str,

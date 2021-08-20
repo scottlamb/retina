@@ -29,6 +29,10 @@ impl Connection {
             Host::Ipv4(h) => TcpStream::connect((h, port)).await,
             Host::Ipv6(h) => TcpStream::connect((h, port)).await,
         }?;
+        Self::from_stream(stream)
+    }
+
+    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
         let established = Instant::now();
         let local_addr = stream.local_addr()?;
