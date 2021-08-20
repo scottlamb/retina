@@ -1,4 +1,4 @@
-## `v0.2.0` (unreleased)
+## `v0.2.0` (2021-08-20)
 
 *   BREAKING CHANGE: `retina::client::Session::describe` now takes a new
     `options: SessionOptions`. The `creds` has moved into the `options`, along
