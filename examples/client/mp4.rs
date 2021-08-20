@@ -168,14 +168,14 @@ impl TrakTracker {
             buf.put_u32(u32::try_from(self.chunks.len())?);
             let mut prev_sample_number = 1;
             let mut chunk_number = 1;
-            for &(sample_number, _pos) in &self.chunks[1..] {
-                buf.put_u32(chunk_number);
-                buf.put_u32(sample_number - prev_sample_number);
-                buf.put_u32(1); // sample_description_index
-                prev_sample_number = sample_number;
-                chunk_number += 1;
-            }
             if !self.chunks.is_empty() {
+                for &(sample_number, _pos) in &self.chunks[1..] {
+                    buf.put_u32(chunk_number);
+                    buf.put_u32(sample_number - prev_sample_number);
+                    buf.put_u32(1); // sample_description_index
+                    prev_sample_number = sample_number;
+                    chunk_number += 1;
+                }
                 buf.put_u32(chunk_number);
                 buf.put_u32(self.samples + 1 - prev_sample_number);
                 buf.put_u32(1); // sample_description_index
