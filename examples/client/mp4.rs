@@ -44,6 +44,9 @@ pub struct Opts {
     no_audio: bool,
 
     #[structopt(long)]
+    allow_loss: bool,
+
+    #[structopt(long)]
     ignore_spurious_data: bool,
 
     #[structopt(parse(try_from_str))]
@@ -85,6 +88,7 @@ pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
     mdat_pos: u32,
     video_params: Option<Box<VideoParameters>>,
     audio_params: Option<Box<AudioParameters>>,
+    allow_loss: bool,
 
     /// The (1-indexed) video sample (frame) number of each sync sample (random access point).
     video_sync_sample_nums: Vec<u32>,
@@ -117,8 +121,9 @@ impl TrakTracker {
         size: u32,
         timestamp: retina::Timestamp,
         loss: u16,
+        allow_loss: bool,
     ) -> Result<(), Error> {
-        if self.samples > 0 && loss > 0 {
+        if self.samples > 0 && loss > 0 && !allow_loss {
             bail!("Lost {} RTP packets mid-stream", loss);
         }
         self.samples += 1;
@@ -204,6 +209,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     pub async fn new(
         video_params: Option<Box<VideoParameters>>,
         audio_params: Option<Box<AudioParameters>>,
+        allow_loss: bool,
         mut inner: W,
     ) -> Result<Self, Error> {
         let mut buf = BytesMut::new();
@@ -221,6 +227,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             inner,
             video_params,
             audio_params,
+            allow_loss,
             video_trak: TrakTracker::default(),
             audio_trak: TrakTracker::default(),
             video_sync_sample_nums: Vec::new(),
@@ -501,8 +508,13 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             self.video_params = Some(p);
         }
         let size = u32::try_from(frame.data().remaining())?;
-        self.video_trak
-            .add_sample(self.mdat_pos, size, frame.timestamp, frame.loss)?;
+        self.video_trak.add_sample(
+            self.mdat_pos,
+            size,
+            frame.timestamp,
+            frame.loss,
+            self.allow_loss,
+        )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
@@ -523,8 +535,13 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             frame.data.remaining()
         );
         let size = u32::try_from(frame.data.remaining())?;
-        self.audio_trak
-            .add_sample(self.mdat_pos, size, frame.timestamp, frame.loss)?;
+        self.audio_trak.add_sample(
+            self.mdat_pos,
+            size,
+            frame.timestamp,
+            frame.loss,
+            self.allow_loss,
+        )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
@@ -589,6 +606,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let mut mp4 = Mp4Writer::new(
         video_stream.map(|(_, p)| Box::new(p)),
         audio_stream.map(|(_, p)| Box::new(p)),
+        opts.allow_loss,
         out,
     )
     .await?;
