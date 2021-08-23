@@ -1,3 +1,8 @@
+## unreleased
+
+*   [#22](https://github.com/scottlamb/retina/issues/22): fix handling of
+    44.1 kHz AAC audio.
+
 ## `v0.2.0` (2021-08-20)
 
 *   BREAKING CHANGE: `retina::client::Session::describe` now takes a new

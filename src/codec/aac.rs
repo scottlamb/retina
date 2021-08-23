@@ -81,7 +81,7 @@ impl AudioSpecificConfig {
             o => o,
         };
 
-        // ISO/IEC 14496-3 section 1.6.3.4.
+        // ISO/IEC 14496-3 section 1.6.3.3.
         let sampling_frequency = match r
             .read_u8(4)
             .map_err(|e| format!("unable to read sampling_frequency: {}", e))?
@@ -90,6 +90,7 @@ impl AudioSpecificConfig {
             0x1 => 88_200,
             0x2 => 64_000,
             0x3 => 48_000,
+            0x4 => 44_100,
             0x5 => 32_000,
             0x6 => 24_000,
             0x7 => 22_050,
@@ -104,7 +105,7 @@ impl AudioSpecificConfig {
             0xf => r
                 .read_u32(24)
                 .map_err(|e| format!("unable to read sampling_frequency ext: {}", e))?,
-            _ => unreachable!(),
+            0x10..=0xff => unreachable!(),
         };
         let channels = {
             let c = r
