@@ -34,21 +34,33 @@ pub struct Opts {
     #[structopt(flatten)]
     src: super::Source,
 
+    /// Policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
+    /// One of `default`, `require`, `ignore`, `permissive`.
     #[structopt(default_value, long)]
     initial_timestamp: retina::client::InitialTimestampPolicy,
 
+    /// Don't attempt to include video streams.
     #[structopt(long)]
     no_video: bool,
 
+    /// Don't attempt to include audio streams.
     #[structopt(long)]
     no_audio: bool,
 
+    /// Allow lost packets mid-stream without aborting.
     #[structopt(long)]
     allow_loss: bool,
 
+    /// Works around an old live555 server bug which sends data packets meant
+    /// for a closed RTP connection to one opened afterward.
     #[structopt(long)]
     ignore_spurious_data: bool,
 
+    /// Duration after which to exit automatically, in seconds.
+    #[structopt(long, name = "secs")]
+    duration: Option<u64>,
+
+    /// Path to `.mp4` file to write.
     #[structopt(parse(try_from_str))]
     out: PathBuf,
 }
@@ -553,7 +565,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 
 pub async fn run(opts: Opts) -> Result<(), Error> {
     let creds = super::creds(opts.src.username, opts.src.password);
-    let stop = tokio::signal::ctrl_c();
+    let stop_signal = tokio::signal::ctrl_c();
     let mut session = retina::client::Session::describe(
         opts.src.url,
         retina::client::SessionOptions::default()
@@ -611,8 +623,15 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     )
     .await?;
 
+    let sleep = match opts.duration {
+        Some(secs) => {
+            futures::future::Either::Left(tokio::time::sleep(std::time::Duration::from_secs(secs)))
+        }
+        None => futures::future::Either::Right(futures::future::pending()),
+    };
     tokio::pin!(session);
-    tokio::pin!(stop);
+    tokio::pin!(stop_signal);
+    tokio::pin!(sleep);
     loop {
         tokio::select! {
             pkt = session.next() => {
@@ -625,12 +644,16 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                     _ => continue,
                 };
             },
-            _ = &mut stop => {
+            _ = &mut stop_signal => {
+                info!("Stopping due to signal");
+                break;
+            },
+            _ = &mut sleep => {
+                info!("Stopping after {} seconds", opts.duration.unwrap());
                 break;
             },
         }
     }
-    info!("Stopping");
     mp4.finish().await?;
     Ok(())
 }

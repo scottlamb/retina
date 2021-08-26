@@ -13,12 +13,15 @@ use structopt::StructOpt;
 
 #[derive(StructOpt)]
 struct Source {
+    /// `rtsp://` URL to connect to.
     #[structopt(long, parse(try_from_str))]
     url: url::Url,
 
-    #[structopt(long, requires = "password")]
+    /// Username to send if the server requires authentication.
+    #[structopt(long)]
     username: Option<String>,
 
+    /// Password; requires username.
     #[structopt(long, requires = "username")]
     password: Option<String>,
 }
@@ -62,11 +65,12 @@ fn creds(
     password: Option<String>,
 ) -> Option<retina::client::Credentials> {
     match (username, password) {
-        (Some(username), Some(password)) => {
-            Some(retina::client::Credentials { username, password })
-        }
+        (Some(username), password) => Some(retina::client::Credentials {
+            username,
+            password: password.unwrap_or_default(),
+        }),
         (None, None) => None,
-        _ => unreachable!(), // structopt/clap enforce username and password's mutual "requires".
+        _ => unreachable!(), // structopt/clap enforce that password requires username.
     }
 }
 
