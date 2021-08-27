@@ -29,12 +29,11 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         .position(|s| matches!(s.parameters(), Some(retina::codec::Parameters::Message(..))))
         .ok_or_else(|| anyhow!("couldn't find onvif stream"))?;
     session.setup(onvif_stream_i).await?;
-    let session = session
+    let mut session = session
         .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
         .await?
         .demuxed()?;
 
-    tokio::pin!(session);
     tokio::pin!(stop);
     loop {
         tokio::select! {
@@ -51,5 +50,6 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             },
         }
     }
+    session.teardown().await?;
     Ok(())
 }

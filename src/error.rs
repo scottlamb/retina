@@ -3,7 +3,7 @@
 
 use std::fmt::Display;
 
-use crate::{ConnectionContext, RtspMessageContext};
+use crate::{ConnectionContext, PacketContext, RtspMessageContext};
 use thiserror::Error;
 
 /// An opaque `std::error::Error + Send + Sync + 'static` implementation.
@@ -65,23 +65,21 @@ pub(crate) enum ErrorInt {
         channel_id: u8,
     },
 
-    #[error("[{conn_ctx}, {msg_ctx} channel {channel_id} stream {stream_id}] RTSP data message: {description}")]
-    RtspDataMessageError {
+    #[error("[{conn_ctx}, {pkt_ctx} stream {stream_id}]: {description}")]
+    PacketError {
         conn_ctx: ConnectionContext,
-        msg_ctx: RtspMessageContext,
-        channel_id: u8,
+        pkt_ctx: PacketContext,
         stream_id: usize,
         description: String,
     },
 
     #[error(
-        "[{conn_ctx}, {msg_ctx}, channel={channel_id}, stream={stream_id}, ssrc={ssrc:08x}, \
+        "[{conn_ctx}, {pkt_ctx}, stream={stream_id}, ssrc={ssrc:08x}, \
          seq={sequence_number:08x}] {description}"
     )]
     RtpPacketError {
         conn_ctx: ConnectionContext,
-        msg_ctx: RtspMessageContext,
-        channel_id: u8,
+        pkt_ctx: crate::PacketContext,
         stream_id: usize,
         ssrc: u32,
         sequence_number: u16,
@@ -92,9 +90,16 @@ pub(crate) enum ErrorInt {
     ConnectError(#[source] std::io::Error),
 
     #[error("[{conn_ctx}, {msg_ctx}] Error reading from RTSP peer: {source}")]
-    ReadError {
+    RtspReadError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
+        source: std::io::Error,
+    },
+
+    #[error("[{conn_ctx}, {pkt_ctx}] Error receiving UDP packet: {source}")]
+    UdpRecvError {
+        conn_ctx: ConnectionContext,
+        pkt_ctx: PacketContext,
         source: std::io::Error,
     },
 

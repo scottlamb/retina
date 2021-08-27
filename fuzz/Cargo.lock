@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "retina"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "bitreader",
@@ -557,6 +557,7 @@ dependencies = [
  "once_cell",
  "pin-project",
  "pretty-hex",
+ "rand",
  "rtp-rs",
  "rtsp-types",
  "sdp",

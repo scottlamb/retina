@@ -427,7 +427,7 @@ pub(crate) struct Depacketizer {
 
 #[derive(Debug)]
 struct Aggregate {
-    ctx: crate::RtspMessageContext,
+    ctx: crate::PacketContext,
 
     /// RTP packets lost before the next frame in this aggregate. Includes old
     /// loss that caused a previous fragment to be too short.
@@ -440,7 +440,6 @@ struct Aggregate {
     /// to be too short.
     loss_since_mark: bool,
 
-    channel_id: u8,
     stream_id: usize,
     ssrc: u32,
     sequence_number: u16,
@@ -606,7 +605,6 @@ impl Depacketizer {
                     ctx: pkt.ctx,
                     loss: *prev_loss + pkt.loss,
                     loss_since_mark: pkt.loss > 0,
-                    channel_id: pkt.channel_id,
                     stream_id: pkt.stream_id,
                     ssrc: pkt.ssrc,
                     sequence_number: pkt.sequence_number,
@@ -726,8 +724,7 @@ impl Depacketizer {
 fn error(conn_ctx: ConnectionContext, agg: Aggregate, description: String) -> Error {
     Error(Box::new(ErrorInt::RtpPacketError {
         conn_ctx,
-        msg_ctx: agg.ctx,
-        channel_id: agg.channel_id,
+        pkt_ctx: agg.ctx,
         stream_id: agg.stream_id,
         ssrc: agg.ssrc,
         sequence_number: agg.sequence_number,

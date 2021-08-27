@@ -4,7 +4,7 @@
 use std::num::NonZeroU16;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use retina::client::{rtp::StrictSequenceChecker, Timeline};
+use retina::client::{rtp::InorderParser, Timeline};
 use retina::codec::{CodecItem, Depacketizer};
 use std::convert::TryFrom;
 use std::io::Write;
@@ -24,15 +24,15 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         Timeline::new(Some(0), 90_000, None).unwrap(),
     ];
     let mut rtps = [
-        StrictSequenceChecker::new(None, Some(1)),
-        StrictSequenceChecker::new(None, Some(1)),
+        InorderParser::new(None, Some(1)),
+        InorderParser::new(None, Some(1)),
     ];
     let mut depacketizers = [
         Depacketizer::new("audio", "mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap(),
         Depacketizer::new("video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap(),
     ];
     let conn_ctx = retina::ConnectionContext::dummy();
-    let msg_ctx = retina::RtspMessageContext::dummy();
+    let pkt_ctx = retina::PacketContext::dummy();
     while !remaining.is_empty() {
         assert!(remaining.len() > 4);
         assert_eq!(remaining[0], b'$');
@@ -50,9 +50,8 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         let pkt = match rtps[stream_id].rtp(
             &retina::client::SessionOptions::default(),
             &conn_ctx,
-            &msg_ctx,
+            &pkt_ctx,
             &mut timelines[stream_id],
-            channel_id,
             stream_id,
             data,
         ) {

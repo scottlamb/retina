@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bytes::Bytes;
+use log::trace;
 //use failure::{bail, format_err, Error};
 use once_cell::sync::Lazy;
+use rand::Rng;
 use rtsp_types::Message;
 use std::fmt::{Debug, Display};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
+use std::ops::Range;
 
 mod error;
 mod rtcp;
@@ -218,8 +222,7 @@ pub struct ConnectionContext {
 impl ConnectionContext {
     #[doc(hidden)]
     pub fn dummy() -> Self {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         Self {
             local_addr: addr,
             peer_addr: addr,
@@ -283,6 +286,58 @@ impl Display for RtspMessageContext {
     }
 }
 
+/// Context for an RTP or RTCP packet, received either via RTSP interleaved data or UDP.
+///
+/// Should be paired with an [`RtspConnectionContext`] of the RTSP connection that started
+/// the session. In the interleaved data case, it's assumed the packet was received over
+/// that same connection.
+#[derive(Copy, Clone, Debug)]
+pub struct PacketContext(PacketContextInner);
+
+impl PacketContext {
+    #[doc(hidden)]
+    pub fn dummy() -> PacketContext {
+        Self(PacketContextInner::Dummy)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum PacketContextInner {
+    Tcp {
+        msg_ctx: RtspMessageContext,
+        channel_id: u8,
+    },
+    Udp {
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        received_wall: WallTime,
+        received: std::time::Instant,
+    },
+    Dummy,
+}
+
+impl Display for PacketContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            PacketContextInner::Udp {
+                local_addr,
+                peer_addr,
+                received_wall,
+                ..
+            } => {
+                write!(f, "{}->{}@{}", peer_addr, local_addr, received_wall)
+            }
+            PacketContextInner::Tcp {
+                msg_ctx,
+                channel_id,
+            } => {
+                write!(f, "{} ch={}", msg_ctx, channel_id)
+            }
+            PacketContextInner::Dummy => write!(f, "dummy"),
+        }
+    }
+}
+
 /// Returns the range within `buf` that represents `subset`.
 /// If `subset` is empty, returns None; otherwise panics if `subset` is not within `buf`.
 pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usize>> {
@@ -302,4 +357,78 @@ pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usiz
     let end = off + subset.len();
     assert!(end <= buf.len());
     Some(off..end)
+}
+
+/// A pair of local UDP sockets used for RTP and RTCP transmission.
+///
+/// The RTP port is always even, and the RTCP port is always the following (odd) integer.
+struct UdpPair {
+    rtp_port: u16,
+    rtp_socket: UdpSocket,
+    rtcp_socket: UdpSocket,
+}
+
+impl UdpPair {
+    fn for_ip(ip_addr: IpAddr) -> Result<Self, std::io::Error> {
+        const MAX_TRIES: usize = 10;
+        const ALLOWED_RTP_RANGE: Range<u16> = 5000..65000; // stolen from ffmpeg's defaults.
+        let mut rng = rand::thread_rng();
+        for i in 0..MAX_TRIES {
+            let rtp_port = rng.gen_range(ALLOWED_RTP_RANGE) & !0b1;
+            debug_assert!(ALLOWED_RTP_RANGE.contains(&rtp_port));
+            let rtp_addr = SocketAddr::new(ip_addr, rtp_port);
+            let rtp_socket = match UdpSocket::bind(rtp_addr) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    trace!(
+                        "Try {}/{}: unable to bind RTP addr {:?}",
+                        i,
+                        MAX_TRIES,
+                        rtp_addr
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let rtcp_addr = SocketAddr::new(ip_addr, rtp_port + 1);
+            let rtcp_socket = match UdpSocket::bind(rtcp_addr) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    trace!(
+                        "Try {}/{}: unable to bind RTCP addr {:?}",
+                        i,
+                        MAX_TRIES,
+                        rtcp_addr
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            return Ok(Self {
+                rtp_port,
+                rtp_socket,
+                rtcp_socket,
+            });
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "Unable to find even/odd pair in {}:{}..{} after {} tries",
+                ip_addr, ALLOWED_RTP_RANGE.start, ALLOWED_RTP_RANGE.end, MAX_TRIES
+            ),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn local_udp_pair() {
+        // Just test that it succeeds.
+        UdpPair::for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+    }
 }

@@ -157,7 +157,7 @@ impl AudioParameters {
 
 /// An audio frame, which consists of one or more samples.
 pub struct AudioFrame {
-    pub ctx: crate::RtspMessageContext,
+    pub ctx: crate::PacketContext,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
     pub frame_length: NonZeroU32,
@@ -202,7 +202,7 @@ impl Buf for AudioFrame {
 pub struct MessageParameters(onvif::CompressionType);
 
 pub struct MessageFrame {
-    pub ctx: crate::RtspMessageContext,
+    pub ctx: crate::PacketContext,
     pub timestamp: crate::Timestamp,
     pub stream_id: usize,
 
@@ -242,8 +242,8 @@ pub struct VideoFrame {
 
     // A pair of contexts: for the start and for the end.
     // Having both can be useful to measure the total time elapsed while receiving the frame.
-    start_ctx: crate::RtspMessageContext,
-    end_ctx: crate::RtspMessageContext,
+    start_ctx: crate::PacketContext,
+    end_ctx: crate::PacketContext,
 
     /// This picture's timestamp in the time base associated with the stream.
     pub timestamp: crate::Timestamp,
@@ -265,12 +265,12 @@ pub struct VideoFrame {
 
 impl VideoFrame {
     #[inline]
-    pub fn start_ctx(&self) -> crate::RtspMessageContext {
+    pub fn start_ctx(&self) -> crate::PacketContext {
         self.start_ctx
     }
 
     #[inline]
-    pub fn end_ctx(&self) -> crate::RtspMessageContext {
+    pub fn end_ctx(&self) -> crate::PacketContext {
         self.end_ctx
     }
 

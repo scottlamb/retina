@@ -5,7 +5,7 @@ use bytes::{Buf, Bytes};
 use log::debug;
 use pretty_hex::PrettyHex;
 use sdp::media_description::MediaDescription;
-use std::{convert::TryFrom, num::NonZeroU16};
+use std::{convert::TryFrom, net::IpAddr, num::NonZeroU16};
 use url::Url;
 
 use super::{Presentation, Stream};
@@ -365,6 +365,7 @@ fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<S
         rtp_payload_type,
         depacketizer,
         control,
+        sockets: None,
         channels,
         state: super::StreamState::Uninit,
     })
@@ -446,14 +447,15 @@ pub(crate) fn parse_describe(
         base_url,
         control,
         accept_dynamic_rate,
-        sdp,
     })
 }
 
 pub(crate) struct SetupResponse<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) ssrc: Option<u32>,
-    pub(crate) channel_id: u8,
+    pub(crate) channel_id: Option<u8>,
+    pub(crate) source: Option<IpAddr>,
+    pub(crate) server_port: Option<(u16, u16)>,
 }
 
 /// Parses a `SETUP` response.
@@ -473,6 +475,8 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
         .ok_or_else(|| "Missing Transport header".to_string())?;
     let mut channel_id = None;
     let mut ssrc = None;
+    let mut source = None;
+    let mut server_port = None;
     for part in transport.as_str().split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
             let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {}", v))?;
@@ -490,14 +494,33 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
                 }
             }
             channel_id = Some(n);
+        } else if let Some(s) = part.strip_prefix("source=") {
+            source = Some(
+                s.parse()
+                    .map_err(|_| format!("Transport header has unparseable source {:?}", s))?,
+            );
+        } else if let Some(s) = part.strip_prefix("server_port=") {
+            let mut ports = s.splitn(2, '-');
+            let n = ports.next().expect("splitn returns at least one part");
+            let n = u16::from_str_radix(n, 10)
+                .map_err(|_| format!("bad port in Transport: {}", transport.as_str()))?;
+            if let Some(m) = ports.next() {
+                let m = u16::from_str_radix(m, 10).map_err(|_| format!("bad second port {}", m))?;
+                server_port = Some((n, m))
+            } else {
+                // TODO: this is allowed by RFC 2326's grammar, but I'm not sure
+                // what it means. Does it use the same port for both RTP and
+                // RTCP, or is it implied the second is one more than the first?
+                return Err("Transport header specifies a single server_port".to_owned());
+            }
         }
     }
-    let channel_id =
-        channel_id.ok_or_else(|| "Transport header has no interleaved parameter".to_string())?;
     Ok(SetupResponse {
         session_id,
         ssrc,
         channel_id,
+        source,
+        server_port,
     })
 }
 
@@ -670,7 +693,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/dahua_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "634214675641");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x30a98ee7));
         p.streams[0].state = StreamState::Init(StreamStateInit {
             ssrc: setup_response.ssrc,
@@ -767,7 +790,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/hikvision_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "708345999");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x4cacc3d1));
         p.streams[0].state = StreamState::Init(StreamStateInit {
             ssrc: setup_response.ssrc,
@@ -842,7 +865,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/reolink_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "F8F8E425");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit::default());
         p.streams[1].state = StreamState::Init(StreamStateInit::default());
@@ -920,7 +943,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/bunny_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "1642021126");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit::default());
         p.streams[1].state = StreamState::Init(StreamStateInit::default());
@@ -1081,7 +1104,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/gw_main_setup_video.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "9a90de54");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit {
             ssrc: None,
@@ -1092,7 +1115,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/gw_main_setup_audio.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "9a90de54");
-        assert_eq!(setup_response.channel_id, 2);
+        assert_eq!(setup_response.channel_id, Some(2));
         assert_eq!(setup_response.ssrc, None);
         p.streams[1].state = StreamState::Init(StreamStateInit {
             ssrc: None,
@@ -1161,7 +1184,7 @@ mod tests {
         let setup_response = response(include_bytes!("testdata/gw_sub_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
         assert_eq!(setup_response.session_id, "9b0d0e54");
-        assert_eq!(setup_response.channel_id, 0);
+        assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit {
             ssrc: None,

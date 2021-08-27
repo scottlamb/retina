@@ -14,7 +14,8 @@ Progress:
 *   [x] client support
     *   [x] digest authentication.
     *   [x] RTP over TCP via RTSP interleaved channels.
-    *   [ ] RTP over UDP.
+    *   [x] RTP over UDP (experimental).
+    *   *   [ ] re-order buffer. (Out-of-order packets are dropped now.)
     *   [x] RTSP/1.0.
     *   [ ] RTSP/2.0.
     *   [ ] SRTP.

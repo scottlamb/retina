@@ -1,5 +1,7 @@
-## unreleased
+## `v0.3.0` (unreleased)
 
+*   [#30](https://github.com/scottlamb/retina/issues/30): experimental UDP
+    support.
 *   [#22](https://github.com/scottlamb/retina/issues/22): fix handling of
     44.1 kHz AAC audio.
 

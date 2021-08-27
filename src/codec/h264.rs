@@ -56,8 +56,8 @@ struct Nal {
 /// An access unit that is currently being accumulated during `PreMark` state.
 #[derive(Debug)]
 struct AccessUnit {
-    start_ctx: crate::RtspMessageContext,
-    end_ctx: crate::RtspMessageContext,
+    start_ctx: crate::PacketContext,
+    end_ctx: crate::PacketContext,
     timestamp: crate::Timestamp,
     stream_id: usize,
 
@@ -846,8 +846,7 @@ impl Packetizer {
                     };
                     // TODO: ctx, channel_id, and ssrc are placeholders.
                     return Ok(Some(Packet {
-                        ctx: crate::RtspMessageContext::dummy(),
-                        channel_id: 0,
+                        ctx: crate::PacketContext::dummy(),
                         stream_id: self.stream_id,
                         timestamp,
                         ssrc: 0,
@@ -870,8 +869,7 @@ impl Packetizer {
                     mark = false;
                 }
                 Ok(Some(Packet {
-                    ctx: crate::RtspMessageContext::dummy(),
-                    channel_id: 0,
+                    ctx: crate::PacketContext::dummy(),
                     stream_id: self.stream_id,
                     timestamp,
                     ssrc: 0,
@@ -923,8 +921,7 @@ impl Packetizer {
                 }
                 // TODO: placeholders.
                 Ok(Some(Packet {
-                    ctx: crate::RtspMessageContext::dummy(),
-                    channel_id: 0,
+                    ctx: crate::PacketContext::dummy(),
                     stream_id: self.stream_id,
                     timestamp,
                     ssrc: 0,
@@ -1030,8 +1027,7 @@ mod tests {
         };
         d.push(Packet {
             // plain SEI packet.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1044,8 +1040,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // STAP-A packet.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1058,8 +1053,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, start.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1072,8 +1066,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, middle.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1086,8 +1079,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // FU-A packet, end.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1128,8 +1120,7 @@ mod tests {
         };
         d.push(Packet {
             // SPS with (incorrect) mark
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts1,
             ssrc: 0,
@@ -1142,8 +1133,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // PPS
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts1,
             ssrc: 0,
@@ -1160,8 +1150,7 @@ mod tests {
             // RFC 6184 section 5.1 says that "the timestamp must match that of
             // the primary coded picture of the access unit and that the marker
             // bit can only be set on the final packet of the access unit.""
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts2,
             ssrc: 0,
@@ -1203,8 +1192,7 @@ mod tests {
         d.push(Packet {
             // Slice layer without partitioning non-IDR, representing the
             // last frame of the previous GOP.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts1,
             ssrc: 0,
@@ -1222,8 +1210,7 @@ mod tests {
         assert_eq!(frame.timestamp, ts1);
         d.push(Packet {
             // SPS with (incorrect) timestamp matching last frame.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts1,
             ssrc: 0,
@@ -1236,8 +1223,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // PPS, again with timestamp matching last frame.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts1,
             ssrc: 0,
@@ -1250,8 +1236,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // Slice layer without partitioning IDR. Now correct timestamp.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp: ts2,
             ssrc: 0,
@@ -1289,8 +1274,7 @@ mod tests {
             start: 0,
         };
         d.push(Packet { // new SPS.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1302,8 +1286,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // same PPS again.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,
@@ -1316,8 +1299,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(Packet {
             // dummy slice NAL to end the AU.
-            ctx: crate::RtspMessageContext::dummy(),
-            channel_id: 0,
+            ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
             ssrc: 0,

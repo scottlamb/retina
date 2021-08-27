@@ -36,7 +36,7 @@ enum State {
 
 #[derive(Debug)]
 struct InProgress {
-    ctx: crate::RtspMessageContext,
+    ctx: crate::PacketContext,
     timestamp: crate::Timestamp,
     data: BytesMut,
     loss: u16,

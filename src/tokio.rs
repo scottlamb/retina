@@ -11,7 +11,7 @@ use pretty_hex::PrettyHex;
 use rtsp_types::{Data, Message};
 use std::convert::TryFrom;
 use std::time::Instant;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::codec::Framed;
 use url::Host;
 
@@ -84,7 +84,7 @@ impl Stream for Connection {
     ) -> std::task::Poll<Option<Self::Item>> {
         self.0.poll_next_unpin(cx).map_err(|e| {
             wrap!(match e {
-                CodecError::IoError(error) => ErrorInt::ReadError {
+                CodecError::IoError(error) => ErrorInt::RtspReadError {
                     conn_ctx: *self.ctx(),
                     msg_ctx: self.eof_ctx(),
                     source: error,
@@ -294,5 +294,25 @@ impl tokio_util::codec::Encoder<rtsp_types::Message<Bytes>> for Codec {
         item.write(&mut (&mut dst).writer())
             .expect("BufMut Writer is infallible");
         Ok(())
+    }
+}
+
+/// tokio-specific version of [`crate::UdpPair`].
+pub(crate) struct UdpPair {
+    pub(crate) rtp_port: u16,
+    pub(crate) rtp_socket: UdpSocket,
+    pub(crate) rtcp_socket: UdpSocket,
+}
+
+impl UdpPair {
+    pub(crate) fn for_ip(ip_addr: std::net::IpAddr) -> Result<Self, std::io::Error> {
+        let inner = crate::UdpPair::for_ip(ip_addr)?;
+        inner.rtp_socket.set_nonblocking(true)?;
+        inner.rtcp_socket.set_nonblocking(true)?;
+        Ok(Self {
+            rtp_port: inner.rtp_port,
+            rtp_socket: UdpSocket::from_std(inner.rtp_socket)?,
+            rtcp_socket: UdpSocket::from_std(inner.rtcp_socket)?,
+        })
     }
 }

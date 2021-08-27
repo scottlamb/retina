@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
     let conn_ctx = retina::ConnectionContext::dummy();
-    let msg_ctx = retina::RtspMessageContext::dummy();
+    let pkt_ctx = retina::PacketContext::dummy();
     while data.has_remaining() {
         let hdr = data.get_u8();
         let ts_change = (hdr & 0b001) != 0;
@@ -30,8 +30,7 @@ fuzz_target!(|data: &[u8]| {
             timestamp = timestamp.try_add(1).unwrap();
         }
         let pkt = retina::client::rtp::Packet {
-            ctx: msg_ctx,
-            channel_id: 0,
+            ctx: pkt_ctx,
             stream_id: 0,
             timestamp,
             ssrc: 0,

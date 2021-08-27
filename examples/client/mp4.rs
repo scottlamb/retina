@@ -20,8 +20,11 @@
 use anyhow::{anyhow, bail, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::StreamExt;
-use log::info;
-use retina::codec::{AudioParameters, CodecItem, VideoParameters};
+use log::{info, warn};
+use retina::{
+    client::Transport,
+    codec::{AudioParameters, CodecItem, VideoParameters},
+};
 
 use std::convert::TryFrom;
 use std::io::SeekFrom;
@@ -59,6 +62,12 @@ pub struct Opts {
     /// Duration after which to exit automatically, in seconds.
     #[structopt(long, name = "secs")]
     duration: Option<u64>,
+
+    /// The transport to use: `tcp` or `udp` (experimental).
+    ///
+    /// Note: `--allow-loss` is strongly recommended with `udp`.
+    #[structopt(default_value, long)]
+    transport: retina::client::Transport,
 
     /// Path to `.mp4` file to write.
     #[structopt(parse(try_from_str))]
@@ -564,6 +573,10 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 }
 
 pub async fn run(opts: Opts) -> Result<(), Error> {
+    if matches!(opts.transport, Transport::Udp) && !opts.allow_loss {
+        warn!("Using --transport=udp without strongly recommended --allow-loss!");
+    }
+
     let creds = super::creds(opts.src.username, opts.src.password);
     let stop_signal = tokio::signal::ctrl_c();
     let mut session = retina::client::Session::describe(
@@ -571,6 +584,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         retina::client::SessionOptions::default()
             .creds(creds)
             .user_agent("Retina mp4 example".to_owned())
+            .transport(opts.transport)
             .ignore_spurious_data(opts.ignore_spurious_data),
     )
     .await?;
@@ -604,7 +618,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     if let Some((i, _)) = audio_stream {
         session.setup(i).await?;
     }
-    let session = session
+    let mut session = session
         .play(
             retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
@@ -629,7 +643,6 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         }
         None => futures::future::Either::Right(futures::future::pending()),
     };
-    tokio::pin!(session);
     tokio::pin!(stop_signal);
     tokio::pin!(sleep);
     loop {
@@ -654,6 +667,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             },
         }
     }
+    session.teardown().await?;
     mp4.finish().await?;
     Ok(())
 }
