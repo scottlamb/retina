@@ -226,7 +226,7 @@ impl InorderParser {
                         ntp_timestamp: pkt.ntp_timestamp(),
                     });
                 }
-                crate::rtcp::Packet::Unknown(pkt) => debug!("rtcp: pt {:?}", pkt.payload_type()),
+                crate::rtcp::Packet::Unknown(pkt) => trace!("rtcp: pt {:?}", pkt.payload_type()),
             }
             i += 1;
         }
