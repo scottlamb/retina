@@ -95,19 +95,6 @@ impl InorderParser {
         stream_id: usize,
         mut data: Bytes,
     ) -> Result<Option<PacketItem>, Error> {
-        // Terrible hack to try to make sense of the GW Security GW4089IP's audio stream.
-        // It appears to have one RTSP interleaved message wrapped in another. RTP and RTCP
-        // packets can never start with '$', so this shouldn't interfere with well-behaved
-        // servers.
-        if data.len() > 4
-            && data[0] == b'$'
-            && usize::from(u16::from_be_bytes([data[2], data[3]])) <= data.len() - 4
-        {
-            log::debug!("stripping extra interleaved data header");
-            data.advance(4);
-            // also remove suffix? dunno.
-        }
-
         let reader = rtp_rs::RtpReader::new(&data[..]).map_err(|e| {
             wrap!(ErrorInt::PacketError {
                 conn_ctx: *conn_ctx,
