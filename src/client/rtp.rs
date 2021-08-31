@@ -4,7 +4,7 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::{Buf, Bytes};
-use log::debug;
+use log::trace;
 use pretty_hex::PrettyHex;
 
 use crate::client::PacketItem;
