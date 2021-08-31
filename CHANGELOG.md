@@ -1,7 +1,11 @@
 ## `v0.3.0` (unreleased)
 
-*   [#30](https://github.com/scottlamb/retina/issues/30): experimental UDP
-    support.
+*   BREAKING CHANGE: [#30](https://github.com/scottlamb/retina/issues/30):
+    experimental UDP support. Several `RtspMessageContext` fields have been
+    replaced with `PacketContext`.
+*   BREAKING CHANGE: remove `retina::client::SessionOptions::ignore_spurious_data`. This
+    was an attempted workaround for old live555 servers
+    ([#17](https://github.com/scottlamb/retina/issues/17)) that was ineffective.
 *   [#22](https://github.com/scottlamb/retina/issues/22): fix handling of
     44.1 kHz AAC audio.
 

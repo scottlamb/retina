@@ -125,29 +125,17 @@ impl InorderParser {
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s != ssrc) {
-            if session_options.ignore_spurious_data {
-                log::debug!(
-                    "Ignoring spurious RTP data with ssrc={:08x} seq={:04x} while expecting \
-                             ssrc={:08x?} seq={:04x?}",
-                    ssrc,
-                    sequence_number,
-                    self.ssrc,
-                    self.next_seq
-                );
-                return Ok(None);
-            } else {
-                bail!(ErrorInt::RtpPacketError {
-                    conn_ctx: *conn_ctx,
-                    pkt_ctx: *pkt_ctx,
-                    stream_id,
-                    ssrc,
-                    sequence_number,
-                    description: format!(
-                        "Wrong ssrc; expecting ssrc={:08x?} seq={:04x?}",
-                        self.ssrc, self.next_seq
-                    ),
-                });
-            }
+            bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                pkt_ctx: *pkt_ctx,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: format!(
+                    "Wrong ssrc; expecting ssrc={:08x?} seq={:04x?}",
+                    self.ssrc, self.next_seq
+                ),
+            });
         }
         if loss > 0x80_00 {
             if matches!(session_options.transport, super::Transport::Tcp) {
@@ -211,7 +199,6 @@ impl InorderParser {
 
     pub fn rtcp(
         &mut self,
-        session_options: &super::SessionOptions,
         pkt_ctx: &crate::PacketContext,
         timeline: &mut super::Timeline,
         stream_id: usize,
@@ -238,20 +225,10 @@ impl InorderParser {
 
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
-                        if session_options.ignore_spurious_data {
-                            log::debug!(
-                                "Ignoring spurious RTCP data with ssrc={:08x} while \
-                                         expecting ssrc={:08x?}",
-                                ssrc,
-                                self.ssrc
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(format!(
-                                "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
-                                self.ssrc, ssrc
-                            ));
-                        }
+                        return Err(format!(
+                            "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                            self.ssrc, ssrc
+                        ));
                     }
                     self.ssrc = Some(ssrc);
 

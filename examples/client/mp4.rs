@@ -54,11 +54,6 @@ pub struct Opts {
     #[structopt(long)]
     allow_loss: bool,
 
-    /// Works around an old live555 server bug which sends data packets meant
-    /// for a closed RTP connection to one opened afterward.
-    #[structopt(long)]
-    ignore_spurious_data: bool,
-
     /// Duration after which to exit automatically, in seconds.
     #[structopt(long, name = "secs")]
     duration: Option<u64>,
@@ -584,8 +579,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         retina::client::SessionOptions::default()
             .creds(creds)
             .user_agent("Retina mp4 example".to_owned())
-            .transport(opts.transport)
-            .ignore_spurious_data(opts.ignore_spurious_data),
+            .transport(opts.transport),
     )
     .await?;
     let video_stream = if !opts.no_video {
