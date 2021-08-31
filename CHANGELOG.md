@@ -1,4 +1,4 @@
-## `v0.3.0` (unreleased)
+## `v0.3.0` (2021-08-31)
 
 *   BREAKING CHANGE: [#30](https://github.com/scottlamb/retina/issues/30):
     experimental UDP support. Several `RtspMessageContext` fields have been
