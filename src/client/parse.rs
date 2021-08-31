@@ -417,6 +417,7 @@ pub(crate) fn parse_describe(
         .unwrap_or(Ok(request_url.clone()))?;
 
     let mut control = None;
+    let mut tool = None;
     for a in &sdp.attributes {
         if a.key == "control" {
             control = a
@@ -425,6 +426,8 @@ pub(crate) fn parse_describe(
                 .map(|c| join_control(&base_url, c))
                 .transpose()?;
             break;
+        } else if a.key == "tool" {
+            tool = a.value.as_deref().map(Into::into);
         }
     }
     let control = control.unwrap_or(request_url);
@@ -447,6 +450,7 @@ pub(crate) fn parse_describe(
         base_url,
         control,
         accept_dynamic_rate,
+        tool,
     })
 }
 
@@ -825,6 +829,10 @@ mod tests {
         let base = "rtsp://192.168.5.206/h264Preview_01_main/";
         assert_eq!(p.control.as_str(), base);
         assert!(!p.accept_dynamic_rate);
+        assert_eq!(
+            p.tool.as_deref(),
+            Some("LIVE555 Streaming Media v2013.04.08")
+        );
 
         assert_eq!(p.streams.len(), 2);
 
@@ -967,6 +975,10 @@ mod tests {
         let p = parse_describe(prefix, include_bytes!("testdata/foscam_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
         assert!(!p.accept_dynamic_rate);
+        assert_eq!(
+            p.tool.as_deref(),
+            Some("LIVE555 Streaming Media v2014.02.10")
+        );
 
         assert_eq!(p.streams.len(), 2);
 

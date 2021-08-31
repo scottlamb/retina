@@ -1,3 +1,7 @@
+## unreleased
+
+*   warn when connecting via TCP to a known-broken live555 server version.
+
 ## `v0.3.0` (2021-08-31)
 
 *   BREAKING CHANGE: [#30](https://github.com/scottlamb/retina/issues/30):

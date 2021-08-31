@@ -216,6 +216,9 @@ pub struct Presentation {
     base_url: Url,
     pub control: Url,
     pub accept_dynamic_rate: bool,
+
+    /// Session-level `a:tool` from SDP.
+    tool: Option<Box<str>>,
 }
 
 /// Information about a stream offered within a presentation.
@@ -908,6 +911,17 @@ impl Session<Described> {
                 "must SETUP before PLAY".into()
             ))
         })?;
+        if let Some(tool) = inner.presentation.tool.as_deref() {
+            if matches!(inner.options.transport, Transport::Tcp) && has_live555_tcp_bug(tool) {
+                warn!(
+                    "Connecting via TCP to known-broken RTSP server {:?}. \
+                       See <https://github.com/scottlamb/retina/issues/17>. \
+                       Consider using UDP instead!",
+                    tool
+                );
+            }
+        }
+
         trace!("PLAY with channel mappings: {:#?}", &inner.conn.channels);
         let (msg_ctx, cseq, response) = inner
             .conn
@@ -1020,6 +1034,17 @@ impl Session<Described> {
         *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(KEEPALIVE_DURATION)));
         Ok(Session(self.0, Playing(())))
     }
+}
+
+/// Checks if the `tool` entry refers to a live555 version affected by
+/// [#17](https://github.com/scottlamb/retina/issues/17).
+fn has_live555_tcp_bug(tool: &str) -> bool {
+    const PREFIX: &str = "LIVE555 Streaming Media v";
+    if !tool.starts_with(PREFIX) {
+        return false;
+    }
+    let version = &tool[PREFIX.len()..];
+    version > "0000.00.00" && version < "2017.06.04"
 }
 
 /// Sends dummy RTP and RTCP packets to punch a hole in connection-tracking
@@ -1747,5 +1772,14 @@ mod tests {
         ] {
             println!("{:-40} {:4}", name, size);
         }
+    }
+
+    #[test]
+    fn check_live555_tcp_bug() {
+        assert!(!has_live555_tcp_bug("not live555"));
+        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v"));
+        assert!(has_live555_tcp_bug("LIVE555 Streaming Media v2013.04.08"));
+        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2017.06.04"));
+        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2020.01.01"));
     }
 }
