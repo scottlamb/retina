@@ -3,6 +3,9 @@
 *   warn when connecting via TCP to a known-broken live555 server version.
 *   improve compatibility with Geovision cameras (work in progress).
 *   UDP fixes.
+*   improve compatibility with cameras with non-compliant SDP, including
+    Anpviz ([#26](https://github.com/scottlamb/retina/issues/26) and
+    Geovision ([#33])(https://github.com/scottlamb/retina/issues/33)).
 
 ## `v0.3.0` (2021-08-31)
 

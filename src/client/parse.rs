@@ -1,11 +1,11 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use log::debug;
 use pretty_hex::PrettyHex;
-use sdp::media_description::MediaDescription;
-use std::{convert::TryFrom, net::IpAddr, num::NonZeroU16};
+use sdp_types::Media;
+use std::{net::IpAddr, num::NonZeroU16};
 use url::Url;
 
 use super::{Presentation, Stream};
@@ -224,21 +224,16 @@ pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
 /// Parses a [MediaDescription] to a [Stream].
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
-fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<Stream, String> {
-    let media = media_description.media_name.media.clone();
+fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, String> {
+    let media = media_description.media.clone();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
     // sub-field is "RTP/AVP" or "RTP/SAVP" the <fmt> sub-fields contain RTP
     // payload type numbers."
     // https://www.iana.org/assignments/sdp-parameters/sdp-parameters.xhtml#sdp-parameters-2
-    // shows several other variants, such as "TCP/RTP/AVP". Looking a "RTP" component
+    // shows several other variants, such as "TCP/RTP/AVP". Looking for a "RTP" component
     // seems appropriate.
-    if !media_description
-        .media_name
-        .protos
-        .iter()
-        .any(|p| p == "RTP")
-    {
+    if !media_description.proto.starts_with("RTP/") && !media_description.proto.contains("/RTP/") {
         return Err("Expected RTP-based proto".into());
     }
 
@@ -248,10 +243,10 @@ fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<S
     // format for the session." Just use the first until we find a stream
     // where this isn't the right thing to do.
     let rtp_payload_type_str = media_description
-        .media_name
-        .formats
-        .first()
-        .ok_or_else(|| "missing RTP payload type".to_string())?;
+        .fmt
+        .split_ascii_whitespace()
+        .next()
+        .unwrap();
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
         .map_err(|_| format!("invalid RTP payload type {:?}", rtp_payload_type_str))?;
     if (rtp_payload_type & 0x80) != 0 {
@@ -268,7 +263,7 @@ fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<S
     let mut fmtp = None;
     let mut control = None;
     for a in &media_description.attributes {
-        if a.key == "rtpmap" {
+        if a.attribute == "rtpmap" {
             let v = a
                 .value
                 .as_ref()
@@ -287,7 +282,7 @@ fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<S
             if rtpmap_payload_type == rtp_payload_type_str {
                 rtpmap = Some(v);
             }
-        } else if a.key == "fmtp" {
+        } else if a.attribute == "fmtp" {
             // Similarly starts with payload-type SP.
             let v = a
                 .value
@@ -299,7 +294,7 @@ fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<S
             if fmtp_payload_type == rtp_payload_type_str {
                 fmtp = Some(v);
             }
-        } else if a.key == "control" {
+        } else if a.attribute == "control" {
             control = a
                 .value
                 .as_deref()
@@ -385,24 +380,13 @@ pub(crate) fn parse_describe(
         ));
     }
 
-    let sdp;
-    {
-        let mut cursor = std::io::Cursor::new(&response.body()[..]);
-        sdp =
-            sdp::session_description::SessionDescription::unmarshal(&mut cursor).map_err(|e| {
-                format!(
-                    "Unable to parse SDP: {}\n\n{:#?}",
-                    e,
-                    response.body().hex_dump()
-                )
-            })?;
-        if cursor.has_remaining() {
-            return Err(format!(
-                "garbage after sdp: {:?}",
-                &response.body()[usize::try_from(cursor.position()).unwrap()..]
-            ));
-        }
-    }
+    let sdp = sdp_types::Session::parse(&response.body()[..]).map_err(|e| {
+        format!(
+            "Unable to parse SDP: {}\n\n{:#?}",
+            e,
+            response.body().hex_dump()
+        )
+    })?;
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
@@ -419,21 +403,21 @@ pub(crate) fn parse_describe(
     let mut control = None;
     let mut tool = None;
     for a in &sdp.attributes {
-        if a.key == "control" {
+        if a.attribute == "control" {
             control = a
                 .value
                 .as_deref()
                 .map(|c| join_control(&base_url, c))
                 .transpose()?;
             break;
-        } else if a.key == "tool" {
+        } else if a.attribute == "tool" {
             tool = a.value.as_deref().map(Into::into);
         }
     }
     let control = control.unwrap_or(request_url);
 
     let streams = sdp
-        .media_descriptions
+        .medias
         .iter()
         .enumerate()
         .map(|(i, m)| {
@@ -616,6 +600,7 @@ pub(crate) fn parse_play(
 mod tests {
     use std::num::NonZeroU16;
 
+    use bytes::Bytes;
     use url::Url;
 
     use crate::{client::StreamStateInit, codec::Parameters};
@@ -629,6 +614,30 @@ mod tests {
     ) -> Result<super::Presentation, String> {
         let url = Url::parse(raw_url).unwrap();
         super::parse_describe(url, &response(raw_response))
+    }
+
+    #[test]
+    fn anvpiz_sdp() {
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let response =
+            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
+                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
+                .build(Bytes::from_static(include_bytes!(
+                    "testdata/anpviz_sdp.txt"
+                )));
+        super::parse_describe(url, &response).unwrap();
+    }
+
+    #[test]
+    fn geovision_sdp() {
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let response =
+            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
+                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
+                .build(Bytes::from_static(include_bytes!(
+                    "testdata/geovision_sdp.txt"
+                )));
+        super::parse_describe(url, &response).unwrap();
     }
 
     #[test]
