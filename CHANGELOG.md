@@ -1,6 +1,7 @@
 ## unreleased
 
 *   warn when connecting via TCP to a known-broken live555 server version.
+*   improve compatibility with Geovision cameras (work in progress).
 
 ## `v0.3.0` (2021-08-31)
 

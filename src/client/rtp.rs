@@ -4,15 +4,17 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::{Buf, Bytes};
-use log::trace;
+use log::{debug, trace};
 use pretty_hex::PrettyHex;
 
 use crate::client::PacketItem;
-use crate::{Error, ErrorInt};
+use crate::{ConnectionContext, Error, ErrorInt, PacketContext};
+
+use super::{SessionOptions, Timeline};
 
 /// A received RTP packet.
 pub struct Packet {
-    pub ctx: crate::PacketContext,
+    pub ctx: PacketContext,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
     pub ssrc: u32,
@@ -51,7 +53,7 @@ impl std::fmt::Debug for Packet {
 #[derive(Debug)]
 pub struct SenderReport {
     pub stream_id: usize,
-    pub ctx: crate::PacketContext,
+    pub ctx: PacketContext,
     pub timestamp: crate::Timestamp,
     pub ntp_timestamp: crate::NtpTimestamp,
 }
@@ -88,10 +90,10 @@ impl InorderParser {
 
     pub fn rtp(
         &mut self,
-        session_options: &super::SessionOptions,
-        conn_ctx: &crate::ConnectionContext,
-        pkt_ctx: &crate::PacketContext,
-        timeline: &mut super::Timeline,
+        session_options: &SessionOptions,
+        conn_ctx: &ConnectionContext,
+        pkt_ctx: &PacketContext,
+        timeline: &mut Timeline,
         stream_id: usize,
         mut data: Bytes,
     ) -> Result<Option<PacketItem>, Error> {
@@ -108,6 +110,18 @@ impl InorderParser {
                 ),
             })
         })?;
+
+        // Skip pt=50 packets, sent by at least Geovision cameras. I'm not sure
+        // what purpose these serve, but they have the same sequence number as
+        // the packet immediately before. In TCP streams, this can cause an
+        // "Out-of-order packet or large loss" error. In UDP streams, if these
+        // are delivered out of order, they will cause the more important other
+        // packet with the same sequence number to be skipped.
+        if reader.payload_type() == 50 {
+            debug!("skipping pkt with invalid payload type 50");
+            return Ok(None);
+        }
+
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
@@ -186,8 +200,8 @@ impl InorderParser {
 
     pub fn rtcp(
         &mut self,
-        pkt_ctx: &crate::PacketContext,
-        timeline: &mut super::Timeline,
+        pkt_ctx: &PacketContext,
+        timeline: &mut Timeline,
         stream_id: usize,
         data: Bytes,
     ) -> Result<Option<PacketItem>, String> {
@@ -231,5 +245,64 @@ impl InorderParser {
             i += 1;
         }
         Ok(sr.map(PacketItem::SenderReport))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checks dropping and logging Geovision's extra payload type 50 packets.
+    /// On a GV-EBD4701 running V1.02_2021_04_08, these seem to appear after
+    /// every IDR frame, with the same sequence number as the final packet in
+    /// that frame.
+    #[test]
+    fn geovision_pt50_packet() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0xd25614e), None);
+
+        // Normal packet.
+        match parser.rtp(
+            &SessionOptions::default(),
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            &mut timeline,
+            0,
+            rtp_rs::RtpPacketBuilder::new()
+                .payload_type(105)
+                .ssrc(0xd25614e)
+                .sequence(0x1234.into())
+                .timestamp(141000)
+                .marked(true)
+                .payload(b"foo")
+                .build()
+                .unwrap()
+                .into(),
+        ) {
+            Ok(Some(PacketItem::RtpPacket(_))) => {}
+            o => panic!("unexpected packet 1 result: {:#?}", o),
+        }
+
+        // Mystery pt=50 packet with same sequence number.
+        match parser.rtp(
+            &SessionOptions::default(),
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            &mut timeline,
+            0,
+            rtp_rs::RtpPacketBuilder::new()
+                .payload_type(50)
+                .ssrc(0xd25614e)
+                .sequence(0x1234.into())
+                .timestamp(141000)
+                .marked(true)
+                .payload(b"bar")
+                .build()
+                .unwrap()
+                .into(),
+        ) {
+            Ok(None) => {}
+            o => panic!("unexpected packet 2 result: {:#?}", o),
+        }
     }
 }
