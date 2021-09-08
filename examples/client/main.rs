@@ -53,7 +53,7 @@ async fn main() {
         let _a = h.async_scope();
         main_inner().await
     } {
-        error!("Fatal: {}", e);
+        error!("Fatal: {}", itertools::join(e.chain(), "\ncaused by: "));
         std::process::exit(1);
     }
     info!("Done");

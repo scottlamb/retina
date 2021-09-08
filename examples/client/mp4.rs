@@ -17,7 +17,7 @@
 //! https://github.com/scottlamb/moonfire-nvr/wiki/Standards-and-specifications
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::StreamExt;
 use log::{info, warn};
@@ -524,13 +524,14 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             self.video_params = Some(p);
         }
         let size = u32::try_from(frame.data().remaining())?;
-        self.video_trak.add_sample(
-            self.mdat_pos,
-            size,
-            frame.timestamp,
-            frame.loss,
-            self.allow_loss,
-        )?;
+        self.video_trak
+            .add_sample(
+                self.mdat_pos,
+                size,
+                frame.timestamp,
+                frame.loss,
+                self.allow_loss,
+            )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
@@ -643,8 +644,16 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         tokio::select! {
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
-                    CodecItem::VideoFrame(f) => mp4.video(f).await?,
-                    CodecItem::AudioFrame(f) => mp4.audio(f).await?,
+                    CodecItem::VideoFrame(f) => {
+                        let start_ctx = f.start_ctx();
+                        mp4.video(f).await.with_context(
+                            || format!("Error processing video frame starting with {}", start_ctx))?;
+                    },
+                    CodecItem::AudioFrame(f) => {
+                        let ctx = f.ctx;
+                        mp4.audio(f).await.with_context(
+                            || format!("Error processing audio frame, {}", ctx))?;
+                    },
                     CodecItem::SenderReport(sr) => {
                         println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
                     },

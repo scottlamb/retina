@@ -1000,6 +1000,7 @@ dependencies = [
  "futures",
  "h264-reader",
  "hex",
+ "itertools 0.10.1",
  "log",
  "mylog",
  "once_cell",
