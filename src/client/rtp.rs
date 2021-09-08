@@ -158,6 +158,7 @@ impl InorderParser {
                     self.ssrc,
                     self.next_seq
                 );
+                return Ok(None);
             }
         }
         let timestamp = match timeline.advance_to(reader.timestamp()) {
@@ -302,6 +303,81 @@ mod tests {
                 .into(),
         ) {
             Ok(None) => {}
+            o => panic!("unexpected packet 2 result: {:#?}", o),
+        }
+    }
+
+    #[test]
+    fn out_of_order() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0xd25614e), None);
+
+        let session_options = SessionOptions::default().transport(crate::client::Transport::Udp);
+        match parser.rtp(
+            &session_options,
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            &mut timeline,
+            0,
+            rtp_rs::RtpPacketBuilder::new()
+                .payload_type(96)
+                .ssrc(0xd25614e)
+                .sequence(2.into())
+                .timestamp(2)
+                .marked(true)
+                .payload(b"pkt 2")
+                .build()
+                .unwrap()
+                .into(),
+        ) {
+            Ok(Some(PacketItem::RtpPacket(p))) => {
+                assert_eq!(p.timestamp.elapsed(), 0);
+            }
+            o => panic!("unexpected packet 2 result: {:#?}", o),
+        }
+
+        match parser.rtp(
+            &session_options,
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            &mut timeline,
+            0,
+            rtp_rs::RtpPacketBuilder::new()
+                .payload_type(96)
+                .ssrc(0xd25614e)
+                .sequence(1.into())
+                .timestamp(1)
+                .marked(true)
+                .payload(b"pkt 1")
+                .build()
+                .unwrap()
+                .into(),
+        ) {
+            Ok(None) => {}
+            o => panic!("unexpected packet 1 result: {:#?}", o),
+        }
+
+        match parser.rtp(
+            &session_options,
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            &mut timeline,
+            0,
+            rtp_rs::RtpPacketBuilder::new()
+                .payload_type(96)
+                .ssrc(0xd25614e)
+                .sequence(3.into())
+                .timestamp(3)
+                .marked(true)
+                .payload(b"pkt 3")
+                .build()
+                .unwrap()
+                .into(),
+        ) {
+            Ok(Some(PacketItem::RtpPacket(p))) => {
+                // The missing timestamp shouldn't have adjusted time.
+                assert_eq!(p.timestamp.elapsed(), 1);
+            }
             o => panic!("unexpected packet 2 result: {:#?}", o),
         }
     }

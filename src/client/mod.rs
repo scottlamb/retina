@@ -1305,7 +1305,10 @@ impl Session<Playing> {
     }
 
     /// Polls a single UDP stream, `inner.presentation.streams[i]`.
+    ///
     /// Assumes `buf` is cleared and large enough for any UDP packet.
+    /// Only returns `Poll::Pending` after both RTCP and RTP sockets have
+    /// returned `Poll::Pending`.
     fn poll_udp_stream(
         &mut self,
         cx: &mut std::task::Context,
@@ -1324,7 +1327,7 @@ impl Session<Playing> {
                 _ => unreachable!("Session<Playing>'s {}->{:?} not in Playing state", i, s),
             };
             // Prioritize RTCP over RTP within a stream.
-            if let Poll::Ready(r) = sockets.rtcp_socket.poll_recv(cx, buf) {
+            while let Poll::Ready(r) = sockets.rtcp_socket.poll_recv(cx, buf) {
                 let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
                     local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port + 1),
                     peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtcp_port),
@@ -1356,7 +1359,7 @@ impl Session<Playing> {
                     }
                 }
             }
-            if let Poll::Ready(r) = sockets.rtp_socket.poll_recv(cx, buf) {
+            while let Poll::Ready(r) = sockets.rtp_socket.poll_recv(cx, buf) {
                 let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
                     local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port),
                     peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtp_port),
