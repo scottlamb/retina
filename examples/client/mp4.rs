@@ -524,14 +524,13 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             self.video_params = Some(p);
         }
         let size = u32::try_from(frame.data().remaining())?;
-        self.video_trak
-            .add_sample(
-                self.mdat_pos,
-                size,
-                frame.timestamp,
-                frame.loss,
-                self.allow_loss,
-            )?;
+        self.video_trak.add_sample(
+            self.mdat_pos,
+            size,
+            frame.timestamp,
+            frame.loss,
+            self.allow_loss,
+        )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
