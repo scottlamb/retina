@@ -19,18 +19,21 @@
 
 use anyhow::{anyhow, bail, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use log::{info, warn};
 use retina::{
     client::Transport,
     codec::{AudioParameters, CodecItem, VideoParameters},
 };
 
-use std::convert::TryFrom;
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use tokio::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use std::{convert::TryFrom, pin::Pin};
+use tokio::{
+    fs::File,
+    io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
+};
 
 #[derive(structopt::StructOpt)]
 pub struct Opts {
@@ -567,15 +570,115 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     }
 }
 
+/// Copies packets from `session` to `mp4` without handling any cleanup on error.
+async fn copy<'a>(
+    opts: &'a Opts,
+    session: &'a mut retina::client::Demuxed,
+    stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
+    mp4: &'a mut Mp4Writer<File>,
+) -> Result<(), Error> {
+    let sleep = match opts.duration {
+        Some(secs) => {
+            futures::future::Either::Left(tokio::time::sleep(std::time::Duration::from_secs(secs)))
+        }
+        None => futures::future::Either::Right(futures::future::pending()),
+    };
+    tokio::pin!(stop_signal);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            pkt = session.next() => {
+                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
+                    CodecItem::VideoFrame(f) => {
+                        let start_ctx = f.start_ctx();
+                        mp4.video(f).await.with_context(
+                            || format!("Error processing video frame starting with {}", start_ctx))?;
+                    },
+                    CodecItem::AudioFrame(f) => {
+                        let ctx = f.ctx;
+                        mp4.audio(f).await.with_context(
+                            || format!("Error processing audio frame, {}", ctx))?;
+                    },
+                    CodecItem::SenderReport(sr) => {
+                        println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
+                    },
+                    _ => continue,
+                };
+            },
+            _ = &mut stop_signal => {
+                info!("Stopping due to signal");
+                break;
+            },
+            _ = &mut sleep => {
+                info!("Stopping after {} seconds", opts.duration.unwrap());
+                break;
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Writes the `.mp4`, including trying to finish or clean up the file.
+async fn write_mp4<'a>(
+    opts: &'a Opts,
+    session: &'a mut retina::client::Demuxed,
+    video_stream: Option<(usize, VideoParameters)>,
+    audio_stream: Option<(usize, AudioParameters)>,
+    stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
+) -> Result<(), Error> {
+    // Append into a filename suffixed with ".partial", then try to either rename it into
+    // place if it's complete or delete it otherwise.
+    const PARTIAL_SUFFIX: &str = ".partial";
+    let mut tmp_filename = opts.out.as_os_str().to_owned();
+    tmp_filename.push(PARTIAL_SUFFIX); // OsString::push doesn't put in a '/', unlike PathBuf::.
+    let tmp_filename: PathBuf = tmp_filename.into();
+    let out = tokio::fs::File::create(&tmp_filename).await?;
+    let mut mp4 = Mp4Writer::new(
+        video_stream.map(|(_, p)| Box::new(p)),
+        audio_stream.map(|(_, p)| Box::new(p)),
+        opts.allow_loss,
+        out,
+    )
+    .await?;
+
+    let result = copy(opts, session, stop_signal, &mut mp4).await;
+    if let Err(e) = result {
+        // Log errors about finishing, returning the original error.
+        if let Err(e) = mp4.finish().await {
+            log::error!(".mp4 finish failed: {}", e);
+            if let Err(e) = tokio::fs::remove_file(&tmp_filename).await {
+                log::error!("and removing .mp4 failed too: {}", e);
+            }
+        } else {
+            if let Err(e) = tokio::fs::rename(&tmp_filename, &opts.out).await {
+                log::error!("unable to move completed .mp4 into place: {}", e);
+            }
+        }
+        Err(e)
+    } else {
+        // Directly return errors about finishing.
+        if let Err(e) = mp4.finish().await {
+            log::error!(".mp4 finish failed: {}", e);
+            if let Err(e) = tokio::fs::remove_file(&tmp_filename).await {
+                log::error!("and removing .mp4 failed too: {}", e);
+            }
+            Err(e)
+        } else {
+            tokio::fs::rename(&tmp_filename, &opts.out).await?;
+            Ok(())
+        }
+    }
+}
+
 pub async fn run(opts: Opts) -> Result<(), Error> {
     if matches!(opts.transport, Transport::Udp) && !opts.allow_loss {
         warn!("Using --transport=udp without strongly recommended --allow-loss!");
     }
 
-    let creds = super::creds(opts.src.username, opts.src.password);
-    let stop_signal = tokio::signal::ctrl_c();
+    let creds = super::creds(opts.src.username.clone(), opts.src.password.clone());
+    let stop_signal = Box::pin(tokio::signal::ctrl_c());
     let mut session = retina::client::Session::describe(
-        opts.src.url,
+        opts.src.url.clone(),
         retina::client::SessionOptions::default()
             .creds(creds)
             .user_agent("Retina mp4 example".to_owned())
@@ -621,55 +724,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         .await?
         .demuxed()?;
 
-    // Read RTP data.
-    let out = tokio::fs::File::create(opts.out).await?;
-    let mut mp4 = Mp4Writer::new(
-        video_stream.map(|(_, p)| Box::new(p)),
-        audio_stream.map(|(_, p)| Box::new(p)),
-        opts.allow_loss,
-        out,
-    )
-    .await?;
+    // TODO: should also send a TEARDOWN if the PLAY response won't parse or if
+    // demuxed() fails. The former isn't even possible with the current API.
 
-    let sleep = match opts.duration {
-        Some(secs) => {
-            futures::future::Either::Left(tokio::time::sleep(std::time::Duration::from_secs(secs)))
-        }
-        None => futures::future::Either::Right(futures::future::pending()),
-    };
-    tokio::pin!(stop_signal);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            pkt = session.next() => {
-                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
-                    CodecItem::VideoFrame(f) => {
-                        let start_ctx = f.start_ctx();
-                        mp4.video(f).await.with_context(
-                            || format!("Error processing video frame starting with {}", start_ctx))?;
-                    },
-                    CodecItem::AudioFrame(f) => {
-                        let ctx = f.ctx;
-                        mp4.audio(f).await.with_context(
-                            || format!("Error processing audio frame, {}", ctx))?;
-                    },
-                    CodecItem::SenderReport(sr) => {
-                        println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
-                    },
-                    _ => continue,
-                };
-            },
-            _ = &mut stop_signal => {
-                info!("Stopping due to signal");
-                break;
-            },
-            _ = &mut sleep => {
-                info!("Stopping after {} seconds", opts.duration.unwrap());
-                break;
-            },
-        }
+    let result = write_mp4(&opts, &mut session, video_stream, audio_stream, stop_signal).await;
+    if let Err(e) = session.teardown().await {
+        log::error!("TEARDOWN failed: {}", e);
     }
-    session.teardown().await?;
-    mp4.finish().await?;
-    Ok(())
+    result
 }
