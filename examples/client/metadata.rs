@@ -3,8 +3,10 @@
 
 use anyhow::{anyhow, Error};
 use futures::StreamExt;
-use log::info;
+use log::{error, info};
+use retina::client::SessionGroup;
 use retina::codec::CodecItem;
+use std::sync::Arc;
 
 #[derive(structopt::StructOpt)]
 pub struct Opts {
@@ -13,6 +15,15 @@ pub struct Opts {
 }
 
 pub async fn run(opts: Opts) -> Result<(), Error> {
+    let session_group = Arc::new(SessionGroup::default());
+    let r = run_inner(opts, session_group.clone()).await;
+    if let Err(e) = session_group.await_teardown().await {
+        error!("TEARDOWN failed: {}", e);
+    }
+    r
+}
+
+async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), Error> {
     let stop = tokio::signal::ctrl_c();
 
     let creds = super::creds(opts.src.username, opts.src.password);
@@ -20,7 +31,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         opts.src.url,
         retina::client::SessionOptions::default()
             .creds(creds)
-            .user_agent("Retina metadata example".to_owned()),
+            .user_agent("Retina metadata example".to_owned())
+            .session_group(session_group),
     )
     .await?;
     let onvif_stream_i = session
@@ -50,6 +62,5 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             },
         }
     }
-    session.teardown().await?;
     Ok(())
 }

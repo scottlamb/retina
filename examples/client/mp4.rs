@@ -57,6 +57,10 @@ pub struct Opts {
     #[structopt(long)]
     allow_loss: bool,
 
+    /// When to issue a `TEARDOWN` request: `auto`, `always`, or `never`.
+    #[structopt(default_value, long)]
+    teardown: retina::client::TeardownPolicy,
+
     /// Duration after which to exit automatically, in seconds.
     #[structopt(long, name = "secs")]
     duration: Option<u64>,
@@ -693,7 +697,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .creds(creds)
             .session_group(session_group.clone())
             .user_agent("Retina mp4 example".to_owned())
-            .transport(opts.transport),
+            .transport(opts.transport)
+            .teardown(opts.teardown),
     )
     .await?;
     let video_stream = if !opts.no_video {
@@ -729,8 +734,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let result = write_mp4(&opts, session, video_stream, audio_stream, stop_signal).await;
 
     // Session has now been dropped, on success or failure. A TEARDOWN should
-    // be pending if necessary. session_group.teardown() will wait for it.
-    if let Err(e) = session_group.teardown().await {
+    // be pending if necessary. session_group.await_teardown() will wait for it.
+    if let Err(e) = session_group.await_teardown().await {
         log::error!("TEARDOWN failed: {}", e);
     }
     result

@@ -39,6 +39,7 @@ struct StaleSession {
 
     id: Option<Box<str>>,
 
+    maybe_playing: bool,
     is_tcp: bool,
 
     /// Upper bound of advertised expiration time.
@@ -47,25 +48,27 @@ struct StaleSession {
 
 /// A grouping of sessions, currently used only to track stale sessions.
 ///
+/// Sessions are associated with a group via [`SessionOptions::session_group`].
+///
 /// This is an experimental API which may change in an upcoming Retina version.
 ///
-/// Stale sessions are ones that may still be attempting data transmission.
-/// They are tracked in three cases:
+/// Stale sessions are ones which are no longer active on the client side
+/// (no [`Session`] struct exists) but may still be in state `Ready`, `Playing`,
+/// or `Recording` on the server. The client has neither seen a `TEARDOWN`
+/// response nor believes they have reached their expiration time. They are
+/// tracked in two cases:
 ///
-/// 1.  UDP sessions for which we've sent a `PLAY` request and dropped the
-///     `Session` without receiving a `TEARDOWN` response. These may still be
-///     consuming bandwidth.
-/// 2.  TCP sessions in a similar situation, if the server advertises a specific
-///     buggy version of live555 (see [`has_live555_tcp_bug`]). These sessions
-///     at least consume CPU on the server, and they will cause problems if
-///     another connection claims the same file descriptor.
-/// 3.  TCP sessions we learn about via unexpected RTSP interleaved data
-///     packets.  These are assumed to be caused by the same bug as #2 but might
-///     have been started by a process unknown to us.
+/// 1.  Dropped [`Session`]s if the [`TeardownPolicy`] says to do so
+///     and a valid `SETUP` response has been received.
+/// 2.  TCP sessions discovered via unexpected RTSP interleaved data
+///     packets. These are assumed to be due to a live555 bug in which
+///     data continues to be sent on a stale file descriptor after a
+///     connection is closed. They may have been started by a process
+///     unknown to us and their session id is unknown.
 ///
-/// Currently in cases #1 and #2, a single `TEARDOWN` will be attempted in the
-/// background after the `Session` is dropped. [`SessionGroup::teardown`] can
-/// be used to wait for it to conclude.
+/// Currently a single `TEARDOWN` will be attempted in the background after
+/// a `Session` is dropped. [`SessionGroup::await_teardown`] can be used to wait
+/// for it to conclude.
 ///
 /// Stale sessions are forgotten either on teardown or expiration. In general,
 /// the tracked expiration time is worst-case. The exception is if the sender
@@ -88,26 +91,32 @@ struct SessionGroupInner {
     sessions: Vec<StaleSession>,
 }
 
-/// The overall status of stale sessions belonging to a group.
+/// The overall status of stale sessions that may be in state `Playing` and
+/// belong to a particular group.
 pub struct StaleSessionStatus {
-    /// The maximum expire time of any stale session in this group.
+    /// The maximum expire time of any such sessions.
     pub max_expires: Option<tokio::time::Instant>,
 
-    /// The total number of stale sessions.
+    /// The total number of sessions.
     pub num_sessions: usize,
 }
 
 impl SessionGroup {
     /// Returns the status of stale sessions in this group.
     ///
-    /// The caller might use this in a loop to sleep until there are no expired
+    /// Currently this only returns information about sessions which may be in
+    /// state `Playing`. That is, Retina has sent a `PLAY` request, regardless
+    /// of whether it has received a response.
+    ///
+    /// The caller might use this in a loop to sleep until there are no such
     /// sessions.
     pub fn stale_sessions(&self) -> StaleSessionStatus {
         let mut l = self.0.lock().unwrap();
         l.prune(tokio::time::Instant::now());
+        let playing = l.sessions.iter().filter(|s| s.maybe_playing);
         StaleSessionStatus {
-            max_expires: l.sessions.iter().map(|s| s.expires).max(),
-            num_sessions: l.sessions.len(),
+            max_expires: playing.clone().map(|s| s.expires).max(),
+            num_sessions: playing.count(),
         }
     }
 
@@ -121,10 +130,11 @@ impl SessionGroup {
     /// This method waits for that to conclude. It doesn't attempt any new
     /// `TEARDOWN` requests, even if called repeatedly. This may change.
     ///
-    /// Ignores the case #3 sessions, as it's not possible to tear them down. If
-    /// desired, the caller can learn of those through
-    /// [`SessionGroup::stale_sessions`] and sleep until they expire.
-    pub async fn teardown(&self) -> Result<(), Error> {
+    /// Ignores the discovered sessions, as it's impossible to send a `TEARDOWN`
+    /// without knowing the session id. If desired, the caller can learn of the
+    /// existence of the sessions through [`SessionGroup::stale_sessions`] and
+    /// sleep until they expire.
+    pub async fn await_teardown(&self) -> Result<(), Error> {
         let mut watches: Vec<_>;
         {
             let mut l = self.0.lock().unwrap();
@@ -183,6 +193,7 @@ impl SessionGroup {
             teardown_receiver: None,
             is_tcp: true,
             id: None,
+            maybe_playing: true,
         });
     }
 }
@@ -191,6 +202,53 @@ impl SessionGroupInner {
     /// Removes expired sessions.
     fn prune(&mut self, now: tokio::time::Instant) {
         self.sessions.retain(|session| session.expires > now);
+    }
+}
+
+/// Policy for when to send `TEARDOWN` requests.
+///
+/// Specify via [`SessionOptions::teardown`].
+#[derive(Copy, Clone, Debug)]
+pub enum TeardownPolicy {
+    /// Automatic: send when using UDP transport or if the server appears to be
+    /// using a [buggy live555
+    /// version](https://github.com/scottlamb/retina/issues/17) in which data
+    /// continues to be sent on a stale file descriptor after a connection is
+    /// closed.
+    Auto,
+    Always,
+    Never,
+}
+
+impl Default for TeardownPolicy {
+    fn default() -> Self {
+        TeardownPolicy::Auto
+    }
+}
+
+impl std::fmt::Display for TeardownPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            TeardownPolicy::Auto => "auto",
+            TeardownPolicy::Never => "never",
+            TeardownPolicy::Always => "always",
+        })
+    }
+}
+
+impl std::str::FromStr for TeardownPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "auto" => TeardownPolicy::Auto,
+            "never" => TeardownPolicy::Never,
+            "always" => TeardownPolicy::Always,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad TeardownPolicy {}; expected auto, never, or always",
+                s
+            ))),
+        })
     }
 }
 
@@ -262,6 +320,7 @@ pub struct SessionOptions {
     user_agent: Option<Box<str>>,
     transport: Transport,
     session_group: Option<Arc<SessionGroup>>,
+    teardown: TeardownPolicy,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -334,6 +393,11 @@ impl SessionOptions {
 
     pub fn session_group(mut self, session_group: Arc<SessionGroup>) -> Self {
         self.session_group = Some(session_group);
+        self
+    }
+
+    pub fn teardown(mut self, teardown: TeardownPolicy) -> Self {
+        self.teardown = teardown;
         self
     }
 }
@@ -552,8 +616,12 @@ enum ResponseMode {
     Teardown,
 }
 
-/// An RTSP session, or a connection that may be used in a proscriptive way.
-/// See discussion at [State].
+/// An RTSP session.
+///
+/// When a `Session` is dropped, Retina may issue a `TEARDOWN` in the
+/// background, depending on the [`SessionOptions::teardown`] parameter. Clients
+/// may need to wait for the `TEARDOWN` to complete; see
+/// [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
 pub struct Session<S: State>(Pin<Box<SessionInner>>, S);
 
 #[pin_project(PinnedDrop)]
@@ -590,6 +658,8 @@ struct SessionInner {
 
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
+    /// Set if the server may be in state Playing: we have sent a `PLAY`
+    /// request, regardless of if the response has been received.
     maybe_playing: bool,
     has_live555_tcp_bug: bool,
 
@@ -1094,13 +1164,6 @@ impl Session<Described> {
     ///
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
-    ///
-    /// When a `Session<Playing>` is dropped—including when `play` returns
-    /// error, a `TEARDOWN` request may be necessary. This will happen in the
-    /// background. The caller may need to wait for the session to be
-    /// successfully destroyed, for example before exiting the program or before
-    /// starting another session. See [`SessionOptions::session_group`] and
-    /// [`SessionGroup::teardown`].
     pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner.conn.as_mut().unwrap();
@@ -1312,14 +1375,7 @@ impl Session<Playing> {
     }
 
     /// Sends a `TEARDOWN`, ending the session.
-    ///
-    /// Note relying on this method to tear down the session misses some cases
-    /// in which a `TEARDOWN` is necessary:
-    /// *   `Session<Described>::play` may fail parsing the response. It
-    ///     consumes the session, so calling this method is not possible.
-    /// *   `Session<Playing>::demuxed` similarly consumes the session.
-    /// See [`SessionOptions::session_group`] and [`SessionGroup::teardown`]
-    /// for a more robust mechanism.
+    #[deprecated(since = "0.3.1", note = "Use SessionGroup::await_teardown instead")]
     pub async fn teardown(mut self) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         let mut req = rtsp_types::Request::builder(Method::Teardown, rtsp_types::Version::V1_0)
@@ -1631,17 +1687,15 @@ impl PinnedDrop for SessionInner {
         let this = self.project();
 
         let is_tcp = matches!(this.options.transport, Transport::Tcp);
-        if !*this.maybe_playing || (is_tcp && !*this.has_live555_tcp_bug) {
-            // No TEARDOWN is necessary.
-            return;
+        match this.options.teardown {
+            TeardownPolicy::Auto if is_tcp && !*this.has_live555_tcp_bug => return,
+            TeardownPolicy::Auto | TeardownPolicy::Always => {}
+            TeardownPolicy::Never => return,
         }
 
         let session = match this.session.take() {
             Some(s) => s,
-            None => {
-                log::warn!("Session::drop: maybe_playing set without a session id");
-                return;
-            }
+            None => return,
         };
 
         // For now, assume the whole timeout is left.
@@ -1657,6 +1711,7 @@ impl PinnedDrop for SessionInner {
                 teardown_receiver: Some(teardown_receiver),
                 is_tcp,
                 id: Some(session.id.clone()),
+                maybe_playing: *this.maybe_playing,
             });
         }
 
@@ -1810,8 +1865,9 @@ pub struct Demuxed {
 }
 
 impl Demuxed {
-    /// Tears down the session; see [`Session<Playing>::teardown`].
+    #[deprecated(since = "0.3.1", note = "Use SessionGroup::await_teardown instead")]
     pub async fn teardown(self) -> Result<(), Error> {
+        #[allow(deprecated)]
         self.session.teardown().await
     }
 }
