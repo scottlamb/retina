@@ -26,10 +26,10 @@ use retina::{
     codec::{AudioParameters, CodecItem, VideoParameters},
 };
 
-use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::{convert::TryFrom, pin::Pin};
+use std::{io::SeekFrom, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
@@ -621,11 +621,20 @@ async fn copy<'a>(
 /// Writes the `.mp4`, including trying to finish or clean up the file.
 async fn write_mp4<'a>(
     opts: &'a Opts,
-    session: &'a mut retina::client::Demuxed,
+    session: retina::client::Session<retina::client::Described>,
     video_stream: Option<(usize, VideoParameters)>,
     audio_stream: Option<(usize, AudioParameters)>,
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
 ) -> Result<(), Error> {
+    let mut session = session
+        .play(
+            retina::client::PlayOptions::default()
+                .initial_timestamp(opts.initial_timestamp)
+                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
+        )
+        .await?
+        .demuxed()?;
+
     // Append into a filename suffixed with ".partial", then try to either rename it into
     // place if it's complete or delete it otherwise.
     const PARTIAL_SUFFIX: &str = ".partial";
@@ -641,7 +650,7 @@ async fn write_mp4<'a>(
     )
     .await?;
 
-    let result = copy(opts, session, stop_signal, &mut mp4).await;
+    let result = copy(opts, &mut session, stop_signal, &mut mp4).await;
     if let Err(e) = result {
         // Log errors about finishing, returning the original error.
         if let Err(e) = mp4.finish().await {
@@ -677,10 +686,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
 
     let creds = super::creds(opts.src.username.clone(), opts.src.password.clone());
     let stop_signal = Box::pin(tokio::signal::ctrl_c());
+    let session_group = Arc::new(retina::client::SessionGroup::default());
     let mut session = retina::client::Session::describe(
         opts.src.url.clone(),
         retina::client::SessionOptions::default()
             .creds(creds)
+            .session_group(session_group.clone())
             .user_agent("Retina mp4 example".to_owned())
             .transport(opts.transport),
     )
@@ -715,20 +726,11 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     if let Some((i, _)) = audio_stream {
         session.setup(i).await?;
     }
-    let mut session = session
-        .play(
-            retina::client::PlayOptions::default()
-                .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
-        )
-        .await?
-        .demuxed()?;
+    let result = write_mp4(&opts, session, video_stream, audio_stream, stop_signal).await;
 
-    // TODO: should also send a TEARDOWN if the PLAY response won't parse or if
-    // demuxed() fails. The former isn't even possible with the current API.
-
-    let result = write_mp4(&opts, &mut session, video_stream, audio_stream, stop_signal).await;
-    if let Err(e) = session.teardown().await {
+    // Session has now been dropped, on success or failure. A TEARDOWN should
+    // be pending if necessary. session_group.teardown() will wait for it.
+    if let Err(e) = session_group.teardown().await {
         log::error!("TEARDOWN failed: {}", e);
     }
     result

@@ -6,6 +6,7 @@
 *   improve compatibility with cameras with non-compliant SDP, including
     Anpviz ([#26](https://github.com/scottlamb/retina/issues/26) and
     Geovision ([#33])(https://github.com/scottlamb/retina/issues/33)).
+*   new mechanism to more reliably send `TEARDOWN` requests.
 
 ## `v0.3.0` (2021-08-31)
 

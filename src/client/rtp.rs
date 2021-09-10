@@ -125,7 +125,11 @@ impl InorderParser {
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
+        let is_tcp = matches!(session_options.transport, super::Transport::Tcp);
         if matches!(self.ssrc, Some(s) if s != ssrc) {
+            if let (Some(session_group), true) = (session_options.session_group.as_ref(), is_tcp) {
+                session_group.note_stale_live555_data();
+            }
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
                 pkt_ctx: *pkt_ctx,
@@ -201,6 +205,7 @@ impl InorderParser {
 
     pub fn rtcp(
         &mut self,
+        session_options: &SessionOptions,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
         stream_id: usize,
@@ -227,6 +232,13 @@ impl InorderParser {
 
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
+                        use super::Transport;
+                        if let (Some(session_group), Transport::Tcp) = (
+                            session_options.session_group.as_ref(),
+                            session_options.transport,
+                        ) {
+                            session_group.note_stale_live555_data();
+                        }
                         return Err(format!(
                             "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
                             self.ssrc, ssrc

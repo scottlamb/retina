@@ -114,4 +114,13 @@ pub(crate) enum ErrorInt {
 
     #[error("Internal error: {0}")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// Silly kind used by `SessionGroup::teardown`.
+    ///
+    /// TODO: Currently the teardown process needs to clone its `Result`, and
+    /// `ErrorInt` isn't cloneable due to `Internal` above. We should come up
+    /// with some more satisfactory solution. Maybe `RtspConnection::send`
+    /// should return a more restricted error type which is cloneable.
+    #[error("{0}")]
+    Teardown(String),
 }

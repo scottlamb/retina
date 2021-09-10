@@ -438,8 +438,14 @@ pub(crate) fn parse_describe(
     })
 }
 
-pub(crate) struct SetupResponse<'a> {
-    pub(crate) session_id: &'a str,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionHeader {
+    pub(crate) id: Box<str>,
+    pub(crate) timeout_sec: u32,
+}
+
+pub(crate) struct SetupResponse {
+    pub(crate) session: SessionHeader,
     pub(crate) ssrc: Option<u32>,
     pub(crate) channel_id: Option<u8>,
     pub(crate) source: Option<IpAddr>,
@@ -451,12 +457,27 @@ pub(crate) struct SetupResponse<'a> {
 /// Returns an assigned interleaved channel id (implying the next channel id
 /// is also assigned) or errors.
 pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<SetupResponse, String> {
+    // https://datatracker.ietf.org/doc/html/rfc2326#section-12.37
     let session = response
         .header(&rtsp_types::headers::SESSION)
         .ok_or_else(|| "Missing Session header".to_string())?;
-    let session_id = match session.as_str().find(';') {
-        None => session.as_str(),
-        Some(i) => &session.as_str()[..i],
+    let session = match session.as_str().split_once(';') {
+        None => SessionHeader {
+            id: session.as_str().into(),
+            timeout_sec: 60, // default
+        },
+        Some((id, timeout_str)) => {
+            if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
+                let timeout_sec =
+                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {}", v))?;
+                SessionHeader {
+                    id: id.into(),
+                    timeout_sec,
+                }
+            } else {
+                return Err(format!("Unparseable Session header {:?}", session.as_str()));
+            }
+        }
     };
     let transport = response
         .header(&rtsp_types::headers::TRANSPORT)
@@ -504,7 +525,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
         }
     }
     Ok(SetupResponse {
-        session_id,
+        session,
         ssrc,
         channel_id,
         source,
@@ -606,6 +627,7 @@ mod tests {
     use crate::{client::StreamStateInit, codec::Parameters};
 
     use super::super::StreamState;
+    use super::SessionHeader;
     use crate::testutil::response;
 
     fn parse_describe(
@@ -705,7 +727,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/dahua_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "634214675641");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "634214675641".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x30a98ee7));
         p.streams[0].state = StreamState::Init(StreamStateInit {
@@ -802,7 +830,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/hikvision_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "708345999");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "708345999".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x4cacc3d1));
         p.streams[0].state = StreamState::Init(StreamStateInit {
@@ -881,7 +915,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/reolink_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "F8F8E425");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "F8F8E425".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit::default());
@@ -959,7 +999,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/bunny_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "1642021126");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "1642021126".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit::default());
@@ -1124,7 +1170,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/gw_main_setup_video.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "9a90de54");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "9a90de54".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit {
@@ -1135,7 +1187,13 @@ mod tests {
 
         let setup_response = response(include_bytes!("testdata/gw_main_setup_audio.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "9a90de54");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "9a90de54".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(2));
         assert_eq!(setup_response.ssrc, None);
         p.streams[1].state = StreamState::Init(StreamStateInit {
@@ -1204,7 +1262,13 @@ mod tests {
         // SETUP.
         let setup_response = response(include_bytes!("testdata/gw_sub_setup.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
-        assert_eq!(setup_response.session_id, "9b0d0e54");
+        assert_eq!(
+            setup_response.session,
+            SessionHeader {
+                id: "9b0d0e54".into(),
+                timeout_sec: 60
+            }
+        );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
         p.streams[0].state = StreamState::Init(StreamStateInit {
