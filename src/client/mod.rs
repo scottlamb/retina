@@ -1247,7 +1247,7 @@ impl Session<Described> {
                                     description: format!(
                                         "Expected rtptime on PLAY with mode {:?}, missing on \
                                              stream {} ({:?}). Consider setting initial timestamp \
-                                             mode use-if-all-present.",
+                                             mode permissive.",
                                         policy.initial_timestamp, i, &s.control
                                     ),
                                 });
