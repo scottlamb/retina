@@ -454,7 +454,11 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                         write_box!(buf, b"stsd", {
                             buf.put_u32(0); // version
                             buf.put_u32(1); // entry_count
-                            buf.extend_from_slice(&parameters.sample_entry().unwrap()[..]);
+                            buf.extend_from_slice(
+                                &parameters
+                                    .sample_entry()
+                                    .expect("all added streams have sample entries")[..],
+                            );
                         });
                         self.audio_trak.write_common_stbl_parts(buf)?;
 
@@ -722,7 +726,11 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .iter()
             .enumerate()
             .find_map(|(i, s)| match s.parameters() {
-                Some(retina::codec::Parameters::Audio(a)) => Some((i, a.clone())),
+                // Only consider audio streams that can produce a .mp4 sample
+                // entry.
+                Some(retina::codec::Parameters::Audio(a)) if a.sample_entry().is_some() => {
+                    Some((i, a.clone()))
+                }
                 _ => None,
             })
     } else {
