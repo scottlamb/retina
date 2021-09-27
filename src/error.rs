@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use crate::{ConnectionContext, PacketContext, RtspMessageContext};
 use thiserror::Error;
@@ -15,7 +15,8 @@ use thiserror::Error;
 /// If you wish to inspect Retina errors programmatically, or if you need
 /// errors formatted in a different way, please file an issue on the `retina`
 /// repository.
-pub struct Error(pub(crate) Box<ErrorInt>);
+#[derive(Clone)]
+pub struct Error(pub(crate) Arc<ErrorInt>);
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,12 +116,6 @@ pub(crate) enum ErrorInt {
     #[error("Internal error: {0}")]
     Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
 
-    /// Silly kind used by `SessionGroup::teardown`.
-    ///
-    /// TODO: Currently the teardown process needs to clone its `Result`, and
-    /// `ErrorInt` isn't cloneable due to `Internal` above. We should come up
-    /// with some more satisfactory solution. Maybe `RtspConnection::send`
-    /// should return a more restricted error type which is cloneable.
-    #[error("{0}")]
-    Teardown(String),
+    #[error("Timeout")]
+    Timeout,
 }

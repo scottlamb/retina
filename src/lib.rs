@@ -23,13 +23,13 @@ pub use error::Error;
 /// Wraps the supplied `ErrorInt` and returns it as an `Err`.
 macro_rules! bail {
     ($e:expr) => {
-        return Err(crate::error::Error(Box::new($e)))
+        return Err(crate::error::Error(std::sync::Arc::new($e)))
     };
 }
 
 macro_rules! wrap {
     ($e:expr) => {
-        crate::error::Error(Box::new($e))
+        crate::error::Error(std::sync::Arc::new($e))
     };
 }
 

@@ -26,6 +26,7 @@ use crate::{Error, ErrorInt, RtspMessageContext};
 mod channel_mapping;
 mod parse;
 pub mod rtp;
+mod teardown;
 mod timeline;
 
 /// Duration between keepalive RTSP requests during [Playing] state.
@@ -33,11 +34,12 @@ pub const KEEPALIVE_DURATION: std::time::Duration = std::time::Duration::from_se
 
 /// A stale RTP session.
 struct StaleSession {
-    /// If this stale session was created from a dropped [`Session`], the
-    /// a channel which receives the result of a single `TEARDOWN` attempt.
-    teardown_receiver: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+    seqnum: u64,
 
-    id: Option<Box<str>>,
+    /// If this stale session was created from a dropped [`Session`],
+    /// a watch showing the results of the latest `TEARDOWN` attempt, or `None`
+    /// if one hasn't yet concluded.
+    teardown_rx: Option<tokio::sync::watch::Receiver<Option<Result<(), Error>>>>,
 
     maybe_playing: bool,
     is_tcp: bool,
@@ -88,6 +90,7 @@ pub struct SessionGroup(Mutex<SessionGroupInner>);
 
 #[derive(Default)]
 struct SessionGroupInner {
+    next_seqnum: u64,
     sessions: Vec<StaleSession>,
 }
 
@@ -111,8 +114,7 @@ impl SessionGroup {
     /// The caller might use this in a loop to sleep until there are no such
     /// sessions.
     pub fn stale_sessions(&self) -> StaleSessionStatus {
-        let mut l = self.0.lock().unwrap();
-        l.prune(tokio::time::Instant::now());
+        let l = self.0.lock().unwrap();
         let playing = l.sessions.iter().filter(|s| s.maybe_playing);
         StaleSessionStatus {
             max_expires: playing.clone().map(|s| s.expires).max(),
@@ -120,15 +122,15 @@ impl SessionGroup {
         }
     }
 
-    /// Waits for a `TEARDOWN` to be attempted on all stale sessions that exist
-    /// as of when this method is called, returning an error if any fail.
+    /// Waits for a reasonable attempt at `TEARDOWN` on all stale sessions that
+    /// exist as of when this method is called, returning an error if any fail.
     ///
     /// This has no timeout other than the sessions' expiration times. The
     /// caller can wrap the call in `tokio::time::timeout` for an earlier time.
     ///
-    /// Currently on `Session::drop`, a `TEARDOWN` is started in the background.
-    /// This method waits for that to conclude. It doesn't attempt any new
-    /// `TEARDOWN` requests, even if called repeatedly. This may change.
+    /// Currently on `Session::drop`, a `TEARDOWN` loop is started in the
+    /// background. This method waits for an attempt on an existing connection
+    /// (if any) and the first attempt on a fresh connection.
     ///
     /// Ignores the discovered sessions, as it's impossible to send a `TEARDOWN`
     /// without knowing the session id. If desired, the caller can learn of the
@@ -137,12 +139,11 @@ impl SessionGroup {
     pub async fn await_teardown(&self) -> Result<(), Error> {
         let mut watches: Vec<_>;
         {
-            let mut l = self.0.lock().unwrap();
-            l.prune(tokio::time::Instant::now());
+            let l = self.0.lock().unwrap();
             watches = l
                 .sessions
                 .iter()
-                .filter_map(|s| s.teardown_receiver.clone())
+                .filter_map(|s| s.teardown_rx.clone())
                 .collect();
         }
 
@@ -162,8 +163,7 @@ impl SessionGroup {
             let r = r.expect("teardown result should be populated after change");
             overall_result = overall_result.and(r);
         }
-
-        overall_result.map_err(|description| wrap!(ErrorInt::Teardown(description)))
+        overall_result
     }
 
     /// Notes an unexpected RTSP interleaved data message.
@@ -174,8 +174,6 @@ impl SessionGroup {
     /// 65 seconds.
     fn note_stale_live555_data(&self) {
         let mut lock = self.0.lock().unwrap();
-        let now = tokio::time::Instant::now();
-        lock.prune(now);
         for s in &lock.sessions {
             if s.is_tcp {
                 // This session plausibly explains the packet.
@@ -185,23 +183,19 @@ impl SessionGroup {
                 return;
             }
         }
+        let seqnum = lock.next_seqnum;
+        lock.next_seqnum += 1;
         lock.sessions.push(StaleSession {
+            seqnum,
+
             // The caller *might* have a better guess than 65 seconds via a
             // SETUP response, but it's also possible for
             // note_stale_live555_data to be called prior to SETUP.
             expires: tokio::time::Instant::now() + std::time::Duration::from_secs(65),
-            teardown_receiver: None,
+            teardown_rx: None,
             is_tcp: true,
-            id: None,
             maybe_playing: true,
         });
-    }
-}
-
-impl SessionGroupInner {
-    /// Removes expired sessions.
-    fn prune(&mut self, now: tokio::time::Instant) {
-        self.sessions.retain(|session| session.expires > now);
     }
 }
 
@@ -990,7 +984,10 @@ impl Session<Described> {
         let inner = &mut self.0.as_mut().project();
         let presentation = &mut inner.presentation;
         let options = &inner.options;
-        let conn = inner.conn.as_mut().unwrap();
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         let stream = &mut presentation.streams[stream_i];
         if !matches!(stream.state, StreamState::Uninit) {
             bail!(ErrorInt::FailedPrecondition("stream already set up".into()));
@@ -1166,7 +1163,10 @@ impl Session<Described> {
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
     pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
         let inner = self.0.as_mut().project();
-        let conn = inner.conn.as_mut().unwrap();
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         let session = inner.session.as_ref().ok_or_else(|| {
             wrap!(ErrorInt::FailedPrecondition(
                 "must SETUP before PLAY".into()
@@ -1354,11 +1354,15 @@ impl Session<Playing> {
     /// Fails if a stream that has been setup can't be depacketized.
     pub fn demuxed(mut self) -> Result<Demuxed, Error> {
         let inner = self.0.as_mut().project();
+        let conn = inner
+            .conn
+            .as_ref()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         for s in &mut inner.presentation.streams {
             if matches!(s.state, StreamState::Playing { .. }) {
                 if let Err(ref description) = s.depacketizer {
                     bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *inner.conn.as_ref().unwrap().inner.ctx(),
+                        conn_ctx: *conn.inner.ctx(),
                         msg_ctx: *inner.describe_ctx,
                         method: rtsp_types::Method::Describe,
                         cseq: *inner.describe_cseq,
@@ -1410,7 +1414,10 @@ impl Session<Playing> {
         cx: &mut std::task::Context<'_>,
     ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
-        let conn = inner.conn.as_mut().unwrap();
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         // Expect the previous keepalive request to have finished.
         match inner.keepalive_state {
             KeepaliveState::Flushing(cseq) => bail!(ErrorInt::WriteError {
@@ -1488,7 +1495,12 @@ impl Session<Playing> {
 
         // The only response we expect in this state is to our keepalive request.
         bail!(ErrorInt::RtspFramingError {
-            conn_ctx: *inner.conn.as_ref().unwrap().inner.ctx(),
+            conn_ctx: *inner
+                .conn
+                .as_ref()
+                .expect("have conn when handling response")
+                .inner
+                .ctx(),
             msg_ctx: *msg_ctx,
             description: format!("Unexpected RTSP response {:#?}", response),
         })
@@ -1500,7 +1512,10 @@ impl Session<Playing> {
         data: rtsp_types::Data<Bytes>,
     ) -> Result<Option<PacketItem>, Error> {
         let inner = self.0.as_mut().project();
-        let conn = inner.conn.as_ref().unwrap();
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         let channel_id = data.channel_id();
         let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Tcp {
             msg_ctx: *msg_ctx,
@@ -1567,7 +1582,12 @@ impl Session<Playing> {
     ) -> Poll<Option<Result<PacketItem, Error>>> {
         debug_assert!(buf.filled().is_empty());
         let inner = self.0.as_mut().project();
-        let conn_ctx = *inner.conn.as_ref().unwrap().inner.ctx();
+        let conn_ctx = inner
+            .conn
+            .as_ref()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
+            .inner
+            .ctx();
         let s = &mut inner.presentation.streams[i];
         if let Some(sockets) = &mut s.sockets {
             let (mut timeline, rtp_handler) = match &mut s.state {
@@ -1593,7 +1613,7 @@ impl Session<Playing> {
                             Ok(None) => buf.clear(),
                             Err(description) => {
                                 return Poll::Ready(Some(Err(wrap!(ErrorInt::PacketError {
-                                    conn_ctx,
+                                    conn_ctx: *conn_ctx,
                                     pkt_ctx,
                                     stream_id: i,
                                     description,
@@ -1603,7 +1623,7 @@ impl Session<Playing> {
                     }
                     Err(source) => {
                         return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                            conn_ctx,
+                            conn_ctx: *conn_ctx,
                             pkt_ctx,
                             source,
                         }))))
@@ -1635,7 +1655,7 @@ impl Session<Playing> {
                     }
                     Err(source) => {
                         return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                            conn_ctx,
+                            conn_ctx: *conn_ctx,
                             pkt_ctx,
                             source,
                         }))))
@@ -1703,17 +1723,22 @@ impl PinnedDrop for SessionInner {
             + std::time::Duration::from_secs(session.timeout_sec.into());
 
         // Track the session, if there is a group.
-        let (teardown_sender, teardown_receiver) = tokio::sync::watch::channel(None);
-        if let Some(session_group) = this.options.session_group.as_ref() {
+        let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
+        let seqnum = if let Some(session_group) = this.options.session_group.as_ref() {
             let mut lock = session_group.0.lock().unwrap();
+            let seqnum = lock.next_seqnum;
+            lock.next_seqnum += 1;
             lock.sessions.push(StaleSession {
+                seqnum,
                 expires: expires.clone(),
-                teardown_receiver: Some(teardown_receiver),
+                teardown_rx: Some(teardown_rx),
                 is_tcp,
-                id: Some(session.id.clone()),
                 maybe_playing: *this.maybe_playing,
             });
-        }
+            Some(seqnum)
+        } else {
+            None
+        };
 
         let handle = match this.runtime_handle.take() {
             Some(h) => h,
@@ -1721,68 +1746,24 @@ impl PinnedDrop for SessionInner {
                 const MSG: &str = "Unable to start async TEARDOWN because describe wasn't called \
                                    from a tokio runtime";
                 log::warn!("{}", MSG);
-                let _ = teardown_sender.send(Some(Err(MSG.into())));
+                let _ =
+                    teardown_tx.send(Some(Err(wrap!(ErrorInt::FailedPrecondition(MSG.into())))));
                 return;
             }
         };
 
-        handle.spawn(background_teardown(
+        log::debug!("Starting background TEARDOWN for {}", &*session.id);
+        handle.spawn(teardown::background_teardown(
+            seqnum,
             this.presentation.base_url.clone(),
             session.id,
             std::mem::take(this.options),
             this.requested_auth.take(),
-            this.conn.take().unwrap(),
-            teardown_sender,
+            this.conn.take(),
+            teardown_tx,
             expires,
         ));
     }
-}
-
-async fn background_teardown(
-    base_url: Url,
-    session_id: Box<str>,
-    options: SessionOptions,
-    mut requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
-    mut conn: RtspConnection,
-    sender: tokio::sync::watch::Sender<Option<Result<(), String>>>,
-    expires: tokio::time::Instant,
-) {
-    let mut req = rtsp_types::Request::builder(Method::Teardown, rtsp_types::Version::V1_0)
-        .request_uri(base_url)
-        .header(rtsp_types::headers::SESSION, session_id.to_string())
-        .build(Bytes::new());
-    let r = match tokio::time::timeout_at(
-        expires,
-        conn.send(
-            ResponseMode::Teardown,
-            &options,
-            &mut requested_auth,
-            &mut req,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("unable to complete TEARDOWN before session expiration".to_owned()),
-    };
-    log::debug!("Background TEARDOWN: {:?}", &r);
-    if let (Some(ref mut session_group), Ok(_)) = (options.session_group, &r) {
-        let mut l = session_group.0.lock().unwrap();
-        let i = l
-            .sessions
-            .iter()
-            .position(|s| matches!(&s.id, Some(id) if &**id == &*session_id));
-        match i {
-            Some(i) => {
-                l.sessions.swap_remove(i);
-            }
-            None => log::warn!("Unable to find session {:?} on TEARDOWN", &*session_id),
-        }
-    }
-
-    // In the most common case, the send will fail because all receivers have been dropped.
-    let _ = sender.send(Some(r));
 }
 
 impl futures::Stream for Session<Playing> {
@@ -1841,7 +1822,7 @@ impl futures::Stream for Session<Playing> {
             if let KeepaliveState::Flushing(cseq) = self.0.keepalive_state {
                 match self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => self.0.keepalive_state = KeepaliveState::Waiting(cseq),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Box::new(e))))),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
                     Poll::Pending => {}
                 }
             }
@@ -1897,7 +1878,12 @@ impl futures::Stream for Demuxed {
                 Ok(d) => d,
                 Err(_) => unreachable!("depacketizer was Ok"),
             };
-            let conn_ctx = inner.conn.as_ref().unwrap().inner.ctx();
+            let conn_ctx = inner
+                .conn
+                .as_ref()
+                .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
+                .inner
+                .ctx();
             if let Some(p) = pkt {
                 let pkt_ctx = p.ctx;
                 let stream_id = p.stream_id;

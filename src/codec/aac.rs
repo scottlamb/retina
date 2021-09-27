@@ -722,7 +722,7 @@ impl Depacketizer {
 }
 
 fn error(conn_ctx: ConnectionContext, agg: Aggregate, description: String) -> Error {
-    Error(Box::new(ErrorInt::RtpPacketError {
+    Error(std::sync::Arc::new(ErrorInt::RtpPacketError {
         conn_ctx,
         pkt_ctx: agg.ctx,
         stream_id: agg.stream_id,
