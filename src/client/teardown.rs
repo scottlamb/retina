@@ -24,7 +24,8 @@ pub(super) async fn background_teardown(
     mut tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
     expires: tokio::time::Instant,
 ) {
-    let _ = tokio::time::timeout_at(
+    log::debug!("TEARDOWN {} starting", &*session_id);
+    if tokio::time::timeout_at(
         expires,
         teardown_loop_forever(
             base_url,
@@ -35,7 +36,11 @@ pub(super) async fn background_teardown(
             &mut tx,
         ),
     )
-    .await;
+    .await
+    .is_err()
+    {
+        log::debug!("TEARDOWN {} aborted on session expiration", &*session_id);
+    }
     if let Some(ref session_group) = options.session_group {
         let seqnum = seqnum.expect("seqnum specified when session_group exists");
         let mut l = session_group.0.lock().unwrap();

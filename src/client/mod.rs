@@ -1752,7 +1752,6 @@ impl PinnedDrop for SessionInner {
             }
         };
 
-        log::debug!("Starting background TEARDOWN for {}", &*session.id);
         handle.spawn(teardown::background_teardown(
             seqnum,
             this.presentation.base_url.clone(),
