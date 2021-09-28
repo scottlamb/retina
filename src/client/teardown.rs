@@ -167,7 +167,23 @@ async fn attempt(
     // Use a second match clause to look inside the Arc.
     match *e.0 {
         ErrorInt::RtspResponseError { status, .. }
-            if status == rtsp_types::StatusCode::SessionNotFound =>
+            if status == rtsp_types::StatusCode::SessionNotFound ||
+
+            // This is deeply unsatisfying, but at least the Hikvision
+            // DS-2CD2032 with firmware V5.4.41 build 170312 exhibits the
+            // following non-standard behavior:
+            //
+            // * the RTSP session is tied to a particular connection, even when
+            //   streaming RTP over UDP. If the connection is dropped, the UDP
+            //   packets stop flowing.
+            // * a TEARDOWN on a fresh connection will always fail with
+            //   status 500 Internal Server Error.
+            //
+            // This contradicts RFC 2326 section 1.1, which says "An RTSP
+            // session is in no way tied to a transport-level connection such as
+            // a TCP connection". Nonetheless, we'll go along with this for now
+            // by assuming the session is gone when we get a 500 response.
+            status == rtsp_types::StatusCode::InternalServerError =>
         {
             Ok(())
         }
