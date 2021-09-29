@@ -83,8 +83,8 @@ pub(super) async fn teardown_loop_forever(
             biased;
             r = attempt(&mut req, &options, &mut requested_auth, conn) => {
                 match r {
-                    Ok(()) => {
-                        log::debug!("TEARDOWN {} on existing conn succeeded.", session_id);
+                    Ok(status) => {
+                        log::debug!("TEARDOWN {} on existing conn succeeded (status {}).", session_id, u16::from(status));
                         return
                     },
                     Err(e) => {
@@ -128,8 +128,8 @@ pub(super) async fn teardown_loop_forever(
             biased;
             r = attempt => {
                 match r {
-                    Ok(()) => {
-                        log::debug!("TEARDOWN {} fresh connection attempt {} succeeded.", session_id, attempt_num);
+                    Ok(status) => {
+                        log::debug!("TEARDOWN {} fresh connection attempt {} succeeded (status {}).", session_id, attempt_num, u16::from(status));
                         return
                     },
                     Err(e) => {
@@ -157,12 +157,12 @@ async fn attempt(
     options: &SessionOptions,
     requested_auth: &mut Option<digest_auth::WwwAuthenticateHeader>,
     mut conn: RtspConnection,
-) -> Result<(), Error> {
+) -> Result<rtsp_types::StatusCode, Error> {
     let e = match conn
         .send(ResponseMode::Teardown, &options, requested_auth, req)
         .await
     {
-        Ok(_) => return Ok(()),
+        Ok((_ctx, _cseq, resp)) => return Ok(resp.status()),
         Err(e) => e,
     };
 
@@ -187,7 +187,7 @@ async fn attempt(
             // by assuming the session is gone when we get a 500 response.
             status == rtsp_types::StatusCode::InternalServerError =>
         {
-            Ok(())
+            Ok(status)
         }
         _ => Err(e),
     }
