@@ -1,4 +1,4 @@
-## unreleased
+## `v0.3.2` (2021-09-29)
 
 *   better `TEARDOWN` handling, which often avoids the need to wait for session
     expiration ([(#34](https://github.com/scottlamb/retina/issues/34)).
