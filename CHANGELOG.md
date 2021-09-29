@@ -1,3 +1,8 @@
+## unreleased
+
+*   better `TEARDOWN` handling, which often avoids the need to wait for session
+    expiration ([(#34](https://github.com/scottlamb/retina/issues/34)).
+
 ## `v0.3.1` (2021-09-09)
 
 *   warn when connecting via TCP to a known-broken live555 server version.
