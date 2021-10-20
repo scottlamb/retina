@@ -1,3 +1,11 @@
+## `v0.3.3` (2021-10-20)
+
+*   [#25](https://github.com/scottlamb/retina/issues/25): better HTTP
+    authentication support via the new [`http-auth`
+    crate](https://crates.io/crates/http-auth). Before, `retina` would only
+    authenticate properly if the first requested challenge was `Digest`. Now, it
+    will pick out a `Digest` or `Basic` challenge from a list.
+
 ## `v0.3.2` (2021-09-29)
 
 *   better `TEARDOWN` handling, which often avoids the need to wait for session

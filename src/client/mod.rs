@@ -1,13 +1,14 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Instant;
-use std::{borrow::Cow, fmt::Debug, num::NonZeroU16, pin::Pin};
+use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
@@ -656,7 +657,7 @@ struct SessionInner {
     runtime_handle: Option<tokio::runtime::Handle>,
 
     options: SessionOptions,
-    requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
+    requested_auth: Option<http_auth::PasswordClient>,
     presentation: Presentation,
 
     /// This will be set iff one or more `SETUP` calls have been issued.
@@ -727,7 +728,7 @@ impl RtspConnection {
         &mut self,
         mode: ResponseMode,
         options: &SessionOptions,
-        requested_auth: &mut Option<digest_auth::WwwAuthenticateHeader>,
+        requested_auth: &mut Option<http_auth::PasswordClient>,
         req: &mut rtsp_types::Request<Bytes>,
     ) -> Result<(RtspMessageContext, u32, rtsp_types::Response<Bytes>), Error> {
         loop {
@@ -828,22 +829,6 @@ impl RtspConnection {
                     }),
                     Some(h) => h,
                 };
-                let www_authenticate = www_authenticate.as_str();
-                if !www_authenticate.starts_with("Digest ") {
-                    // TODO: the header(s) might also indicate both Basic and Digest; we shouldn't
-                    // error or not based on ordering.
-                    bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status(),
-                        description: format!(
-                            "Non-digest authentication requested: {}",
-                            www_authenticate
-                        ),
-                    })
-                }
                 if options.creds.is_none() {
                     bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
@@ -855,21 +840,18 @@ impl RtspConnection {
                             .to_owned(),
                     })
                 }
-                let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)
-                    .map_err(|e| {
-                        wrap!(ErrorInt::RtspResponseError {
-                            conn_ctx: *self.inner.ctx(),
-                            msg_ctx,
-                            method: req.method().clone(),
-                            cseq,
-                            status: resp.status(),
-                            description: format!(
-                                "Bad WWW-Authenticate header {:?}: {}",
-                                www_authenticate, e
-                            ),
-                        })
-                    })?;
-                *requested_auth = Some(www_authenticate);
+                let www_authenticate = www_authenticate.as_str();
+                *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
+                    Ok(c) => Some(c),
+                    Err(e) => bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: format!("Can't understand WWW-Authenticate header: {}", e),
+                    }),
+                };
                 continue;
             } else if !resp.status().is_success() {
                 bail!(ErrorInt::RtspResponseError {
@@ -889,7 +871,7 @@ impl RtspConnection {
     fn fill_req(
         &mut self,
         options: &SessionOptions,
-        requested_auth: &mut Option<digest_auth::WwwAuthenticateHeader>,
+        requested_auth: &mut Option<http_auth::PasswordClient>,
         req: &mut rtsp_types::Request<Bytes>,
     ) -> Result<u32, Error> {
         let cseq = self.next_cseq;
@@ -899,21 +881,15 @@ impl RtspConnection {
                 .creds
                 .as_ref()
                 .expect("creds were checked when filling request_auth");
-            let uri = req.request_uri().map(|u| u.as_str()).unwrap_or("*");
-            let method = digest_auth::HttpMethod(Cow::Borrowed(req.method().into()));
-            let ctx = digest_auth::AuthContext::new_with_method(
-                &creds.username,
-                &creds.password,
-                uri,
-                Option::<&'static [u8]>::None,
-                method,
-            );
-
-            // digest_auth's comments seem to say 'respond' failing means a parser bug.
             let authorization = auth
-                .respond(&ctx)
-                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?
-                .to_string();
+                .respond(&http_auth::PasswordParams {
+                    username: &creds.username,
+                    password: &creds.password,
+                    uri: req.request_uri().map(|u| u.as_str()).unwrap_or("*"),
+                    method: req.method().into(),
+                    body: Some(&[]),
+                })
+                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
             req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
         }
         req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());

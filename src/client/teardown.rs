@@ -19,7 +19,7 @@ pub(super) async fn background_teardown(
     base_url: Url,
     session_id: Box<str>,
     options: SessionOptions,
-    requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
+    requested_auth: Option<http_auth::PasswordClient>,
     conn: Option<RtspConnection>,
     mut tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
     expires: tokio::time::Instant,
@@ -63,7 +63,7 @@ pub(super) async fn teardown_loop_forever(
     url: Url,
     session_id: &str,
     options: &SessionOptions,
-    mut requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
+    mut requested_auth: Option<http_auth::PasswordClient>,
     mut conn: Option<RtspConnection>,
     tx: &mut tokio::sync::watch::Sender<Option<Result<(), Error>>>,
 ) {
@@ -155,7 +155,7 @@ pub(super) async fn teardown_loop_forever(
 async fn attempt(
     req: &mut Request<Bytes>,
     options: &SessionOptions,
-    requested_auth: &mut Option<digest_auth::WwwAuthenticateHeader>,
+    requested_auth: &mut Option<http_auth::PasswordClient>,
     mut conn: RtspConnection,
 ) -> Result<rtsp_types::StatusCode, Error> {
     let e = match conn
