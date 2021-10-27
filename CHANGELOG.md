@@ -1,3 +1,7 @@
+## `v0.3.4` (2021-10-26)
+
+*   use `rtsp-types` 0.0.3, and thus `nom` 7.0.
+
 ## `v0.3.3` (2021-10-20)
 
 *   [#25](https://github.com/scottlamb/retina/issues/25): better HTTP
