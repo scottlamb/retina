@@ -446,9 +446,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "http-auth"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1df750a5b554adc1530f1c97c62931795c6e3e41fc81ac1a303516c6fb91a5d"
+checksum = "f2eaf042771da62e2195732e3af5bf46f782234cdfdf6010b6da19c18a855b6c"
 dependencies = [
  "base64",
  "digest",
