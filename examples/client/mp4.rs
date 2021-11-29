@@ -706,22 +706,41 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     )
     .await?;
     let video_stream = if !opts.no_video {
-        session
+        let s = session
             .streams()
             .iter()
             .enumerate()
             .find_map(|(i, s)| match s.parameters() {
-                Some(retina::codec::Parameters::Video(v)) => Some((i, v.clone())),
+                Some(retina::codec::Parameters::Video(v)) => {
+                    log::info!(
+                        "Using {} video stream (rfc 6381 codec {})",
+                        &s.encoding_name,
+                        v.rfc6381_codec()
+                    );
+                    Some((i, v.clone()))
+                }
+                _ if s.media == "video" => {
+                    log::info!(
+                        "Ignoring {} video stream because it's unsupported",
+                        &s.encoding_name
+                    );
+                    None
+                }
                 _ => None,
-            })
+            });
+        if s.is_none() {
+            log::info!("No suitable video stream found");
+        }
+        s
     } else {
+        log::info!("Ignoring video streams (if any) because of --no-video");
         None
     };
     if let Some((i, _)) = video_stream {
         session.setup(i).await?;
     }
     let audio_stream = if !opts.no_audio {
-        session
+        let s = session
             .streams()
             .iter()
             .enumerate()
@@ -729,15 +748,28 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
                 Some(retina::codec::Parameters::Audio(a)) if a.sample_entry().is_some() => {
+                    log::info!("Using {} audio stream (rfc 6381 codec {})", &s.encoding_name, a.rfc6381_codec().unwrap());
                     Some((i, a.clone()))
                 }
+                _ if s.media == "audio" => {
+                    log::info!("Ignoring {} audio stream because it can't be placed into a .mp4 file without transcoding", &s.encoding_name);
+                    None
+                }
                 _ => None,
-            })
+            });
+        if s.is_none() {
+            log::info!("No suitable audio stream found");
+        }
+        s
     } else {
+        log::info!("Ignoring audio streams (if any) because of --no-audio");
         None
     };
     if let Some((i, _)) = audio_stream {
         session.setup(i).await?;
+    }
+    if video_stream.is_none() && audio_stream.is_none() {
+        bail!("Exiting because no video or audio stream was selected; see info log messages above");
     }
     let result = write_mp4(&opts, session, video_stream, audio_stream, stop_signal).await;
 
