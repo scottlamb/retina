@@ -105,7 +105,6 @@ impl Depacketizer {
             ));
         }
 
-        // TODO: the spec doesn't require out-of-band parameters, so we shouldn't either.
         let parameters = match format_specific_params {
             None => None,
             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
