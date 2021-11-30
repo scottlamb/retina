@@ -1,4 +1,4 @@
-## unreleased
+## `v0.3.5` (2021-11-30)
 
 *   [#42](https://github.com/scottlamb/retina/issues/42): support servers that
     don't send out-of-band H.264 parameters or send invalid parameters; wait for
@@ -56,7 +56,7 @@
     adopts a URL joining behavior which isn't RFC-compliant but seems to
     be more compatible in practice.
 
-## v0.1.0 (2021-08-13)
+## `v0.1.0` (2021-08-13)
 
 *   use `SET_PARAMETERS` rather than `GET_PARAMETERS` for keepalives.
     The latter doesn't work with GW Security GW4089IP cameras.
@@ -66,7 +66,7 @@
     crate, including `tokio`. (`retina`'s own `tokio` dependency will likely
     become optional in a future version.)
 
-## v0.0.5 (2021-07-08)
+## `v0.0.5` (2021-07-08)
 
 *   BREAKING CHANGE: New opaque error type with more uniform, richer error
     messages. No more `failure` dependency.
@@ -77,21 +77,21 @@
     64-bit platforms). The box is only rarely populated.
 *   in `client mp4` example, handle an initial video parameter change correctly.
 
-## v0.0.4 (2021-06-28)
+## `v0.0.4` (2021-06-28)
 
 *   bugfix: Retina stopped receiving packets after receiving a keepalive response.
 
-## v0.0.3 (2021-06-28)
+## `v0.0.3` (2021-06-28)
 
 *   BREAKING CHANGE: `Session<Playing>` now directly implements `Stream` instead of
     through `pkts()`.
 *   Performance improvements.
 
-## v0.0.2 (2021-06-25)
+## `v0.0.2` (2021-06-25)
 
 *   BREAKING CHANGE: Video frames are now provided as a single, contiguous `Bytes`, and
     H.264 depacketization is more efficient ([#4](https://github.com/scottlamb/retina/issues/4)).
 
-## v0.0.1 (2021-06-09)
+## `v0.0.1` (2021-06-09)
 
 Initial release.
