@@ -24,6 +24,7 @@ pub mod h264;
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
+/// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug)]
 pub enum CodecItem {
     VideoFrame(VideoFrame),
@@ -32,6 +33,17 @@ pub enum CodecItem {
     SenderReport(crate::client::rtp::SenderReport),
 }
 
+/// Parameters which describe a stream.
+///
+/// Parameters are often, but not always, available immediately
+/// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
+/// always be available after the first frame.
+///
+/// Video streams' parameters may change mid-stream; if so, the frame which
+/// changed them will have `VideoFrame::new_parameters` set, and subsequent
+/// calls to [`crate::client::Stream::parameters`] will return the new value.
+///
+/// Currently audio and message streams' parameters never change mid-stream.
 #[derive(Clone, Debug)]
 pub enum Parameters {
     Video(VideoParameters),
@@ -39,6 +51,15 @@ pub enum Parameters {
     Message(MessageParameters),
 }
 
+/// Parameters which describe a video stream.
+///
+/// A video stream's parameters are often, but not always, available immediately
+/// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
+/// always be available after the first frame. They may change mid-stream.
+///
+/// Video streams' parameters may change mid-stream; if so, the frame which
+/// changed them will have `VideoFrame::new_parameters` set, and subsequent
+/// calls to [`crate::client::Stream::parameters`] will return the new value.
 #[derive(Clone)]
 pub struct VideoParameters {
     pixel_dimensions: (u32, u32),
@@ -107,6 +128,7 @@ impl std::fmt::Debug for VideoParameters {
     }
 }
 
+/// Parameters which describe an audio stream.
 #[derive(Clone)]
 pub struct AudioParameters {
     rfc6381_codec: Option<String>,
@@ -198,9 +220,11 @@ impl Buf for AudioFrame {
     }
 }
 
+/// Parameters which describe a message stream, for `application` media types.
 #[derive(Clone, Debug)]
 pub struct MessageParameters(onvif::CompressionType);
 
+/// A single message, for `application` media types.
 pub struct MessageFrame {
     pub ctx: crate::PacketContext,
     pub timestamp: crate::Timestamp,

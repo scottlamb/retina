@@ -25,7 +25,7 @@ pub struct Packet {
     /// In the case of the first packet on the stream, this may also report loss
     /// packets since the `RTP-Info` header's `seq` value. However, currently
     /// that header is not required to be present and may be ignored (see
-    /// [`retina::client::PlayPolicy::ignore_zero_seq()`].)
+    /// [`super::PlayOptions::ignore_zero_seq()`].)
     pub loss: u16,
 
     pub mark: bool,

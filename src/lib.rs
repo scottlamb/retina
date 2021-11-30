@@ -1,6 +1,11 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! High-level RTSP library.
+//!
+//! Currently this is useful for clients; it will be extended to support
+//! servers and proxies.
+
 use bytes::Bytes;
 use log::trace;
 //use failure::{bail, format_err, Error};
@@ -40,9 +45,13 @@ mod tokio;
 
 use error::ErrorInt;
 
+// TODO: these are `pub`, yet the crate doesn't expose a direct way to set or get
+// headers, a combination which makes little sense.
+#[doc(hidden)]
 pub static X_ACCEPT_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> = Lazy::new(|| {
     rtsp_types::HeaderName::from_static_str("x-Accept-Dynamic-Rate").expect("is ascii")
 });
+#[doc(hidden)]
 pub static X_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> =
     Lazy::new(|| rtsp_types::HeaderName::from_static_str("x-Dynamic-Rate").expect("is ascii"));
 
@@ -54,6 +63,7 @@ struct ReceivedMessage {
 }
 
 /// A monotonically increasing timestamp within an RTP stream.
+///
 /// The [Display] and [Debug] implementations display:
 /// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a
 ///     codec-specified clock rate.
@@ -148,11 +158,26 @@ impl Debug for Timestamp {
     }
 }
 
+/// The Unix epoch as an [`NtpTimestamp`].
 pub const UNIX_EPOCH: NtpTimestamp = NtpTimestamp((2_208_988_800) << 32);
 
 /// A wallclock time represented using the format of the Network Time Protocol.
-/// This isn't necessarily gathered from a real NTP server. Reported NTP
-/// timestamps are allowed to jump backwards and/or be complete nonsense.
+///
+/// NTP timestamps are in a fixed-point representation of seconds since
+/// 0h UTC on 1 January 1900. The top 32 bits represent the integer part
+/// (wrapping around every 68 years) and the bottom 32 bits represent the
+/// fractional part.
+///
+/// This is a simple wrapper around a `u64` in that format, with a `Display`
+/// impl that writes the timestamp as a human-readable string. Currently this
+/// assumes the time is within 68 years of 1970; the string will be incorrect
+/// after `2038-01-19T03:14:07Z`.
+///
+/// An `NtpTimestamp` isn't necessarily gathered from a real NTP server.
+/// Reported NTP timestamps are allowed to jump backwards and/or be complete
+/// nonsense.
+///
+/// The NTP timestamp of the Unix epoch is available via the constant [`UNIX_EPOCH`].
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct NtpTimestamp(pub u64);
 
@@ -288,7 +313,7 @@ impl Display for RtspMessageContext {
 
 /// Context for an RTP or RTCP packet, received either via RTSP interleaved data or UDP.
 ///
-/// Should be paired with an [`RtspConnectionContext`] of the RTSP connection that started
+/// Should be paired with an [`ConnectionContext`] of the RTSP connection that started
 /// the session. In the interleaved data case, it's assumed the packet was received over
 /// that same connection.
 #[derive(Copy, Clone, Debug)]

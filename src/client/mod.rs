@@ -1,6 +1,8 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! RTSP client: connect to a server via [`Session`].
+
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -31,6 +33,8 @@ pub mod rtp;
 mod teardown;
 mod timeline;
 
+// TODO: this is pub but can't be fed back into the crate in any way; strange.
+#[doc(hidden)]
 /// Duration between keepalive RTSP requests during [Playing] state.
 pub const KEEPALIVE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -50,7 +54,7 @@ struct StaleSession {
     expires: tokio::time::Instant,
 }
 
-/// A grouping of sessions, currently used only to track stale sessions.
+/// A group of sessions, currently used only to track stale sessions.
 ///
 /// Sessions are associated with a group via [`SessionOptions::session_group`].
 ///
@@ -80,7 +84,7 @@ struct StaleSession {
 /// no bound on when the server could see the request and extend the session.
 /// Retina ignores this possibility.
 ///
-/// A SessionGroup can be of any granularity, but a typical use is to ensure
+/// A `SessionGroup` can be of any granularity, but a typical use is to ensure
 /// there are no stale sessions before starting a fresh session. Groups should
 /// be sized to match that idea. If connecting to a live555 server affected by
 /// the stale TCP session bug, it might be wise to have one group per server, so
@@ -344,11 +348,15 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
 }
 
+/// The RTP packet transport to request.
+///
+/// Defaults to `Transport::Tcp`.
 #[derive(Copy, Clone, Debug)]
 pub enum Transport {
+    /// Sends RTP packets over the RTSP TCP connection via interleaved data.
     Tcp,
 
-    /// UDP (experimental).
+    /// Sends RTP packets over UDP (experimental).
     ///
     /// This support is currently only suitable for a LAN for a couple reasons:
     /// *   There's no reorder buffer, so out-of-order packets are all dropped.
@@ -435,6 +443,7 @@ pub struct PlayOptions {
 }
 
 impl PlayOptions {
+    /// Sets the policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
     pub fn initial_timestamp(self, initial_timestamp: InitialTimestampPolicy) -> Self {
         Self {
             initial_timestamp,
@@ -442,9 +451,11 @@ impl PlayOptions {
         }
     }
 
-    /// If the `RTP-Time` specifies `seq=0`, ignore it. Some cameras set this value then start
-    /// the stream with something dramatically different. (Eg the Hikvision DS-2CD2032-I on its
-    /// metadata stream; the other streams are fine.)
+    /// If the `RTP-Time` specifies `seq=0`, ignore it.
+    ///
+    /// Some cameras set this value then start the stream with something
+    /// dramatically different. (Eg the Hikvision DS-2CD2032-I on its metadata
+    /// stream; the other streams are fine.)
     pub fn ignore_zero_seq(self, ignore_zero_seq: bool) -> Self {
         Self {
             ignore_zero_seq,
@@ -466,6 +477,9 @@ impl PlayOptions {
     }
 }
 
+// TODO: this is `pub` yet not actually accessible from outside the crate, a combination which
+// makes little sense.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct Presentation {
     pub streams: Vec<Stream>,
@@ -478,6 +492,7 @@ pub struct Presentation {
 }
 
 /// Information about a stream offered within a presentation.
+///
 /// Currently if multiple formats are offered, this only describes the first.
 #[derive(Debug)]
 pub struct Stream {
@@ -499,6 +514,7 @@ pub struct Stream {
     pub encoding_name: String,
 
     /// RTP payload type.
+    ///
     /// See the [registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
     /// It's common to use one of the dynamically assigned values, 96–127.
     pub rtp_payload_type: u8,
@@ -512,6 +528,7 @@ pub struct Stream {
     depacketizer: Result<crate::codec::Depacketizer, String>,
 
     /// The specified control URL.
+    ///
     /// This is needed with multiple streams to send `SETUP` requests and
     /// interpret the `PLAY` response's `RTP-Info` header.
     /// [RFC 2326 section C.3](https://datatracker.ietf.org/doc/html/rfc2326#appendix-C.3)
@@ -579,7 +596,8 @@ struct StreamStateInit {
     initial_rtptime: Option<u32>,
 }
 
-#[derive(Clone)]
+/// Username and password authentication credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
@@ -639,10 +657,18 @@ enum ResponseMode {
 
 /// An RTSP session.
 ///
-/// When a `Session` is dropped, Retina may issue a `TEARDOWN` in the
-/// background, depending on the [`SessionOptions::teardown`] parameter. Clients
-/// may need to wait for the `TEARDOWN` to complete; see
-/// [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
+/// The expected lifecycle is as follows:
+///
+/// 1. Create a session via [`Session::describe`].
+/// 2. Examine the session's available streams via [`Session::streams`] and set
+///    up one or more via [`Session::setup`].
+/// 3. Start playing via [`Session::play`].
+/// 4. Get packets via the [`futures::stream::Stream`] impl on `Session<Playing>`,
+///    or frames via the [`futures::stream::Stream`] impl returned by [`Session<Playing>::demuxed`].
+/// 5. Drop the session. Retina may issue a `TEARDOWN` in the background, depending on the
+///    `[SessionOptions::teardown`] parameter.
+/// 6. Possibly wait for `TEARDOWN` to complete; see
+///    [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
 pub struct Session<S: State>(Pin<Box<SessionInner>>, S);
 
 #[pin_project(PinnedDrop)]
@@ -900,6 +926,13 @@ impl RtspConnection {
     }
 }
 
+impl<S: State> Session<S> {
+    /// Returns the available streams as described the server.
+    pub fn streams(&self) -> &[Stream] {
+        &self.0.presentation.streams
+    }
+}
+
 impl Session<Described> {
     /// Creates a new session from a `DESCRIBE` request on the given URL.
     ///
@@ -967,10 +1000,6 @@ impl Session<Described> {
             }),
             Described(()),
         ))
-    }
-
-    pub fn streams(&self) -> &[Stream] {
-        &self.0.presentation.streams
     }
 
     /// Sends a `SETUP` request for a stream.
@@ -1344,6 +1373,7 @@ async fn punch_firewall_hole(
     Ok(())
 }
 
+/// An item yielded by [`Session<Playing>`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug)]
 pub enum PacketItem {
     RtpPacket(rtp::Packet),
@@ -1381,7 +1411,7 @@ impl Session<Playing> {
     }
 
     /// Sends a `TEARDOWN`, ending the session.
-    #[deprecated(since = "0.3.1", note = "Use SessionGroup::await_teardown instead")]
+    #[deprecated(since = "0.3.1", note = "Use `SessionGroup::await_teardown` instead")]
     pub async fn teardown(mut self) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         let mut req = rtsp_types::Request::builder(Method::Teardown, rtsp_types::Version::V1_0)
@@ -1405,10 +1435,6 @@ impl Session<Playing> {
         *inner.session = None;
         *inner.maybe_playing = false;
         Ok(())
-    }
-
-    pub fn streams(&self) -> &[Stream] {
-        &self.0.presentation.streams
     }
 
     fn handle_keepalive_timer(
@@ -1847,7 +1873,7 @@ pub struct Demuxed {
 }
 
 impl Demuxed {
-    #[deprecated(since = "0.3.1", note = "Use SessionGroup::await_teardown instead")]
+    #[deprecated(since = "0.3.1", note = "Use `SessionGroup::await_teardown` instead")]
     pub async fn teardown(self) -> Result<(), Error> {
         #[allow(deprecated)]
         self.session.teardown().await
