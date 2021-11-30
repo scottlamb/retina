@@ -391,6 +391,13 @@ impl Depacketizer {
         }))
     }
 
+    /// Returns the current codec parameters, if known.
+    ///
+    /// Most servers supply codec parameters "out-of-band" (within the SDP of
+    /// the `DESCRIBE` response), so parameters will be available as soon as the
+    /// `Depacketizer` is created. Some servers supply only "in-band" parameters
+    /// (within the RTP packet stream). In this case, `parameters` will return
+    /// `None` until the first packet is processed.
     pub fn parameters(&self) -> Option<Parameters> {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),

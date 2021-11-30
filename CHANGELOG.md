@@ -1,3 +1,9 @@
+## unreleased
+
+*   [#42](https://github.com/scottlamb/retina/issues/42): support servers that
+    don't send out-of-band H.264 parameters or send invalid parameters; wait for
+    in-band parameters in this case. The in-band parameters must be valid.
+
 ## `v0.3.4` (2021-10-26)
 
 *   use `rtsp-types` 0.0.3, and thus `nom` 7.0.

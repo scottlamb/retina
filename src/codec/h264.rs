@@ -31,7 +31,7 @@ pub(crate) struct Depacketizer {
     /// A complete video frame ready for pull.
     pending: Option<VideoFrame>,
 
-    parameters: InternalParameters,
+    parameters: Option<InternalParameters>,
 
     /// In state `PreMark`, pieces of NALs, excluding their header bytes.
     /// Kept around (empty) in other states to re-use the backing allocation.
@@ -106,21 +106,29 @@ impl Depacketizer {
         }
 
         // TODO: the spec doesn't require out-of-band parameters, so we shouldn't either.
-        let format_specific_params = format_specific_params
-            .ok_or_else(|| "H.264 depacketizer expects out-of-band parameters".to_owned())?;
+        let parameters = match format_specific_params {
+            None => None,
+            Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!("Ignoring bad H.264 format-specific-params {:?}: {}", fp, e);
+                    None
+                }
+            },
+        };
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             pending: None,
             pieces: Vec::new(),
             nals: Vec::new(),
-            parameters: InternalParameters::parse_format_specific_params(format_specific_params)?,
+            parameters,
         })
     }
 
     pub(super) fn parameters(&self) -> Option<super::Parameters> {
-        Some(super::Parameters::Video(
-            self.parameters.generic_parameters.clone(),
-        ))
+        self.parameters
+            .as_ref()
+            .map(|p| super::Parameters::Video(p.generic_parameters.clone()))
     }
 
     pub(super) fn push(&mut self, pkt: Packet) -> Result<(), String> {
@@ -431,12 +439,22 @@ impl Depacketizer {
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.nal_unit_type() {
                 UnitType::SeqParameterSet => {
-                    if !matches(&self.parameters.sps_nal[..], nal.hdr, nal_pieces) {
+                    if self
+                        .parameters
+                        .as_ref()
+                        .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces))
+                        .unwrap_or(true)
+                    {
                         new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
                 UnitType::PicParameterSet => {
-                    if !matches(&self.parameters.pps_nal[..], nal.hdr, nal_pieces) {
+                    if self
+                        .parameters
+                        .as_ref()
+                        .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces))
+                        .unwrap_or(true)
+                    {
                         new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
@@ -473,14 +491,28 @@ impl Depacketizer {
         self.nals.clear();
         self.pieces.clear();
 
-        let new_parameters = if new_sps.is_some() || new_pps.is_some() {
-            let sps_nal = new_sps.as_deref().unwrap_or(&self.parameters.sps_nal);
-            let pps_nal = new_pps.as_deref().unwrap_or(&self.parameters.pps_nal);
-            // TODO: could map this to a RtpPacketError more accurately.
-            self.parameters = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
-            Some(Box::new(self.parameters.generic_parameters.clone()))
-        } else {
-            None
+        let new_parameters = match (
+            new_sps.as_deref(),
+            new_pps.as_deref(),
+            self.parameters.as_ref(),
+        ) {
+            (Some(sps_nal), Some(pps_nal), _) => {
+                // TODO: could map this to a RtpPacketError more accurately.
+                let ip = InternalParameters::parse_sps_and_pps(&sps_nal, &pps_nal)?;
+                let p = ip.generic_parameters.clone();
+                self.parameters = Some(ip);
+                Some(Box::new(p))
+            }
+            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
+                let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
+                let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
+                // TODO: as above, could map this to a RtpPacketError more accurately.
+                let ip = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
+                let p = ip.generic_parameters.clone();
+                self.parameters = Some(ip);
+                Some(Box::new(p))
+            }
+            _ => None,
         };
         Ok(VideoFrame {
             new_parameters,
@@ -601,13 +633,14 @@ impl InternalParameters {
         let mut sps_nal = None;
         let mut pps_nal = None;
         for nal in sprop_parameter_sets.split(',') {
-            let nal =
-                base64::decode(nal).map_err(|_| "NAL has invalid base64 encoding".to_string())?;
+            let nal = base64::decode(nal).map_err(|_| {
+                "bad sprop-parameter-sets: NAL has invalid base64 encoding".to_string()
+            })?;
             if nal.is_empty() {
-                return Err("empty NAL".into());
+                return Err("bad sprop-parameter-sets: empty NAL".into());
             }
             let header = h264_reader::nal::NalHeader::new(nal[0])
-                .map_err(|_| format!("bad NAL header {:0x}", nal[0]))?;
+                .map_err(|_| format!("bad sprop-parameter-sets: bad NAL header {:0x}", nal[0]))?;
             match header.nal_unit_type() {
                 UnitType::SeqParameterSet => {
                     if sps_nal.is_some() {
@@ -732,7 +765,7 @@ impl InternalParameters {
 }
 
 /// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..data]`.
-fn matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
+fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
     if nal.is_empty() || nal[0] != u8::from(hdr) {
         return false;
     }
@@ -1333,5 +1366,74 @@ mod tests {
             b"\x67\x4d\x00\x1e\x95\xa8\x2d\x0f\x69\xb8\x08\x08\x08\x10"
         );
         assert_eq!(&params.pps_nal[..], b"\x68\xee\x3c\x80");
+    }
+
+    #[test]
+    fn bad_format_specific_params() {
+        // These bad parameters are taken from a VStarcam camera. The sprop-parameter-sets
+        // don't start with proper NAL headers. (They look almost like the raw RBSP of each
+        // NAL plus extra trailing NUL bytes?)
+        // https://github.com/scottlamb/retina/issues/42
+        const BAD_PARAMS: &str = "packetization-mode=1;\
+                                  profile-level-id=00f004;\
+                                  sprop-parameter-sets=6QDwBE/LCAAAH0gAB1TgIAAAAAA=,AAAAAA==";
+        super::InternalParameters::parse_format_specific_params(BAD_PARAMS).unwrap_err();
+
+        // Creating a depacketizer should ignore (and log) the bad parameters.
+        let mut d = super::Depacketizer::new(90_000, Some(BAD_PARAMS)).unwrap();
+        assert!(d.parameters().is_none());
+
+        // The stream should honor in-band parameters.
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(Packet {
+            // SPS
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(
+                b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20",
+            ),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // PPS
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 1,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(b"\x68\xea\x8f\x20"),
+        })
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(Packet {
+            // IDR slice
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 2,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(b"\x65idr slice"),
+        })
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert!(frame.new_parameters.is_some());
+        assert!(d.parameters().is_some());
     }
 }
