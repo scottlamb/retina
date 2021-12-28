@@ -798,16 +798,15 @@ impl RtspConnection {
                         } else if let (ResponseMode::Play, Some(m)) =
                             (&mode, self.channels.lookup(d.channel_id()))
                         {
-                            if m.channel_type == ChannelType::Rtcp {
-                                debug!(
-                                    "ignoring interleaved data message on RTCP channel {} while \
+                            debug!(
+                                "ignoring interleaved data message on {:?} channel {} while \
                                      waiting for response to {} CSeq {}",
-                                    d.channel_id(),
-                                    method,
-                                    cseq
-                                );
-                                continue;
-                            }
+                                m.channel_type,
+                                d.channel_id(),
+                                method,
+                                cseq
+                            );
+                            continue;
                         }
 
                         if let Some(session_group) = options.session_group.as_ref() {
