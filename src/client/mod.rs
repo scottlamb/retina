@@ -26,6 +26,7 @@ use url::Url;
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
 use crate::{Error, ErrorInt, RtspMessageContext};
+use crate::fmt_option;
 
 mod channel_mapping;
 mod parse;
@@ -591,6 +592,50 @@ pub struct Stream {
     sockets: Option<UdpSockets>,
 
     state: StreamState,
+}
+
+// Display summary information about stream.
+impl std::fmt::Display for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let udp: String = match &self.sockets {
+            Some(x) => format!(concat!(
+                "\n",
+                "    local ip: {}\n",
+                "    local port: {}\n",
+                "    remote ip: {}\n",
+                "    remote rtp port: {}\n",
+                "    remote rtcp port: {}",
+                ),
+                &x.local_ip,
+                &x.local_rtp_port,
+                &x.remote_ip,
+                &x.remote_rtp_port,
+                &x.remote_rtcp_port),
+            None => "None".to_string(),
+        };
+        write!(f, concat!(
+            "Stream:\n",
+            "  media: {}\n",
+            "  url: {}\n",
+            "  encoding name: {}\n",
+            "  RTP payload time: {}\n",
+            "  clock rate: {}\n",
+            "  channels: {}\n",
+            "  depacketizer: {:#?}\n",
+            "  UDP: {}\n",
+            "  stream state: {:?}",
+            ),
+            &self.media,
+            fmt_option(&self.control),
+            &self.encoding_name,
+            &self.rtp_payload_type,
+            &self.clock_rate,
+            fmt_option(&self.channels),
+            &self.depacketizer,
+            udp,
+            &self.state
+        )
+    }
 }
 
 #[derive(Debug)]
