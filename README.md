@@ -12,6 +12,7 @@ brokenness in cheap closed-source cameras.
 Progress:
 
 *   [x] client support
+    *   [x] basic authentication.
     *   [x] digest authentication.
     *   [x] RTP over TCP via RTSP interleaved channels.
     *   [x] RTP over UDP (experimental).
