@@ -2070,12 +2070,16 @@ mod tests {
         );
     }
 
-    /// Tests ignoring a bogus RTCP message while waiting for PLAY response.
+    /// Tests ignoring bogus RTP and RTCP messages while waiting for PLAY response.
     #[tokio::test]
-    async fn ignore_early_rtcp() {
+    async fn ignore_early_rtp_rtcp() {
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
-        let bogus_pkt = rtsp_types::Message::Data(rtsp_types::Data::new(
+        let bogus_rtp = rtsp_types::Message::Data(rtsp_types::Data::new(
+            0,                                // RTP channel
+            Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
+        ));
+        let bogus_rtcp = rtsp_types::Message::Data(rtsp_types::Data::new(
             1,                                // RTCP channel
             Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
         ));
@@ -2109,7 +2113,8 @@ mod tests {
 
         // PLAY.
         let (session, _) = tokio::join!(session.play(PlayOptions::default()), async move {
-            server.send(bogus_pkt).await.unwrap();
+            server.send(bogus_rtp).await.unwrap();
+            server.send(bogus_rtcp).await.unwrap();
             req_response(
                 &mut server,
                 rtsp_types::Method::Play,
