@@ -230,11 +230,20 @@ impl SessionGroup {
                     // (We could go so far as to examine the data packet's SSRC to
                     // see if it matches one associated with this session. But
                     // retrying once per expiration is probably good enough.)
+                    log::debug!(
+                        "Unexpected RTSP interleaved packet (live555 stale file descriptor \
+                                 bug) plausibly explained by known stale session. Not adding a \
+                                 session entry."
+                    );
                     return;
                 }
             }
             seqnum = lock.next_seqnum;
             lock.next_seqnum += 1;
+            log::debug!(
+                "Unexpected RTSP interleaved packet, presumed due to live555 stale file \
+                         descriptor bug; tracking expiration in 65 seconds."
+            );
             lock.sessions.push(StaleSession {
                 seqnum,
 
@@ -256,14 +265,18 @@ impl SessionGroup {
         let handle = match handle {
             Some(h) => h,
             None => {
-                log::warn!("Unable to launch task to clean up stale live555 data session");
+                log::warn!(
+                    "Unable to launch task to clean up stale live555 file descriptor session"
+                );
                 return;
             }
         };
         handle.spawn(async move {
             tokio::time::sleep_until(expires).await;
             if !self.try_remove_seqnum(seqnum) {
-                log::warn!("Unable to find stale file descriptor session at expiration");
+                log::warn!("Unable to find stale live555 file descriptor session at expiration");
+            } else {
+                log::debug!("Stale live555 file descriptor bug session presumed expired.");
             }
         });
     }

@@ -24,7 +24,11 @@ pub(super) async fn background_teardown(
     mut tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
     expires: tokio::time::Instant,
 ) {
-    log::debug!("TEARDOWN {} starting", &*session_id);
+    log::debug!(
+        "TEARDOWN {} starting for URL {}",
+        &*session_id,
+        base_url.as_str()
+    );
     if tokio::time::timeout_at(
         expires,
         teardown_loop_forever(
