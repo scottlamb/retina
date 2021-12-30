@@ -1,3 +1,9 @@
+## unreleased
+
+*   correctly expire stale session entries that track live555 stale file
+    descriptor sessions.
+    See [moonfire-nvr#184](https://github.com/scottlamb/moonfire-nvr/issues/184).
+
 ## `v0.3.5` (2021-11-30)
 
 *   [#42](https://github.com/scottlamb/retina/issues/42): support servers that

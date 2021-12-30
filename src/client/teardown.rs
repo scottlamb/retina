@@ -43,15 +43,8 @@ pub(super) async fn background_teardown(
     }
     if let Some(ref session_group) = options.session_group {
         let seqnum = seqnum.expect("seqnum specified when session_group exists");
-        let mut l = session_group.sessions.lock().unwrap();
-        let i = l.sessions.iter().position(|s| s.seqnum == seqnum);
-        match i {
-            Some(i) => {
-                l.sessions.swap_remove(i);
-                drop(l);
-                session_group.notify.notify_waiters();
-            }
-            None => log::warn!("Unable to find session {:?} on TEARDOWN", &*session_id),
+        if !session_group.try_remove_seqnum(seqnum) {
+            log::warn!("Unable to find session {:?} on TEARDOWN", &*session_id);
         }
     }
 

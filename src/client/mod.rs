@@ -198,35 +198,73 @@ impl SessionGroup {
         }
     }
 
+    /// Removes the session with `seqnum`, removing true iff it existed.
+    fn try_remove_seqnum(&self, seqnum: u64) -> bool {
+        let mut l = self.sessions.lock().unwrap();
+        let i = l.sessions.iter().position(|s| s.seqnum == seqnum);
+        match i {
+            Some(i) => {
+                l.sessions.swap_remove(i);
+                drop(l);
+                self.notify.notify_waiters();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Notes an unexpected RTSP interleaved data message.
     ///
     /// This is assumed to be due to a live555 RTP/AVP/TCP session that belonged
     /// to a since-closed RTSP connection. If there's no known session which
     /// explains this, adds an unknown session with live555's default timeout,
     /// 65 seconds.
-    fn note_stale_live555_data(&self) {
-        let mut lock = self.sessions.lock().unwrap();
-        for s in &lock.sessions {
-            if s.is_tcp {
-                // This session plausibly explains the packet.
-                // (We could go so far as to examine the data packet's SSRC to
-                // see if it matches one associated with this session. But
-                // retrying once per expiration is probably good enough.)
+    fn note_stale_live555_data(self: Arc<Self>, handle: Option<tokio::runtime::Handle>) {
+        let seqnum;
+        let expires = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
+        {
+            let mut lock = self.sessions.lock().unwrap();
+            for s in &lock.sessions {
+                if s.is_tcp {
+                    // This session plausibly explains the packet.
+                    // (We could go so far as to examine the data packet's SSRC to
+                    // see if it matches one associated with this session. But
+                    // retrying once per expiration is probably good enough.)
+                    return;
+                }
+            }
+            seqnum = lock.next_seqnum;
+            lock.next_seqnum += 1;
+            lock.sessions.push(StaleSession {
+                seqnum,
+
+                // The caller *might* have a better guess than 65 seconds via a
+                // SETUP response, but it's also possible for
+                // note_stale_live555_data to be called prior to SETUP.
+                expires,
+                teardown_rx: None,
+                is_tcp: true,
+                maybe_playing: true,
+            });
+        }
+
+        // Spawn a task which removes the stale session at its expiration.
+        // We could instead prune expired entries on stale_session() calls and
+        // set a deadline within await_stale_sessions() calls, which might be
+        // a bit more efficient. But this is simpler given that we already are
+        // spawning tasks for stale sessions created from Session's Drop impl.
+        let handle = match handle {
+            Some(h) => h,
+            None => {
+                log::warn!("Unable to launch task to clean up stale live555 data session");
                 return;
             }
-        }
-        let seqnum = lock.next_seqnum;
-        lock.next_seqnum += 1;
-        lock.sessions.push(StaleSession {
-            seqnum,
-
-            // The caller *might* have a better guess than 65 seconds via a
-            // SETUP response, but it's also possible for
-            // note_stale_live555_data to be called prior to SETUP.
-            expires: tokio::time::Instant::now() + std::time::Duration::from_secs(65),
-            teardown_rx: None,
-            is_tcp: true,
-            maybe_playing: true,
+        };
+        handle.spawn(async move {
+            tokio::time::sleep_until(expires).await;
+            if !self.try_remove_seqnum(seqnum) {
+                log::warn!("Unable to find stale file descriptor session at expiration");
+            }
         });
     }
 }
@@ -811,7 +849,9 @@ impl RtspConnection {
                         }
 
                         if let Some(session_group) = options.session_group.as_ref() {
-                            session_group.note_stale_live555_data();
+                            session_group.clone().note_stale_live555_data(
+                                tokio::runtime::Handle::try_current().ok(),
+                            );
                         }
 
                         format!(
@@ -1574,6 +1614,7 @@ impl Session<Playing> {
                 conn.inner.ctx(),
                 &pkt_ctx,
                 &mut timeline,
+                inner.runtime_handle.as_ref(),
                 m.stream_i,
                 data.into_body(),
             )?),
@@ -1582,6 +1623,7 @@ impl Session<Playing> {
                     &inner.options,
                     &pkt_ctx,
                     &mut timeline,
+                    inner.runtime_handle.as_ref(),
                     m.stream_i,
                     data.into_body(),
                 ) {
@@ -1636,7 +1678,14 @@ impl Session<Playing> {
                 match r {
                     Ok(()) => {
                         let msg = Bytes::copy_from_slice(buf.filled());
-                        match rtp_handler.rtcp(&inner.options, &pkt_ctx, &mut timeline, i, msg) {
+                        match rtp_handler.rtcp(
+                            &inner.options,
+                            &pkt_ctx,
+                            &mut timeline,
+                            inner.runtime_handle.as_ref(),
+                            i,
+                            msg,
+                        ) {
                             Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
                             Ok(None) => buf.clear(),
                             Err(description) => {
@@ -1673,6 +1722,7 @@ impl Session<Playing> {
                             &conn_ctx,
                             &pkt_ctx,
                             &mut timeline,
+                            inner.runtime_handle.as_ref(),
                             i,
                             msg,
                         ) {
@@ -2204,6 +2254,53 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - drop_time;
         assert!(
             elapsed >= std::time::Duration::from_secs(60),
+            "elapsed={:?}",
+            elapsed
+        );
+    }
+
+    /// Stale sessions detected via unexpected RTSP interleaved packets should be tracked
+    /// until expiration.
+    #[tokio::test(start_paused = true)]
+    async fn stale_file_descriptor_session() {
+        init_logging();
+        log::debug!("debug logging works");
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let group = Arc::new(SessionGroup::default());
+        let bogus_rtp = rtsp_types::Message::Data(rtsp_types::Data::new(
+            0,                                // RTP channel
+            Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
+        ));
+
+        let start = tokio::time::Instant::now();
+
+        // DESCRIBE.
+        tokio::join!(
+            async {
+                let e = Session::describe_with_conn(
+                    conn,
+                    SessionOptions::default().session_group(group.clone()),
+                    url,
+                )
+                .await
+                .map(|_s| ())
+                .unwrap_err();
+                assert!(matches!(*e.0, ErrorInt::RtspFramingError { .. }));
+            },
+            async { server.send(bogus_rtp).await.unwrap() },
+        );
+
+        let stale_sessions = group.stale_sessions();
+        assert_eq!(stale_sessions.num_sessions, 1);
+
+        group.await_stale_sessions(&stale_sessions).await;
+        let elapsed = tokio::time::Instant::now() - start;
+        assert_eq!(group.stale_sessions().num_sessions, 0);
+
+        // 65 seconds is the hardcoded time for a live555 stale TCP session.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(65),
             "elapsed={:?}",
             elapsed
         );
