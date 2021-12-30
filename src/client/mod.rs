@@ -184,14 +184,15 @@ impl SessionGroup {
     pub async fn await_stale_sessions(&self, status: &StaleSessionStatus) {
         loop {
             let notified = self.notify.notified();
-            let l = self.sessions.lock().unwrap();
-            let all_gone = l
-                .sessions
-                .iter()
-                .all(|s| !s.maybe_playing || s.seqnum >= status.next_seqnum);
-            drop(l);
-            if all_gone {
-                return;
+            {
+                let l = self.sessions.lock().unwrap();
+                let all_gone = l
+                    .sessions
+                    .iter()
+                    .all(|s| !s.maybe_playing || s.seqnum >= status.next_seqnum);
+                if all_gone {
+                    return;
+                }
             }
             notified.await;
         }
@@ -2157,5 +2158,14 @@ mod tests {
         assert!(has_live555_tcp_bug("LIVE555 Streaming Media v2013.04.08"));
         assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2017.06.04"));
         assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2020.01.01"));
+    }
+
+    #[test]
+    fn await_stale_sessions_is_send() {
+        // There's probably a more elegant way to test this, but here goes.
+        fn assert_send<T: Send>(_: T) {}
+        let group = SessionGroup::default();
+        let stale_sessions = group.stale_sessions();
+        assert_send(group.await_stale_sessions(&stale_sessions));
     }
 }
