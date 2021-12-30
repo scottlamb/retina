@@ -39,7 +39,7 @@ criterion = { version = "0.3.4", features = ["async_tokio"] }
 itertools = "0.10.1"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 structopt = "0.3.21"
-tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal"] }
+tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "parking_lot", "rt-multi-thread", "signal", "test-util"] }
 
 [profile.bench]
 debug = true
