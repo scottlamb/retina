@@ -23,7 +23,11 @@ pub async fn run(opts: Opts, is_info: bool) -> Result<(), Error> {
     r
 }
 
-async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>, is_info: bool) -> Result<(), Error> {
+async fn run_inner(
+    opts: Opts,
+    session_group: Arc<SessionGroup>,
+    is_info: bool,
+) -> Result<(), Error> {
     let stop = tokio::signal::ctrl_c();
 
     let creds = super::creds(opts.src.username, opts.src.password);

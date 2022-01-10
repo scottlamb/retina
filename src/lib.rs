@@ -62,7 +62,10 @@ struct ReceivedMessage {
     msg: Message<Bytes>,
 }
 
-pub fn fmt_option<T>(opt: &Option<T>) -> String where T: std::fmt::Display {
+pub fn fmt_option<T>(opt: &Option<T>) -> String
+where
+    T: std::fmt::Display,
+{
     match opt {
         Some(x) => x.to_string(),
         None => "None".to_string(),
