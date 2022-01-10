@@ -622,7 +622,7 @@ impl std::fmt::Display for Stream {
                 "  media: {}\n",
                 "  url: {}\n",
                 "  encoding name: {}\n",
-                "  RTP payload time: {}\n",
+                "  RTP payload type: {}\n",
                 "  clock rate: {}\n",
                 "  channels: {}\n",
                 "  depacketizer: {:#?}\n",
