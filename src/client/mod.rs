@@ -547,7 +547,6 @@ pub struct Presentation {
 /// Information about a stream offered within a presentation.
 ///
 /// Currently if multiple formats are offered, this only describes the first.
-#[derive(Debug)]
 pub struct Stream {
     /// Media type, as specified in the [IANA SDP parameters media
     /// registry](https://www.iana.org/assignments/sdp-parameters/sdp-parameters.xhtml#sdp-parameters-1).
@@ -594,55 +593,25 @@ pub struct Stream {
     state: StreamState,
 }
 
-// Display summary information about stream.
-impl std::fmt::Display for Stream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let udp: String = match &self.sockets {
-            Some(x) => format!(
-                concat!(
-                    "\n",
-                    "    local ip: {}\n",
-                    "    local port: {}\n",
-                    "    remote ip: {}\n",
-                    "    remote rtp port: {}\n",
-                    "    remote rtcp port: {}",
-                ),
-                &x.local_ip,
-                &x.local_rtp_port,
-                &x.remote_ip,
-                &x.remote_rtp_port,
-                &x.remote_rtcp_port
-            ),
-            None => "None".to_string(),
-        };
-        write!(
-            f,
-            concat!(
-                "Stream:\n",
-                "  media: {}\n",
-                "  url: {}\n",
-                "  encoding name: {}\n",
-                "  RTP payload type: {}\n",
-                "  clock rate: {}\n",
-                "  channels: {}\n",
-                "  depacketizer: {:#?}\n",
-                "  UDP: {}\n",
-                "  stream state: {:?}",
-            ),
-            &self.media,
-            fmt_option(&self.control),
-            &self.encoding_name,
-            &self.rtp_payload_type,
-            &self.clock_rate,
-            fmt_option(&self.channels),
-            &self.depacketizer,
-            udp,
-            &self.state
-        )
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("Stream")
+            .field("media", &self.media)
+            .field(
+                "control",
+                &fmt_option(&self.control.as_ref().map(Url::as_str)),
+            )
+            .field("encoding_name", &self.encoding_name)
+            .field("rtp_payload_type", &self.rtp_payload_type)
+            .field("clock_rate", &self.clock_rate)
+            .field("channels", &fmt_option(&self.channels))
+            .field("depacketizer", &self.depacketizer)
+            .field("UDP", &self.sockets)
+            .field("state", &self.state)
+            .finish()
     }
 }
 
-#[derive(Debug)]
 struct UdpSockets {
     local_ip: IpAddr,
     local_rtp_port: u16,
@@ -651,6 +620,20 @@ struct UdpSockets {
     rtp_socket: UdpSocket,
     remote_rtcp_port: u16,
     rtcp_socket: UdpSocket,
+}
+
+impl std::fmt::Debug for UdpSockets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("UDP")
+            .field("local_ip", &self.local_ip)
+            .field("local_rtp_port", &self.local_rtp_port)
+            .field("remote_ip", &self.remote_ip)
+            .field("remote_rtp_port", &self.remote_rtp_port)
+            .field("rtp_socket", &self.rtp_socket)
+            .field("remote_rtcp_port", &self.remote_rtcp_port)
+            .field("rtcp_socket", &self.rtcp_socket)
+            .finish()
+    }
 }
 
 impl Stream {

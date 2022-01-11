@@ -41,7 +41,7 @@ async fn run_inner(
     .await?;
     if is_info {
         for stream in session.streams() {
-            println!("{}", stream);
+            println!("{:#?}", stream);
         }
         return Ok(());
     }
