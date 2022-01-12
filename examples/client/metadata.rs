@@ -14,16 +14,20 @@ pub struct Opts {
     src: super::Source,
 }
 
-pub async fn run(opts: Opts) -> Result<(), Error> {
+pub async fn run(opts: Opts, is_info: bool) -> Result<(), Error> {
     let session_group = Arc::new(SessionGroup::default());
-    let r = run_inner(opts, session_group.clone()).await;
+    let r = run_inner(opts, session_group.clone(), is_info).await;
     if let Err(e) = session_group.await_teardown().await {
         error!("TEARDOWN failed: {}", e);
     }
     r
 }
 
-async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), Error> {
+async fn run_inner(
+    opts: Opts,
+    session_group: Arc<SessionGroup>,
+    is_info: bool,
+) -> Result<(), Error> {
     let stop = tokio::signal::ctrl_c();
 
     let creds = super::creds(opts.src.username, opts.src.password);
@@ -35,6 +39,12 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
             .session_group(session_group),
     )
     .await?;
+    if is_info {
+        for stream in session.streams() {
+            println!("{:#?}", stream);
+        }
+        return Ok(());
+    }
     let onvif_stream_i = session
         .streams()
         .iter()

@@ -28,8 +28,12 @@ struct Source {
 
 #[derive(StructOpt)]
 enum Cmd {
+    /// Write available audio and video streams to mp4 file
     Mp4(mp4::Opts),
+    /// Get realtime metadata of onvif stream, use Ctrl+C to stop
     Metadata(metadata::Opts),
+    /// Get info about available streams and exit
+    Info(metadata::Opts),
 }
 
 fn init_logging() -> mylog::Handle {
@@ -78,6 +82,7 @@ async fn main_inner() -> Result<(), Error> {
     let cmd = Cmd::from_args();
     match cmd {
         Cmd::Mp4(opts) => mp4::run(opts).await,
-        Cmd::Metadata(opts) => metadata::run(opts).await,
+        Cmd::Metadata(opts) => metadata::run(opts, false).await,
+        Cmd::Info(opts) => metadata::run(opts, true).await,
     }
 }

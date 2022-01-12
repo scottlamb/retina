@@ -12,6 +12,7 @@ brokenness in cheap closed-source cameras.
 Progress:
 
 *   [x] client support
+    *   [x] basic authentication.
     *   [x] digest authentication.
     *   [x] RTP over TCP via RTSP interleaved channels.
     *   [x] RTP over UDP (experimental).
@@ -63,11 +64,23 @@ Help welcome!
 Try the `mp4` example. It streams from an RTSP server to a `.mp4` file until
 you hit ctrl-C.
 
-```
+```shell
 $ cargo run --example client mp4 --url rtsp://ip.address.goes.here/ --username admin --password test out.mp4
 ...
 ^C
 ```
+
+## Example client
+
+```shell
+$ cargo run --example client <CMD>
+```
+
+Where CMD:
+
+* **info** - Get info about available streams and exit
+* **mp4** - Write RTSP streams to mp4 file, exit with Ctrl+C
+* **metadata** - Get realtime onvif metadata if available, exit with Ctrl+C
 
 ## Acknowledgements
 
