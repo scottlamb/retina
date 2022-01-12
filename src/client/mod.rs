@@ -25,7 +25,6 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
-use crate::fmt_option;
 use crate::{Error, ErrorInt, RtspMessageContext};
 
 mod channel_mapping;
@@ -597,14 +596,11 @@ impl std::fmt::Debug for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Stream")
             .field("media", &self.media)
-            .field(
-                "control",
-                &fmt_option(&self.control.as_ref().map(Url::as_str)),
-            )
+            .field("control", &self.control.as_ref().map(Url::as_str))
             .field("encoding_name", &self.encoding_name)
             .field("rtp_payload_type", &self.rtp_payload_type)
             .field("clock_rate", &self.clock_rate)
-            .field("channels", &fmt_option(&self.channels))
+            .field("channels", &self.channels)
             .field("depacketizer", &self.depacketizer)
             .field("UDP", &self.sockets)
             .field("state", &self.state)
