@@ -621,9 +621,12 @@ impl InternalParameters {
     fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
         let mut sprop_parameter_sets = None;
         for p in format_specific_params.split(';') {
-            let (key, value) = p.trim().split_once('=').unwrap();
-            if key == "sprop-parameter-sets" {
-                sprop_parameter_sets = Some(value);
+            match p.trim().split_once('=') {
+                Some((key, value)) if key == "sprop-parameter-sets" => {
+                    sprop_parameter_sets = Some(value)
+                }
+                None => return Err("key without value".into()),
+                _ => (),
             }
         }
         let sprop_parameter_sets = sprop_parameter_sets
@@ -1360,6 +1363,15 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Tests parsing empty parameters, which can for example happen with
+    /// v4l2-rtspserver if the hardware hasn't given it a frame with the required data yet.
+    /// (Mostly that it should not panic.)
+    #[test]
+    fn depacketize_empty() {
+        assert!(super::InternalParameters::parse_format_specific_params("").is_err());
+        assert!(super::InternalParameters::parse_format_specific_params(" ").is_err());
     }
 
     /// Tests parsing parameters from GW Security camera, which erroneously puts
