@@ -1341,13 +1341,25 @@ mod tests {
             payload: Bytes::from_static(b"\x65slice"),
         })
         .unwrap();
+
+        // By codec::Depacketizer::parameters's contract, it's unspecified what the depacketizer
+        // parameters are set to between push and pull.
+
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {:#?}", o),
         };
+
+        // After pull, new_parameters and parameters() both reflect the change.
         assert!(frame.new_parameters.is_some());
         let p = frame.new_parameters.unwrap();
         assert_eq!(p.pixel_dimensions(), (640, 480));
+        match d.parameters() {
+            Some(crate::codec::Parameters::Video(v)) => {
+                assert_eq!(v.pixel_dimensions(), (640, 480));
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Tests parsing parameters from GW Security camera, which erroneously puts

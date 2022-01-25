@@ -633,10 +633,37 @@ impl std::fmt::Debug for UdpSockets {
 }
 
 impl Stream {
-    /// Returns the parameters for this stream.
+    /// Returns codec-specified parameters for this stream, if available.
     ///
-    /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't specified
-    /// via SDP. Some codecs allow parameters to be specified in-band instead.
+    /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't (yet) known.
+    ///
+    /// This is initially populated from the `DESCRIBE` response's SDP. Not all codecs guarantee
+    /// parameters are provided in the SDP. Notably, H.264 allows parameters to be specified
+    /// "in-band" (with the data packets) instead of or in addition to "out-of-band" (via SDP).
+    /// Thus, it's unspecified whether a `parameters` call immediately after `Session::describe`
+    /// will return `Some` or `None`.
+    ///
+    /// # With [`Demuxed`]
+    ///
+    /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl:
+    ///
+    /// *   After `poll_next` returns `Ready`, `parameters` reflects all parameter changes as of
+    ///     returned frame.
+    /// *   After `poll_next` returns `Pending`, currently the parameters may or may not reflect
+    ///     changes sent as part of the *next* frame that `poll_next` will return. (It's likely
+    ///     that an upcoming Retina release will guarantee not.)
+    ///
+    /// If there is no packet loss, parameters are generally available after the first frame is
+    /// returned. In the case of H.264, [RFC 6184 section
+    /// 8.4](https://datatracker.ietf.org/doc/html/rfc6184#section-8.4) says "when parameter sets
+    /// are added or updated, care SHOULD be taken to ensure that any parameter set is delivered
+    /// prior to its usage."
+    ///
+    /// # Without [`Demuxed`]
+    ///
+    /// When directly using [`Session`]'s packet-by-packet `futures::Stream` impl, codec
+    /// depacketization logic is bypassed. The parameters returned by this function may be out of
+    /// date.
     pub fn parameters(&self) -> Option<crate::codec::Parameters> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }

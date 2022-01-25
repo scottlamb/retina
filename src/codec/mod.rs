@@ -256,7 +256,12 @@ impl std::fmt::Debug for MessageFrame {
 /// specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
 pub struct VideoFrame {
-    // New video parameters. Rarely populated and large, so boxed to reduce bloat.
+    // New video parameters.
+    //
+    // Rarely populated and large, so boxed to reduce bloat.
+    //
+    // To obtain the current parameters for the stream regardless of whether this frame set new
+    // parameters, see [`crate::client::Stream::parameters`].
     pub new_parameters: Option<Box<VideoParameters>>,
 
     /// Number of lost RTP packets before this video frame. See [crate::client::rtp::Packet::loss].
@@ -326,7 +331,8 @@ impl std::fmt::Debug for VideoFrame {
     }
 }
 
-/// Turns RTP packets into [CodecItem]s.
+/// Turns RTP packets into [`CodecItem`]s.
+///
 /// This interface unstable and for internal use; it's exposed for direct fuzzing and benchmarking.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -417,11 +423,11 @@ impl Depacketizer {
 
     /// Returns the current codec parameters, if known.
     ///
-    /// Most servers supply codec parameters "out-of-band" (within the SDP of
-    /// the `DESCRIBE` response), so parameters will be available as soon as the
-    /// `Depacketizer` is created. Some servers supply only "in-band" parameters
-    /// (within the RTP packet stream). In this case, `parameters` will return
-    /// `None` until the first packet is processed.
+    /// See documentation at [`crate::client::Stream::parameters`].
+    ///
+    /// If the caller has called `push` more recently than `pull`, it's currently undefined
+    /// whether the depacketizer returns parameters as of the most recently pulled or the upcoming
+    /// frame.
     pub fn parameters(&self) -> Option<Parameters> {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),
@@ -432,6 +438,11 @@ impl Depacketizer {
         }
     }
 
+    /// Supplies a new packet to the depacketizer.
+    ///
+    /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
+    /// calls to `push`, the caller must call `pull` until `pull` returns `Ok(None)`. The later
+    /// `push` call may panic or drop data if this expectation is violated.
     pub fn push(&mut self, input: rtp::Packet) -> Result<(), String> {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.push(input),
@@ -442,6 +453,10 @@ impl Depacketizer {
         }
     }
 
+    /// Retrieves a completed frame from the depacketizer.
+    ///
+    /// Some packetization formats support aggregating multiple frames into one packet, so a single
+    /// `push` call may cause `pull` to return `Ok(Some(...))` more than once.
     pub fn pull(&mut self, conn_ctx: &ConnectionContext) -> Result<Option<CodecItem>, Error> {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.pull(conn_ctx),
