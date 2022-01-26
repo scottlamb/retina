@@ -5,7 +5,7 @@
     See [moonfire-nvr#184](https://github.com/scottlamb/moonfire-nvr/issues/184).
 *   ignore (rather than error on) spurious RTP data packets between the `PLAY`
     request and response. These are sent by some versions of
-    (v4l2rtspserver)[https://github.com/mpromonet/v4l2rtspserver].
+    [v4l2rtspserver](https://github.com/mpromonet/v4l2rtspserver).
 
 ## `v0.3.5` (2021-11-30)
 
