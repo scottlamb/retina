@@ -9,6 +9,9 @@ ONVIF RTSP/1.0 IP surveillance cameras, as needed by
 [Moonfire NVR](https://github.com/scottlamb/moonfire-nvr). Works around
 brokenness in cheap closed-source cameras.
 
+Status: In production use in Moonfire NVR. Many missing features. Some breaking
+changes needed to clean up APIs (see [#47](https://github.com/scottlamb/retina/issues/47).)
+
 Progress:
 
 *   [x] client support
@@ -37,24 +40,22 @@ Progress:
         *   [x] multiple slices per picture
         *   [ ] multiple SPS/PPS
         *   [ ] interleaved mode
+        *   [x] AAC output format
+        *   [ ] Annex B output format ([#44](https://github.com/scottlamb/retina/issues/44))
     *   audio
         *   [x] AAC
             *   [ ] interleaving
         *   [x] [RFC 3551](https://datatracker.ietf.org/doc/html/rfc3551)
             codecs: G.711, G.723, L8/L16
     *   [x] application: ONVIF metadata
-*   [ ] uniform, documented API. (Currently haphazard in terms of naming, what
-        fields are exposed directly vs use an accessors, etc.)
+*   [ ] clean, stable API. (See [#47](https://github.com/scottlamb/retina/issues/47).)
 *   quality errors
 *   *   [x] detailed error description text.
 *   *   [ ] programmatically inspectable error type.
-*   [ ] good functional testing coverage. (Currently lightly / unevenly tested.)
+*   [ ] good functional testing coverage. (Currently lightly / unevenly tested.
         Most depacketizers have no tests.)
 *   [ ] fuzz testing. (In progress.)
 *   [x] benchmark
-
-Currently very unstable: expect breaking API changes at every release as I work
-through items above.
 
 Help welcome!
 
