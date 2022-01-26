@@ -62,40 +62,53 @@ struct ReceivedMessage {
     msg: Message<Bytes>,
 }
 
-/// An RTP timestamp, coupled with clock rate and stream start time for conversion to "NPT".
+/// An annotated RTP timestamp.
+///
+/// This couples together three pieces of information:
+///
+/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
+///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
+///     than `i32::MAX` from previous timestamps are treated as backwards jumps.
+///
+/// *   The codec-specific clock rate.
+///
+/// *   The stream's starting time. In client use, this is often as received in the RTSP
+///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`].
+///     According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial
+///     value of the timestamp SHOULD be random".
+///
+/// In combination, these allow conversion to "normal play time" (NPT): seconds since start of
+/// the stream.
 ///
 /// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
-/// many RTP servers violate this.
+/// many RTP servers violate this. The Retina client allows such violations unless
+/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
 ///
-/// The [Display] and [Debug] implementations display:
+/// In client use, the top bits should be inferred from wraparounds of 32-bit RTP timestamps.
+/// The Retina client's policy is that timestamps that differ by more than `i32::MAX` from
+/// previous timestamps are treated as backwards jumps. It's allowed for a timestamp to
+/// indicate a time *before* the stream's starting point.
+///
+/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
+/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return
+/// error in these cases. This should rarely cause problems. It'd take ~2^32 packets (~4 billion)
+/// to advance the time this far forward or backward even with a hostile server.
+///
+/// The [`Display`] and [`Debug`] implementations currently display:
 /// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a
 ///     codec-specified clock rate.
 /// *   the full timestamp.
-/// *   a conversion to RTSP "normal play time" (NPT): zero-based and normalized to seconds.
+/// *   NPT
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Timestamp {
     /// A timestamp which must be compared to `start`.
-    ///
-    /// In client use, the top bits should be inferred from wraparounds of 32-bit RTP timestamps.
-    /// The Retina client's policy is that timestamps that differ by more than `i32::MAX` from
-    /// previous timestamps are treated as backwards jumps. It's allowed for a timestamp to
-    /// indicate a time *before* `start`, unless
-    /// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
-    ///
-    ///  `timestamp` itself is not allowed to overflow/underflow; similarly `timestamp - start` is
-    /// not allowed to underflow. This should rarely cause problems. It'd take ~2^31 packets (~2
-    /// billion) to advance the time this far forward or backward even with a hostile server.
     timestamp: i64,
 
     /// The codec-specified clock rate, in Hz. Must be non-zero.
     clock_rate: NonZeroU32,
 
     /// The stream's starting time, as specified in the RTSP `RTP-Info` header.
-    ///
-    /// According to [RFC 3550 section
-    /// 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial value of the
-    /// timestamp SHOULD be random".
     start: u32,
 }
 
