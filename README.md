@@ -27,8 +27,7 @@ Progress:
 *   [ ] server support
 *   I/O modes
     *   [x] async with tokio
-    *   [ ] async-std. (Most of the crate's code is independent of the async
-        library, so I don't expect this would be too hard to add.)
+    *   [ ] async-std
     *   [ ] synchronous with std only
 *   codec depacketization
     *   [x] video: H.264
