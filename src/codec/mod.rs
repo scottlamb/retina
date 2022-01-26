@@ -252,8 +252,7 @@ impl std::fmt::Debug for MessageFrame {
 
 /// A single encoded video frame (aka picture, video sample, or video access unit).
 ///
-/// Use the [bytes::Buf] implementation to retrieve data. Durations aren't
-/// specified here; they can be calculated from the timestamp of a following
+/// Durations aren't specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
 pub struct VideoFrame {
     // New video parameters.
@@ -303,6 +302,13 @@ impl VideoFrame {
         self.end_ctx
     }
 
+    /// Returns the data in a codec-specific format.
+    ///
+    /// H.264 is currently the only supported video codec. A frame is encoded in AAC format with
+    /// four-byte lengths. That is, each NAL is encoded as a `u32` length in big-endian format
+    /// followed by the actual contents of the NAL (including "emulation prevention three" bytes).
+    /// In the future, a configuration parameter may allow the caller to request Annex B encoding
+    /// instead.  See [#44](https://github.com/scottlamb/retina/issues/44).
     #[inline]
     pub fn data(&self) -> &Bytes {
         &self.data
