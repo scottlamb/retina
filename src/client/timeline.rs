@@ -100,7 +100,7 @@ impl Timeline {
             .checked_add(i64::from(delta))
             .ok_or_else(|| {
                 // This probably won't happen even with a hostile server. It'd
-                // take ~2^31 packets (~ 4 billion) to advance the time this far
+                // take ~2^31 packets (~ 2 billion) to advance the time this far
                 // forward or backward even with no limits on time jump per
                 // packet.
                 format!(

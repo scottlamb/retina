@@ -62,25 +62,40 @@ struct ReceivedMessage {
     msg: Message<Bytes>,
 }
 
-/// A monotonically increasing timestamp within an RTP stream.
+/// An RTP timestamp, coupled with clock rate and stream start time for conversion to "NPT".
+///
+/// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
+/// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
+/// many RTP servers violate this.
 ///
 /// The [Display] and [Debug] implementations display:
 /// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a
 ///     codec-specified clock rate.
-/// *   the full timestamp, with top bits accumulated as RTP packet timestamps wrap around.
+/// *   the full timestamp.
 /// *   a conversion to RTSP "normal play time" (NPT): zero-based and normalized to seconds.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Timestamp {
-    /// A timestamp which must be compared to `start`. The top bits are inferred
-    /// from wraparounds of 32-bit RTP timestamps. The `i64` itself is not
-    /// allowed to overflow/underflow; similarly `timestamp - start` is not
-    /// allowed to underflow.
+    /// A timestamp which must be compared to `start`.
+    ///
+    /// In client use, the top bits should be inferred from wraparounds of 32-bit RTP timestamps.
+    /// The Retina client's policy is that timestamps that differ by more than `i32::MAX` from
+    /// previous timestamps are treated as backwards jumps. It's allowed for a timestamp to
+    /// indicate a time *before* `start`, unless
+    /// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
+    ///
+    ///  `timestamp` itself is not allowed to overflow/underflow; similarly `timestamp - start` is
+    /// not allowed to underflow. This should rarely cause problems. It'd take ~2^31 packets (~2
+    /// billion) to advance the time this far forward or backward even with a hostile server.
     timestamp: i64,
 
     /// The codec-specified clock rate, in Hz. Must be non-zero.
     clock_rate: NonZeroU32,
 
     /// The stream's starting time, as specified in the RTSP `RTP-Info` header.
+    ///
+    /// According to [RFC 3550 section
+    /// 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial value of the
+    /// timestamp SHOULD be random".
     start: u32,
 }
 
