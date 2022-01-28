@@ -1,3 +1,9 @@
+## `v0.3.7` (2022-01-28)
+
+*   [#50](https://github.com/scottlamb/retina/pull/50): fix a panic on certain
+    invalid H.264 `sprop-parameter-sets`
+*   documentation improvements
+
 ## `v0.3.6` (2021-12-29)
 
 *   correctly expire stale session entries that track live555 stale file
