@@ -250,7 +250,10 @@ impl std::fmt::Debug for MessageFrame {
     }
 }
 
-/// A single encoded video frame (aka picture, video sample, or video access unit).
+/// A single video frame (aka video sample or video access unit).
+///
+/// Typically this is an encoded picture. It could also be a single field of an interlaced
+/// picture.
 ///
 /// Durations aren't specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
