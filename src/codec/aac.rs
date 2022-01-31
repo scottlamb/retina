@@ -50,6 +50,8 @@ struct ChannelConfig {
     ncc: u16,
 
     /// A human-friendly name for the channel configuration.
+    // The name is used in tests and in the Debug output. Suppress dead code warning.
+    #[cfg_attr(not(test), allow(dead_code))]
     name: &'static str,
 }
 
@@ -425,6 +427,11 @@ pub(crate) struct Depacketizer {
     state: DepacketizerState,
 }
 
+/// [DepacketizerState] holding access units within a single RTP packet.
+///
+/// This is the state used when there are multiple access units within a packet
+/// (thus the name), when there's a single access unit, and even at the
+/// beginning of a fragment.
 #[derive(Debug)]
 struct Aggregate {
     ctx: crate::PacketContext,
@@ -450,10 +457,11 @@ struct Aggregate {
     /// The buffer, positioned at frame 0's header.
     buf: Bytes,
 
-    /// The index in range `[0, frame_count)` of the next frame to output.
+    /// The index in range `[0, frame_count)` of the next frame to return from `pull`.
     frame_i: u16,
 
-    /// The non-zero total frames within this aggregate.
+    /// The total non-zero total frames within this aggregate (including ones which have already
+    /// been returned by `pull`).
     frame_count: u16,
 
     /// The starting byte offset of `frame_i`'s data within `buf`.
@@ -465,6 +473,7 @@ struct Aggregate {
     mark: bool,
 }
 
+/// The received prefix of a single access unit which has been spread across multiple packets.
 #[derive(Debug)]
 struct Fragment {
     rtp_timestamp: u16,
@@ -481,14 +490,22 @@ struct Fragment {
     buf: BytesMut,
 }
 
+/// State of the depacketizer between calls to `push` and `pull`.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum DepacketizerState {
+    /// State when there's no buffered data.
     Idle {
         prev_loss: u16,
         loss_since_mark: bool,
     },
+
+    /// State after a packet has been RTP packet has been received. As described at
+    /// [`Aggregate`], this may hold the first packet of a fragment, one packet, or multiple
+    /// complete packets.
     Aggregated(Aggregate),
+
+    /// State when a prefix of a fragmented packet has been received.
     Fragmented(Fragment),
     Ready(super::AudioFrame),
 }

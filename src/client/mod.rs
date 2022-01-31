@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
@@ -1741,7 +1740,6 @@ impl Session<Playing> {
                     local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port + 1),
                     peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtcp_port),
                     received_wall: crate::WallTime::now(),
-                    received: Instant::now(),
                 });
                 match r {
                     Ok(()) => {
@@ -1780,7 +1778,6 @@ impl Session<Playing> {
                     local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port),
                     peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtp_port),
                     received_wall: crate::WallTime::now(),
-                    received: Instant::now(),
                 });
                 match r {
                     Ok(()) => {

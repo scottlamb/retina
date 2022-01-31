@@ -269,7 +269,6 @@ pub struct ConnectionContext {
     local_addr: std::net::SocketAddr,
     peer_addr: std::net::SocketAddr,
     established_wall: WallTime,
-    established: std::time::Instant,
 }
 
 impl ConnectionContext {
@@ -280,7 +279,6 @@ impl ConnectionContext {
             local_addr: addr,
             peer_addr: addr,
             established_wall: WallTime::now(),
-            established: std::time::Instant::now(),
         }
     }
 }
@@ -364,7 +362,6 @@ enum PacketContextInner {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         received_wall: WallTime,
-        received: std::time::Instant,
     },
     Dummy,
 }

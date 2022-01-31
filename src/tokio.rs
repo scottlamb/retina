@@ -34,7 +34,6 @@ impl Connection {
 
     pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
-        let established = Instant::now();
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
         Ok(Self(Framed::new(
@@ -44,7 +43,6 @@ impl Connection {
                     local_addr,
                     peer_addr,
                     established_wall,
-                    established,
                 },
                 read_pos: 0,
             },
