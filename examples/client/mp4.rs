@@ -20,10 +20,10 @@
 use anyhow::{anyhow, bail, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{Future, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use retina::{
     client::Transport,
-    codec::{AudioParameters, CodecItem, VideoParameters},
+    codec::{AudioParameters, CodecItem, Parameters, VideoParameters},
 };
 
 use std::num::NonZeroU32;
@@ -530,9 +530,17 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         );
         if let Some(p) = frame.new_parameters.take() {
             if self.video_trak.samples > 0 {
-                bail!("parameters change unimplemented. new parameters: {:#?}", p);
+                let old = self.video_params.as_ref().unwrap();
+                bail!(
+                    "video parameters change unimplemented.\nold: {:#?}\nnew: {:#?}",
+                    old,
+                    p
+                );
             }
             self.video_params = Some(p);
+        } else if self.video_params.is_none() {
+            debug!("Discarding video frame received before parameters");
+            return Ok(());
         }
         let size = u32::try_from(frame.data().remaining())?;
         self.video_trak.add_sample(
@@ -630,8 +638,8 @@ async fn copy<'a>(
 async fn write_mp4<'a>(
     opts: &'a Opts,
     session: retina::client::Session<retina::client::Described>,
-    video_stream: Option<(usize, VideoParameters)>,
-    audio_stream: Option<(usize, AudioParameters)>,
+    video_params: Option<Box<VideoParameters>>,
+    audio_params: Option<Box<AudioParameters>>,
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
 ) -> Result<(), Error> {
     let mut session = session
@@ -650,14 +658,7 @@ async fn write_mp4<'a>(
     tmp_filename.push(PARTIAL_SUFFIX); // OsString::push doesn't put in a '/', unlike PathBuf::.
     let tmp_filename: PathBuf = tmp_filename.into();
     let out = tokio::fs::File::create(&tmp_filename).await?;
-    let mut mp4 = Mp4Writer::new(
-        video_stream.map(|(_, p)| Box::new(p)),
-        audio_stream.map(|(_, p)| Box::new(p)),
-        opts.allow_loss,
-        out,
-    )
-    .await?;
-
+    let mut mp4 = Mp4Writer::new(video_params, audio_params, opts.allow_loss, out).await?;
     let result = copy(opts, &mut session, stop_signal, &mut mp4).await;
     if let Err(e) = result {
         // Log errors about finishing, returning the original error.
@@ -705,38 +706,38 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .teardown(opts.teardown),
     )
     .await?;
-    let video_stream = if !opts.no_video {
-        let s = session
-            .streams()
-            .iter()
-            .enumerate()
-            .find_map(|(i, s)| match s.parameters() {
-                Some(retina::codec::Parameters::Video(v)) => {
-                    log::info!(
-                        "Using {} video stream (rfc 6381 codec {})",
-                        &s.encoding_name,
-                        v.rfc6381_codec()
-                    );
-                    Some((i, v.clone()))
+    let (video_stream_i, video_params) = if !opts.no_video {
+        let s = session.streams().iter().enumerate().find_map(|(i, s)| {
+            if s.media == "video" {
+                if s.encoding_name == "h264" {
+                    log::info!("Using h264 video stream");
+                    return Some((
+                        i,
+                        match s.parameters() {
+                            Some(Parameters::Video(v)) => Some(Box::new(v)),
+                            Some(_) => panic!("expected parameters to match stream type video"),
+                            None => None,
+                        },
+                    ));
                 }
-                _ if s.media == "video" => {
-                    log::info!(
-                        "Ignoring {} video stream because it's unsupported",
-                        &s.encoding_name
-                    );
-                    None
-                }
-                _ => None,
-            });
-        if s.is_none() {
+                log::info!(
+                    "Ignoring {} video stream because it's unsupported",
+                    &s.encoding_name
+                );
+            }
+            None
+        });
+        if let Some((i, p)) = s {
+            (Some(i), p)
+        } else {
             log::info!("No suitable video stream found");
+            (None, None)
         }
-        s
     } else {
         log::info!("Ignoring video streams (if any) because of --no-video");
-        None
+        (None, None)
     };
-    if let Some((i, _)) = video_stream {
+    if let Some(i) = video_stream_i {
         session.setup(i).await?;
     }
     let audio_stream = if !opts.no_audio {
@@ -749,7 +750,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 // entry.
                 Some(retina::codec::Parameters::Audio(a)) if a.sample_entry().is_some() => {
                     log::info!("Using {} audio stream (rfc 6381 codec {})", &s.encoding_name, a.rfc6381_codec().unwrap());
-                    Some((i, a.clone()))
+                    Some((i, Box::new(a.clone())))
                 }
                 _ if s.media == "audio" => {
                     log::info!("Ignoring {} audio stream because it can't be placed into a .mp4 file without transcoding", &s.encoding_name);
@@ -768,10 +769,17 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     if let Some((i, _)) = audio_stream {
         session.setup(i).await?;
     }
-    if video_stream.is_none() && audio_stream.is_none() {
+    if video_stream_i.is_none() && audio_stream.is_none() {
         bail!("Exiting because no video or audio stream was selected; see info log messages above");
     }
-    let result = write_mp4(&opts, session, video_stream, audio_stream, stop_signal).await;
+    let result = write_mp4(
+        &opts,
+        session,
+        video_params,
+        audio_stream.map(|(_i, p)| p),
+        stop_signal,
+    )
+    .await;
 
     // Session has now been dropped, on success or failure. A TEARDOWN should
     // be pending if necessary. session_group.await_teardown() will wait for it.
