@@ -45,6 +45,13 @@ jobs:
     - name: Check fuzz crate formatting
       if: matrix.rust == 'stable'
       run: cd fuzz && cargo fmt -- --check
+    - name: Clippy on main crate
+      if: matrix.rust == 'stable'
+      run: cargo clippy -- --check
+    - name: Clippy on fuzz crate
+      if: matrix.rust == 'stable'
+      run: cd fuzz && cargo clippy
+        
   license:
     name: Check copyright/license headers
     runs-on: ubuntu-20.04

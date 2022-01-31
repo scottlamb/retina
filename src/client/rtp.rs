@@ -88,6 +88,7 @@ impl InorderParser {
         Self { ssrc, next_seq }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rtp(
         &mut self,
         session_options: &SessionOptions,

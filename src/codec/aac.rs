@@ -70,7 +70,7 @@ const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
 impl AudioSpecificConfig {
     /// Parses from raw bytes.
     fn parse(raw: &[u8]) -> Result<Self, String> {
-        let mut r = bitreader::BitReader::new(&raw[..]);
+        let mut r = bitreader::BitReader::new(raw);
         let audio_object_type = match r
             .read_u8(5)
             .map_err(|e| format!("unable to read audio_object_type: {}", e))?
@@ -213,23 +213,31 @@ fn set_length(len: usize, data: &mut [u8]) -> Result<usize, String> {
 /// Writes a box length and type (four-character code) for everything appended
 /// in the supplied scope.
 macro_rules! write_box {
-    ($buf:expr, $fourcc:expr, $b:block) => {{
-        let _: &mut BytesMut = $buf; // type-check.
-        let pos_start = $buf.len();
-        let fourcc: &[u8; 4] = $fourcc;
-        $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
-        let r = {
-            $b;
-        };
-        let pos_end = $buf.len();
-        let len = pos_end.checked_sub(pos_start).unwrap();
-        $buf[pos_start..pos_start + 4].copy_from_slice(
-            &u32::try_from(len)
-                .map_err(|_| format!("box length {} exceeds u32::MAX", len))?
-                .to_be_bytes()[..],
-        );
-        r
-    }};
+    ($buf:expr, $fourcc:expr, $b:block) => {
+        // The caller uses `&mut buf`. clippy likes to complain about the `&mut`
+        // being unnecessary for len(), but it is necessary for other things.
+        // The macro also can't store `$buf` in its own local, because `$b`
+        // is expected to reference `$buf` via the original name.
+        #[allow(clippy::unnecessary_mut_passed)]
+        {
+            let _: &mut BytesMut = $buf; // type-check.
+
+            let pos_start = $buf.len();
+            let fourcc: &[u8; 4] = $fourcc;
+            $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
+            let r = {
+                $b;
+            };
+            let pos_end = $buf.len();
+            let len = pos_end.checked_sub(pos_start).unwrap();
+            $buf[pos_start..pos_start + 4].copy_from_slice(
+                &u32::try_from(len)
+                    .map_err(|_| format!("box length {} exceeds u32::MAX", len))?
+                    .to_be_bytes()[..],
+            );
+            r
+        }
+    };
 }
 
 /// Writes a descriptor tag and length for everything appended in the supplied
@@ -663,7 +671,7 @@ impl Depacketizer {
         &mut self,
         conn_ctx: &ConnectionContext,
     ) -> Result<Option<super::CodecItem>, Error> {
-        match std::mem::replace(&mut self.state, DepacketizerState::default()) {
+        match std::mem::take(&mut self.state) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
                 self.state = s;
                 Ok(None)

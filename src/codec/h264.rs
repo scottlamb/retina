@@ -497,7 +497,7 @@ impl Depacketizer {
         ) {
             (Some(sps_nal), Some(pps_nal), _) => {
                 // TODO: could map this to a RtpPacketError more accurately.
-                let ip = InternalParameters::parse_sps_and_pps(&sps_nal, &pps_nal)?;
+                let ip = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
                 let p = ip.generic_parameters.clone();
                 self.parameters = Some(ip);
                 Some(Box::new(p))

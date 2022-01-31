@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
             sequence_number,
             loss: u16::from(loss),
             mark,
-            payload: data.split_off(usize::from(len)),
+            payload: data.split_off(len),
         };
         //println!("pkt: {:#?}", pkt);
         if depacketizer.push(pkt).is_err() {

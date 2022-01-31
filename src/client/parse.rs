@@ -398,7 +398,7 @@ pub(crate) fn parse_describe(
                 .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
         })
         .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
-        .unwrap_or(Ok(request_url.clone()))?;
+        .unwrap_or_else(|| Ok(request_url.clone()))?;
 
     let mut control = None;
     let mut tool = None;
@@ -421,7 +421,7 @@ pub(crate) fn parse_describe(
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            parse_media(&base_url, &m)
+            parse_media(&base_url, m)
                 .map_err(|e| format!("Unable to parse stream {}: {}\n\n{:#?}", i, &e, &m))
         })
         .collect::<Result<Vec<Stream>, String>>()?;

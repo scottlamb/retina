@@ -14,6 +14,7 @@ const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Handles `TEARDOWN` loop in the background, removing the stale session entry on success or
 /// session expiry.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn background_teardown(
     seqnum: Option<u64>,
     base_url: Url,
@@ -78,7 +79,7 @@ pub(super) async fn teardown_loop_forever(
         // they don't have a chance to mess up any other sockets.
         tokio::select! {
             biased;
-            r = attempt(&mut req, &options, &mut requested_auth, conn) => {
+            r = attempt(&mut req, options, &mut requested_auth, conn) => {
                 match r {
                     Ok(status) => {
                         log::debug!("TEARDOWN {} on existing conn succeeded (status {}).", session_id, u16::from(status));
@@ -119,7 +120,7 @@ pub(super) async fn teardown_loop_forever(
             .reset(tokio::time::Instant::now() + timeout);
         let attempt = async {
             let conn = RtspConnection::connect(&url).await?;
-            attempt(&mut req, &options, &mut requested_auth, conn).await
+            attempt(&mut req, options, &mut requested_auth, conn).await
         };
         tokio::select! {
             biased;
@@ -156,7 +157,7 @@ async fn attempt(
     mut conn: RtspConnection,
 ) -> Result<rtsp_types::StatusCode, Error> {
     let e = match conn
-        .send(ResponseMode::Teardown, &options, requested_auth, req)
+        .send(ResponseMode::Teardown, options, requested_auth, req)
         .await
     {
         Ok((_ctx, _cseq, resp)) => return Ok(resp.status()),

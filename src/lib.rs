@@ -6,6 +6,10 @@
 //! Currently this is useful for clients; it will be extended to support
 //! servers and proxies.
 
+#![forbid(clippy::print_stderr, clippy::print_stdout)]
+// I prefer to use from_str_radix(..., 10) to explicitly note the base.
+#![allow(clippy::from_str_radix_10)]
+
 use bytes::Bytes;
 use log::trace;
 //use failure::{bail, format_err, Error};

@@ -1185,8 +1185,8 @@ impl Session<Described> {
         let (msg_ctx, cseq, response) = conn
             .send(
                 ResponseMode::Normal,
-                &inner.options,
-                &mut inner.requested_auth,
+                inner.options,
+                inner.requested_auth,
                 &mut req.build(Bytes::new()),
             )
             .await?;
@@ -1326,7 +1326,7 @@ impl Session<Described> {
         let (msg_ctx, cseq, response) = conn
             .send(
                 ResponseMode::Play,
-                &inner.options,
+                inner.options,
                 inner.requested_auth,
                 &mut rtsp_types::Request::builder(Method::Play, rtsp_types::Version::V1_0)
                     .request_uri(inner.presentation.control.clone())
@@ -1665,7 +1665,7 @@ impl Session<Playing> {
             }),
         };
         let stream = &mut inner.presentation.streams[m.stream_i];
-        let (mut timeline, rtp_handler) = match &mut stream.state {
+        let (timeline, rtp_handler) = match &mut stream.state {
             StreamState::Playing {
                 timeline,
                 rtp_handler,
@@ -1677,19 +1677,19 @@ impl Session<Playing> {
         };
         match m.channel_type {
             ChannelType::Rtp => Ok(rtp_handler.rtp(
-                &inner.options,
+                inner.options,
                 conn.inner.ctx(),
                 &pkt_ctx,
-                &mut timeline,
+                timeline,
                 inner.runtime_handle.as_ref(),
                 m.stream_i,
                 data.into_body(),
             )?),
             ChannelType::Rtcp => {
                 match rtp_handler.rtcp(
-                    &inner.options,
+                    inner.options,
                     &pkt_ctx,
-                    &mut timeline,
+                    timeline,
                     inner.runtime_handle.as_ref(),
                     m.stream_i,
                     data.into_body(),
@@ -1697,7 +1697,7 @@ impl Session<Playing> {
                     Ok(p) => Ok(p),
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
                         conn_ctx: *conn.inner.ctx(),
-                        pkt_ctx: pkt_ctx,
+                        pkt_ctx,
                         stream_id: m.stream_i,
                         description,
                     })),
@@ -1727,7 +1727,7 @@ impl Session<Playing> {
             .ctx();
         let s = &mut inner.presentation.streams[i];
         if let Some(sockets) = &mut s.sockets {
-            let (mut timeline, rtp_handler) = match &mut s.state {
+            let (timeline, rtp_handler) = match &mut s.state {
                 StreamState::Playing {
                     timeline,
                     rtp_handler,
@@ -1745,9 +1745,9 @@ impl Session<Playing> {
                     Ok(()) => {
                         let msg = Bytes::copy_from_slice(buf.filled());
                         match rtp_handler.rtcp(
-                            &inner.options,
+                            inner.options,
                             &pkt_ctx,
-                            &mut timeline,
+                            timeline,
                             inner.runtime_handle.as_ref(),
                             i,
                             msg,
@@ -1783,10 +1783,10 @@ impl Session<Playing> {
                     Ok(()) => {
                         let msg = Bytes::copy_from_slice(buf.filled());
                         match rtp_handler.rtp(
-                            &inner.options,
-                            &conn_ctx,
+                            inner.options,
+                            conn_ctx,
                             &pkt_ctx,
-                            &mut timeline,
+                            timeline,
                             inner.runtime_handle.as_ref(),
                             i,
                             msg,
@@ -1873,7 +1873,7 @@ impl PinnedDrop for SessionInner {
             lock.next_seqnum += 1;
             lock.sessions.push(StaleSession {
                 seqnum,
-                expires: expires.clone(),
+                expires,
                 teardown_rx: Some(teardown_rx),
                 is_tcp,
                 maybe_playing: *this.maybe_playing,
