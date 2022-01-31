@@ -484,10 +484,22 @@ struct Fragment {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum DepacketizerState {
-    Idle { prev_loss: u16 },
+    Idle {
+        prev_loss: u16,
+        loss_since_mark: bool,
+    },
     Aggregated(Aggregate),
     Fragmented(Fragment),
     Ready(super::AudioFrame),
+}
+
+impl Default for DepacketizerState {
+    fn default() -> Self {
+        DepacketizerState::Idle {
+            prev_loss: 0,
+            loss_since_mark: false,
+        }
+    }
 }
 
 impl Depacketizer {
@@ -507,7 +519,7 @@ impl Depacketizer {
         }
         Ok(Self {
             config,
-            state: DepacketizerState::Idle { prev_loss: 0 },
+            state: DepacketizerState::default(),
         })
     }
 
@@ -516,12 +528,17 @@ impl Depacketizer {
     }
 
     pub(super) fn push(&mut self, mut pkt: Packet) -> Result<(), String> {
-        if pkt.loss > 0 && matches!(self.state, DepacketizerState::Fragmented(_)) {
-            log::debug!(
-                "Discarding fragmented AAC frame due to loss of {} RTP packets.",
-                pkt.loss
-            );
-            self.state = DepacketizerState::Idle { prev_loss: 0 };
+        if pkt.loss > 0 {
+            if let DepacketizerState::Fragmented(ref mut f) = self.state {
+                log::debug!(
+                    "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
+                    pkt.loss
+                );
+                self.state = DepacketizerState::Idle {
+                    prev_loss: f.loss, // note this packet's loss will be added in later.
+                    loss_since_mark: true,
+                };
+            }
         }
 
         // Read the AU headers.
@@ -562,9 +579,10 @@ impl Depacketizer {
                 match (frag.buf.len() + data.len()).cmp(&size) {
                     std::cmp::Ordering::Less => {
                         if pkt.mark {
-                            if frag.loss > 0 {
+                            if frag.loss_since_mark {
                                 self.state = DepacketizerState::Idle {
                                     prev_loss: frag.loss,
+                                    loss_since_mark: false,
                                 };
                                 return Ok(());
                             }
@@ -597,14 +615,17 @@ impl Depacketizer {
                 }
             }
             DepacketizerState::Aggregated(_) => panic!("push when already in state aggregated"),
-            DepacketizerState::Idle { prev_loss } => {
+            DepacketizerState::Idle {
+                prev_loss,
+                loss_since_mark,
+            } => {
                 if au_headers_count == 0 {
                     return Err("aggregate with no headers".to_string());
                 }
                 self.state = DepacketizerState::Aggregated(Aggregate {
                     ctx: pkt.ctx,
                     loss: *prev_loss + pkt.loss,
-                    loss_since_mark: pkt.loss > 0,
+                    loss_since_mark: *loss_since_mark || pkt.loss > 0,
                     stream_id: pkt.stream_id,
                     ssrc: pkt.ssrc,
                     sequence_number: pkt.sequence_number,
@@ -625,13 +646,13 @@ impl Depacketizer {
         &mut self,
         conn_ctx: &ConnectionContext,
     ) -> Result<Option<super::CodecItem>, Error> {
-        match std::mem::replace(&mut self.state, DepacketizerState::Idle { prev_loss: 0 }) {
+        match std::mem::replace(&mut self.state, DepacketizerState::default()) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
                 self.state = s;
                 Ok(None)
             }
             DepacketizerState::Ready(f) => {
-                self.state = DepacketizerState::Idle { prev_loss: 0 };
+                self.state = DepacketizerState::default();
                 Ok(Some(CodecItem::AudioFrame(f)))
             }
             DepacketizerState::Aggregated(mut agg) => {
@@ -660,6 +681,17 @@ impl Depacketizer {
                         ));
                     }
                     if agg.mark {
+                        if agg.loss_since_mark {
+                            log::debug!(
+                                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
+                                agg.loss
+                            );
+                            self.state = DepacketizerState::Idle {
+                                prev_loss: agg.loss,
+                                loss_since_mark: false,
+                            };
+                            return Ok(None);
+                        }
                         return Err(error(
                             *conn_ctx,
                             agg,
@@ -895,5 +927,314 @@ mod tests {
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foobarbaz");
         assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+    }
+
+    /// Tests that depacketization skips/reports a frame in which its first packet was lost.
+    #[test]
+    fn depacketize_fragment_initial_loss() {
+        let mut d = Depacketizer::new(
+            48_000, // clock rate, as specified in rtpmap
+            None, // channels, as specified in rtpmap
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        // Fragment
+        d.push(Packet {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 1,
+            mark: false,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'r',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        d.push(Packet {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'z',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Following frame reports the loss.
+        d.push(Packet {
+            // single frame.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.loss, 1);
+        assert_eq!(&a.data[..], b"asdf");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+    }
+
+    /// Tests that depacketization skips/reports a frame in which an interior frame is lost.
+    #[test]
+    fn depacketize_fragment_interior_loss() {
+        let mut d = Depacketizer::new(
+            48_000, // clock rate, as specified in rtpmap
+            None, // channels, as specified in rtpmap
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        d.push(Packet {
+            // 1/3
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'f', b'o', b'o',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        // Fragment 2/3 is lost
+        d.push(Packet {
+            // 3/3 reports the loss
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 1,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'z',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Following frame reports the loss.
+        d.push(Packet {
+            // single frame.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.loss, 1);
+        assert_eq!(&a.data[..], b"asdf");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+    }
+
+    /// Tests that depacketization skips/reports a frame in which the interior frame is lost.
+    #[test]
+    fn depacketize_fragment_final_loss() {
+        let mut d = Depacketizer::new(
+            48_000, // clock rate, as specified in rtpmap
+            None, // channels, as specified in rtpmap
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        d.push(Packet {
+            // 1/3
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'f', b'o', b'o',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        // Fragment 2/3 is lost
+        d.push(Packet {
+            // 3/3 reports the loss
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 1,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'z',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Following frame reports the loss.
+        d.push(Packet {
+            // single frame.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.loss, 1);
+        assert_eq!(&a.data[..], b"asdf");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+    }
+
+    /// Tests the distinction between `loss` and `loss_since_last_mark`.
+    ///
+    /// Old loss should get reported via the CodecItem but shouldn't suppress
+    /// error checking.
+    #[test]
+    fn depacketize_fragment_old_loss_doesnt_prevent_error() {
+        let mut d = Depacketizer::new(
+            48_000, // clock rate, as specified in rtpmap
+            None, // channels, as specified in rtpmap
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        d.push(Packet {
+            // end of previous fragment, first parts missing.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 1,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'r',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Incomplete fragment with no reported loss.
+        d.push(Packet {
+            // end of previous fragment, first parts missing.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'r',
+            ]),
+        })
+        .unwrap();
+        let e = d.pull(&ConnectionContext::dummy()).unwrap_err();
+        let e_str = e.to_string();
+        assert!(
+            e_str.contains("mark can't be set on beginning of fragment"),
+            "{}",
+            e
+        );
     }
 }
