@@ -575,6 +575,7 @@ impl Depacketizer {
                                 size
                             ));
                         }
+                        frag.buf.extend_from_slice(data);
                     }
                     std::cmp::Ordering::Equal => {
                         if !pkt.mark {
@@ -583,7 +584,6 @@ impl Depacketizer {
                             );
                         }
                         frag.buf.extend_from_slice(data);
-                        println!("au {}: len-{}, fragmented", &pkt.timestamp, size);
                         self.state = DepacketizerState::Ready(super::AudioFrame {
                             ctx: pkt.ctx,
                             loss: frag.loss,
@@ -734,18 +734,166 @@ fn error(conn_ctx: ConnectionContext, agg: Aggregate, description: String) -> Er
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn parse_audio_specific_config() {
-        let dahua = super::AudioSpecificConfig::parse(&[0x11, 0x88]).unwrap();
+        let dahua = AudioSpecificConfig::parse(&[0x11, 0x88]).unwrap();
         assert_eq!(dahua.sampling_frequency, 48_000);
         assert_eq!(dahua.channels.name, "mono");
 
-        let bunny = super::AudioSpecificConfig::parse(&[0x14, 0x90]).unwrap();
+        let bunny = AudioSpecificConfig::parse(&[0x14, 0x90]).unwrap();
         assert_eq!(bunny.sampling_frequency, 12_000);
         assert_eq!(bunny.channels.name, "stereo");
 
-        let rfc3640 = super::AudioSpecificConfig::parse(&[0x11, 0xB0]).unwrap();
+        let rfc3640 = AudioSpecificConfig::parse(&[0x11, 0xB0]).unwrap();
         assert_eq!(rfc3640.sampling_frequency, 48_000);
         assert_eq!(rfc3640.channels.name, "5.1");
+    }
+
+    #[test]
+    fn depacketize_happy_path() {
+        let mut d = Depacketizer::new(
+            48_000, // clock rate, as specified in rtpmap
+            None, // channels, as specified in rtpmap
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        // Single frame.
+        d.push(Packet {
+            // single frame.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.timestamp, timestamp);
+        assert_eq!(&a.data[..], b"asdf");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Aggregate of 3 frames.
+        d.push(Packet {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x30, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 3 headers
+                0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
+                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                b'f', b'o', b'o', b'b', b'a', b'r', b'b', b'a', b'z',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.timestamp, timestamp);
+        assert_eq!(&a.data[..], b"foo");
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.timestamp, timestamp.try_add(1_024).unwrap());
+        assert_eq!(&a.data[..], b"bar");
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
+        assert_eq!(&a.data[..], b"baz");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+
+        // Fragment across 3 packets.
+        d.push(Packet {
+            // fragment 1/3.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'f', b'o', b'o',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        d.push(Packet {
+            // fragment 2/3.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: false,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'r',
+            ]),
+        })
+        .unwrap();
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        d.push(Packet {
+            // fragment 3/3.
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload: Bytes::from_static(&[
+                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                0x00,
+                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                b'b', b'a', b'z',
+            ]),
+        })
+        .unwrap();
+        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+            Some(CodecItem::AudioFrame(a)) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(a.timestamp, timestamp);
+        assert_eq!(&a.data[..], b"foobarbaz");
+        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
     }
 }

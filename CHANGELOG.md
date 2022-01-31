@@ -1,3 +1,7 @@
+## unreleased
+
+*   fix depacketization of fragmented AAC frames
+
 ## `v0.3.7` (2022-01-28)
 
 *   [#50](https://github.com/scottlamb/retina/pull/50): fix a panic on certain
