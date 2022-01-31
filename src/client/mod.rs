@@ -1173,7 +1173,7 @@ impl Session<Described> {
                 req = req.header(
                     rtsp_types::headers::TRANSPORT,
                     format!(
-                        "RTP/AVP/UDP;client_port={}-{}",
+                        "RTP/AVP/UDP;unicast;client_port={}-{}",
                         pair.rtp_port,
                         pair.rtp_port + 1,
                     ),
