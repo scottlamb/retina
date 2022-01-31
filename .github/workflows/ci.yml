@@ -47,7 +47,7 @@ jobs:
       run: cd fuzz && cargo fmt -- --check
     - name: Clippy on main crate
       if: matrix.rust == 'stable'
-      run: cargo clippy -- --check
+      run: cargo clippy
     - name: Clippy on fuzz crate
       if: matrix.rust == 'stable'
       run: cd fuzz && cargo clippy
