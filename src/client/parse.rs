@@ -262,44 +262,57 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     let mut rtpmap = None;
     let mut fmtp = None;
     let mut control = None;
+    let mut framerate = None;
     for a in &media_description.attributes {
-        if a.attribute == "rtpmap" {
-            let v = a
-                .value
-                .as_ref()
-                .ok_or_else(|| "rtpmap attribute with no value".to_string())?;
-            // https://tools.ietf.org/html/rfc8866#section-6.6
-            // rtpmap-value = payload-type SP encoding-name
-            //   "/" clock-rate [ "/" encoding-params ]
-            // payload-type = zero-based-integer
-            // encoding-name = token
-            // clock-rate = integer
-            // encoding-params = channels
-            // channels = integer
-            let (rtpmap_payload_type, v) = v
-                .split_once(' ')
-                .ok_or_else(|| "invalid rtmap attribute".to_string())?;
-            if rtpmap_payload_type == rtp_payload_type_str {
-                rtpmap = Some(v);
+        match a.attribute.as_str() {
+            "rtpmap" => {
+                let v = a
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| "rtpmap attribute with no value".to_string())?;
+                // https://tools.ietf.org/html/rfc8866#section-6.6
+                // rtpmap-value = payload-type SP encoding-name
+                //   "/" clock-rate [ "/" encoding-params ]
+                // payload-type = zero-based-integer
+                // encoding-name = token
+                // clock-rate = integer
+                // encoding-params = channels
+                // channels = integer
+                let (rtpmap_payload_type, v) = v
+                    .split_once(' ')
+                    .ok_or_else(|| "invalid rtmap attribute".to_string())?;
+                if rtpmap_payload_type == rtp_payload_type_str {
+                    rtpmap = Some(v);
+                }
             }
-        } else if a.attribute == "fmtp" {
-            // Similarly starts with payload-type SP.
-            let v = a
-                .value
-                .as_ref()
-                .ok_or_else(|| "fmtp attribute with no value".to_string())?;
-            let (fmtp_payload_type, v) = v
-                .split_once(' ')
-                .ok_or_else(|| "invalid fmtp attribute".to_string())?;
-            if fmtp_payload_type == rtp_payload_type_str {
-                fmtp = Some(v);
+            "fmtp" => {
+                // Similarly starts with payload-type SP.
+                let v = a
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| "fmtp attribute with no value".to_string())?;
+                let (fmtp_payload_type, v) = v
+                    .split_once(' ')
+                    .ok_or_else(|| "invalid fmtp attribute".to_string())?;
+                if fmtp_payload_type == rtp_payload_type_str {
+                    fmtp = Some(v);
+                }
             }
-        } else if a.attribute == "control" {
-            control = a
-                .value
-                .as_deref()
-                .map(|c| join_control(base_url, c))
-                .transpose()?;
+            "control" => {
+                control = a
+                    .value
+                    .as_deref()
+                    .map(|c| join_control(base_url, c))
+                    .transpose()?;
+            }
+            "framerate" => {
+                if let Some(s) = a.value.as_ref() {
+                    if let Ok(f) = s.parse::<f32>() {
+                        framerate = Some(f);
+                    }
+                }
+            }
+            _ => (),
         }
     }
 
@@ -362,6 +375,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         control,
         sockets: None,
         channels,
+        framerate,
         state: super::StreamState::Uninit,
     })
 }

@@ -575,6 +575,9 @@ pub struct Stream {
     /// Number of audio channels, if applicable (`media` is `audio`) and known.
     pub channels: Option<NonZeroU16>,
 
+    /// Video framerate if present in SDP attributes
+    pub framerate: Option<f32>,
+
     depacketizer: Result<crate::codec::Depacketizer, String>,
 
     /// The specified control URL.
@@ -600,6 +603,7 @@ impl std::fmt::Debug for Stream {
             .field("rtp_payload_type", &self.rtp_payload_type)
             .field("clock_rate", &self.clock_rate)
             .field("channels", &self.channels)
+            .field("framerate", &self.framerate)
             .field("depacketizer", &self.depacketizer)
             .field("UDP", &self.sockets)
             .field("state", &self.state)
