@@ -3,6 +3,7 @@
 *   fix depacketization of fragmented AAC frames
 *   [#52](https://github.com/scottlamb/retina/issues/52): allow compatibility
     with cameras that incorrectly omit the SDP origin line.
+*   fix panic if RTSP server precedes a data message with a CRLF.
 
 ## `v0.3.7` (2022-01-28)
 

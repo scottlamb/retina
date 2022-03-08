@@ -152,6 +152,7 @@ struct Codec {
 /// An intermediate error type that exists because [`Framed`] expects the
 /// codec's error type to implement `From<std::io::Error>`, and [`Error`]
 /// takes additional context.
+#[derive(Debug)]
 enum CodecError {
     IoError(std::io::Error),
     ParseError { description: String, pos: u64 },
@@ -165,6 +166,13 @@ impl std::convert::From<std::io::Error> for CodecError {
 
 impl Codec {
     fn parse_msg(&self, src: &mut BytesMut) -> Result<Option<(usize, Message<Bytes>)>, CodecError> {
+        // Skip whitespace as `rtsp-types` does. It's important to also do it here, or we might
+        // skip the our own data message encoding (next if) then hit
+        // unreachable! after rtsp-types returns Message::Data.
+        while src.starts_with(b"\r\n") {
+            src.advance(2);
+        }
+
         if !src.is_empty() && src[0] == b'$' {
             // Fast path for interleaved data, avoiding MessageRef -> Message<&[u8]> ->
             // Message<Bytes> conversion. This speeds things up quite a bit in practice,
@@ -312,5 +320,23 @@ impl UdpPair {
             rtp_socket: UdpSocket::from_std(inner.rtp_socket)?,
             rtcp_socket: UdpSocket::from_std(inner.rtcp_socket)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::codec::Decoder;
+
+    use super::*;
+
+    #[test]
+    fn crlf_data() {
+        let mut codec = Codec {
+            ctx: ConnectionContext::dummy(),
+            read_pos: 0,
+        };
+        let mut buf = BytesMut::from(&b"\r\n$\x00\x00\x04asdfrest"[..]);
+        codec.decode(&mut buf).unwrap();
+        assert_eq!(&buf[..], b"rest");
     }
 }
