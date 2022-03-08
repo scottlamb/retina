@@ -1310,7 +1310,11 @@ mod tests {
     #[test]
     fn macrovideo() {
         // DESCRIBE.
-        let p = parse_describe("rtsp://camera", include_bytes!("testdata/macrovideo_describe.txt")).unwrap();
+        let p = parse_describe(
+            "rtsp://camera",
+            include_bytes!("testdata/macrovideo_describe.txt"),
+        )
+        .unwrap();
         assert_eq!(p.streams.len(), 1);
     }
 }
