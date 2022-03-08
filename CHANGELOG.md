@@ -1,9 +1,10 @@
-## unreleased
+## `v0.3.8` (2022-03-08)
 
 *   fix depacketization of fragmented AAC frames
 *   [#52](https://github.com/scottlamb/retina/issues/52): allow compatibility
     with cameras that incorrectly omit the SDP origin line.
 *   fix panic if RTSP server precedes a data message with a CRLF.
+*   expose SDP framerate via `retina::client::Stream::framerate`.
 
 ## `v0.3.7` (2022-01-28)
 
