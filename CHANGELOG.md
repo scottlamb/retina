@@ -1,6 +1,8 @@
 ## unreleased
 
 *   fix depacketization of fragmented AAC frames
+*   [#52](https://github.com/scottlamb/retina/issues/52): allow compatibility
+    with cameras that incorrectly omit the SDP origin line.
 
 ## `v0.3.7` (2022-01-28)
 
