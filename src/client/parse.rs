@@ -425,7 +425,7 @@ pub(crate) fn parse_describe(
                 .transpose()?;
             break;
         } else if a.attribute == "tool" {
-            tool = a.value.as_deref().map(Into::into);
+            tool = a.value.as_deref().map(super::Tool::new);
         }
     }
     let control = control.unwrap_or(request_url);
@@ -566,8 +566,7 @@ pub(crate) fn parse_play(
             .strip_prefix("url=")
             .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
         let url = join_control(&presentation.base_url, url)?;
-        let stream;
-        if presentation.streams.len() == 1 {
+        let stream = if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
             // single-stream presentations. Additionally, some buggy
             // cameras (eg the GW Security GW4089IP) use an incorrect URL.
@@ -576,13 +575,13 @@ pub(crate) fn parse_play(
             // servers to be forgiving of clients with single-stream
             // containers.
             // https://datatracker.ietf.org/doc/html/rfc2326#section-14.3
-            stream = Some(&mut presentation.streams[0]);
+            Some(&mut presentation.streams[0])
         } else {
-            stream = presentation
+            presentation
                 .streams
                 .iter_mut()
-                .find(|s| matches!(&s.control, Some(u) if u == &url));
-        }
+                .find(|s| matches!(&s.control, Some(u) if u == &url))
+        };
         let stream = match stream {
             Some(s) => s,
             None => {

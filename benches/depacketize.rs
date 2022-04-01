@@ -49,6 +49,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         };
         let pkt = match rtps[stream_id].rtp(
             &retina::client::SessionOptions::default(),
+            None,
             &conn_ctx,
             &pkt_ctx,
             &mut timelines[stream_id],

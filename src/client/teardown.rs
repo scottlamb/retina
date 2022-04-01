@@ -5,7 +5,7 @@ use bytes::Bytes;
 use rtsp_types::{Method, Request};
 use url::Url;
 
-use super::{ResponseMode, RtspConnection, SessionOptions};
+use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
 use crate::{error::ErrorInt, Error};
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -18,6 +18,7 @@ const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub(super) async fn background_teardown(
     seqnum: Option<u64>,
     base_url: Url,
+    tool: Option<Tool>,
     session_id: Box<str>,
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
@@ -34,6 +35,7 @@ pub(super) async fn background_teardown(
         expires,
         teardown_loop_forever(
             base_url,
+            tool,
             &*session_id,
             &options,
             requested_auth,
@@ -48,8 +50,19 @@ pub(super) async fn background_teardown(
     }
     if let Some(ref session_group) = options.session_group {
         let seqnum = seqnum.expect("seqnum specified when session_group exists");
+        log::trace!(
+            "Clearing session {:?}/{} for id {:?}",
+            session_group.debug_id(),
+            seqnum,
+            &*session_id
+        );
         if !session_group.try_remove_seqnum(seqnum) {
-            log::warn!("Unable to find session {:?} on TEARDOWN", &*session_id);
+            log::warn!(
+                "Unable to find session {:?}/{} for id {:?} on TEARDOWN",
+                session_group.debug_id(),
+                seqnum,
+                &*session_id
+            );
         }
     }
 
@@ -59,6 +72,7 @@ pub(super) async fn background_teardown(
 /// Attempts `TEARDOWN` in a loop until success; caller should bound by session expiry.
 pub(super) async fn teardown_loop_forever(
     url: Url,
+    tool: Option<Tool>,
     session_id: &str,
     options: &SessionOptions,
     mut requested_auth: Option<http_auth::PasswordClient>,
@@ -79,7 +93,7 @@ pub(super) async fn teardown_loop_forever(
         // they don't have a chance to mess up any other sockets.
         tokio::select! {
             biased;
-            r = attempt(&mut req, options, &mut requested_auth, conn) => {
+            r = attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn) => {
                 match r {
                     Ok(status) => {
                         log::debug!("TEARDOWN {} on existing conn succeeded (status {}).", session_id, u16::from(status));
@@ -120,7 +134,7 @@ pub(super) async fn teardown_loop_forever(
             .reset(tokio::time::Instant::now() + timeout);
         let attempt = async {
             let conn = RtspConnection::connect(&url).await?;
-            attempt(&mut req, options, &mut requested_auth, conn).await
+            attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn).await
         };
         tokio::select! {
             biased;
@@ -152,12 +166,13 @@ pub(super) async fn teardown_loop_forever(
 /// Makes a single attempt on the supplied connection; caller is responsible for the timeout.
 async fn attempt(
     req: &mut Request<Bytes>,
+    tool: Option<&Tool>,
     options: &SessionOptions,
     requested_auth: &mut Option<http_auth::PasswordClient>,
     mut conn: RtspConnection,
 ) -> Result<rtsp_types::StatusCode, Error> {
     let e = match conn
-        .send(ResponseMode::Teardown, options, requested_auth, req)
+        .send(ResponseMode::Teardown, options, tool, requested_auth, req)
         .await
     {
         Ok((_ctx, _cseq, resp)) => return Ok(resp.status()),

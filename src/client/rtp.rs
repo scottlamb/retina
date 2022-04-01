@@ -92,6 +92,7 @@ impl InorderParser {
     pub fn rtp(
         &mut self,
         session_options: &SessionOptions,
+        tool: Option<&super::Tool>,
         conn_ctx: &ConnectionContext,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
@@ -127,12 +128,9 @@ impl InorderParser {
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
-        let is_tcp = matches!(session_options.transport, super::Transport::Tcp);
         if matches!(self.ssrc, Some(s) if s != ssrc) {
-            if let (Some(session_group), true) = (session_options.session_group.as_ref(), is_tcp) {
-                session_group
-                    .clone()
-                    .note_stale_live555_data(runtime_handle.cloned());
+            if matches!(session_options.transport, super::Transport::Tcp) {
+                super::note_stale_live555_data(runtime_handle.cloned(), tool, session_options);
             }
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -207,9 +205,11 @@ impl InorderParser {
         })))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rtcp(
         &mut self,
         session_options: &SessionOptions,
+        tool: Option<&super::Tool>,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
         runtime_handle: Option<&tokio::runtime::Handle>,
@@ -237,14 +237,12 @@ impl InorderParser {
 
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
-                        use super::Transport;
-                        if let (Some(session_group), Transport::Tcp) = (
-                            session_options.session_group.as_ref(),
-                            session_options.transport,
-                        ) {
-                            session_group
-                                .clone()
-                                .note_stale_live555_data(runtime_handle.cloned());
+                        if matches!(session_options.transport, super::Transport::Tcp) {
+                            super::note_stale_live555_data(
+                                runtime_handle.cloned(),
+                                tool,
+                                session_options,
+                            );
                         }
                         return Err(format!(
                             "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
@@ -284,6 +282,7 @@ mod tests {
         // Normal packet.
         match parser.rtp(
             &SessionOptions::default(),
+            None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
@@ -307,6 +306,7 @@ mod tests {
         // Mystery pt=50 packet with same sequence number.
         match parser.rtp(
             &SessionOptions::default(),
+            None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
@@ -336,6 +336,7 @@ mod tests {
         let session_options = SessionOptions::default().transport(crate::client::Transport::Udp);
         match parser.rtp(
             &session_options,
+            None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
@@ -360,6 +361,7 @@ mod tests {
 
         match parser.rtp(
             &session_options,
+            None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
@@ -382,6 +384,7 @@ mod tests {
 
         match parser.rtp(
             &session_options,
+            None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,

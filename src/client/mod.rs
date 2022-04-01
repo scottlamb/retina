@@ -37,7 +37,14 @@ mod timeline;
 /// Duration between keepalive RTSP requests during [Playing] state.
 pub const KEEPALIVE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A stale RTP session.
+/// Assumed expiration time for stale live555 TCP sessions (case #2 of "Stale
+/// sessions" in [`SessionGroup`]).
+///
+/// This constant is taken from
+/// [here](https://github.com/rgaufman/live555/blob/41a5ec5f65bd626918a43951f743b4c9ffc52289/liveMedia/include/RTSPServer.hh#L35).
+const LIVE555_EXPIRATION_SEC: u64 = 65;
+
+/// A stale RTP session. See explanation at [`SessionGroup`].
 struct StaleSession {
     seqnum: u64,
 
@@ -59,6 +66,8 @@ struct StaleSession {
 ///
 /// This is an experimental API which may change in an upcoming Retina version.
 ///
+/// ## Stale sessions
+///
 /// Stale sessions are ones which are no longer active on the client side
 /// (no [`Session`] struct exists) but may still be in state `Ready`, `Playing`,
 /// or `Recording` on the server. The client has neither seen a `TEARDOWN`
@@ -67,31 +76,42 @@ struct StaleSession {
 ///
 /// 1.  Dropped [`Session`]s if the [`TeardownPolicy`] says to do so
 ///     and a valid `SETUP` response has been received.
+///
+///     A tokio background task is responsible for attempting a `TEARDOWN` and
+///     cleaning the session after success or expiration.
+///     [`SessionGroup::await_teardown`] can be used to wait out this process.
+///
+///     In general, the tracked expiration time is worst-case. The exception is
+///     if the sender hasn't responded to a keepalive request. In that case
+///     there's theoretically no bound on when the server could see the request
+///     and extend the session. Retina ignores this possibility.
+///
 /// 2.  TCP sessions discovered via unexpected RTSP interleaved data
 ///     packets. These are assumed to be due to a live555 bug in which
 ///     data continues to be sent on a stale file descriptor after a
-///     connection is closed. They may have been started by a process
-///     unknown to us and their session id is unknown.
+///     connection is closed. The sessions' packets may be sent to unrelated
+///     (even unauthenticated and/or non-RTSP!) connections after the file
+///     descriptor is reused.  These sessions may have been started by a process
+///     unknown to us and their session id is unknown, so in general it is not
+///     possible to send a `TEARDOWN`.
 ///
-/// Currently a single `TEARDOWN` will be attempted in the background after
-/// a `Session` is dropped. [`SessionGroup::await_teardown`] can be used to wait
-/// for it to conclude.
+///     These sessions are assumed to expire 65 seconds after discovery, a
+///     constant taken from old live555 code.
 ///
-/// Stale sessions are forgotten either on teardown or expiration. In general,
-/// the tracked expiration time is worst-case. The exception is if the sender
-/// hasn't responded to a keepalive request. In that case there's theoretically
-/// no bound on when the server could see the request and extend the session.
-/// Retina ignores this possibility.
+/// ## Granularity
 ///
 /// A `SessionGroup` can be of any granularity, but a typical use is to ensure
-/// there are no stale sessions before starting a fresh session. Groups should
-/// be sized to match that idea. If connecting to a live555 server affected by
-/// the stale TCP session bug, it might be wise to have one group per server, so
-/// that all such sessions can be drained before initiating new connections.
-/// Otherwise it might be useful to have one group per describe URL (potentially
-/// several per server) and have at most one active session per URL.
+/// there are no stale sessions before starting a fresh session (see
+/// [`SessionGroup::stale_sessions`] and [`SessionGroup::await_stale_session`]).
+/// Groups should be sized to match that idea. If connecting to a live555 server
+/// affected by the stale TCP session bug, it might be wise to have one group
+/// per server, so that all such sessions can be drained before initiating new
+/// connections. Otherwise it might be useful to have one group per describe
+/// URL (potentially several per server) and have at most one active session per
+/// URL.
 #[derive(Default)]
 pub struct SessionGroup {
+    name: Option<String>,
     sessions: Mutex<SessionGroupInner>,
     notify: Notify,
 }
@@ -99,6 +119,8 @@ pub struct SessionGroup {
 #[derive(Default)]
 struct SessionGroupInner {
     next_seqnum: u64,
+
+    /// Stale sessions, unordered.
     sessions: Vec<StaleSession>,
 }
 
@@ -116,6 +138,29 @@ pub struct StaleSessionStatus {
 }
 
 impl SessionGroup {
+    /// Returns this group with an assigned name.
+    ///
+    /// Typically called before placing into an `Arc`, e.g.
+    /// `Arc::new(SessionGroup::default().named("foo"))`.
+    pub fn named(self, name: String) -> Self {
+        SessionGroup {
+            name: Some(name),
+            ..self
+        }
+    }
+
+    /// Returns the name of this session group, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// An identifier for this session group, for use in log messages.
+    ///
+    /// Currently uses the name if set, a pointer address otherwise.
+    fn debug_id(&self) -> impl Debug {
+        self.name.clone().unwrap_or_else(|| format!("{:p}", &self))
+    }
+
     /// Returns the status of stale sessions in this group.
     ///
     /// Currently this only returns information about sessions which may be in
@@ -145,10 +190,10 @@ impl SessionGroup {
     /// background. This method waits for an attempt on an existing connection
     /// (if any) and the first attempt on a fresh connection.
     ///
-    /// Ignores the discovered sessions, as it's impossible to send a `TEARDOWN`
-    /// without knowing the session id. If desired, the caller can learn of the
-    /// existence of the sessions through [`SessionGroup::stale_sessions`] and
-    /// sleep until they expire.
+    /// Ignores the discovered live555 bug sessions, as it's impossible to send
+    /// a `TEARDOWN` without knowing the session id. If desired, the caller can
+    /// learn of the existence of the sessions through
+    /// [`SessionGroup::stale_sessions`] and sleep until they expire.
     pub async fn await_teardown(&self) -> Result<(), Error> {
         let mut watches: Vec<_>;
         {
@@ -185,11 +230,18 @@ impl SessionGroup {
             let notified = self.notify.notified();
             {
                 let l = self.sessions.lock().unwrap();
-                let all_gone = l
+                let left = l
                     .sessions
                     .iter()
-                    .all(|s| !s.maybe_playing || s.seqnum >= status.next_seqnum);
-                if all_gone {
+                    .filter(|s| s.maybe_playing && s.seqnum < status.next_seqnum)
+                    .count();
+                log::trace!(
+                    "Session group {:?} has {} relevant sessions numbered < {}",
+                    self.debug_id(),
+                    left,
+                    status.next_seqnum
+                );
+                if left == 0 {
                     return;
                 }
             }
@@ -197,7 +249,7 @@ impl SessionGroup {
         }
     }
 
-    /// Removes the session with `seqnum`, removing true iff it existed.
+    /// Removes the session with `seqnum` removing true iff it existed. Notifies waiters.
     fn try_remove_seqnum(&self, seqnum: u64) -> bool {
         let mut l = self.sessions.lock().unwrap();
         let i = l.sessions.iter().position(|s| s.seqnum == seqnum);
@@ -210,74 +262,6 @@ impl SessionGroup {
             }
             None => false,
         }
-    }
-
-    /// Notes an unexpected RTSP interleaved data message.
-    ///
-    /// This is assumed to be due to a live555 RTP/AVP/TCP session that belonged
-    /// to a since-closed RTSP connection. If there's no known session which
-    /// explains this, adds an unknown session with live555's default timeout,
-    /// 65 seconds.
-    fn note_stale_live555_data(self: Arc<Self>, handle: Option<tokio::runtime::Handle>) {
-        let seqnum;
-        let expires = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
-        {
-            let mut lock = self.sessions.lock().unwrap();
-            for s in &lock.sessions {
-                if s.is_tcp {
-                    // This session plausibly explains the packet.
-                    // (We could go so far as to examine the data packet's SSRC to
-                    // see if it matches one associated with this session. But
-                    // retrying once per expiration is probably good enough.)
-                    log::debug!(
-                        "Unexpected RTSP interleaved packet (live555 stale file descriptor \
-                                 bug) plausibly explained by known stale session. Not adding a \
-                                 session entry."
-                    );
-                    return;
-                }
-            }
-            seqnum = lock.next_seqnum;
-            lock.next_seqnum += 1;
-            log::debug!(
-                "Unexpected RTSP interleaved packet, presumed due to live555 stale file \
-                         descriptor bug; tracking expiration in 65 seconds."
-            );
-            lock.sessions.push(StaleSession {
-                seqnum,
-
-                // The caller *might* have a better guess than 65 seconds via a
-                // SETUP response, but it's also possible for
-                // note_stale_live555_data to be called prior to SETUP.
-                expires,
-                teardown_rx: None,
-                is_tcp: true,
-                maybe_playing: true,
-            });
-        }
-
-        // Spawn a task which removes the stale session at its expiration.
-        // We could instead prune expired entries on stale_session() calls and
-        // set a deadline within await_stale_sessions() calls, which might be
-        // a bit more efficient. But this is simpler given that we already are
-        // spawning tasks for stale sessions created from Session's Drop impl.
-        let handle = match handle {
-            Some(h) => h,
-            None => {
-                log::warn!(
-                    "Unable to launch task to clean up stale live555 file descriptor session"
-                );
-                return;
-            }
-        };
-        handle.spawn(async move {
-            tokio::time::sleep_until(expires).await;
-            if !self.try_remove_seqnum(seqnum) {
-                log::warn!("Unable to find stale live555 file descriptor session at expiration");
-            } else {
-                log::debug!("Stale live555 file descriptor bug session presumed expired.");
-            }
-        });
     }
 }
 
@@ -485,7 +469,7 @@ impl SessionOptions {
 /// Options which must be decided at `PLAY` time.
 ///
 /// These are mostly adjustments for non-compliant server implementations.
-/// See also [SessionOptions] for options which must be decided earlier.
+/// See also [`SessionOptions`] for options which must be decided earlier.
 #[derive(Default)]
 pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
@@ -537,9 +521,40 @@ pub struct Presentation {
     base_url: Url,
     pub control: Url,
     pub accept_dynamic_rate: bool,
+    tool: Option<Tool>,
+}
 
-    /// Session-level `a:tool` from SDP.
-    tool: Option<Box<str>>,
+/// The server's version as declared in the `DESCRIBE` response's `a:tool` SDP attribute.
+pub struct Tool(Box<str>);
+
+impl Tool {
+    pub fn new(raw: &str) -> Self {
+        Self(raw.into())
+    }
+
+    /// Returns if the given tool is known to be a live555 version that causes
+    /// the stale TCP sessions described at [`SessionGroup`].
+    pub fn has_live555_tcp_bug(&self) -> bool {
+        if let Some(version) = self.0.strip_prefix("LIVE555 Streaming Media v") {
+            version > "0000.00.00" && version < "2017.06.04"
+        } else {
+            false
+        }
+    }
+}
+
+impl std::fmt::Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::ops::Deref for Tool {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
 }
 
 /// Information about a stream offered within a presentation.
@@ -818,7 +833,6 @@ struct SessionInner {
     /// Set if the server may be in state Playing: we have sent a `PLAY`
     /// request, regardless of if the response has been received.
     maybe_playing: bool,
-    has_live555_tcp_bug: bool,
 
     /// The index within `presentation.streams` to start the next poll at.
     /// Round-robining between them rather than always starting at 0 should
@@ -864,6 +878,7 @@ impl RtspConnection {
         &mut self,
         mode: ResponseMode,
         options: &SessionOptions,
+        tool: Option<&Tool>,
         requested_auth: &mut Option<http_auth::PasswordClient>,
         req: &mut rtsp_types::Request<Bytes>,
     ) -> Result<(RtspMessageContext, u32, rtsp_types::Response<Bytes>), Error> {
@@ -919,11 +934,11 @@ impl RtspConnection {
                             continue;
                         }
 
-                        if let Some(session_group) = options.session_group.as_ref() {
-                            session_group.clone().note_stale_live555_data(
-                                tokio::runtime::Handle::try_current().ok(),
-                            );
-                        }
+                        note_stale_live555_data(
+                            tokio::runtime::Handle::try_current().ok(),
+                            tool,
+                            options,
+                        );
 
                         format!(
                             "{}-byte interleaved data message on channel {}",
@@ -1042,6 +1057,12 @@ impl<S: State> Session<S> {
     pub fn streams(&self) -> &[Stream] {
         &self.0.presentation.streams
     }
+
+    /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
+    /// attribute.
+    pub fn tool(&self) -> Option<&Tool> {
+        self.0.presentation.tool.as_ref()
+    }
 }
 
 impl Session<Described> {
@@ -1073,6 +1094,7 @@ impl Session<Described> {
             .send(
                 ResponseMode::Normal,
                 &options,
+                None, // tool isn't known until after the DESCRIBE response is parsed below.
                 &mut requested_auth,
                 &mut req,
             )
@@ -1087,11 +1109,6 @@ impl Session<Described> {
                 description,
             })
         })?;
-        let has_live555_tcp_bug = presentation
-            .tool
-            .as_deref()
-            .map(has_live555_tcp_bug)
-            .unwrap_or(false);
         Ok(Session(
             Box::pin(SessionInner {
                 conn: Some(conn),
@@ -1106,7 +1123,6 @@ impl Session<Described> {
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
                 maybe_playing: false,
-                has_live555_tcp_bug,
                 udp_next_poll_i: 0,
             }),
             Described(()),
@@ -1190,6 +1206,7 @@ impl Session<Described> {
             .send(
                 ResponseMode::Normal,
                 inner.options,
+                presentation.tool.as_ref(),
                 inner.requested_auth,
                 &mut req.build(Bytes::new()),
             )
@@ -1314,13 +1331,13 @@ impl Session<Described> {
                 "must SETUP before PLAY".into()
             ))
         })?;
-        if let Some(tool) = inner.presentation.tool.as_deref() {
-            if matches!(inner.options.transport, Transport::Tcp) && *inner.has_live555_tcp_bug {
+        if let Some(ref t) = inner.presentation.tool {
+            if matches!(inner.options.transport, Transport::Tcp) {
                 warn!(
                     "Connecting via TCP to known-broken RTSP server {:?}. \
-                       See <https://github.com/scottlamb/retina/issues/17>. \
-                       Consider using UDP instead!",
-                    tool
+                        See <https://github.com/scottlamb/retina/issues/17>. \
+                        Consider using UDP instead!",
+                    &*t
                 );
             }
         }
@@ -1331,6 +1348,7 @@ impl Session<Described> {
             .send(
                 ResponseMode::Play,
                 inner.options,
+                inner.presentation.tool.as_ref(),
                 inner.requested_auth,
                 &mut rtsp_types::Request::builder(Method::Play, rtsp_types::Version::V1_0)
                     .request_uri(inner.presentation.control.clone())
@@ -1439,15 +1457,106 @@ impl Session<Described> {
     }
 }
 
-/// Checks if the `tool` entry refers to a live555 version affected by
-/// [#17](https://github.com/scottlamb/retina/issues/17).
-fn has_live555_tcp_bug(tool: &str) -> bool {
-    const PREFIX: &str = "LIVE555 Streaming Media v";
-    if !tool.starts_with(PREFIX) {
-        return false;
+/// Notes an unexpected RTSP interleaved data message.
+///
+/// This is assumed to be due to a live555 RTP/AVP/TCP session that belonged
+/// to a since-closed RTSP connection, as described in case 2 of "Stale sessions"
+/// at [`SessionGroup`]. If there's no known session which explains this,
+/// adds an unknown session with live555's default timeout.
+fn note_stale_live555_data(
+    handle: Option<tokio::runtime::Handle>,
+    tool: Option<&Tool>,
+    options: &SessionOptions,
+) {
+    let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
+    if !known_to_have_live555_tcp_bug {
+        log::warn!(
+            "Saw unexpected RTSP packet. This is presumed to be due to a bug in old live555 \
+                    servers' TCP handling, though tool attribute {:?} does not refer to a \
+                    known-buggy version. Consider switching to UDP.",
+            tool
+        );
     }
-    let version = &tool[PREFIX.len()..];
-    version > "0000.00.00" && version < "2017.06.04"
+
+    let group = match options.session_group.as_ref() {
+        Some(g) => g,
+        None => {
+            log::debug!("Not tracking stale session because there's no session group.");
+            return;
+        }
+    };
+
+    // The caller *might* have a better guess than LIVE555_EXPIRATION_SEC via a SETUP response,
+    // but it's also possible for note_stale_live555_data to be called prior to SETUP.
+    let expires =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC);
+    let seqnum;
+    {
+        let mut lock = group.sessions.lock().unwrap();
+        for s in &lock.sessions {
+            if s.is_tcp {
+                // This session plausibly explains the packet.
+                // (We could go so far as to examine the data packet's SSRC to
+                // see if it matches one associated with this session. But
+                // retrying once per expiration is probably good enough.)
+                log::debug!(
+                    "Unexpected RTSP interleaved packet (live555 stale file \
+                     descriptor bug) plausibly explained by known stale \
+                     session {:?}/{}. Not adding a session entry.",
+                    group.debug_id(),
+                    s.seqnum,
+                );
+                return;
+            }
+        }
+        seqnum = lock.next_seqnum;
+        lock.next_seqnum += 1;
+        log::debug!(
+            "Unexpected RTSP interleaved packet, presumed due to live555 stale \
+             file descriptor bug; adding stale session {:?}/{} that will \
+             expire in {} seconds.",
+            group.debug_id(),
+            seqnum,
+            LIVE555_EXPIRATION_SEC,
+        );
+        lock.sessions.push(StaleSession {
+            seqnum,
+            expires,
+            teardown_rx: None,
+            is_tcp: true,
+            maybe_playing: true,
+        });
+    }
+
+    // Spawn a task which removes the stale session at its expiration.
+    // We could instead prune expired entries on stale_session() calls and
+    // set a deadline within await_stale_sessions() calls, which might be
+    // a bit more efficient. But this is simpler given that we already are
+    // spawning tasks for stale sessions created from Session's Drop impl.
+    let handle = match handle {
+        Some(h) => h,
+        None => {
+            log::warn!("Unable to launch task to clean up stale live555 file descriptor session");
+            return;
+        }
+    };
+    let group = group.clone();
+    handle.spawn(async move {
+        tokio::time::sleep_until(expires).await;
+        if !group.try_remove_seqnum(seqnum) {
+            log::warn!(
+                "Unable to find stale live555 file descriptor session {:?}/{} at expiration",
+                group.debug_id(),
+                seqnum
+            );
+        } else {
+            log::debug!(
+                "Stale live555 file descriptor bug session {:?}/{} presumed expired.",
+                group.debug_id(),
+                seqnum
+            );
+        }
+    });
 }
 
 /// Sends dummy RTP and RTCP packets to punch a hole in connection-tracking
@@ -1539,6 +1648,7 @@ impl Session<Playing> {
             .send(
                 ResponseMode::Teardown,
                 inner.options,
+                inner.presentation.tool.as_ref(),
                 inner.requested_auth,
                 &mut req,
             )
@@ -1682,6 +1792,7 @@ impl Session<Playing> {
         match m.channel_type {
             ChannelType::Rtp => Ok(rtp_handler.rtp(
                 inner.options,
+                inner.presentation.tool.as_ref(),
                 conn.inner.ctx(),
                 &pkt_ctx,
                 timeline,
@@ -1692,6 +1803,7 @@ impl Session<Playing> {
             ChannelType::Rtcp => {
                 match rtp_handler.rtcp(
                     inner.options,
+                    inner.presentation.tool.as_ref(),
                     &pkt_ctx,
                     timeline,
                     inner.runtime_handle.as_ref(),
@@ -1750,6 +1862,7 @@ impl Session<Playing> {
                         let msg = Bytes::copy_from_slice(buf.filled());
                         match rtp_handler.rtcp(
                             inner.options,
+                            inner.presentation.tool.as_ref(),
                             &pkt_ctx,
                             timeline,
                             inner.runtime_handle.as_ref(),
@@ -1788,6 +1901,7 @@ impl Session<Playing> {
                         let msg = Bytes::copy_from_slice(buf.filled());
                         match rtp_handler.rtp(
                             inner.options,
+                            inner.presentation.tool.as_ref(),
                             conn_ctx,
                             &pkt_ctx,
                             timeline,
@@ -1855,7 +1969,17 @@ impl PinnedDrop for SessionInner {
 
         let is_tcp = matches!(this.options.transport, Transport::Tcp);
         match this.options.teardown {
-            TeardownPolicy::Auto if is_tcp && !*this.has_live555_tcp_bug => return,
+            TeardownPolicy::Auto if is_tcp => {
+                if !this
+                    .presentation
+                    .tool
+                    .as_ref()
+                    .map(Tool::has_live555_tcp_bug)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+            }
             TeardownPolicy::Auto | TeardownPolicy::Always => {}
             TeardownPolicy::Never => return,
         }
@@ -1882,6 +2006,12 @@ impl PinnedDrop for SessionInner {
                 is_tcp,
                 maybe_playing: *this.maybe_playing,
             });
+            log::debug!(
+                "{:?}/{} tracking TEARDOWN of session id {}",
+                session_group.debug_id(),
+                seqnum,
+                &session.id
+            );
             Some(seqnum)
         } else {
             None
@@ -1902,6 +2032,7 @@ impl PinnedDrop for SessionInner {
         handle.spawn(teardown::background_teardown(
             seqnum,
             this.presentation.base_url.clone(),
+            this.presentation.tool.take(),
             session.id,
             std::mem::take(this.options),
             this.requested_auth.take(),
@@ -1996,6 +2127,12 @@ impl Demuxed {
     pub async fn teardown(self) -> Result<(), Error> {
         #[allow(deprecated)]
         self.session.teardown().await
+    }
+
+    /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
+    /// attribute.
+    pub fn tool(&self) -> Option<&Tool> {
+        self.session.tool()
     }
 }
 
@@ -2333,7 +2470,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stale_file_descriptor_session() {
         init_logging();
-        log::debug!("debug logging works");
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
         let group = Arc::new(SessionGroup::default());
@@ -2367,9 +2503,8 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - start;
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        // 65 seconds is the hardcoded time for a live555 stale TCP session.
         assert!(
-            elapsed >= std::time::Duration::from_secs(65),
+            elapsed >= std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC),
             "elapsed={:?}",
             elapsed
         );
@@ -2460,11 +2595,11 @@ mod tests {
     #[test]
     fn check_live555_tcp_bug() {
         init_logging();
-        assert!(!has_live555_tcp_bug("not live555"));
-        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v"));
-        assert!(has_live555_tcp_bug("LIVE555 Streaming Media v2013.04.08"));
-        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2017.06.04"));
-        assert!(!has_live555_tcp_bug("LIVE555 Streaming Media v2020.01.01"));
+        assert!(!Tool::new("not live555").has_live555_tcp_bug());
+        assert!(!Tool::new("LIVE555 Streaming Media v").has_live555_tcp_bug());
+        assert!(Tool::new("LIVE555 Streaming Media v2013.04.08").has_live555_tcp_bug());
+        assert!(!Tool::new("LIVE555 Streaming Media v2017.06.04").has_live555_tcp_bug());
+        assert!(!Tool::new("LIVE555 Streaming Media v2020.01.01").has_live555_tcp_bug());
     }
 
     #[test]
