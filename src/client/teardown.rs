@@ -20,6 +20,7 @@ pub(super) async fn background_teardown(
     base_url: Url,
     tool: Option<Tool>,
     session_id: Box<str>,
+    just_try_once: bool,
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
     conn: Option<RtspConnection>,
@@ -29,7 +30,7 @@ pub(super) async fn background_teardown(
     log::debug!(
         "TEARDOWN {} starting for URL {}",
         &*session_id,
-        base_url.as_str()
+        base_url.as_str(),
     );
     if tokio::time::timeout_at(
         expires,
@@ -37,6 +38,7 @@ pub(super) async fn background_teardown(
             base_url,
             tool,
             &*session_id,
+            just_try_once,
             &options,
             requested_auth,
             conn,
@@ -74,6 +76,7 @@ pub(super) async fn teardown_loop_forever(
     url: Url,
     tool: Option<Tool>,
     session_id: &str,
+    just_try_once: bool,
     options: &SessionOptions,
     mut requested_auth: Option<http_auth::PasswordClient>,
     mut conn: Option<RtspConnection>,
@@ -124,6 +127,17 @@ pub(super) async fn teardown_loop_forever(
             _ = &mut attempt_deadline => log::debug!("TEARDOWN {} on existing conn timed out", session_id),
         }
     };
+
+    if just_try_once {
+        // TCP, auto teardown, server not known to be affected by the live555
+        // TCP session bug, tried one TEARDOWN on the existingconn if any (just in case the server
+        // really does have that bug), closed the connection. Good enough.
+        log::debug!(
+            "Giving up on TEARDOWN {}; use TearDownPolicy::Always to try harder",
+            session_id
+        );
+        return;
+    }
 
     // Now retry with a fresh connection each time, giving longer times to
     // subsequent attempts.

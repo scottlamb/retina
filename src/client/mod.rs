@@ -181,14 +181,17 @@ impl SessionGroup {
     }
 
     /// Waits for a reasonable attempt at `TEARDOWN` on all stale sessions that
-    /// exist as of when this method is called, returning an error if any fail.
+    /// exist as of when this method is called, returning an error if any
+    /// session's reasonable attempts fail.
     ///
     /// This has no timeout other than the sessions' expiration times. The
     /// caller can wrap the call in `tokio::time::timeout` for an earlier time.
     ///
     /// Currently on `Session::drop`, a `TEARDOWN` loop is started in the
     /// background. This method waits for an attempt on an existing connection
-    /// (if any) and the first attempt on a fresh connection.
+    /// (if any) and in some cases the first attempt on a fresh connection.
+    /// Retina may continue sending more attempts even after this method
+    /// returns.
     ///
     /// Ignores the discovered live555 bug sessions, as it's impossible to send
     /// a `TEARDOWN` without knowing the session id. If desired, the caller can
@@ -270,13 +273,28 @@ impl SessionGroup {
 /// Specify via [`SessionOptions::teardown`].
 #[derive(Copy, Clone, Debug)]
 pub enum TeardownPolicy {
-    /// Automatic: send when using UDP transport or if the server appears to be
-    /// using a [buggy live555
-    /// version](https://github.com/scottlamb/retina/issues/17) in which data
-    /// continues to be sent on a stale file descriptor after a connection is
-    /// closed.
+    /// Automatic.
+    ///
+    /// The current policy is as follows:
+    ///
+    /// *   Like `Always` if `Transport::Udp` is selected or if the server
+    ///     appears to be using a using a [buggy live555
+    ///     version](https://github.com/scottlamb/retina/issues/17) in which data
+    ///     continues to be sent on a stale file descriptor after a connection is
+    ///     closed.
+    /// *   Otherwise (TCP, server not known to be buggy), tries a single `TEARDOWN`
+    ///     on the existing connection. This is just in case; some servers appear
+    ///     to be buggy but don't advertise buggy versions. After the single attempt,
+    ///     closes the TCP connection and considers the session done.
     Auto,
+
+    /// Always send `TEARDOWN` requests, regardless of transport.
+    ///
+    /// This tries repeatedly to tear down the session until success or expiration;
+    /// [`SessionGroup`] will track it also.
     Always,
+
+    /// Never send `TEARDOWN` or track stale sessions.
     Never,
 }
 
@@ -1968,21 +1986,22 @@ impl PinnedDrop for SessionInner {
         let this = self.project();
 
         let is_tcp = matches!(this.options.transport, Transport::Tcp);
-        match this.options.teardown {
+        let just_try_once = match this.options.teardown {
             TeardownPolicy::Auto if is_tcp => {
-                if !this
+                // If the server is known to have the live555 bug, try really hard to send a
+                // TEARDOWN before considering the session cleaned up. Otherwise, try once on
+                // the existing connection, primarily in case the server has
+                // this bug but doesn't advertise a buggy version.
+                !this
                     .presentation
                     .tool
                     .as_ref()
                     .map(Tool::has_live555_tcp_bug)
                     .unwrap_or(false)
-                {
-                    return;
-                }
             }
-            TeardownPolicy::Auto | TeardownPolicy::Always => {}
+            TeardownPolicy::Auto | TeardownPolicy::Always => false,
             TeardownPolicy::Never => return,
-        }
+        };
 
         let session = match this.session.take() {
             Some(s) => s,
@@ -2034,6 +2053,7 @@ impl PinnedDrop for SessionInner {
             this.presentation.base_url.clone(),
             this.presentation.tool.take(),
             session.id,
+            just_try_once,
             std::mem::take(this.options),
             this.requested_auth.take(),
             this.conn.take(),
