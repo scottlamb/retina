@@ -80,7 +80,7 @@ Where CMD:
 
 * **info** - Gets info about available streams and exits.
 * **mp4** - Writes RTSP streams to mp4 file; exit with Ctrl+C.
-* **metadata** - Gets realtime onvif metadata if available; exit with Ctrl+C.
+* **onvif** - Gets realtime onvif metadata if available; exit with Ctrl+C.
 
 ## Acknowledgements
 
