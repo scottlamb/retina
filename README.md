@@ -78,9 +78,9 @@ $ cargo run --example client <CMD>
 
 Where CMD:
 
-* **info** - Get info about available streams and exit
-* **mp4** - Write RTSP streams to mp4 file, exit with Ctrl+C
-* **metadata** - Get realtime onvif metadata if available, exit with Ctrl+C
+* **info** - Gets info about available streams and exits.
+* **mp4** - Writes RTSP streams to mp4 file; exit with Ctrl+C.
+* **metadata** - Gets realtime onvif metadata if available; exit with Ctrl+C.
 
 ## Acknowledgements
 

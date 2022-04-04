@@ -758,7 +758,9 @@ pub trait State {}
 
 /// Initial state after a `DESCRIBE`; use via `Session<Described>`.
 #[doc(hidden)]
-pub struct Described(());
+pub struct Described {
+    sdp: Bytes,
+}
 impl State for Described {}
 
 enum KeepaliveState {
@@ -1127,6 +1129,8 @@ impl Session<Described> {
                 description,
             })
         })?;
+        let describe_status = response.status();
+        let sdp = response.into_body();
         Ok(Session(
             Box::pin(SessionInner {
                 conn: Some(conn),
@@ -1137,14 +1141,23 @@ impl Session<Described> {
                 session: None,
                 describe_ctx: msg_ctx,
                 describe_cseq: cseq,
-                describe_status: response.status(),
+                describe_status,
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
                 maybe_playing: false,
                 udp_next_poll_i: 0,
             }),
-            Described(()),
+            Described { sdp },
         ))
+    }
+
+    /// Returns the raw SDP (Session Description Protocol) session description of this URL.
+    ///
+    /// Retina interprets the SDP automatically, but the raw bytes may be useful for debugging.
+    /// They're accessibled in the `Session<Described>` state. Currently, they're discarded on
+    /// `play` to reduce memory usage.
+    pub fn sdp(&self) -> &[u8] {
+        &self.1.sdp
     }
 
     /// Sends a `SETUP` request for a stream.

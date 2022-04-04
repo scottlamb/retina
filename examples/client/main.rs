@@ -3,8 +3,9 @@
 
 //! RTSP client examples.
 
-mod metadata;
+mod info;
 mod mp4;
+mod onvif;
 
 use anyhow::Error;
 use log::{error, info};
@@ -28,12 +29,12 @@ struct Source {
 
 #[derive(StructOpt)]
 enum Cmd {
-    /// Write available audio and video streams to mp4 file
+    /// Gets info about available streams and exits.
+    Info(info::Opts),
+    /// Writes available audio and video streams to mp4 file; use Ctrl+C to stop.
     Mp4(mp4::Opts),
-    /// Get realtime metadata of onvif stream, use Ctrl+C to stop
-    Metadata(metadata::Opts),
-    /// Get info about available streams and exit
-    Info(metadata::Opts),
+    /// Follows ONVIF metadata stream; use Ctrl+C to stop.
+    Onvif(onvif::Opts),
 }
 
 fn init_logging() -> mylog::Handle {
@@ -81,8 +82,8 @@ fn creds(
 async fn main_inner() -> Result<(), Error> {
     let cmd = Cmd::from_args();
     match cmd {
+        Cmd::Info(opts) => info::run(opts).await,
         Cmd::Mp4(opts) => mp4::run(opts).await,
-        Cmd::Metadata(opts) => metadata::run(opts, false).await,
-        Cmd::Info(opts) => metadata::run(opts, true).await,
+        Cmd::Onvif(opts) => onvif::run(opts).await,
     }
 }
