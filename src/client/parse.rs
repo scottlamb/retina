@@ -3,7 +3,6 @@
 
 use bytes::Bytes;
 use log::debug;
-use pretty_hex::PrettyHex;
 use sdp_types::Media;
 use std::{net::IpAddr, num::NonZeroU16};
 use url::Url;
@@ -380,6 +379,31 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     })
 }
 
+/// Holds something that's supposed to be mostly ASCII.
+///
+/// Some SDP values are allowed to be UTF-8-encoded ISO-10646 characters, but mostly it's
+/// supposed to be valid ASCII. This has a `Debug` impl that is fairly readable for ASCII
+/// characters and can be copy'n'pasted into Python's `codecs.decode(..., 'string_escape'`)`
+/// or the like.
+struct MostlyAscii<'a>(&'a [u8]);
+
+impl<'a> std::fmt::Debug for MostlyAscii<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\"")?;
+        for &b in self.0 {
+            match b {
+                b'"' => write!(f, "\"")?,
+                b'\r' => write!(f, "\\r")?,
+                // Note this writes newlines in unescaped form.
+                b' ' | b'\n' | 0x20..=0x7E => write!(f, "{}", b as char)?,
+                _ => write!(f, "\\x{:02X}", b)?,
+            }
+        }
+        write!(f, "\"")?;
+        Ok(())
+    }
+}
+
 /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
 /// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
 pub(crate) fn parse_describe(
@@ -394,13 +418,9 @@ pub(crate) fn parse_describe(
         ));
     }
 
-    let sdp = sdp_types::Session::parse(&response.body()[..]).map_err(|e| {
-        format!(
-            "Unable to parse SDP: {}\n\n{:#?}",
-            e,
-            response.body().hex_dump()
-        )
-    })?;
+    let raw_sdp = MostlyAscii(&response.body()[..]);
+    let sdp = sdp_types::Session::parse(raw_sdp.0)
+        .map_err(|e| format!("Unable to parse SDP: {}\n\n{:#?}", e, raw_sdp,))?;
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
@@ -435,8 +455,12 @@ pub(crate) fn parse_describe(
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            parse_media(&base_url, m)
-                .map_err(|e| format!("Unable to parse stream {}: {}\n\n{:#?}", i, &e, &m))
+            parse_media(&base_url, m).map_err(|e| {
+                format!(
+                    "Unable to parse stream {}: {}\nraw SDP: {:#?}",
+                    i, &e, raw_sdp
+                )
+            })
         })
         .collect::<Result<Vec<Stream>, String>>()?;
 
