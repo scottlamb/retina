@@ -1346,7 +1346,7 @@ mod tests {
 
     /// Tests parsing SDP from an "IPCAM C9F0SeZ3N0PbL0" [sic], as quoted in
     /// [imoonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213).
-    /// 
+    ///
     /// This camera notably sends a trailing space in its `rtpmap` attribute.
     #[test]
     fn ipcam() {
