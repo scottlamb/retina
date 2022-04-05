@@ -268,7 +268,8 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                 let v = a
                     .value
                     .as_ref()
-                    .ok_or_else(|| "rtpmap attribute with no value".to_string())?;
+                    .ok_or_else(|| "rtpmap attribute with no value".to_string())?
+                    .trim_end_matches(" ");
                 // https://tools.ietf.org/html/rfc8866#section-6.6
                 // rtpmap-value = payload-type SP encoding-name
                 //   "/" clock-rate [ "/" encoding-params ]
@@ -277,6 +278,8 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                 // clock-rate = integer
                 // encoding-params = channels
                 // channels = integer
+                //
+                // At least one camera (improperly) sends a trailing space; trim this.
                 let (rtpmap_payload_type, v) = v
                     .split_once(' ')
                     .ok_or_else(|| "invalid rtmap attribute".to_string())?;
@@ -1336,6 +1339,21 @@ mod tests {
         let p = parse_describe(
             "rtsp://camera",
             include_bytes!("testdata/macrovideo_describe.txt"),
+        )
+        .unwrap();
+        assert_eq!(p.streams.len(), 1);
+    }
+
+    /// Tests parsing SDP from an "IPCAM C9F0SeZ3N0PbL0" [sic], as quoted in
+    /// [imoonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213).
+    /// 
+    /// This camera notably sends a trailing space in its `rtpmap` attribute.
+    #[test]
+    fn ipcam() {
+        // DESCRIBE.
+        let p = parse_describe(
+            "rtsp://camera",
+            include_bytes!("testdata/ipcam_describe.txt"),
         )
         .unwrap();
         assert_eq!(p.streams.len(), 1);
