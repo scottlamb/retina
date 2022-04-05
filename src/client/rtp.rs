@@ -5,7 +5,6 @@
 
 use bytes::{Buf, Bytes};
 use log::{debug, trace};
-use pretty_hex::PrettyHex;
 
 use crate::client::PacketItem;
 use crate::{ConnectionContext, Error, ErrorInt, PacketContext};
@@ -44,7 +43,7 @@ impl std::fmt::Debug for Packet {
             .field("sequence_number", &self.sequence_number)
             .field("loss", &self.loss)
             .field("mark", &self.mark)
-            .field("payload", &self.payload.hex_dump())
+            .field("payload", &crate::hex::LimitedHex::new(&self.payload, 64))
             .finish()
     }
 }
@@ -109,7 +108,7 @@ impl InorderParser {
                     "corrupt RTP header while expecting seq={:04x?}: {:?}\n{:#?}",
                     &self.next_seq,
                     e,
-                    data.hex_dump(),
+                    crate::hex::LimitedHex::new(&data, 64),
                 ),
             })
         })?;

@@ -4,6 +4,7 @@
 use std::{fmt::Display, sync::Arc};
 
 use crate::{ConnectionContext, PacketContext, RtspMessageContext};
+use bytes::Bytes;
 use thiserror::Error;
 
 /// An opaque `std::error::Error + Send + Sync + 'static` implementation.
@@ -58,12 +59,15 @@ pub(crate) enum ErrorInt {
     },
 
     #[error(
-        "[{conn_ctx}, {msg_ctx}] Received interleaved data on unassigned channel {channel_id}"
+        "[{conn_ctx}, {msg_ctx}] Received interleaved data on unassigned channel {channel_id}: \n\
+         {:?}",
+        crate::hex::LimitedHex::new(data, 64)
     )]
     RtspUnassignedChannelError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
         channel_id: u8,
+        data: Bytes,
     },
 
     #[error("[{conn_ctx}, {pkt_ctx} stream {stream_id}]: {description}")]

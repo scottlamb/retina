@@ -24,6 +24,7 @@ use std::ops::Range;
 mod error;
 mod rtcp;
 
+mod hex;
 #[cfg(test)]
 mod testutil;
 

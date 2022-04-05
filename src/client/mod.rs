@@ -1803,11 +1803,19 @@ impl Session<Playing> {
         });
         let m = match conn.channels.lookup(channel_id) {
             Some(m) => m,
-            None => bail!(ErrorInt::RtspUnassignedChannelError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx: *msg_ctx,
-                channel_id,
-            }),
+            None => {
+                note_stale_live555_data(
+                    tokio::runtime::Handle::try_current().ok(),
+                    inner.presentation.tool.as_ref(),
+                    inner.options,
+                );
+                bail!(ErrorInt::RtspUnassignedChannelError {
+                    conn_ctx: *conn.inner.ctx(),
+                    msg_ctx: *msg_ctx,
+                    channel_id,
+                    data: data.into_body(),
+                });
+            }
         };
         let stream = &mut inner.presentation.streams[m.stream_i];
         let (timeline, rtp_handler) = match &mut stream.state {

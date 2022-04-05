@@ -6,7 +6,6 @@
 use std::num::NonZeroU32;
 
 use bytes::Bytes;
-use pretty_hex::PrettyHex;
 
 const FIXED_CLOCK_RATE: u32 = 8_000;
 
@@ -53,7 +52,7 @@ impl Depacketizer {
         if !Self::validate(&pkt) {
             return Err(format!(
                 "Invalid G.723 packet: {:#?}",
-                pkt.payload.hex_dump()
+                crate::hex::LimitedHex::new(&pkt.payload, 64),
             ));
         }
         self.pending = Some(super::AudioFrame {

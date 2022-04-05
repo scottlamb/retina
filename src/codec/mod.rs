@@ -13,7 +13,6 @@ use crate::client::rtp;
 use crate::ConnectionContext;
 use crate::Error;
 use bytes::{Buf, Bytes};
-use pretty_hex::PrettyHex;
 
 pub(crate) mod aac;
 pub(crate) mod g723;
@@ -123,7 +122,10 @@ impl std::fmt::Debug for VideoParameters {
             .field("pixel_dimensions", &self.pixel_dimensions)
             .field("pixel_aspect_ratio", &self.pixel_aspect_ratio)
             .field("frame_rate", &self.frame_rate)
-            .field("extra_data", &self.extra_data.hex_dump())
+            .field(
+                "extra_data",
+                &crate::hex::LimitedHex::new(&self.extra_data, 256),
+            )
             .finish()
     }
 }
@@ -143,7 +145,10 @@ impl std::fmt::Debug for AudioParameters {
         f.debug_struct("AudioParameters")
             .field("rfc6381_codec", &self.rfc6381_codec)
             .field("frame_length", &self.frame_length)
-            .field("extra_data", &self.extra_data.hex_dump())
+            .field(
+                "extra_data",
+                &crate::hex::LimitedHex::new(&self.extra_data, 256),
+            )
             .finish()
     }
 }
@@ -201,7 +206,7 @@ impl std::fmt::Debug for AudioFrame {
             .field("loss", &self.loss)
             .field("timestamp", &self.timestamp)
             .field("frame_length", &self.frame_length)
-            .field("data", &self.data.hex_dump())
+            .field("data", &crate::hex::LimitedHex::new(&self.data, 64))
             .finish()
     }
 }
@@ -245,7 +250,7 @@ impl std::fmt::Debug for MessageFrame {
             .field("stream_id", &self.stream_id)
             .field("loss", &self.loss)
             .field("timestamp", &self.timestamp)
-            .field("data", &self.data.hex_dump())
+            .field("data", &crate::hex::LimitedHex::new(&self.data, 64))
             .finish()
     }
 }
@@ -334,8 +339,7 @@ impl std::fmt::Debug for VideoFrame {
             .field("new_parameters", &self.new_parameters)
             .field("is_random_access_point", &self.is_random_access_point)
             .field("is_disposable", &self.is_disposable)
-            .field("data_len", &self.data.len())
-            //.field("data", &self.data.hex_dump())
+            .field("data", &crate::hex::LimitedHex::new(&self.data, 64))
             .finish()
     }
 }
