@@ -72,6 +72,7 @@ pub(super) async fn background_teardown(
 }
 
 /// Attempts `TEARDOWN` in a loop until success; caller should bound by session expiry.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn teardown_loop_forever(
     url: Url,
     tool: Option<Tool>,

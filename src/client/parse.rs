@@ -269,7 +269,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                     .value
                     .as_ref()
                     .ok_or_else(|| "rtpmap attribute with no value".to_string())?
-                    .trim_end_matches(" ");
+                    .trim_end_matches(' ');
                 // https://tools.ietf.org/html/rfc8866#section-6.6
                 // rtpmap-value = payload-type SP encoding-name
                 //   "/" clock-rate [ "/" encoding-params ]
