@@ -1,3 +1,11 @@
+## unreleased
+
+*   camera interop: eliminate `bad clockrate in rtpmap` errors with cameras that
+    (incorrectly) add trailing spaces to this SDP parameter, as described at
+    [scottlamb/moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issue-1190760423).
+*   camera interop: allow ignoring RTSP interleaved data messages on unassigned
+    channels, also described at [scottlamb-moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issuecomment-1089411093).
+
 ## `v0.3.8` (2022-03-08)
 
 *   fix depacketization of fragmented AAC frames
