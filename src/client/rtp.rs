@@ -95,7 +95,6 @@ impl InorderParser {
         conn_ctx: &ConnectionContext,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
-        runtime_handle: Option<&tokio::runtime::Handle>,
         stream_id: usize,
         mut data: Bytes,
     ) -> Result<Option<PacketItem>, Error> {
@@ -129,7 +128,7 @@ impl InorderParser {
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s != ssrc) {
             if matches!(session_options.transport, super::Transport::Tcp) {
-                super::note_stale_live555_data(runtime_handle.cloned(), tool, session_options);
+                super::note_stale_live555_data(tool, session_options);
             }
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -211,7 +210,6 @@ impl InorderParser {
         tool: Option<&super::Tool>,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
-        runtime_handle: Option<&tokio::runtime::Handle>,
         stream_id: usize,
         data: Bytes,
     ) -> Result<Option<PacketItem>, String> {
@@ -237,11 +235,7 @@ impl InorderParser {
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
                         if matches!(session_options.transport, super::Transport::Tcp) {
-                            super::note_stale_live555_data(
-                                runtime_handle.cloned(),
-                                tool,
-                                session_options,
-                            );
+                            super::note_stale_live555_data(tool, session_options);
                         }
                         return Err(format!(
                             "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
@@ -285,7 +279,6 @@ mod tests {
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
-            None,
             0,
             rtp_rs::RtpPacketBuilder::new()
                 .payload_type(105)
@@ -309,7 +302,6 @@ mod tests {
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
-            None,
             0,
             rtp_rs::RtpPacketBuilder::new()
                 .payload_type(50)
@@ -339,7 +331,6 @@ mod tests {
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
-            None,
             0,
             rtp_rs::RtpPacketBuilder::new()
                 .payload_type(96)
@@ -364,7 +355,6 @@ mod tests {
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
-            None,
             0,
             rtp_rs::RtpPacketBuilder::new()
                 .payload_type(96)
@@ -387,7 +377,6 @@ mod tests {
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
             &mut timeline,
-            None,
             0,
             rtp_rs::RtpPacketBuilder::new()
                 .payload_type(96)

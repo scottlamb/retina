@@ -5,6 +5,7 @@
     [scottlamb/moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issue-1190760423).
 *   camera interop: allow ignoring RTSP interleaved data messages on unassigned
     channels, also described at [scottlamb-moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issuecomment-1089411093).
+*   clarify `Session`'s expectations for tokio runtimes.
 
 ## `v0.3.8` (2022-03-08)
 

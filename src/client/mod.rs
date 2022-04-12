@@ -197,6 +197,11 @@ impl SessionGroup {
     /// a `TEARDOWN` without knowing the session id. If desired, the caller can
     /// learn of the existence of the sessions through
     /// [`SessionGroup::stale_sessions`] and sleep until they expire.
+    ///
+    /// ## Panics
+    ///
+    /// If the `TEARDOWN` was initiated from a tokio runtime which has since
+    /// shut down.
     pub async fn await_teardown(&self) -> Result<(), Error> {
         let mut watches: Vec<_>;
         {
@@ -214,9 +219,10 @@ impl SessionGroup {
 
             if r.is_none() {
                 // An attempt hasn't finished yet. Wait for it.
-                w.changed()
-                    .await
-                    .expect("teardown Sender shouldn't be dropped");
+                w.changed().await.expect(
+                    "teardown Sender shouldn't be dropped; \
+                             ensure the Session's tokio runtime is still alive",
+                );
                 r = (*w.borrow()).clone();
             }
 
@@ -892,6 +898,12 @@ enum ResponseMode {
 ///    `[SessionOptions::teardown`] parameter.
 /// 6. Possibly wait for `TEARDOWN` to complete; see
 ///    [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
+///
+/// ## tokio runtime
+///
+/// All `Session` operations are currently expected to be performed from
+/// "within" a tokio runtime with both time and I/O resource drivers enabled.
+/// Operations may panic or fail otherwise.
 pub struct Session<S: State>(Pin<Box<SessionInner>>, S);
 
 #[pin_project(PinnedDrop)]
@@ -900,10 +912,6 @@ struct SessionInner {
     /// connection, even while playing a RTP/AVP/UDP session. The only
     /// exception is during drop.
     conn: Option<RtspConnection>,
-
-    /// A handle to the tokio runtime which created this session. It will
-    /// be used to asynchronously send a `TEARDOWN` on drop.
-    runtime_handle: Option<tokio::runtime::Handle>,
 
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
@@ -1152,7 +1160,7 @@ impl RtspConnection {
         };
 
         if live555 {
-            note_stale_live555_data(tokio::runtime::Handle::try_current().ok(), tool, options);
+            note_stale_live555_data(tool, options);
         }
 
         let channel_id = data.channel_id();
@@ -1261,7 +1269,6 @@ impl Session<Described> {
             Box::pin(SessionInner {
                 conn: Some(conn),
                 options,
-                runtime_handle: tokio::runtime::Handle::try_current().ok(),
                 requested_auth,
                 presentation,
                 session: None,
@@ -1620,11 +1627,7 @@ impl Session<Described> {
 /// to a since-closed RTSP connection, as described in case 2 of "Stale sessions"
 /// at [`SessionGroup`]. If there's no known session which explains this,
 /// adds an unknown session with live555's default timeout.
-fn note_stale_live555_data(
-    handle: Option<tokio::runtime::Handle>,
-    tool: Option<&Tool>,
-    options: &SessionOptions,
-) {
+fn note_stale_live555_data(tool: Option<&Tool>, options: &SessionOptions) {
     let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
     if !known_to_have_live555_tcp_bug {
         log::warn!(
@@ -1690,15 +1693,8 @@ fn note_stale_live555_data(
     // set a deadline within await_stale_sessions() calls, which might be
     // a bit more efficient. But this is simpler given that we already are
     // spawning tasks for stale sessions created from Session's Drop impl.
-    let handle = match handle {
-        Some(h) => h,
-        None => {
-            log::warn!("Unable to launch task to clean up stale live555 file descriptor session");
-            return;
-        }
-    };
     let group = group.clone();
-    handle.spawn(async move {
+    tokio::spawn(async move {
         tokio::time::sleep_until(expires).await;
         if !group.try_remove_seqnum(seqnum) {
             log::warn!(
@@ -1957,7 +1953,6 @@ impl Session<Playing> {
                 conn.inner.ctx(),
                 &pkt_ctx,
                 timeline,
-                inner.runtime_handle.as_ref(),
                 m.stream_i,
                 data.into_body(),
             )?),
@@ -1967,7 +1962,6 @@ impl Session<Playing> {
                     inner.presentation.tool.as_ref(),
                     &pkt_ctx,
                     timeline,
-                    inner.runtime_handle.as_ref(),
                     m.stream_i,
                     data.into_body(),
                 ) {
@@ -2026,7 +2020,6 @@ impl Session<Playing> {
                             inner.presentation.tool.as_ref(),
                             &pkt_ctx,
                             timeline,
-                            inner.runtime_handle.as_ref(),
                             i,
                             msg,
                         ) {
@@ -2066,7 +2059,6 @@ impl Session<Playing> {
                             conn_ctx,
                             &pkt_ctx,
                             timeline,
-                            inner.runtime_handle.as_ref(),
                             i,
                             msg,
                         ) {
@@ -2179,19 +2171,7 @@ impl PinnedDrop for SessionInner {
             None
         };
 
-        let handle = match this.runtime_handle.take() {
-            Some(h) => h,
-            None => {
-                const MSG: &str = "Unable to start async TEARDOWN because describe wasn't called \
-                                   from a tokio runtime";
-                log::warn!("{}", MSG);
-                let _ =
-                    teardown_tx.send(Some(Err(wrap!(ErrorInt::FailedPrecondition(MSG.into())))));
-                return;
-            }
-        };
-
-        handle.spawn(teardown::background_teardown(
+        tokio::spawn(teardown::background_teardown(
             seqnum,
             this.presentation.base_url.clone(),
             this.presentation.tool.take(),
