@@ -28,7 +28,7 @@ impl<'a> std::fmt::Debug for LimitedHex<'a> {
             self.inner
         };
         writeln!(f, "Length: {0} (0x{0:x}) bytes", self.inner.len())?;
-        writeln!(
+        write!(
             f,
             "{:#?}",
             print.hex_conf(pretty_hex::HexConfig {
