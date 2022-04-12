@@ -441,6 +441,35 @@ impl Default for UnassignedChannelDataPolicy {
     }
 }
 
+impl std::fmt::Display for UnassignedChannelDataPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            UnassignedChannelDataPolicy::Auto => "auto",
+            UnassignedChannelDataPolicy::AssumeStaleSession => "assume-stale-session",
+            UnassignedChannelDataPolicy::Error => "error",
+            UnassignedChannelDataPolicy::Ignore => "ignore",
+        })
+    }
+}
+
+impl std::str::FromStr for UnassignedChannelDataPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "auto" => UnassignedChannelDataPolicy::Auto,
+            "assume-stale-session" => UnassignedChannelDataPolicy::AssumeStaleSession,
+            "error" => UnassignedChannelDataPolicy::Error,
+            "ignore" => UnassignedChannelDataPolicy::Ignore,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad UnassignedChannelDataPolicy {}; expected auto, assume-stale-session, error, \
+                 or ignore",
+                s
+            ))),
+        })
+    }
+}
+
 /// The RTP packet transport to request.
 ///
 /// Defaults to `Transport::Tcp`.
