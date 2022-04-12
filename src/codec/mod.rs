@@ -43,7 +43,7 @@ pub enum CodecItem {
 /// calls to [`crate::client::Stream::parameters`] will return the new value.
 ///
 /// Currently audio and message streams' parameters never change mid-stream.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Parameters {
     Video(VideoParameters),
     Audio(AudioParameters),
@@ -59,7 +59,7 @@ pub enum Parameters {
 /// Video streams' parameters may change mid-stream; if so, the frame which
 /// changed them will have `VideoFrame::new_parameters` set, and subsequent
 /// calls to [`crate::client::Stream::parameters`] will return the new value.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoParameters {
     pixel_dimensions: (u32, u32),
     rfc6381_codec: String,
@@ -131,7 +131,7 @@ impl std::fmt::Debug for VideoParameters {
 }
 
 /// Parameters which describe an audio stream.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AudioParameters {
     rfc6381_codec: Option<String>,
     frame_length: Option<NonZeroU32>,
@@ -226,7 +226,7 @@ impl Buf for AudioFrame {
 }
 
 /// Parameters which describe a message stream, for `application` media types.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MessageParameters(onvif::CompressionType);
 
 /// A single message, for `application` media types.

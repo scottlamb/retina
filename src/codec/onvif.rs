@@ -12,7 +12,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use super::CodecItem;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CompressionType {
     Uncompressed,
     GzipCompressed,

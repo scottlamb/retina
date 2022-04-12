@@ -1170,7 +1170,7 @@ impl RtspConnection {
 }
 
 impl<S: State> Session<S> {
-    /// Returns the available streams as described the server.
+    /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
         &self.0.presentation.streams
     }
@@ -2267,6 +2267,11 @@ impl Demuxed {
     /// attribute.
     pub fn tool(&self) -> Option<&Tool> {
         self.session.tool()
+    }
+
+    /// Returns the available streams as described by the server.
+    pub fn streams(&self) -> &[Stream] {
+        &self.session.streams()
     }
 }
 
