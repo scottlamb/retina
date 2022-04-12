@@ -1,10 +1,13 @@
-## unreleased
+## `v0.3.9` (2022-04-12)
 
 *   camera interop: eliminate `bad clockrate in rtpmap` errors with cameras that
     (incorrectly) add trailing spaces to this SDP parameter, as described at
     [scottlamb/moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issue-1190760423).
 *   camera interop: allow ignoring RTSP interleaved data messages on unassigned
     channels, also described at [scottlamb-moonfire-nvr#213](https://github.com/scottlamb/moonfire-nvr/issues/213#issuecomment-1089411093).
+*   camera interop: when using TCP, default to attempting a `TEARDOWN`  before
+    closing the connection, to improve behavior with cameras that have the
+    live555 stale session bug but do not advertise it.
 *   clarify `Session`'s expectations for tokio runtimes.
 *   additional diagnostics/logging on certain camera failures.
 
