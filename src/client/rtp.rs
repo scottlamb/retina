@@ -80,11 +80,17 @@ pub struct SenderReport {
 pub struct InorderParser {
     ssrc: Option<u32>,
     next_seq: Option<u16>,
+
+    /// True iff `ssrc` was set from the beginning via a `RTP-Info` header.
+    initial_ssrc: bool,
+
+    /// Total packets seen in this stream.
+    seen_packets: u64,
 }
 
 impl InorderParser {
     pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
-        Self { ssrc, next_seq }
+        Self { ssrc, next_seq, initial_ssrc: ssrc.is_some(), seen_packets: 0 }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -137,8 +143,9 @@ impl InorderParser {
                 ssrc,
                 sequence_number,
                 description: format!(
-                    "Wrong ssrc; expecting ssrc={:08x?} seq={:04x?}",
-                    self.ssrc, self.next_seq
+                    "Wrong ssrc after {} packets; expecting ssrc={:08x?} seq={:04x?} \
+                     (initial ssrc: {:?})",
+                    self.seen_packets, self.ssrc, self.next_seq, self.initial_ssrc,
                 ),
             });
         }
@@ -191,6 +198,7 @@ impl InorderParser {
         data.truncate(payload_range.end);
         data.advance(payload_range.start);
         self.next_seq = Some(sequence_number.wrapping_add(1));
+        self.seen_packets += 1;
         Ok(Some(PacketItem::RtpPacket(Packet {
             ctx: *pkt_ctx,
             stream_id,
