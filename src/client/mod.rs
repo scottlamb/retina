@@ -2280,7 +2280,7 @@ impl Demuxed {
 
     /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
-        &self.session.streams()
+        self.session.streams()
     }
 }
 

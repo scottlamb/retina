@@ -47,10 +47,10 @@ jobs:
       run: cd fuzz && cargo fmt -- --check
     - name: Clippy on main crate
       if: matrix.rust == 'stable'
-      run: cargo clippy
+      run: cargo clippy -D warnings
     - name: Clippy on fuzz crate
       if: matrix.rust == 'stable'
-      run: cd fuzz && cargo clippy
+      run: cd fuzz && cargo clippy -D warnings
         
   license:
     name: Check copyright/license headers
