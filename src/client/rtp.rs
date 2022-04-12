@@ -90,7 +90,12 @@ pub struct InorderParser {
 
 impl InorderParser {
     pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
-        Self { ssrc, next_seq, initial_ssrc: ssrc.is_some(), seen_packets: 0 }
+        Self {
+            ssrc,
+            next_seq,
+            initial_ssrc: ssrc.is_some(),
+            seen_packets: 0,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
