@@ -7,7 +7,6 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use pretty_hex::PrettyHex;
 use rtsp_types::{Data, Message};
 use std::convert::TryFrom;
 use std::time::Instant;
@@ -197,27 +196,10 @@ impl Codec {
         let (msg, len): (Message<&[u8]>, _) = match Message::parse(src) {
             Ok((m, l)) => (m, l),
             Err(rtsp_types::ParseError::Error) => {
-                const MAX_DUMP_BYTES: usize = 128;
-                let conf = pretty_hex::HexConfig {
-                    title: false,
-                    ..Default::default()
-                };
-                if src.len() > MAX_DUMP_BYTES {
-                    return Err(CodecError::ParseError {
-                        description: format!(
-                            "Invalid RTSP message; next {} of {} buffered bytes are:\n{:#?}",
-                            MAX_DUMP_BYTES,
-                            src.len(),
-                            (&src[0..MAX_DUMP_BYTES]).hex_conf(conf)
-                        ),
-                        pos: self.read_pos,
-                    });
-                }
                 return Err(CodecError::ParseError {
                     description: format!(
-                        "Invalid RTSP message; next {} buffered bytes are:\n{:#?}",
-                        MAX_DUMP_BYTES,
-                        src.hex_conf(conf)
+                        "Invalid RTSP message; buffered:\n{:#?}",
+                        crate::hex::LimitedHex::new(&src[..], 128),
                     ),
                     pos: self.read_pos,
                 });
