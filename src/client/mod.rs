@@ -1783,34 +1783,6 @@ impl Session<Playing> {
         })
     }
 
-    /// Sends a `TEARDOWN`, ending the session.
-    #[deprecated(since = "0.3.1", note = "Use `SessionGroup::await_teardown` instead")]
-    pub async fn teardown(mut self) -> Result<(), Error> {
-        let inner = self.0.as_mut().project();
-        let mut req = rtsp_types::Request::builder(Method::Teardown, rtsp_types::Version::V1_0)
-            .request_uri(inner.presentation.base_url.clone())
-            .header(
-                rtsp_types::headers::SESSION,
-                inner.session.as_ref().unwrap().id.to_string(),
-            )
-            .build(Bytes::new());
-        inner
-            .conn
-            .as_mut()
-            .unwrap()
-            .send(
-                ResponseMode::Teardown,
-                inner.options,
-                inner.presentation.tool.as_ref(),
-                inner.requested_auth,
-                &mut req,
-            )
-            .await?;
-        *inner.session = None;
-        *inner.maybe_playing = false;
-        Ok(())
-    }
-
     fn handle_keepalive_timer(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -2266,12 +2238,6 @@ pub struct Demuxed {
 }
 
 impl Demuxed {
-    #[deprecated(since = "0.3.1", note = "Use `SessionGroup::await_teardown` instead")]
-    pub async fn teardown(self) -> Result<(), Error> {
-        #[allow(deprecated)]
-        self.session.teardown().await
-    }
-
     /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
     /// attribute.
     pub fn tool(&self) -> Option<&Tool> {

@@ -1,3 +1,8 @@
+## next
+
+*   BREAKING: remove deprecated `retina::client::Session<Playing>::teardown` and
+    `retina::client::Demuxed::teardown`.
+
 ## `v0.3.9` (2022-04-12)
 
 *   camera interop: eliminate `bad clockrate in rtpmap` errors with cameras that
