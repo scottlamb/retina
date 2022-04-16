@@ -12,8 +12,6 @@
 
 use bytes::Bytes;
 use log::trace;
-//use failure::{bail, format_err, Error};
-use once_cell::sync::Lazy;
 use rand::Rng;
 use rtsp_types::Message;
 use std::fmt::{Debug, Display};
@@ -49,16 +47,6 @@ pub mod codec;
 mod tokio;
 
 use error::ErrorInt;
-
-// TODO: these are `pub`, yet the crate doesn't expose a direct way to set or get
-// headers, a combination which makes little sense.
-#[doc(hidden)]
-pub static X_ACCEPT_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> = Lazy::new(|| {
-    rtsp_types::HeaderName::from_static_str("x-Accept-Dynamic-Rate").expect("is ascii")
-});
-#[doc(hidden)]
-pub static X_DYNAMIC_RATE: Lazy<rtsp_types::HeaderName> =
-    Lazy::new(|| rtsp_types::HeaderName::from_static_str("x-Dynamic-Rate").expect("is ascii"));
 
 /// A received RTSP message.
 #[derive(Debug)]

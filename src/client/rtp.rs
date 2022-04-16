@@ -75,7 +75,7 @@ pub struct SenderReport {
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
 /// not sure it will ever come up with IP cameras.
-#[doc(hidden)]
+#[doc(hidden)] // pub only for the benchmarks; not a stable API.
 #[derive(Debug)]
 pub struct InorderParser {
     ssrc: Option<u32>,

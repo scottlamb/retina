@@ -467,14 +467,10 @@ pub(crate) fn parse_describe(
         })
         .collect::<Result<Vec<Stream>, String>>()?;
 
-    let accept_dynamic_rate =
-        matches!(response.header(&crate::X_ACCEPT_DYNAMIC_RATE), Some(h) if h.as_str() == "1");
-
     Ok(Presentation {
         streams,
         base_url,
         control,
-        accept_dynamic_rate,
         tool,
     })
 }
@@ -713,7 +709,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
-        assert!(p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 3);
 
@@ -830,7 +825,6 @@ mod tests {
             p.base_url.as_str(),
             "rtsp://192.168.5.106:554/Streaming/Channels/101/"
         );
-        assert!(!p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 2);
 
@@ -911,7 +905,6 @@ mod tests {
         .unwrap();
         let base = "rtsp://192.168.5.206/h264Preview_01_main/";
         assert_eq!(p.control.as_str(), base);
-        assert!(!p.accept_dynamic_rate);
         assert_eq!(
             p.tool.as_deref(),
             Some("LIVE555 Streaming Media v2013.04.08")
@@ -998,7 +991,6 @@ mod tests {
         let prefix = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
         let mut p = parse_describe(prefix, include_bytes!("testdata/bunny_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
-        assert!(!p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 2);
 
@@ -1069,7 +1061,6 @@ mod tests {
         let prefix = "rtsp://192.168.5.107:65534/videoMain";
         let p = parse_describe(prefix, include_bytes!("testdata/foscam_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
-        assert!(!p.accept_dynamic_rate);
         assert_eq!(
             p.tool.as_deref(),
             Some("LIVE555 Streaming Media v2014.02.10")
@@ -1119,8 +1110,6 @@ mod tests {
         let p = parse_describe(prefix, include_bytes!("testdata/vstarcam_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), &(prefix.to_string()));
 
-        assert!(!p.accept_dynamic_rate);
-
         assert_eq!(p.streams.len(), 2);
 
         // H.264 video stream.
@@ -1169,7 +1158,6 @@ mod tests {
         let base = "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_main_describe.txt")).unwrap();
         assert_eq!(p.control.as_str(), base);
-        assert!(!p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 2);
 
@@ -1276,8 +1264,6 @@ mod tests {
             p.control.as_str(),
             "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif"
         );
-        assert!(!p.accept_dynamic_rate);
-
         assert_eq!(p.streams.len(), 1);
 
         // H.264 video stream.

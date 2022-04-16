@@ -32,10 +32,8 @@ pub mod rtp;
 mod teardown;
 mod timeline;
 
-// TODO: this is pub but can't be fed back into the crate in any way; strange.
-#[doc(hidden)]
 /// Duration between keepalive RTSP requests during [Playing] state.
-pub const KEEPALIVE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const KEEPALIVE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Assumed expiration time for stale live555 TCP sessions (case #2 of "Stale
 /// sessions" in [`SessionGroup`]).
@@ -610,15 +608,11 @@ impl PlayOptions {
     }
 }
 
-// TODO: this is `pub` yet not actually accessible from outside the crate, a combination which
-// makes little sense.
-#[doc(hidden)]
 #[derive(Debug)]
-pub struct Presentation {
+pub(crate) struct Presentation {
     pub streams: Vec<Stream>,
     base_url: Url,
     pub control: Url,
-    pub accept_dynamic_rate: bool,
     tool: Option<Tool>,
 }
 
@@ -1320,8 +1314,7 @@ impl Session<Described> {
             .unwrap_or(&presentation.control)
             .clone();
         let mut req = rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0)
-            .request_uri(url)
-            .header(crate::X_DYNAMIC_RATE.clone(), "1".to_owned());
+            .request_uri(url);
         match options.transport {
             Transport::Tcp => {
                 let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
