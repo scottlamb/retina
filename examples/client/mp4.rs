@@ -22,7 +22,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
-    client::Transport,
+    client::{SetupOptions, Transport},
     codec::{AudioParameters, CodecItem, Parameters, VideoParameters},
 };
 
@@ -766,7 +766,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         None
     };
     if let Some(i) = video_stream_i {
-        session.setup(i).await?;
+        session.setup(i, SetupOptions::default()).await?;
     }
     let audio_stream = if !opts.no_audio {
         let s = session
@@ -795,7 +795,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         None
     };
     if let Some((i, _)) = audio_stream {
-        session.setup(i).await?;
+        session.setup(i, SetupOptions::default()).await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {
         bail!("Exiting because no video or audio stream was selected; see info log messages above");

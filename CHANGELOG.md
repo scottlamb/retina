@@ -3,6 +3,8 @@
 *   BREAKING: remove deprecated `retina::client::Session<Playing>::teardown` and
     `retina::client::Demuxed::teardown`; made private some items already
     `#[doc(hidden)]`.
+*   BREAKING: `retina::client::Session<Described>::setup` takes a new
+    `SetupOptions` argument for future expansion.
 
 ## `v0.3.9` (2022-04-12)
 

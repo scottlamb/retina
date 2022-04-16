@@ -8,7 +8,10 @@ use std::{io::ErrorKind, net::SocketAddr, num::NonZeroU32};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use futures::StreamExt;
-use retina::{client::PlayOptions, codec::CodecItem};
+use retina::{
+    client::{PlayOptions, SetupOptions},
+    codec::CodecItem,
+};
 use std::convert::TryFrom;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -111,7 +114,7 @@ async fn read_to_eof(addr: SocketAddr) {
         retina::client::Session::describe(url, retina::client::SessionOptions::default())
             .await
             .unwrap();
-    session.setup(0).await.unwrap();
+    session.setup(0, SetupOptions::default()).await.unwrap();
     let session = session
         .play(PlayOptions::default())
         .await

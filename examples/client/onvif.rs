@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Error};
 use futures::StreamExt;
 use log::{error, info};
-use retina::client::SessionGroup;
+use retina::client::{SessionGroup, SetupOptions};
 use retina::codec::CodecItem;
 use std::sync::Arc;
 
@@ -40,7 +40,9 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
         .iter()
         .position(|s| matches!(s.parameters(), Some(retina::codec::Parameters::Message(..))))
         .ok_or_else(|| anyhow!("couldn't find onvif stream"))?;
-    session.setup(onvif_stream_i).await?;
+    session
+        .setup(onvif_stream_i, SetupOptions::default())
+        .await?;
     let mut session = session
         .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
         .await?

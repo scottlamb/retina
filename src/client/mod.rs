@@ -562,6 +562,14 @@ impl SessionOptions {
     }
 }
 
+/// Per-stream options decided for `SETUP` time, for future expansion.
+///
+/// There's nothing here yet. Likely in the future this will allow configuring
+/// the output format for H.264 (Annex B or not).
+#[derive(Default)]
+#[non_exhaustive]
+pub struct SetupOptions {}
+
 /// Options which must be decided at `PLAY` time.
 ///
 /// These are mostly adjustments for non-compliant server implementations.
@@ -1296,7 +1304,8 @@ impl Session<Described> {
     /// inspect that first.
     ///
     /// Panics if `stream_i >= self.streams().len()`.
-    pub async fn setup(&mut self, stream_i: usize) -> Result<(), Error> {
+    pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
+        let _ = options; // not yet used.
         let inner = &mut self.0.as_mut().project();
         let presentation = &mut inner.presentation;
         let options = &inner.options;
@@ -1313,8 +1322,8 @@ impl Session<Described> {
             .as_ref()
             .unwrap_or(&presentation.control)
             .clone();
-        let mut req = rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0)
-            .request_uri(url);
+        let mut req =
+            rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0).request_uri(url);
         match options.transport {
             Transport::Tcp => {
                 let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
@@ -2402,7 +2411,7 @@ mod tests {
         // SETUP.
         tokio::join!(
             async {
-                session.setup(0).await.unwrap();
+                session.setup(0, SetupOptions::default()).await.unwrap();
             },
             req_response(
                 &mut server,
@@ -2512,7 +2521,7 @@ mod tests {
         // SETUP.
         tokio::join!(
             async {
-                session.setup(0).await.unwrap();
+                session.setup(0, SetupOptions::default()).await.unwrap();
             },
             req_response(
                 &mut server,
@@ -2664,7 +2673,7 @@ mod tests {
         // SETUP.
         tokio::join!(
             async {
-                session.setup(0).await.unwrap();
+                session.setup(0, SetupOptions::default()).await.unwrap();
             },
             req_response(
                 &mut server,
