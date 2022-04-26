@@ -26,6 +26,7 @@ pub(crate) mod simple_audio;
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CodecItem {
     VideoFrame(VideoFrame),
     AudioFrame(AudioFrame),

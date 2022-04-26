@@ -12,6 +12,8 @@
     `retina::PacketContext`. Both must be printed to provide the same
     information as before. This change reduces how much data needs to be copied
     with each packet.
+*   BREAKING: `PacketItem` and `CodecItem` are now `#[non_exhaustive]` for
+    future expansion.
 
 ## `v0.3.9` (2022-04-12)
 

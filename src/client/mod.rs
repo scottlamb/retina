@@ -1796,6 +1796,7 @@ async fn punch_firewall_hole(
 
 /// An item yielded by [`Session<Playing>`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PacketItem {
     RtpPacket(rtp::Packet),
     SenderReport(rtp::SenderReport),
