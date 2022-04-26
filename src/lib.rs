@@ -330,6 +330,107 @@ impl Display for RtspMessageContext {
     }
 }
 
+/// Context for an active stream (RTP+RTCP session), either TCP or UDP. Owned version.
+#[derive(Copy, Clone, Debug)]
+pub struct StreamContext(StreamContextInner);
+
+impl StreamContext {
+    #[doc(hidden)]
+    pub fn dummy() -> Self {
+        StreamContext(StreamContextInner::Dummy)
+    }
+}
+
+impl Display for StreamContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            StreamContextInner::Tcp(tcp) => {
+                write!(
+                    f,
+                    "TCP, interleaved channel ids {}-{}",
+                    tcp.rtp_channel_id,
+                    tcp.rtp_channel_id + 1
+                )
+            }
+            StreamContextInner::Udp(udp) => Display::fmt(udp, f),
+            StreamContextInner::Dummy => write!(f, "dummy"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum StreamContextInner {
+    Tcp(TcpStreamContext),
+    Udp(UdpStreamContext),
+    Dummy,
+}
+
+/// Context for an active stream (RTP+RTCP session), either TCP or UDP. Reference version.
+#[derive(Copy, Clone, Debug)]
+pub struct StreamContextRef<'a>(StreamContextRefInner<'a>);
+
+impl StreamContextRef<'_> {
+    #[doc(hidden)]
+    pub fn dummy() -> Self {
+        StreamContextRef(StreamContextRefInner::Dummy)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum StreamContextRefInner<'a> {
+    Tcp(TcpStreamContext), // this one is by value because TcpStreamContext is small.
+    Udp(&'a UdpStreamContext),
+    Dummy,
+}
+
+impl StreamContextRef<'_> {
+    fn to_owned(self) -> StreamContext {
+        StreamContext(match self.0 {
+            StreamContextRefInner::Tcp(tcp) => StreamContextInner::Tcp(tcp),
+            StreamContextRefInner::Udp(udp) => StreamContextInner::Udp(*udp),
+            StreamContextRefInner::Dummy => StreamContextInner::Dummy,
+        })
+    }
+}
+
+/// Context for a UDP stream (aka UDP-based RTP transport). Unstable/internal. Exposed for benchmarks.
+///
+/// This stores only the RTP addresses; the RTCP addresses are assumed to use
+/// the same IP and one port higher.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct UdpStreamContext {
+    local_ip: IpAddr,
+    peer_ip: IpAddr,
+    local_rtp_port: u16,
+    peer_rtp_port: u16,
+}
+
+/// Context for a TCP stream. Unstable/internal. Exposed for benchmarks.
+///
+/// This stores only the RTP channel id; the RTCP channel id is assumed to be one higher.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct TcpStreamContext {
+    rtp_channel_id: u8,
+}
+
+impl Display for UdpStreamContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // TODO: this assumes we are the client. Revisit when adding server support.
+        write!(
+            f,
+            "{}:{}-{}(me) -> {}:{}-{}",
+            self.local_ip,
+            self.local_rtp_port,
+            self.local_rtp_port + 1,
+            self.peer_ip,
+            self.peer_rtp_port,
+            self.peer_rtp_port + 1
+        )
+    }
+}
+
 /// Context for an RTP or RTCP packet, received either via RTSP interleaved data or UDP.
 ///
 /// Should be paired with an [`ConnectionContext`] of the RTSP connection that started
@@ -347,35 +448,16 @@ impl PacketContext {
 
 #[derive(Copy, Clone, Debug)]
 enum PacketContextInner {
-    Tcp {
-        msg_ctx: RtspMessageContext,
-        channel_id: u8,
-    },
-    Udp {
-        local_addr: SocketAddr,
-        peer_addr: SocketAddr,
-        received_wall: WallTime,
-    },
+    Tcp { msg_ctx: RtspMessageContext },
+    Udp { received_wall: WallTime },
     Dummy,
 }
 
 impl Display for PacketContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            PacketContextInner::Udp {
-                local_addr,
-                peer_addr,
-                received_wall,
-                ..
-            } => {
-                write!(f, "{}->{}@{}", peer_addr, local_addr, received_wall)
-            }
-            PacketContextInner::Tcp {
-                msg_ctx,
-                channel_id,
-            } => {
-                write!(f, "{} ch={}", msg_ctx, channel_id)
-            }
+            PacketContextInner::Udp { received_wall } => std::fmt::Display::fmt(&received_wall, f),
+            PacketContextInner::Tcp { msg_ctx } => std::fmt::Display::fmt(&msg_ctx, f),
             PacketContextInner::Dummy => write!(f, "dummy"),
         }
     }

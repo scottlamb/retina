@@ -7,7 +7,9 @@ use bytes::{Buf, Bytes};
 use log::{debug, trace};
 
 use crate::client::PacketItem;
-use crate::{ConnectionContext, Error, ErrorInt, PacketContext};
+use crate::{
+    ConnectionContext, Error, ErrorInt, PacketContext, StreamContextRef, StreamContextRefInner,
+};
 
 use super::{SessionOptions, Timeline};
 
@@ -102,6 +104,7 @@ impl InorderParser {
     pub fn rtp(
         &mut self,
         session_options: &SessionOptions,
+        stream_ctx: StreamContextRef,
         tool: Option<&super::Tool>,
         conn_ctx: &ConnectionContext,
         pkt_ctx: &PacketContext,
@@ -112,6 +115,7 @@ impl InorderParser {
         let reader = rtp_rs::RtpReader::new(&data[..]).map_err(|e| {
             wrap!(ErrorInt::PacketError {
                 conn_ctx: *conn_ctx,
+                stream_ctx: stream_ctx.to_owned(),
                 pkt_ctx: *pkt_ctx,
                 stream_id,
                 description: format!(
@@ -138,12 +142,13 @@ impl InorderParser {
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s != ssrc) {
-            if matches!(session_options.transport, super::Transport::Tcp) {
+            if matches!(stream_ctx.0, StreamContextRefInner::Udp(_)) {
                 super::note_stale_live555_data(tool, session_options);
             }
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
                 pkt_ctx: *pkt_ctx,
+                stream_ctx: stream_ctx.to_owned(),
                 stream_id,
                 ssrc,
                 sequence_number,
@@ -155,10 +160,11 @@ impl InorderParser {
             });
         }
         if loss > 0x80_00 {
-            if matches!(session_options.transport, super::Transport::Tcp) {
+            if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
                 bail!(ErrorInt::RtpPacketError {
                     conn_ctx: *conn_ctx,
                     pkt_ctx: *pkt_ctx,
+                    stream_ctx: stream_ctx.to_owned(),
                     stream_id,
                     ssrc,
                     sequence_number,
@@ -182,6 +188,7 @@ impl InorderParser {
             Err(description) => bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
                 pkt_ctx: *pkt_ctx,
+                stream_ctx: stream_ctx.to_owned(),
                 stream_id,
                 ssrc,
                 sequence_number,
@@ -193,6 +200,7 @@ impl InorderParser {
         let payload_range = crate::as_range(&data, reader.payload()).ok_or_else(|| {
             wrap!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
+                stream_ctx: stream_ctx.to_owned(),
                 pkt_ctx: *pkt_ctx,
                 stream_id,
                 ssrc,
@@ -220,6 +228,7 @@ impl InorderParser {
     pub fn rtcp(
         &mut self,
         session_options: &SessionOptions,
+        stream_ctx: StreamContextRef,
         tool: Option<&super::Tool>,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
@@ -247,7 +256,7 @@ impl InorderParser {
 
                     let ssrc = pkt.ssrc();
                     if matches!(self.ssrc, Some(s) if s != ssrc) {
-                        if matches!(session_options.transport, super::Transport::Tcp) {
+                        if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
                             super::note_stale_live555_data(tool, session_options);
                         }
                         return Err(format!(
@@ -274,6 +283,10 @@ impl InorderParser {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::client::UdpStreamContext;
+
     use super::*;
 
     /// Checks dropping and logging Geovision's extra payload type 50 packets.
@@ -284,10 +297,12 @@ mod tests {
     fn geovision_pt50_packet() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
         let mut parser = InorderParser::new(Some(0xd25614e), None);
+        let stream_ctx = StreamContextRef::dummy();
 
         // Normal packet.
         match parser.rtp(
             &SessionOptions::default(),
+            stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -311,6 +326,7 @@ mod tests {
         // Mystery pt=50 packet with same sequence number.
         match parser.rtp(
             &SessionOptions::default(),
+            stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -336,10 +352,17 @@ mod tests {
     fn out_of_order() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
         let mut parser = InorderParser::new(Some(0xd25614e), None);
-
-        let session_options = SessionOptions::default().transport(crate::client::Transport::Udp);
+        let udp = UdpStreamContext {
+            local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_rtp_port: 0,
+            peer_rtp_port: 0,
+        };
+        let stream_ctx = StreamContextRef(StreamContextRefInner::Udp(&udp));
+        let session_options = SessionOptions::default();
         match parser.rtp(
             &session_options,
+            stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -364,6 +387,7 @@ mod tests {
 
         match parser.rtp(
             &session_options,
+            stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -386,6 +410,7 @@ mod tests {
 
         match parser.rtp(
             &session_options,
+            stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),

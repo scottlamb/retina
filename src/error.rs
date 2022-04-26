@@ -3,7 +3,7 @@
 
 use std::{fmt::Display, sync::Arc};
 
-use crate::{ConnectionContext, PacketContext, RtspMessageContext};
+use crate::{ConnectionContext, PacketContext, RtspMessageContext, StreamContext, WallTime};
 use bytes::Bytes;
 use thiserror::Error;
 
@@ -40,15 +40,15 @@ pub(crate) enum ErrorInt {
     InvalidArgument(String),
 
     /// Unparseable or unexpected RTSP message.
-    #[error("[{conn_ctx}, {msg_ctx}] RTSP framing error: {description}")]
+    #[error("RTSP framing error: {description}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
     RtspFramingError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
         description: String,
     },
 
-    #[error("[{conn_ctx}, {msg_ctx}] {status} response to {} CSeq={cseq}: \
-             {description}", Into::<&str>::into(.method))]
+    #[error("{status} response to {} CSeq={cseq}: {description}\n\n\
+             conn: {conn_ctx}\nmsg: {msg_ctx}", Into::<&str>::into(.method))]
     RtspResponseError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
@@ -59,8 +59,8 @@ pub(crate) enum ErrorInt {
     },
 
     #[error(
-        "[{conn_ctx}, {msg_ctx}] Received interleaved data on unassigned channel {channel_id}: \n\
-         {:?}",
+        "Received interleaved data on unassigned channel {channel_id}: \n\
+         {:?}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}",
         crate::hex::LimitedHex::new(data, 64)
     )]
     RtspUnassignedChannelError {
@@ -70,20 +70,23 @@ pub(crate) enum ErrorInt {
         data: Bytes,
     },
 
-    #[error("[{conn_ctx}, {pkt_ctx} stream {stream_id}]: {description}")]
+    #[error("{description}\n\nconn: {conn_ctx}\nstream: {stream_ctx}\npkt: {pkt_ctx}")]
     PacketError {
         conn_ctx: ConnectionContext,
+        stream_ctx: StreamContext,
         pkt_ctx: PacketContext,
         stream_id: usize,
         description: String,
     },
 
     #[error(
-        "[{conn_ctx}, {pkt_ctx}, stream={stream_id}, ssrc={ssrc:08x}, \
-         seq={sequence_number:08x}] {description}"
+        "{description}\n\n\
+             conn: {conn_ctx}\nstream: {stream_ctx}\n\
+             ssrc: {ssrc:08x}\nseq: {sequence_number:08x}\npkt: {pkt_ctx}"
     )]
     RtpPacketError {
         conn_ctx: ConnectionContext,
+        stream_ctx: StreamContext,
         pkt_ctx: crate::PacketContext,
         stream_id: usize,
         ssrc: u32,
@@ -94,21 +97,25 @@ pub(crate) enum ErrorInt {
     #[error("Unable to connect to RTSP server: {0}")]
     ConnectError(#[source] std::io::Error),
 
-    #[error("[{conn_ctx}, {msg_ctx}] Error reading from RTSP peer: {source}")]
+    #[error("Error reading from RTSP peer: {source}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
     RtspReadError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
         source: std::io::Error,
     },
 
-    #[error("[{conn_ctx}, {pkt_ctx}] Error receiving UDP packet: {source}")]
+    #[error(
+        "Error receiving UDP packet: {source}\n\n\
+             conn: {conn_ctx}\nstream: {stream_ctx}\nat: {when}"
+    )]
     UdpRecvError {
         conn_ctx: ConnectionContext,
-        pkt_ctx: PacketContext,
+        stream_ctx: StreamContext,
+        when: WallTime,
         source: std::io::Error,
     },
 
-    #[error("[{conn_ctx}] Error writing to RTSP peer: {source}")]
+    #[error("Error writing to RTSP peer: {source}\n\nconn: {conn_ctx}")]
     WriteError {
         conn_ctx: ConnectionContext,
         source: std::io::Error,

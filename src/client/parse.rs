@@ -375,7 +375,6 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         rtp_payload_type,
         depacketizer,
         control,
-        sockets: None,
         channels,
         framerate,
         state: super::StreamState::Uninit,
@@ -486,7 +485,25 @@ pub(crate) struct SetupResponse {
     pub(crate) ssrc: Option<u32>,
     pub(crate) channel_id: Option<u8>,
     pub(crate) source: Option<IpAddr>,
-    pub(crate) server_port: Option<(u16, u16)>,
+    pub(crate) server_port: Option<u16>,
+}
+
+fn parse_server_port(server_port: &str) -> Result<u16, ()> {
+    if let Some((a, b)) = server_port.split_once('-') {
+        let a = u16::from_str_radix(a, 10).map_err(|_| ())?;
+        let b = u16::from_str_radix(b, 10).map_err(|_| ())?;
+        if a.checked_add(1) != Some(b) {
+            // It's unclear what a non-consecutive range means.
+            return Err(());
+        }
+        return Ok(a);
+    }
+
+    // Note returning a range is allowed by RFC 2326's grammar, but I'm not sure
+    // what it means. RTSP 2.0 allows "RTCP-mux" for using a single port for
+    // both RTP and RTCP, but it's only by client request, and RTSP 1.0 doesn't
+    // reference this.
+    Err(())
 }
 
 /// Parses a `SETUP` response.
@@ -546,19 +563,12 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
                     .map_err(|_| format!("Transport header has unparseable source {:?}", s))?,
             );
         } else if let Some(s) = part.strip_prefix("server_port=") {
-            let mut ports = s.splitn(2, '-');
-            let n = ports.next().expect("splitn returns at least one part");
-            let n = u16::from_str_radix(n, 10)
-                .map_err(|_| format!("bad port in Transport: {}", transport.as_str()))?;
-            if let Some(m) = ports.next() {
-                let m = u16::from_str_radix(m, 10).map_err(|_| format!("bad second port {}", m))?;
-                server_port = Some((n, m))
-            } else {
-                // TODO: this is allowed by RFC 2326's grammar, but I'm not sure
-                // what it means. Does it use the same port for both RTP and
-                // RTCP, or is it implied the second is one more than the first?
-                return Err("Transport header specifies a single server_port".to_owned());
-            }
+            server_port = Some(parse_server_port(s).map_err(|()| {
+                format!(
+                    "Transport header {:?} has bad server_port",
+                    transport.as_str()
+                )
+            })?);
         }
     }
     Ok(SetupResponse {
@@ -660,6 +670,8 @@ mod tests {
     use bytes::Bytes;
     use url::Url;
 
+    use crate::client::StreamTransport;
+    use crate::TcpStreamContext;
     use crate::{client::StreamStateInit, codec::Parameters};
 
     use super::super::StreamState;
@@ -672,6 +684,15 @@ mod tests {
     ) -> Result<super::Presentation, String> {
         let url = Url::parse(raw_url).unwrap();
         super::parse_describe(url, &response(raw_response))
+    }
+
+    fn dummy_stream_state_init(ssrc: Option<u32>) -> StreamState {
+        StreamState::Init(StreamStateInit {
+            ssrc,
+            initial_seq: None,
+            initial_rtptime: None,
+            transport: StreamTransport::Tcp(TcpStreamContext { rtp_channel_id: 0 }),
+        })
     }
 
     #[test]
@@ -771,11 +792,7 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x30a98ee7));
-        p.streams[0].state = StreamState::Init(StreamStateInit {
-            ssrc: setup_response.ssrc,
-            initial_seq: None,
-            initial_rtptime: None,
-        });
+        p.streams[0].state = dummy_stream_state_init(Some(0x30a98ee7));
 
         // PLAY.
         super::parse_play(&response(include_bytes!("testdata/dahua_play.txt")), &mut p).unwrap();
@@ -873,11 +890,7 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, Some(0x4cacc3d1));
-        p.streams[0].state = StreamState::Init(StreamStateInit {
-            ssrc: setup_response.ssrc,
-            initial_seq: None,
-            initial_rtptime: None,
-        });
+        p.streams[0].state = dummy_stream_state_init(Some(0x4cacc3d1));
 
         // PLAY.
         super::parse_play(
@@ -885,7 +898,7 @@ mod tests {
             &mut p,
         )
         .unwrap();
-        match p.streams[0].state {
+        match &p.streams[0].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_seq, Some(24104));
                 assert_eq!(state.initial_rtptime, Some(1270711678));
@@ -957,8 +970,8 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
-        p.streams[0].state = StreamState::Init(StreamStateInit::default());
-        p.streams[1].state = StreamState::Init(StreamStateInit::default());
+        p.streams[0].state = dummy_stream_state_init(None);
+        p.streams[1].state = dummy_stream_state_init(None);
 
         // PLAY.
         super::parse_play(
@@ -966,14 +979,14 @@ mod tests {
             &mut p,
         )
         .unwrap();
-        match p.streams[0].state {
+        match &p.streams[0].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_seq, Some(16852));
                 assert_eq!(state.initial_rtptime, Some(1070938629));
             }
             _ => panic!(),
         };
-        match p.streams[1].state {
+        match &p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(3075976528));
                 assert_eq!(state.ssrc, Some(0x9fc9fff8));
@@ -1040,12 +1053,12 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
-        p.streams[0].state = StreamState::Init(StreamStateInit::default());
-        p.streams[1].state = StreamState::Init(StreamStateInit::default());
+        p.streams[0].state = dummy_stream_state_init(None);
+        p.streams[1].state = dummy_stream_state_init(None);
 
         // PLAY.
         super::parse_play(&response(include_bytes!("testdata/bunny_play.txt")), &mut p).unwrap();
-        match p.streams[1].state {
+        match &p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(0));
                 assert_eq!(state.initial_seq, Some(1));
@@ -1207,11 +1220,7 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
-        p.streams[0].state = StreamState::Init(StreamStateInit {
-            ssrc: None,
-            initial_seq: None,
-            initial_rtptime: None,
-        });
+        p.streams[0].state = dummy_stream_state_init(None);
 
         let setup_response = response(include_bytes!("testdata/gw_main_setup_audio.txt"));
         let setup_response = super::parse_setup(&setup_response).unwrap();
@@ -1224,11 +1233,7 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(2));
         assert_eq!(setup_response.ssrc, None);
-        p.streams[1].state = StreamState::Init(StreamStateInit {
-            ssrc: None,
-            initial_seq: None,
-            initial_rtptime: None,
-        });
+        p.streams[1].state = dummy_stream_state_init(None);
 
         // PLAY.
         super::parse_play(
@@ -1297,11 +1302,7 @@ mod tests {
         );
         assert_eq!(setup_response.channel_id, Some(0));
         assert_eq!(setup_response.ssrc, None);
-        p.streams[0].state = StreamState::Init(StreamStateInit {
-            ssrc: None,
-            initial_seq: None,
-            initial_rtptime: None,
-        });
+        p.streams[0].state = dummy_stream_state_init(None);
 
         // PLAY.
         super::parse_play(

@@ -21,7 +21,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32},
 };
 
-use crate::{client::rtp::Packet, error::ErrorInt, ConnectionContext, Error};
+use crate::{client::rtp::Packet, error::ErrorInt, ConnectionContext, Error, StreamContextRef};
 
 use super::CodecItem;
 
@@ -670,6 +670,7 @@ impl Depacketizer {
     pub(super) fn pull(
         &mut self,
         conn_ctx: &ConnectionContext,
+        stream_ctx: StreamContextRef,
     ) -> Result<Option<super::CodecItem>, Error> {
         match std::mem::take(&mut self.state) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
@@ -692,6 +693,7 @@ impl Depacketizer {
                     // says "receivers MUST support de-interleaving".
                     return Err(error(
                         *conn_ctx,
+                        stream_ctx,
                         agg,
                         "interleaving not yet supported".to_owned(),
                     ));
@@ -701,6 +703,7 @@ impl Depacketizer {
                     if agg.frame_count != 1 {
                         return Err(error(
                             *conn_ctx,
+                            stream_ctx,
                             agg,
                             "fragmented AUs must not share packets".to_owned(),
                         ));
@@ -719,6 +722,7 @@ impl Depacketizer {
                         }
                         return Err(error(
                             *conn_ctx,
+                            stream_ctx,
                             agg,
                             "mark can't be set on beginning of fragment".to_owned(),
                         ));
@@ -737,6 +741,7 @@ impl Depacketizer {
                 if !agg.mark {
                     return Err(error(
                         *conn_ctx,
+                        stream_ctx,
                         agg,
                         "mark must be set on non-fragmented au".to_owned(),
                     ));
@@ -756,6 +761,7 @@ impl Depacketizer {
                         None => {
                             return Err(error(
                                 *conn_ctx,
+                                stream_ctx,
                                 agg,
                                 format!(
                                     "aggregate timestamp {} + {} overflows",
@@ -778,9 +784,15 @@ impl Depacketizer {
     }
 }
 
-fn error(conn_ctx: ConnectionContext, agg: Aggregate, description: String) -> Error {
+fn error(
+    conn_ctx: ConnectionContext,
+    stream_ctx: StreamContextRef,
+    agg: Aggregate,
+    description: String,
+) -> Error {
     Error(std::sync::Arc::new(ErrorInt::RtpPacketError {
         conn_ctx,
+        stream_ctx: stream_ctx.to_owned(),
         pkt_ctx: agg.ctx,
         stream_id: agg.stream_id,
         ssrc: agg.ssrc,
@@ -840,13 +852,19 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Aggregate of 3 frames.
         d.push(Packet {
@@ -868,25 +886,37 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foo");
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(1_024).unwrap());
         assert_eq!(&a.data[..], b"bar");
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
         assert_eq!(&a.data[..], b"baz");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Fragment across 3 packets.
         d.push(Packet {
@@ -907,7 +937,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
         d.push(Packet {
             // fragment 2/3.
             ctx: crate::PacketContext::dummy(),
@@ -926,7 +959,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
         d.push(Packet {
             // fragment 3/3.
             ctx: crate::PacketContext::dummy(),
@@ -945,13 +981,19 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foobarbaz");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
     }
 
     /// Tests that depacketization skips/reports a frame in which its first packet was lost.
@@ -986,7 +1028,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
         d.push(Packet {
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
@@ -1004,7 +1049,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Following frame reports the loss.
         d.push(Packet {
@@ -1025,13 +1073,19 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
     }
 
     /// Tests that depacketization skips/reports a frame in which an interior frame is lost.
@@ -1066,7 +1120,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
         // Fragment 2/3 is lost
         d.push(Packet {
             // 3/3 reports the loss
@@ -1086,7 +1143,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Following frame reports the loss.
         d.push(Packet {
@@ -1107,13 +1167,19 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
     }
 
     /// Tests that depacketization skips/reports a frame in which the interior frame is lost.
@@ -1148,7 +1214,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
         // Fragment 2/3 is lost
         d.push(Packet {
             // 3/3 reports the loss
@@ -1168,7 +1237,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Following frame reports the loss.
         d.push(Packet {
@@ -1189,13 +1261,19 @@ mod tests {
             ]),
         })
         .unwrap();
-        let a = match d.pull(&ConnectionContext::dummy()).unwrap() {
+        let a = match d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+        {
             Some(CodecItem::AudioFrame(a)) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
     }
 
     /// Tests the distinction between `loss` and `loss_since_last_mark`.
@@ -1233,7 +1311,10 @@ mod tests {
             ]),
         })
         .unwrap();
-        assert!(d.pull(&ConnectionContext::dummy()).unwrap().is_none());
+        assert!(d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap()
+            .is_none());
 
         // Incomplete fragment with no reported loss.
         d.push(Packet {
@@ -1254,7 +1335,9 @@ mod tests {
             ]),
         })
         .unwrap();
-        let e = d.pull(&ConnectionContext::dummy()).unwrap_err();
+        let e = d
+            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .unwrap_err();
         let e_str = e.to_string();
         assert!(
             e_str.contains("mark can't be set on beginning of fragment"),

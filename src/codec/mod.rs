@@ -12,6 +12,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use crate::client::rtp;
 use crate::ConnectionContext;
 use crate::Error;
+use crate::StreamContextRef;
 use bytes::{Buf, Bytes};
 
 pub(crate) mod aac;
@@ -470,9 +471,13 @@ impl Depacketizer {
     ///
     /// Some packetization formats support aggregating multiple frames into one packet, so a single
     /// `push` call may cause `pull` to return `Ok(Some(...))` more than once.
-    pub fn pull(&mut self, conn_ctx: &ConnectionContext) -> Result<Option<CodecItem>, Error> {
+    pub fn pull(
+        &mut self,
+        conn_ctx: &ConnectionContext,
+        stream_ctx: StreamContextRef,
+    ) -> Result<Option<CodecItem>, Error> {
         match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.pull(conn_ctx),
+            DepacketizerInner::Aac(d) => d.pull(conn_ctx, stream_ctx),
             DepacketizerInner::G723(d) => Ok(d.pull()),
             DepacketizerInner::H264(d) => Ok(d.pull()),
             DepacketizerInner::Onvif(d) => Ok(d.pull()),

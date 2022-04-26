@@ -24,7 +24,10 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
-use crate::{Error, ErrorInt, RtspMessageContext};
+use crate::{
+    Error, ErrorInt, RtspMessageContext, StreamContextRef, StreamContextRefInner, TcpStreamContext,
+    UdpStreamContext,
+};
 
 mod channel_mapping;
 mod parse;
@@ -703,9 +706,6 @@ pub struct Stream {
     /// says the server is allowed to omit it when there is only a single stream.
     pub control: Option<Url>,
 
-    /// The sockets for `Transport::Udp`.
-    sockets: Option<UdpSockets>,
-
     state: StreamState,
 }
 
@@ -720,34 +720,36 @@ impl std::fmt::Debug for Stream {
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
             .field("depacketizer", &self.depacketizer)
-            .field("UDP", &self.sockets)
             .field("state", &self.state)
             .finish()
     }
 }
 
-struct UdpSockets {
-    local_ip: IpAddr,
-    local_rtp_port: u16,
-    remote_ip: IpAddr,
-    remote_rtp_port: u16,
-    rtp_socket: UdpSocket,
-    remote_rtcp_port: u16,
-    rtcp_socket: UdpSocket,
+enum StreamTransport {
+    Udp(UdpStreamTransport), // the ...Transport wrapper struct keeps ...Context and the sockets.
+    Tcp(TcpStreamContext),   // no sockets; ...Context suffices.
 }
 
-impl std::fmt::Debug for UdpSockets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_struct("UDP")
-            .field("local_ip", &self.local_ip)
-            .field("local_rtp_port", &self.local_rtp_port)
-            .field("remote_ip", &self.remote_ip)
-            .field("remote_rtp_port", &self.remote_rtp_port)
-            .field("rtp_socket", &self.rtp_socket)
-            .field("remote_rtcp_port", &self.remote_rtcp_port)
-            .field("rtcp_socket", &self.rtcp_socket)
-            .finish()
+impl std::fmt::Debug for StreamTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.ctx(), f)
     }
+}
+
+impl StreamTransport {
+    fn ctx(&self) -> StreamContextRef {
+        StreamContextRef(match self {
+            StreamTransport::Tcp(tcp) => StreamContextRefInner::Tcp(*tcp),
+            StreamTransport::Udp(udp) => StreamContextRefInner::Udp(&udp.ctx),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UdpStreamTransport {
+    ctx: UdpStreamContext,
+    rtp_socket: UdpSocket,
+    rtcp_socket: UdpSocket,
 }
 
 impl Stream {
@@ -785,6 +787,15 @@ impl Stream {
     pub fn parameters(&self) -> Option<crate::codec::Parameters> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }
+
+    /// Returns a context for this stream, if it has been set up.
+    pub fn ctx(&self) -> Option<StreamContextRef> {
+        match &self.state {
+            StreamState::Uninit => None,
+            StreamState::Init(init) => Some(init.transport.ctx()),
+            StreamState::Playing { transport, .. } => Some(transport.ctx()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -799,10 +810,11 @@ enum StreamState {
     Playing {
         timeline: Timeline,
         rtp_handler: rtp::InorderParser,
+        transport: StreamTransport,
     },
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Debug)]
 struct StreamStateInit {
     /// The RTP synchronization source (SSRC), as defined in
     /// [RFC 3550](https://tools.ietf.org/html/rfc3550). This is normally
@@ -819,6 +831,8 @@ struct StreamStateInit {
     /// `RTP-Info` header. This field is only used during the `play()` call
     /// itself; by the time it returns, the stream will be in state `Playing`.
     initial_rtptime: Option<u32>,
+
+    transport: StreamTransport,
 }
 
 /// Username and password authentication credentials.
@@ -1324,7 +1338,7 @@ impl Session<Described> {
             .clone();
         let mut req =
             rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0).request_uri(url);
-        match options.transport {
+        let udp = match options.transport {
             Transport::Tcp => {
                 let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
                     wrap!(ErrorInt::FailedPrecondition(
@@ -1339,22 +1353,14 @@ impl Session<Described> {
                         proposed_channel_id + 1
                     ),
                 );
+                None
             }
             Transport::Udp => {
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
-                let ip_addr = conn.inner.ctx().local_addr.ip();
-                let pair = crate::tokio::UdpPair::for_ip(ip_addr)
+                let local_ip = conn.inner.ctx().local_addr.ip();
+                let pair = crate::tokio::UdpPair::for_ip(local_ip)
                     .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
-                stream.sockets = Some(UdpSockets {
-                    local_ip: ip_addr,
-                    local_rtp_port: pair.rtp_port,
-                    remote_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    remote_rtp_port: 0,
-                    rtp_socket: pair.rtp_socket,
-                    remote_rtcp_port: 0,
-                    rtcp_socket: pair.rtcp_socket,
-                });
                 req = req.header(
                     rtsp_types::headers::TRANSPORT,
                     format!(
@@ -1363,8 +1369,18 @@ impl Session<Described> {
                         pair.rtp_port + 1,
                     ),
                 );
+                Some(UdpStreamTransport {
+                    ctx: UdpStreamContext {
+                        local_ip,
+                        peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        local_rtp_port: pair.rtp_port,
+                        peer_rtp_port: 0,
+                    },
+                    rtp_socket: pair.rtp_socket,
+                    rtcp_socket: pair.rtcp_socket,
+                })
             }
-        }
+        };
         if let Some(ref s) = inner.session {
             req = req.header(rtsp_types::headers::SESSION, s.id.to_string());
         }
@@ -1408,8 +1424,8 @@ impl Session<Described> {
             None => *inner.session = Some(response.session),
         };
         let conn_ctx = conn.inner.ctx();
-        match options.transport {
-            Transport::Tcp => {
+        let transport = match udp {
+            None => {
                 let channel_id = match response.channel_id {
                     Some(id) => id,
                     None => bail!(ErrorInt::RtspResponseError {
@@ -1433,8 +1449,11 @@ impl Session<Described> {
                             description,
                         })
                     })?;
+                StreamTransport::Tcp(TcpStreamContext {
+                    rtp_channel_id: channel_id,
+                })
             }
-            Transport::Udp => {
+            Some(mut udp) => {
                 // TODO: RFC 2326 section 12.39 says "If the source address for
                 // the stream is different than can be derived from the RTSP
                 // endpoint address (the server in playback or the client in
@@ -1455,29 +1474,27 @@ impl Session<Described> {
                         description: "Transport header is missing server_port parameter".to_owned(),
                     })
                 })?;
-                let udp_sockets = stream.sockets.as_mut().unwrap();
-                udp_sockets.remote_ip = source;
-                udp_sockets.remote_rtp_port = server_port.0;
-                udp_sockets.remote_rtcp_port = server_port.1;
-                udp_sockets
-                    .rtp_socket
-                    .connect(SocketAddr::new(source, udp_sockets.remote_rtp_port))
+                udp.ctx.peer_ip = source;
+                udp.ctx.peer_rtp_port = server_port;
+                udp.rtp_socket
+                    .connect(SocketAddr::new(source, server_port))
                     .await
                     .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-                udp_sockets
-                    .rtcp_socket
-                    .connect(SocketAddr::new(source, udp_sockets.remote_rtcp_port))
+                udp.rtcp_socket
+                    .connect(SocketAddr::new(source, server_port + 1))
                     .await
                     .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-                punch_firewall_hole(&udp_sockets.rtp_socket, &udp_sockets.rtcp_socket)
+                punch_firewall_hole(&udp.rtp_socket, &udp.rtcp_socket)
                     .await
                     .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+                StreamTransport::Udp(udp)
             }
-        }
+        };
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
             initial_rtptime: None,
+            transport,
         });
         Ok(())
     }
@@ -1552,11 +1569,12 @@ impl Session<Described> {
         // Move all streams that have been set up from Init to Playing state. Check that required
         // parameters are present while doing so.
         for (i, s) in inner.presentation.streams.iter_mut().enumerate() {
-            match s.state {
+            match std::mem::replace(&mut s.state, StreamState::Uninit) {
                 StreamState::Init(StreamStateInit {
                     initial_rtptime,
                     initial_seq,
                     ssrc,
+                    transport,
                     ..
                 }) => {
                     let initial_rtptime = match policy.initial_timestamp {
@@ -1612,6 +1630,7 @@ impl Session<Described> {
                             })
                         })?,
                         rtp_handler: rtp::InorderParser::new(ssrc, initial_seq),
+                        transport,
                     };
                 }
                 StreamState::Uninit => {}
@@ -1893,10 +1912,7 @@ impl Session<Playing> {
             .as_mut()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         let channel_id = data.channel_id();
-        let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Tcp {
-            msg_ctx: *msg_ctx,
-            channel_id,
-        });
+        let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Tcp { msg_ctx: *msg_ctx });
         let m = match conn.channels.lookup(channel_id) {
             Some(m) => m,
             None => {
@@ -1910,11 +1926,12 @@ impl Session<Playing> {
             }
         };
         let stream = &mut inner.presentation.streams[m.stream_i];
-        let (timeline, rtp_handler) = match &mut stream.state {
+        let (timeline, rtp_handler, stream_ctx) = match &mut stream.state {
             StreamState::Playing {
                 timeline,
                 rtp_handler,
-            } => (timeline, rtp_handler),
+                transport,
+            } => (timeline, rtp_handler, transport.ctx()),
             _ => unreachable!(
                 "Session<Playing>'s {}->{:?} not in Playing state",
                 channel_id, m
@@ -1923,6 +1940,7 @@ impl Session<Playing> {
         match m.channel_type {
             ChannelType::Rtp => Ok(rtp_handler.rtp(
                 inner.options,
+                stream_ctx,
                 inner.presentation.tool.as_ref(),
                 conn.inner.ctx(),
                 &pkt_ctx,
@@ -1933,6 +1951,7 @@ impl Session<Playing> {
             ChannelType::Rtcp => {
                 match rtp_handler.rtcp(
                     inner.options,
+                    stream_ctx,
                     inner.presentation.tool.as_ref(),
                     &pkt_ctx,
                     timeline,
@@ -1942,6 +1961,7 @@ impl Session<Playing> {
                     Ok(p) => Ok(p),
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
                         conn_ctx: *conn.inner.ctx(),
+                        stream_ctx: stream.ctx().unwrap().to_owned(),
                         pkt_ctx,
                         stream_id: m.stream_i,
                         description,
@@ -1964,90 +1984,95 @@ impl Session<Playing> {
     ) -> Poll<Option<Result<PacketItem, Error>>> {
         debug_assert!(buf.filled().is_empty());
         let inner = self.0.as_mut().project();
+        let s = &mut inner.presentation.streams[i];
+        let (timeline, rtp_handler, udp) = match &mut s.state {
+            StreamState::Playing {
+                timeline,
+                rtp_handler,
+                transport: StreamTransport::Udp(udp),
+            } => (timeline, rtp_handler, udp),
+            _ => return Poll::Pending,
+        };
         let conn_ctx = inner
             .conn
             .as_ref()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
             .inner
             .ctx();
-        let s = &mut inner.presentation.streams[i];
-        if let Some(sockets) = &mut s.sockets {
-            let (timeline, rtp_handler) = match &mut s.state {
-                StreamState::Playing {
-                    timeline,
-                    rtp_handler,
-                } => (timeline, rtp_handler),
-                _ => unreachable!("Session<Playing>'s {}->{:?} not in Playing state", i, s),
-            };
-            // Prioritize RTCP over RTP within a stream.
-            while let Poll::Ready(r) = sockets.rtcp_socket.poll_recv(cx, buf) {
-                let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                    local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port + 1),
-                    peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtcp_port),
-                    received_wall: crate::WallTime::now(),
-                });
-                match r {
-                    Ok(()) => {
-                        let msg = Bytes::copy_from_slice(buf.filled());
-                        match rtp_handler.rtcp(
-                            inner.options,
-                            inner.presentation.tool.as_ref(),
-                            &pkt_ctx,
-                            timeline,
-                            i,
-                            msg,
-                        ) {
-                            Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
-                            Ok(None) => buf.clear(),
-                            Err(description) => {
-                                return Poll::Ready(Some(Err(wrap!(ErrorInt::PacketError {
-                                    conn_ctx: *conn_ctx,
-                                    pkt_ctx,
-                                    stream_id: i,
-                                    description,
-                                }))))
-                            }
+        let stream_ctx = StreamContextRef(StreamContextRefInner::Udp(&udp.ctx));
+
+        // Prioritize RTCP over RTP within a stream.
+        while let Poll::Ready(r) = udp.rtcp_socket.poll_recv(cx, buf) {
+            let when = crate::WallTime::now();
+            match r {
+                Ok(()) => {
+                    let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
+                        received_wall: when,
+                    });
+                    let msg = Bytes::copy_from_slice(buf.filled());
+                    match rtp_handler.rtcp(
+                        inner.options,
+                        stream_ctx,
+                        inner.presentation.tool.as_ref(),
+                        &pkt_ctx,
+                        timeline,
+                        i,
+                        msg,
+                    ) {
+                        Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
+                        Ok(None) => buf.clear(),
+                        Err(description) => {
+                            return Poll::Ready(Some(Err(wrap!(ErrorInt::PacketError {
+                                conn_ctx: *conn_ctx,
+                                stream_ctx: stream_ctx.to_owned(),
+                                pkt_ctx,
+                                stream_id: i,
+                                description,
+                            }))))
                         }
-                    }
-                    Err(source) => {
-                        return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                            conn_ctx: *conn_ctx,
-                            pkt_ctx,
-                            source,
-                        }))))
                     }
                 }
+                Err(source) => {
+                    return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
+                        conn_ctx: *conn_ctx,
+                        stream_ctx: stream_ctx.to_owned(),
+                        when,
+                        source,
+                    }))))
+                }
             }
-            while let Poll::Ready(r) = sockets.rtp_socket.poll_recv(cx, buf) {
-                let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                    local_addr: SocketAddr::new(sockets.local_ip, sockets.local_rtp_port),
-                    peer_addr: SocketAddr::new(sockets.remote_ip, sockets.remote_rtp_port),
-                    received_wall: crate::WallTime::now(),
-                });
-                match r {
-                    Ok(()) => {
-                        let msg = Bytes::copy_from_slice(buf.filled());
-                        match rtp_handler.rtp(
-                            inner.options,
-                            inner.presentation.tool.as_ref(),
-                            conn_ctx,
-                            &pkt_ctx,
-                            timeline,
-                            i,
-                            msg,
-                        ) {
-                            Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
-                            Ok(None) => buf.clear(),
-                            Err(e) => return Poll::Ready(Some(Err(e))),
-                        }
+        }
+        while let Poll::Ready(r) = udp.rtp_socket.poll_recv(cx, buf) {
+            let when = crate::WallTime::now();
+            let stream_ctx = StreamContextRef(StreamContextRefInner::Udp(&udp.ctx));
+            match r {
+                Ok(()) => {
+                    let msg = Bytes::copy_from_slice(buf.filled());
+                    let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
+                        received_wall: when,
+                    });
+                    match rtp_handler.rtp(
+                        inner.options,
+                        stream_ctx,
+                        inner.presentation.tool.as_ref(),
+                        conn_ctx,
+                        &pkt_ctx,
+                        timeline,
+                        i,
+                        msg,
+                    ) {
+                        Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
+                        Ok(None) => buf.clear(),
+                        Err(e) => return Poll::Ready(Some(Err(e))),
                     }
-                    Err(source) => {
-                        return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                            conn_ctx: *conn_ctx,
-                            pkt_ctx,
-                            source,
-                        }))))
-                    }
+                }
+                Err(source) => {
+                    return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
+                        conn_ctx: *conn_ctx,
+                        stream_ctx: stream_ctx.to_owned(),
+                        when,
+                        source,
+                    }))))
                 }
             }
         }
@@ -2273,7 +2298,12 @@ impl futures::Stream for Demuxed {
                 DemuxedState::Fused => return Poll::Ready(None),
             };
             let inner = self.session.0.as_mut().project();
-            let depacketizer = match &mut inner.presentation.streams[stream_id].depacketizer {
+            let stream = &mut inner.presentation.streams[stream_id];
+            let stream_ctx = match stream.state {
+                StreamState::Playing { ref transport, .. } => transport.ctx(),
+                _ => unreachable!(),
+            };
+            let depacketizer = match &mut stream.depacketizer {
                 Ok(d) => d,
                 Err(_) => unreachable!("depacketizer was Ok"),
             };
@@ -2291,6 +2321,7 @@ impl futures::Stream for Demuxed {
                 depacketizer.push(p).map_err(|description| {
                     wrap!(ErrorInt::RtpPacketError {
                         conn_ctx: *conn_ctx,
+                        stream_ctx: stream_ctx.to_owned(),
                         pkt_ctx,
                         stream_id,
                         ssrc,
@@ -2299,7 +2330,7 @@ impl futures::Stream for Demuxed {
                     })
                 })?;
             }
-            match depacketizer.pull(conn_ctx) {
+            match depacketizer.pull(conn_ctx, stream_ctx) {
                 Ok(Some(item)) => {
                     self.state = DemuxedState::Pulling(stream_id);
                     return Poll::Ready(Some(Ok(item)));
