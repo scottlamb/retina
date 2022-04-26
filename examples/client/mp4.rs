@@ -726,7 +726,7 @@ async fn write_mp4<'a>(
 }
 
 pub async fn run(opts: Opts) -> Result<(), Error> {
-    if matches!(opts.transport, Transport::Udp) && !opts.allow_loss {
+    if matches!(opts.transport, Transport::Udp(_)) && !opts.allow_loss {
         warn!("Using --transport=udp without strongly recommended --allow-loss!");
     }
 
@@ -739,7 +739,6 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .creds(creds)
             .session_group(session_group.clone())
             .user_agent("Retina mp4 example".to_owned())
-            .transport(opts.transport)
             .teardown(opts.teardown),
     )
     .await?;
@@ -766,7 +765,9 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         None
     };
     if let Some(i) = video_stream_i {
-        session.setup(i, SetupOptions::default()).await?;
+        session
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .await?;
     }
     let audio_stream = if !opts.no_audio {
         let s = session
@@ -795,7 +796,9 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         None
     };
     if let Some((i, _)) = audio_stream {
-        session.setup(i, SetupOptions::default()).await?;
+        session
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {
         bail!("Exiting because no video or audio stream was selected; see info log messages above");

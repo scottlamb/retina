@@ -5,9 +5,13 @@
     `#[doc(hidden)]`.
 *   BREAKING: `retina::client::Session<Described>::setup` takes a new
     `SetupOptions` argument for future expansion.
-*   BREAKING: `retina::StreamContext` has been split out of `retina::PacketContext`.
-    Both must be printed to provide the same information as before. This change
-    reduces how much data needs to be copied with each packet.
+*   BREAKING: the transport to use is configured per-stream as part of
+    `retina::SetupOptions` (rather than the prior `retina::SessionOptions`) and
+    takes per-transport options for future expansion.
+*   BREAKING: `retina::StreamContext` has been split out of
+    `retina::PacketContext`. Both must be printed to provide the same
+    information as before. This change reduces how much data needs to be copied
+    with each packet.
 
 ## `v0.3.9` (2022-04-12)
 
