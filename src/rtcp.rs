@@ -138,7 +138,7 @@ impl<'a> GenericPacket<'a> {
             ));
         }
         let (this, rest) = buf.split_at(len);
-        let padding_bit = this[0] & 0b00100_0000;
+        let padding_bit = this[0] & 0b0010_0000;
         if padding_bit != 0 {
             if raw_len == 0 {
                 return Err("RTCP packet has invalid combination of padding and len=0".to_owned());
@@ -208,5 +208,14 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn padding() {
+        let buf = b"\xa7\x00\x00\x02asdf\x00\x00\x00\x04rest";
+        let (pkt, rest) = GenericPacket::parse(buf).unwrap();
+        assert_eq!(pkt.count(), 7);
+        assert_eq!(&pkt.buf[4..pkt.payload_end], b"asdf");
+        assert_eq!(b"rest", rest);
     }
 }
