@@ -102,7 +102,7 @@ struct StaleSession {
 ///
 /// A `SessionGroup` can be of any granularity, but a typical use is to ensure
 /// there are no stale sessions before starting a fresh session (see
-/// [`SessionGroup::stale_sessions`] and [`SessionGroup::await_stale_session`]).
+/// [`SessionGroup::stale_sessions`] and [`SessionGroup::await_stale_sessions`]).
 /// Groups should be sized to match that idea. If connecting to a live555 server
 /// affected by the stale TCP session bug, it might be wise to have one group
 /// per server, so that all such sessions can be drained before initiating new
@@ -895,7 +895,7 @@ enum ResponseMode {
 /// 4. Get packets via the [`futures::stream::Stream`] impl on `Session<Playing>`,
 ///    or frames via the [`futures::stream::Stream`] impl returned by [`Session<Playing>::demuxed`].
 /// 5. Drop the session. Retina may issue a `TEARDOWN` in the background, depending on the
-///    `[SessionOptions::teardown`] parameter.
+///    [`SessionOptions::teardown`] parameter.
 /// 6. Possibly wait for `TEARDOWN` to complete; see
 ///    [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
 ///
