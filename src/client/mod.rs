@@ -1798,7 +1798,7 @@ async fn punch_firewall_hole(
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PacketItem {
-    RtpPacket(rtp::Packet),
+    RtpPacket(crate::rtp::ReceivedPacket),
     SenderReport(rtp::SenderReport),
 }
 
@@ -2315,7 +2315,7 @@ impl futures::Stream for Demuxed {
         loop {
             let (stream_id, pkt) = match self.state {
                 DemuxedState::Waiting => match ready!(Pin::new(&mut self.session).poll_next(cx)) {
-                    Some(Ok(PacketItem::RtpPacket(p))) => (p.stream_id, Some(p)),
+                    Some(Ok(PacketItem::RtpPacket(p))) => (p.stream_id(), Some(p)),
                     Some(Ok(PacketItem::SenderReport(p))) => {
                         return Poll::Ready(Some(Ok(CodecItem::SenderReport(p))))
                     }
@@ -2342,10 +2342,10 @@ impl futures::Stream for Demuxed {
                 .inner
                 .ctx();
             if let Some(p) = pkt {
-                let pkt_ctx = p.ctx;
-                let stream_id = p.stream_id;
-                let ssrc = p.ssrc;
-                let sequence_number = p.sequence_number;
+                let pkt_ctx = *p.ctx();
+                let stream_id = p.stream_id();
+                let ssrc = p.ssrc();
+                let sequence_number = p.sequence_number();
                 depacketizer.push(p).map_err(|description| {
                     wrap!(ErrorInt::RtpPacketError {
                         conn_ctx: *conn_ctx,
@@ -2498,9 +2498,9 @@ mod tests {
                 async {
                     match session.next().await {
                         Some(Ok(PacketItem::RtpPacket(p))) => {
-                            assert_eq!(p.ssrc, 0xdcc4a0d8);
-                            assert_eq!(p.sequence_number, 0x41d4);
-                            assert_eq!(&p.payload[..], b"hello world");
+                            assert_eq!(p.ssrc(), 0xdcc4a0d8);
+                            assert_eq!(p.sequence_number(), 0x41d4);
+                            assert_eq!(&p.payload()[..], b"hello world");
                         }
                         o => panic!("unexpected item: {:#?}", o),
                     }
@@ -2608,9 +2608,9 @@ mod tests {
                 async {
                     match session.next().await {
                         Some(Ok(PacketItem::RtpPacket(p))) => {
-                            assert_eq!(p.ssrc, 0xdcc4a0d8);
-                            assert_eq!(p.sequence_number, 0x41d4);
-                            assert_eq!(&p.payload[..], b"hello world");
+                            assert_eq!(p.ssrc(), 0xdcc4a0d8);
+                            assert_eq!(p.sequence_number(), 0x41d4);
+                            assert_eq!(&p.payload()[..], b"hello world");
                         }
                         o => panic!("unexpected item: {:#?}", o),
                     }
@@ -2771,7 +2771,6 @@ mod tests {
             ("SessionOptions", std::mem::size_of::<SessionOptions>()),
             ("Demuxed", std::mem::size_of::<Demuxed>()),
             ("Stream", std::mem::size_of::<Stream>()),
-            ("rtp::Packet", std::mem::size_of::<rtp::Packet>()),
             (
                 "rtp::SenderReport",
                 std::mem::size_of::<rtp::SenderReport>(),

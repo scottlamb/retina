@@ -48,22 +48,23 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
         assert!(self.pending.is_none());
-        let frame_length = self.frame_length(pkt.payload.len()).ok_or_else(|| {
+        let payload = pkt.payload();
+        let frame_length = self.frame_length(payload.len()).ok_or_else(|| {
             format!(
                 "invalid length {} for payload of {}-bit audio samples",
-                pkt.payload.len(),
+                payload.len(),
                 self.bits_per_sample
             )
         })?;
         self.pending = Some(super::AudioFrame {
-            loss: pkt.loss,
-            ctx: pkt.ctx,
-            stream_id: pkt.stream_id,
-            timestamp: pkt.timestamp,
+            loss: pkt.loss(),
+            ctx: *pkt.ctx(),
+            stream_id: pkt.stream_id(),
+            timestamp: pkt.timestamp(),
             frame_length,
-            data: pkt.payload,
+            data: pkt.into_payload_bytes(),
         });
         Ok(())
     }

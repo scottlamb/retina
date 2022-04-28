@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let conn_ctx = retina::ConnectionContext::dummy();
     let stream_ctx = retina::StreamContextRef::dummy();
     let max_payload_size = u16::from_be_bytes([data[0], data[1]]);
-    let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0) {
+    let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0, 0, 0) {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -39,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
     let frame = loop {
         match p.pull() {
             Ok(Some(pkt)) => {
-                let mark = pkt.mark;
+                let mark = pkt.mark();
                 if d.push(pkt).is_err() {
                     return;
                 }

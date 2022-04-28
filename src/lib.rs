@@ -23,6 +23,8 @@ mod error;
 mod rtcp;
 
 mod hex;
+pub mod rtp;
+
 #[cfg(test)]
 mod testutil;
 

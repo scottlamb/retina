@@ -57,54 +57,55 @@ impl Depacketizer {
         )))
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
-        if pkt.loss > 0 {
+    pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
+        if pkt.loss() > 0 {
             if let State::InProgress(in_progress) = &self.state {
                 log::debug!(
                     "Discarding {}-byte message prefix due to loss of {} RTP packets",
                     in_progress.data.len(),
-                    pkt.loss
+                    pkt.loss(),
                 );
                 self.state = State::Idle;
             }
         }
         let mut in_progress = match std::mem::replace(&mut self.state, State::Idle) {
             State::InProgress(in_progress) => {
-                if in_progress.timestamp.timestamp != pkt.timestamp.timestamp {
+                if in_progress.timestamp.timestamp != pkt.timestamp().timestamp {
                     return Err(format!(
                         "Timestamp changed from {} to {} with message in progress",
-                        &in_progress.timestamp, &pkt.timestamp,
+                        &in_progress.timestamp,
+                        &pkt.timestamp(),
                     ));
                 }
                 in_progress
             }
             State::Ready(..) => panic!("push while in state ready"),
             State::Idle => {
-                if pkt.mark {
+                if pkt.mark() {
                     // fast-path: avoid copy.
                     self.state = State::Ready(super::MessageFrame {
-                        stream_id: pkt.stream_id,
-                        loss: pkt.loss,
-                        ctx: pkt.ctx,
-                        timestamp: pkt.timestamp,
-                        data: pkt.payload,
+                        stream_id: pkt.stream_id(),
+                        loss: pkt.loss(),
+                        ctx: *pkt.ctx(),
+                        timestamp: pkt.timestamp(),
+                        data: pkt.into_payload_bytes(),
                     });
                     return Ok(());
                 }
                 InProgress {
-                    loss: pkt.loss,
-                    ctx: pkt.ctx,
-                    timestamp: pkt.timestamp,
+                    loss: pkt.loss(),
+                    ctx: *pkt.ctx(),
+                    timestamp: pkt.timestamp(),
                     data: BytesMut::with_capacity(self.high_water_size),
                 }
             }
         };
-        in_progress.data.put(pkt.payload);
-        if pkt.mark {
+        in_progress.data.put(pkt.payload());
+        if pkt.mark() {
             self.high_water_size =
                 std::cmp::max(self.high_water_size, in_progress.data.remaining());
             self.state = State::Ready(super::MessageFrame {
-                stream_id: pkt.stream_id,
+                stream_id: pkt.stream_id(),
                 ctx: in_progress.ctx,
                 timestamp: in_progress.timestamp,
                 data: in_progress.data.freeze(),

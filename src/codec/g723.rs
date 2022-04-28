@@ -36,32 +36,33 @@ impl Depacketizer {
         }))
     }
 
-    fn validate(pkt: &crate::client::rtp::Packet) -> bool {
-        let expected_hdr_bits = match pkt.payload.len() {
+    fn validate(pkt: &crate::rtp::ReceivedPacket) -> bool {
+        let payload = pkt.payload();
+        let expected_hdr_bits = match payload.len() {
             24 => 0b00,
             20 => 0b01,
             4 => 0b10,
             _ => return false,
         };
-        let actual_hdr_bits = pkt.payload[0] & 0b11;
+        let actual_hdr_bits = payload[0] & 0b11;
         actual_hdr_bits == expected_hdr_bits
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
         assert!(self.pending.is_none());
         if !Self::validate(&pkt) {
             return Err(format!(
                 "Invalid G.723 packet: {:#?}",
-                crate::hex::LimitedHex::new(&pkt.payload, 64),
+                crate::hex::LimitedHex::new(pkt.payload(), 64),
             ));
         }
         self.pending = Some(super::AudioFrame {
-            ctx: pkt.ctx,
-            loss: pkt.loss,
-            stream_id: pkt.stream_id,
-            timestamp: pkt.timestamp,
+            ctx: *pkt.ctx(),
+            loss: pkt.loss(),
+            stream_id: pkt.stream_id(),
+            timestamp: pkt.timestamp(),
             frame_length: NonZeroU32::new(240).unwrap(),
-            data: pkt.payload,
+            data: pkt.into_payload_bytes(),
         });
         Ok(())
     }

@@ -9,7 +9,7 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use crate::client::rtp;
+use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContextRef;
@@ -191,7 +191,7 @@ pub struct AudioFrame {
     pub timestamp: crate::Timestamp,
     pub frame_length: NonZeroU32,
 
-    /// Number of lost RTP packets before this audio frame. See [crate::client::rtp::Packet::loss].
+    /// Number of lost RTP packets before this audio frame. See [crate::rtp::ReceivedPacket::loss].
     /// Note that if loss occurs during a fragmented frame, more than this number of packets' worth
     /// of data may be skipped.
     pub loss: u16,
@@ -237,8 +237,9 @@ pub struct MessageFrame {
     pub timestamp: crate::Timestamp,
     pub stream_id: usize,
 
-    /// Number of lost RTP packets before this message frame. See [crate::client::rtp::Packet::loss].
-    /// If this is non-zero, a prefix of the message may be missing.
+    /// Number of lost RTP packets before this message frame. See
+    /// [crate::rtp::ReceivedPacket::loss]. If this is non-zero, a prefix of the
+    /// message may be missing.
     pub loss: u16,
 
     // TODO: expose bytes or Buf (for zero-copy)?
@@ -273,7 +274,7 @@ pub struct VideoFrame {
     // parameters, see [`crate::client::Stream::parameters`].
     pub new_parameters: Option<Box<VideoParameters>>,
 
-    /// Number of lost RTP packets before this video frame. See [crate::client::rtp::Packet::loss].
+    /// Number of lost RTP packets before this video frame. See [crate::rtp::ReceivedPacket::loss].
     /// Note that if loss occurs during a fragmented frame, more than this number of packets' worth
     /// of data may be skipped.
     pub loss: u16,
@@ -458,7 +459,7 @@ impl Depacketizer {
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `Ok(None)`. The later
     /// `push` call may panic or drop data if this expectation is violated.
-    pub fn push(&mut self, input: rtp::Packet) -> Result<(), String> {
+    pub fn push(&mut self, input: ReceivedPacket) -> Result<(), String> {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.push(input),
             DepacketizerInner::G723(d) => d.push(input),

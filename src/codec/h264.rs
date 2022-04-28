@@ -10,7 +10,10 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
-use crate::{client::rtp::Packet, Error, Timestamp};
+use crate::{
+    rtp::{ReceivedPacket, ReceivedPacketBuilder},
+    Error, Timestamp,
+};
 
 use super::VideoFrame;
 
@@ -130,7 +133,7 @@ impl Depacketizer {
             .map(|p| super::Parameters::Video(p.generic_parameters.clone()))
     }
 
-    pub(super) fn push(&mut self, pkt: Packet) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
         // Push shouldn't be called until pull is exhausted.
         if let Some(p) = self.pending.as_ref() {
             panic!("push with data already pending: {:?}", p);
@@ -144,22 +147,23 @@ impl Depacketizer {
                     AccessUnit::start(&pkt, 0, false)
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
-                    if pkt.loss > 0 {
+                    let loss = pkt.loss();
+                    if loss > 0 {
                         self.nals.clear();
                         self.pieces.clear();
-                        if access_unit.timestamp.timestamp == pkt.timestamp.timestamp {
+                        if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
-                            self.input_state = if pkt.mark {
+                            self.input_state = if pkt.mark() {
                                 DepacketizerInputState::PostMark {
-                                    timestamp: pkt.timestamp,
-                                    loss: pkt.loss,
+                                    timestamp: pkt.timestamp(),
+                                    loss,
                                 }
                             } else {
                                 self.pieces.clear();
                                 self.nals.clear();
                                 DepacketizerInputState::Loss {
-                                    timestamp: pkt.timestamp,
-                                    pkts: pkt.loss,
+                                    timestamp: pkt.timestamp(),
+                                    pkts: loss,
                                 }
                             };
                             return Ok(());
@@ -167,16 +171,17 @@ impl Depacketizer {
                         // A suffix of a previous access unit was lost; discard it.
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
-                    } else if access_unit.timestamp.timestamp != pkt.timestamp.timestamp {
+                    } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
                         if access_unit.in_fu_a {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
-                                access_unit.timestamp, pkt.timestamp
+                                access_unit.timestamp,
+                                pkt.timestamp()
                             ));
                         }
                         let last_nal_hdr = self.nals.last().unwrap().hdr;
                         if can_end_au(last_nal_hdr.nal_unit_type()) {
-                            access_unit.end_ctx = pkt.ctx;
+                            access_unit.end_ctx = *pkt.ctx();
                             self.pending =
                                 Some(self.finalize_access_unit(access_unit, "ts change")?);
                             AccessUnit::start(&pkt, 0, false)
@@ -185,7 +190,7 @@ impl Depacketizer {
                                 "Bogus mid-access unit timestamp change after {:?}",
                                 last_nal_hdr
                             );
-                            access_unit.timestamp.timestamp = pkt.timestamp.timestamp;
+                            access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
                             access_unit
                         }
                     } else {
@@ -198,7 +203,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp.timestamp)
+                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
@@ -206,8 +211,8 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    if pkt.timestamp.timestamp == timestamp.timestamp {
-                        pkts += pkt.loss;
+                    if pkt.timestamp().timestamp == timestamp.timestamp {
+                        pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
                     }
@@ -215,7 +220,11 @@ impl Depacketizer {
                 }
             };
 
-        let mut data = pkt.payload;
+        let ctx = *pkt.ctx();
+        let mark = pkt.mark();
+        let loss = pkt.loss();
+        let timestamp = pkt.timestamp();
+        let mut data = pkt.into_payload_bytes();
         if data.is_empty() {
             return Err("Empty NAL".into());
         }
@@ -309,7 +318,7 @@ impl Depacketizer {
                 if (start && end) || reserved {
                     return Err(format!("Invalid FU-A header {:02x}", fu_header));
                 }
-                if !end && pkt.mark {
+                if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
                 let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
@@ -337,17 +346,17 @@ impl Depacketizer {
                         if end {
                             nal.next_piece_idx = pieces;
                             access_unit.in_fu_a = false;
-                        } else if pkt.mark {
+                        } else if mark {
                             return Err("FU-A has MARK and no END".into());
                         }
                     }
                     (false, false) => {
-                        if pkt.loss > 0 {
+                        if loss > 0 {
                             self.pieces.clear();
                             self.nals.clear();
                             self.input_state = DepacketizerInputState::Loss {
-                                timestamp: pkt.timestamp,
-                                pkts: pkt.loss,
+                                timestamp,
+                                pkts: loss,
                             };
                             return Ok(());
                         }
@@ -357,21 +366,18 @@ impl Depacketizer {
             }
             _ => return Err(format!("bad nal header {:02x}", nal_header)),
         }
-        self.input_state = if pkt.mark {
+        self.input_state = if mark {
             let last_nal_hdr = self.nals.last().unwrap().hdr;
             if can_end_au(last_nal_hdr.nal_unit_type()) {
-                access_unit.end_ctx = pkt.ctx;
+                access_unit.end_ctx = ctx;
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
-                DepacketizerInputState::PostMark {
-                    timestamp: pkt.timestamp,
-                    loss: 0,
-                }
+                DepacketizerInputState::PostMark { timestamp, loss: 0 }
             } else {
                 log::debug!(
                     "Bogus mid-access unit timestamp change after {:?}",
                     last_nal_hdr
                 );
-                access_unit.timestamp.timestamp = pkt.timestamp.timestamp;
+                access_unit.timestamp.timestamp = timestamp.timestamp;
                 DepacketizerInputState::PreMark(access_unit)
             }
         } else {
@@ -543,19 +549,19 @@ fn can_end_au(nal_unit_type: UnitType) -> bool {
 
 impl AccessUnit {
     fn start(
-        pkt: &crate::client::rtp::Packet,
+        pkt: &crate::rtp::ReceivedPacket,
         additional_loss: u16,
         same_ts_as_prev: bool,
     ) -> Self {
         AccessUnit {
-            start_ctx: pkt.ctx,
-            end_ctx: pkt.ctx,
-            timestamp: pkt.timestamp,
-            stream_id: pkt.stream_id,
+            start_ctx: *pkt.ctx(),
+            end_ctx: *pkt.ctx(),
+            timestamp: pkt.timestamp(),
+            stream_id: pkt.stream_id(),
             in_fu_a: false,
 
             // TODO: overflow?
-            loss: pkt.loss + additional_loss,
+            loss: pkt.loss() + additional_loss,
             same_ts_as_prev,
         }
     }
@@ -806,6 +812,8 @@ pub struct Packetizer {
     max_payload_size: u16,
     next_sequence_number: u16,
     stream_id: usize,
+    ssrc: u32,
+    payload_type: u8,
     state: PacketizerState,
 }
 
@@ -814,6 +822,8 @@ impl Packetizer {
         max_payload_size: u16,
         stream_id: usize,
         initial_sequence_number: u16,
+        payload_type: u8,
+        ssrc: u32,
     ) -> Result<Self, String> {
         if max_payload_size < 3 {
             // minimum size to make progress with FU-A packets.
@@ -823,6 +833,8 @@ impl Packetizer {
             max_payload_size,
             stream_id,
             next_sequence_number: initial_sequence_number,
+            ssrc,
+            payload_type,
             state: PacketizerState::Idle,
         })
     }
@@ -834,7 +846,7 @@ impl Packetizer {
     }
 
     // TODO: better error type?
-    pub fn pull(&mut self) -> Result<Option<Packet>, String> {
+    pub fn pull(&mut self) -> Result<Option<ReceivedPacket>, String> {
         let max_payload_size = usize::from(self.max_payload_size);
         match std::mem::replace(&mut self.state, PacketizerState::Idle) {
             PacketizerState::Idle => Ok(None),
@@ -867,11 +879,22 @@ impl Packetizer {
                 if usize_len > max_payload_size {
                     // start a FU-A.
                     data.advance(1);
-                    let mut payload = Vec::with_capacity(max_payload_size);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
                     let fu_header = 0b1000_0000 | hdr.nal_unit_type().id(); // START bit set.
-                    payload.extend_from_slice(&[fu_indicator, fu_header]);
-                    payload.extend_from_slice(&data[..max_payload_size - 2]);
+                    let payload = IntoIterator::into_iter([fu_indicator, fu_header])
+                        .chain(data[..max_payload_size - 2].iter().copied());
+                    // TODO: ctx and channel_id are placeholders.
+                    let pkt = ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: self.stream_id,
+                        timestamp,
+                        ssrc: self.ssrc,
+                        sequence_number,
+                        loss: 0,
+                        mark: false,
+                        payload_type: self.payload_type,
+                    }
+                    .build(payload)?;
                     data.advance(max_payload_size - 2);
                     self.state = PacketizerState::InFragment {
                         timestamp,
@@ -879,17 +902,7 @@ impl Packetizer {
                         left: len + 1 - u32::from(self.max_payload_size),
                         data,
                     };
-                    // TODO: ctx, channel_id, and ssrc are placeholders.
-                    return Ok(Some(Packet {
-                        ctx: crate::PacketContext::dummy(),
-                        stream_id: self.stream_id,
-                        timestamp,
-                        ssrc: 0,
-                        sequence_number,
-                        loss: 0,
-                        mark: false,
-                        payload: Bytes::from(payload),
-                    }));
+                    return Ok(Some(pkt));
                 }
 
                 // Send a plain NAL packet. (TODO: consider using STAP-A.)
@@ -903,16 +916,19 @@ impl Packetizer {
                     };
                     mark = false;
                 }
-                Ok(Some(Packet {
-                    ctx: crate::PacketContext::dummy(),
-                    stream_id: self.stream_id,
-                    timestamp,
-                    ssrc: 0,
-                    sequence_number,
-                    loss: 0,
-                    mark,
-                    payload: data,
-                }))
+                Ok(Some(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: self.stream_id,
+                        timestamp,
+                        ssrc: self.ssrc,
+                        sequence_number,
+                        loss: 0,
+                        mark,
+                        payload_type: self.payload_type,
+                    }
+                    .build(data)?,
+                ))
             }
             PacketizerState::InFragment {
                 timestamp,
@@ -955,16 +971,19 @@ impl Packetizer {
                     }
                 }
                 // TODO: placeholders.
-                Ok(Some(Packet {
-                    ctx: crate::PacketContext::dummy(),
-                    stream_id: self.stream_id,
-                    timestamp,
-                    ssrc: 0,
-                    sequence_number,
-                    loss: 0,
-                    mark,
-                    payload: Bytes::from(payload),
-                }))
+                Ok(Some(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: self.stream_id,
+                        timestamp,
+                        ssrc: self.ssrc,
+                        sequence_number,
+                        loss: 0,
+                        mark,
+                        payload_type: self.payload_type,
+                    }
+                    .build(payload)?,
+                ))
             }
         }
     }
@@ -994,10 +1013,9 @@ enum PacketizerState {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use std::num::NonZeroU32;
 
-    use crate::{client::rtp::Packet, codec::CodecItem};
+    use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     /*
      * This test requires
@@ -1060,69 +1078,89 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(Packet {
-            // plain SEI packet.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x06plain"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // plain SEI packet.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(b"\x06plain".iter().copied())
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // STAP-A packet.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 1,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // STAP-A packet.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // FU-A packet, start.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 2,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x7c\x86fu-a start, "),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, start.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x86fu-a start, ")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // FU-A packet, middle.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 3,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x7c\x06fu-a middle, "),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x06fu-a middle, ")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // FU-A packet, end.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 4,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x7c\x46fu-a end"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 4,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x46fu-a end")
+            .unwrap(),
+        )
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
@@ -1153,47 +1191,59 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(Packet {
-            // SPS with (incorrect) mark
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts1,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // SPS with (incorrect) mark
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts1,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // PPS
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts1,
-            ssrc: 0,
-            sequence_number: 1,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x68\xee\x3c\xb0"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // PPS
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts1,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x68\xee\x3c\xb0")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // Slice layer without partitioning IDR.
-            // This has a different timestamp than the SPS and PPS, even though
-            // RFC 6184 section 5.1 says that "the timestamp must match that of
-            // the primary coded picture of the access unit and that the marker
-            // bit can only be set on the final packet of the access unit.""
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts2,
-            ssrc: 0,
-            sequence_number: 2,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x65slice"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // Slice layer without partitioning IDR.
+                // This has a different timestamp than the SPS and PPS, even though
+                // RFC 6184 section 5.1 says that "the timestamp must match that of
+                // the primary coded picture of the access unit and that the marker
+                // bit can only be set on the final packet of the access unit.""
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts2,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x65slice")
+            .unwrap(),
+        )
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
@@ -1224,18 +1274,22 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(Packet {
-            // Slice layer without partitioning non-IDR, representing the
-            // last frame of the previous GOP.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts1,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x01slice"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // Slice layer without partitioning non-IDR, representing the
+                // last frame of the previous GOP.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts1,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x01slice")
+            .unwrap(),
+        )
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
@@ -1243,43 +1297,55 @@ mod tests {
         };
         assert_eq!(&frame.data()[..], b"\x00\x00\x00\x06\x01slice");
         assert_eq!(frame.timestamp, ts1);
-        d.push(Packet {
-            // SPS with (incorrect) timestamp matching last frame.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts1,
-            ssrc: 0,
-            sequence_number: 1,
-            loss: 0,
-            mark: false, // correctly has no mark, unlike first SPS in stream.
-            payload: Bytes::from_static(b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // SPS with (incorrect) timestamp matching last frame.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts1,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false, // correctly has no mark, unlike first SPS in stream.
+                payload_type: 0,
+            }
+            .build(*b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // PPS, again with timestamp matching last frame.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts1,
-            ssrc: 0,
-            sequence_number: 2,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x68\xee\x3c\xb0"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // PPS, again with timestamp matching last frame.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts1,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x68\xee\x3c\xb0")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // Slice layer without partitioning IDR. Now correct timestamp.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp: ts2,
-            ssrc: 0,
-            sequence_number: 3,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x65slice"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // Slice layer without partitioning IDR. Now correct timestamp.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: ts2,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x65slice")
+            .unwrap(),
+        )
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
@@ -1308,7 +1374,7 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(Packet { // new SPS.
+        d.push(ReceivedPacketBuilder { // new SPS.
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
@@ -1316,33 +1382,41 @@ mod tests {
             sequence_number: 0,
             loss: 0,
             mark: false,
-            payload: Bytes::from_static(b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10"),
-        }).unwrap();
+            payload_type: 0,
+        }.build(*b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10").unwrap()).unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // same PPS again.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 1,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x68\xee\x3c\x80"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // same PPS again.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x68\xee\x3c\x80")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // dummy slice NAL to end the AU.
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 2,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x65slice"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // dummy slice NAL to end the AU.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x65slice")
+            .unwrap(),
+        )
         .unwrap();
 
         // By codec::Depacketizer::parameters's contract, it's unspecified what the depacketizer
@@ -1412,7 +1486,7 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(Packet {
+        d.push(ReceivedPacketBuilder {
             // SPS
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
@@ -1421,36 +1495,43 @@ mod tests {
             sequence_number: 0,
             loss: 0,
             mark: false,
-            payload: Bytes::from_static(
-                b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20",
-            ),
-        })
+            payload_type: 0,
+        }.build(
+            *b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20",
+        ).unwrap()).unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // PPS
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x68\xea\x8f\x20")
+            .unwrap(),
+        )
         .unwrap();
         assert!(d.pull().is_none());
-        d.push(Packet {
-            // PPS
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 1,
-            loss: 0,
-            mark: false,
-            payload: Bytes::from_static(b"\x68\xea\x8f\x20"),
-        })
-        .unwrap();
-        assert!(d.pull().is_none());
-        d.push(Packet {
-            // IDR slice
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 2,
-            loss: 0,
-            mark: true,
-            payload: Bytes::from_static(b"\x65idr slice"),
-        })
+        d.push(
+            ReceivedPacketBuilder {
+                // IDR slice
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x65idr slice")
+            .unwrap(),
+        )
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,

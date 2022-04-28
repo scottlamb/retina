@@ -14,6 +14,9 @@
     with each packet.
 *   BREAKING: `PacketItem` and `CodecItem` are now `#[non_exhaustive]` for
     future expansion.
+*   BREAKING: `retina::client::rtp::Packet` is now
+    `retina::rtp::ReceivedPacket`, and field access has been removed in favor
+    of accessors.
 
 ## `v0.3.9` (2022-04-12)
 
