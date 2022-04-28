@@ -1,10 +1,10 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Test a roundtrip through the H.264 packetizer and depacketizer with an arbitrary
+//! Tests a roundtrip through the H.264 packetizer and depacketizer with an arbitrary
 //! input packet size and frame. Ensures the following:
 //! *   there are no crashes.
-//! *   the round trip produces an error or identical data.
+//! *   the round trip produces an error, nothing (see note about `can_end_au`), or identical data.
 
 #![no_main]
 use bytes::Bytes;
@@ -49,7 +49,18 @@ fuzz_target!(|data: &[u8]| {
                         break f;
                     }
                     Ok(Some(_)) => panic!(),
-                    Ok(None) => assert!(!mark),
+                    Ok(None) => {
+                        // XXX: assert!(!mark)
+                        //
+                        // One would expect that a frame would be produced if the packet has mark
+                        // set. This used to be true, but Retina now has a workaround for some
+                        // RTSP servers that spuriously set the mark bit. See
+                        // `retina::codec::h264::can_end_au`. In this case, just exit.
+                        if mark {
+                            assert!(matches!(p.pull(), Ok(None)));
+                            return;
+                        }
+                    }
                 }
             }
             Ok(None) => panic!("packetizer ran out of packets before depacketizer produced frame"),
