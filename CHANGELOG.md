@@ -17,6 +17,7 @@
 *   BREAKING: `retina::client::rtp::Packet` is now
     `retina::rtp::ReceivedPacket`, and field access has been removed in favor
     of accessors.
+*   minimum Rust version is now 1.56.
 
 ## `v0.3.9` (2022-04-12)
 

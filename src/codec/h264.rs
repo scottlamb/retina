@@ -881,7 +881,8 @@ impl Packetizer {
                     data.advance(1);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
                     let fu_header = 0b1000_0000 | hdr.nal_unit_type().id(); // START bit set.
-                    let payload = IntoIterator::into_iter([fu_indicator, fu_header])
+                    let payload = [fu_indicator, fu_header]
+                        .into_iter()
                         .chain(data[..max_payload_size - 2].iter().copied());
                     // TODO: ctx and channel_id are placeholders.
                     let pkt = ReceivedPacketBuilder {

@@ -199,10 +199,11 @@ impl RawPacketBuilder {
         if self.payload_type >= 0x80 {
             return Err("payload type too large");
         }
-        let data: Bytes = IntoIterator::into_iter([
+        let data: Bytes = [
             2 << 6, // version=2, no padding, no extensions, no CSRCs.
             if self.mark { 0b1000_0000 } else { 0 } | self.payload_type,
-        ])
+        ]
+        .into_iter()
         .chain(self.sequence_number.to_be_bytes())
         .chain(self.timestamp.to_be_bytes())
         .chain(self.ssrc.to_be_bytes())
