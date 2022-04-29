@@ -241,7 +241,7 @@ impl std::fmt::Debug for ReceivedPacket {
             .field("ssrc", &self.raw.ssrc())
             .field("sequence_number", &self.raw.sequence_number())
             .field("mark", &self.raw.mark())
-            .field("payload", &crate::hex::LimitedHex::new(&self.payload(), 64))
+            .field("payload", &crate::hex::LimitedHex::new(self.payload(), 64))
             .finish()
     }
 }
