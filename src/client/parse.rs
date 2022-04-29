@@ -499,7 +499,7 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
         return Ok(a);
     }
 
-    // Note returning a range is allowed by RFC 2326's grammar, but I'm not sure
+    // Not returning a range is allowed by RFC 2326's grammar, but I'm not sure
     // what it means. RTSP 2.0 allows "RTCP-mux" for using a single port for
     // both RTP and RTCP, but it's only by client request, and RTSP 1.0 doesn't
     // reference this.
