@@ -13,7 +13,7 @@ use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContextRef;
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 pub(crate) mod aac;
 pub(crate) mod g723;
@@ -186,18 +186,54 @@ impl AudioParameters {
 
 /// An audio frame, which consists of one or more samples.
 pub struct AudioFrame {
-    pub ctx: crate::PacketContext,
-    pub stream_id: usize,
-    pub timestamp: crate::Timestamp,
-    pub frame_length: NonZeroU32,
+    ctx: crate::PacketContext,
+    stream_id: usize,
+    timestamp: crate::Timestamp,
+    frame_length: NonZeroU32,
+    loss: u16,
+    data: Bytes,
+}
 
-    /// Number of lost RTP packets before this audio frame. See [crate::rtp::ReceivedPacket::loss].
-    /// Note that if loss occurs during a fragmented frame, more than this number of packets' worth
-    /// of data may be skipped.
-    pub loss: u16,
+impl AudioFrame {
+    #[inline]
+    pub fn ctx(&self) -> &crate::PacketContext {
+        &self.ctx
+    }
 
-    // TODO: expose bytes or Buf (for zero-copy)?
-    pub data: Bytes,
+    #[inline]
+    pub fn stream_id(&self) -> usize {
+        self.stream_id
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> crate::Timestamp {
+        self.timestamp
+    }
+
+    #[inline]
+    pub fn frame_length(&self) -> NonZeroU32 {
+        self.frame_length
+    }
+
+    /// Returns the number of lost RTP packets before this audio frame. See
+    /// [crate::rtp::ReceivedPacket::loss].
+    ///
+    /// Note that if loss occurs during a fragmented frame, more than this
+    /// number of packets' worth of data may be skipped.
+    #[inline]
+    pub fn loss(&self) -> u16 {
+        self.loss
+    }
+
+    #[inline]
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
+
+    #[inline]
+    pub fn into_data(self) -> Bytes {
+        self.data
+    }
 }
 
 impl std::fmt::Debug for AudioFrame {
@@ -213,37 +249,17 @@ impl std::fmt::Debug for AudioFrame {
     }
 }
 
-impl Buf for AudioFrame {
-    fn remaining(&self) -> usize {
-        self.data.remaining()
-    }
-
-    fn chunk(&self) -> &[u8] {
-        self.data.chunk()
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        self.data.advance(cnt)
-    }
-}
-
 /// Parameters which describe a message stream, for `application` media types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MessageParameters(onvif::CompressionType);
 
 /// A single message, for `application` media types.
 pub struct MessageFrame {
-    pub ctx: crate::PacketContext,
-    pub timestamp: crate::Timestamp,
-    pub stream_id: usize,
-
-    /// Number of lost RTP packets before this message frame. See
-    /// [crate::rtp::ReceivedPacket::loss]. If this is non-zero, a prefix of the
-    /// message may be missing.
-    pub loss: u16,
-
-    // TODO: expose bytes or Buf (for zero-copy)?
-    pub data: Bytes,
+    ctx: crate::PacketContext,
+    timestamp: crate::Timestamp,
+    stream_id: usize,
+    loss: u16,
+    data: Bytes,
 }
 
 impl std::fmt::Debug for MessageFrame {
@@ -258,6 +274,43 @@ impl std::fmt::Debug for MessageFrame {
     }
 }
 
+impl MessageFrame {
+    #[inline]
+    pub fn ctx(&self) -> &crate::PacketContext {
+        &self.ctx
+    }
+
+    #[inline]
+    pub fn stream_id(&self) -> usize {
+        self.stream_id
+    }
+
+    #[inline]
+    pub fn timestamp(&self) -> crate::Timestamp {
+        self.timestamp
+    }
+
+    /// Returns the number of lost RTP packets before this frame. See
+    /// [crate::rtp::ReceivedPacket::loss].
+    ///
+    /// Note that if loss occurs during a fragmented frame, more than this
+    /// number of packets' worth of data may be skipped.
+    #[inline]
+    pub fn loss(&self) -> u16 {
+        self.loss
+    }
+
+    #[inline]
+    pub fn data(&self) -> &Bytes {
+        &self.data
+    }
+
+    #[inline]
+    pub fn into_data(self) -> Bytes {
+        self.data
+    }
+}
+
 /// A single video frame (aka video sample or video access unit).
 ///
 /// Typically this is an encoded picture. It could also be a single field of an interlaced
@@ -266,51 +319,77 @@ impl std::fmt::Debug for MessageFrame {
 /// Durations aren't specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
 pub struct VideoFrame {
-    // New video parameters.
-    //
-    // Rarely populated and large, so boxed to reduce bloat.
-    //
-    // To obtain the current parameters for the stream regardless of whether this frame set new
-    // parameters, see [`crate::client::Stream::parameters`].
-    pub new_parameters: Option<Box<VideoParameters>>,
-
-    /// Number of lost RTP packets before this video frame. See [crate::rtp::ReceivedPacket::loss].
-    /// Note that if loss occurs during a fragmented frame, more than this number of packets' worth
-    /// of data may be skipped.
-    pub loss: u16,
-
     // A pair of contexts: for the start and for the end.
     // Having both can be useful to measure the total time elapsed while receiving the frame.
     start_ctx: crate::PacketContext,
     end_ctx: crate::PacketContext,
 
-    /// This picture's timestamp in the time base associated with the stream.
-    pub timestamp: crate::Timestamp,
+    /// New video parameters.
+    ///
+    /// Rarely populated and large, so boxed to reduce bloat.
+    //
+    /// To obtain the current parameters for the stream regardless of whether this frame set new
+    /// parameters, see [`crate::client::Stream::parameters`].
+    pub new_parameters: Option<Box<VideoParameters>>,
 
-    pub stream_id: usize,
+    loss: u16,
 
-    /// If this is a "random access point (RAP)" aka "instantaneous decoding refresh (IDR)" picture.
-    /// The former is defined in ISO/IEC 14496-12; the latter in H.264. Both mean that this picture
-    /// can be decoded without any other AND no pictures following this one depend on any pictures
-    /// before this one.
-    pub is_random_access_point: bool,
-
-    /// If no other pictures require this one to be decoded correctly.
-    /// In H.264 terms, this is a frame with `nal_ref_idc == 0`.
-    pub is_disposable: bool,
-
+    timestamp: crate::Timestamp,
+    stream_id: usize,
+    is_random_access_point: bool,
+    is_disposable: bool,
     data: bytes::Bytes,
 }
 
 impl VideoFrame {
     #[inline]
-    pub fn start_ctx(&self) -> crate::PacketContext {
-        self.start_ctx
+    pub fn stream_id(&self) -> usize {
+        self.stream_id
+    }
+
+    /// Returns the number of lost RTP packets before this video frame. See
+    /// [`crate::rtp::ReceivedPacket::loss`].
+    ///
+    /// Note that if loss occurs during a fragmented frame, more than this
+    /// number of packets' worth of data may be skipped.
+    #[inline]
+    pub fn loss(&self) -> u16 {
+        self.loss
+    }
+
+    /// Returns this picture's timestamp in the time base associated with the stream.
+    #[inline]
+    pub fn timestamp(&self) -> crate::Timestamp {
+        self.timestamp
     }
 
     #[inline]
-    pub fn end_ctx(&self) -> crate::PacketContext {
-        self.end_ctx
+    pub fn start_ctx(&self) -> &crate::PacketContext {
+        &self.start_ctx
+    }
+
+    #[inline]
+    pub fn end_ctx(&self) -> &crate::PacketContext {
+        &self.end_ctx
+    }
+
+    /// Returns if this is a "random access point (RAP)" aka "instantaneous
+    /// decoding refresh (IDR)" picture.
+    ///
+    /// The former is defined in ISO/IEC 14496-12; the latter in H.264. Both
+    /// mean that this picture can be decoded without any other AND no pictures
+    /// following this one depend on any pictures before this one.
+    #[inline]
+    pub fn is_random_access_point(&self) -> bool {
+        self.is_random_access_point
+    }
+
+    /// Returns if no other pictures require this one to be decoded correctly.
+    ///
+    /// In H.264 terms, this is a frame with `nal_ref_idc == 0`.
+    #[inline]
+    pub fn is_disposable(&self) -> bool {
+        self.is_disposable
     }
 
     /// Returns the data in a codec-specific format.

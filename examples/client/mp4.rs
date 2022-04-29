@@ -547,7 +547,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     ) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
-            &frame.timestamp,
+            &frame.timestamp(),
             frame.data().remaining(),
         );
         let sample_description_index = if let (Some(i), None) = (
@@ -582,15 +582,15 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             sample_description_index,
             self.mdat_pos,
             size,
-            frame.timestamp,
-            frame.loss,
+            frame.timestamp(),
+            frame.loss(),
             self.allow_loss,
         )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
-        if frame.is_random_access_point {
+        if frame.is_random_access_point() {
             self.video_sync_sample_nums
                 .push(u32::try_from(self.video_trak.samples)?);
         }
@@ -599,26 +599,27 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn audio(&mut self, mut frame: retina::codec::AudioFrame) -> Result<(), Error> {
+    async fn audio(&mut self, frame: retina::codec::AudioFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte audio frame",
-            &frame.timestamp,
-            frame.data.remaining()
+            frame.timestamp(),
+            frame.data().remaining()
         );
-        let size = u32::try_from(frame.data.remaining())?;
+        let size = u32::try_from(frame.data().remaining())?;
         self.audio_trak.add_sample(
             /* sample_description_index */ 1,
             self.mdat_pos,
             size,
-            frame.timestamp,
-            frame.loss,
+            frame.timestamp(),
+            frame.loss(),
             self.allow_loss,
         )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
-        write_all_buf(&mut self.inner, &mut frame.data).await?;
+        let mut data = frame.into_data();
+        write_all_buf(&mut self.inner, &mut data).await?;
         Ok(())
     }
 }
@@ -643,13 +644,13 @@ async fn copy<'a>(
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => {
-                        let stream = &session.streams()[f.stream_id];
-                        let start_ctx = f.start_ctx();
+                        let stream = &session.streams()[f.stream_id()];
+                        let start_ctx = *f.start_ctx();
                         mp4.video(stream, f).await.with_context(
                             || format!("Error processing video frame starting with {}", start_ctx))?;
                     },
                     CodecItem::AudioFrame(f) => {
-                        let ctx = f.ctx;
+                        let ctx = *f.ctx();
                         mp4.audio(f).await.with_context(
                             || format!("Error processing audio frame, {}", ctx))?;
                     },
