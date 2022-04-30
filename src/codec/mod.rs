@@ -324,16 +324,8 @@ pub struct VideoFrame {
     start_ctx: crate::PacketContext,
     end_ctx: crate::PacketContext,
 
-    /// New video parameters.
-    ///
-    /// Rarely populated and large, so boxed to reduce bloat.
-    //
-    /// To obtain the current parameters for the stream regardless of whether this frame set new
-    /// parameters, see [`crate::client::Stream::parameters`].
-    pub new_parameters: Option<Box<VideoParameters>>,
-
+    has_new_parameters: bool,
     loss: u16,
-
     timestamp: crate::Timestamp,
     stream_id: usize,
     is_random_access_point: bool,
@@ -345,6 +337,14 @@ impl VideoFrame {
     #[inline]
     pub fn stream_id(&self) -> usize {
         self.stream_id
+    }
+
+    /// Returns true if this frame set new video parameters.
+    ///
+    /// The parameters can be obtained via [`crate::client::Stream::parameters`].
+    #[inline]
+    pub fn has_new_parameters(&self) -> bool {
+        self.has_new_parameters
     }
 
     /// Returns the number of lost RTP packets before this video frame. See
@@ -418,7 +418,7 @@ impl std::fmt::Debug for VideoFrame {
             .field("start_ctx", &self.start_ctx)
             .field("end_ctx", &self.end_ctx)
             .field("loss", &self.loss)
-            .field("new_parameters", &self.new_parameters)
+            .field("has_new_parameters", &self.has_new_parameters)
             .field("is_random_access_point", &self.is_random_access_point)
             .field("is_disposable", &self.is_disposable)
             .field("data", &crate::hex::LimitedHex::new(&self.data, 64))

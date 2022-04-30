@@ -780,13 +780,12 @@ impl Stream {
     ///
     /// # With [`Demuxed`]
     ///
-    /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl:
+    /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl, `parameters` reflects
+    /// all parameters as of returned frames that have been returned from from `poll_next` via
+    /// `Poll::Ready`.
     ///
-    /// *   After `poll_next` returns `Ready`, `parameters` reflects all parameter changes as of
-    ///     returned frame.
-    /// *   After `poll_next` returns `Pending`, currently the parameters may or may not reflect
-    ///     changes sent as part of the *next* frame that `poll_next` will return. (It's likely
-    ///     that an upcoming Retina release will guarantee not.)
+    /// It's guaranteed to *not* reflect any parameter changes in the upcoming frame, even after
+    /// a `Poll::Pending` return.
     ///
     /// If there is no packet loss, parameters are generally available after the first frame is
     /// returned. In the case of H.264, [RFC 6184 section
@@ -2357,7 +2356,16 @@ impl futures::Stream for Demuxed {
                         description,
                     })
                 })?;
+
+                // Note we're committed now to calling `pull` and returning
+                // `Ready` if it has a frame. This is because the
+                // `Stream::parameters` contract guarantees that changes in
+                // upcoming frames are *not* reflected. It's implemented by a
+                // call to `Depacketizer::pull`, which doesn't make a like
+                // guarantee about the state between `push` and `pull`. So we
+                // can't let our callers observe that state.
             }
+
             match depacketizer.pull(conn_ctx, stream_ctx) {
                 Ok(Some(item)) => {
                     self.state = DemuxedState::Pulling(stream_id);

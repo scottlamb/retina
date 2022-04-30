@@ -496,31 +496,27 @@ impl Depacketizer {
         self.nals.clear();
         self.pieces.clear();
 
-        let new_parameters = match (
+        let has_new_parameters = match (
             new_sps.as_deref(),
             new_pps.as_deref(),
             self.parameters.as_ref(),
         ) {
             (Some(sps_nal), Some(pps_nal), _) => {
                 // TODO: could map this to a RtpPacketError more accurately.
-                let ip = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
-                let p = ip.generic_parameters.clone();
-                self.parameters = Some(ip);
-                Some(Box::new(p))
+                self.parameters = Some(InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?);
+                true
             }
             (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
                 let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
                 let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
                 // TODO: as above, could map this to a RtpPacketError more accurately.
-                let ip = InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?;
-                let p = ip.generic_parameters.clone();
-                self.parameters = Some(ip);
-                Some(Box::new(p))
+                self.parameters = Some(InternalParameters::parse_sps_and_pps(sps_nal, pps_nal)?);
+                true
             }
-            _ => None,
+            _ => false,
         };
         Ok(VideoFrame {
-            new_parameters,
+            has_new_parameters,
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,
@@ -1429,9 +1425,7 @@ mod tests {
         };
 
         // After pull, new_parameters and parameters() both reflect the change.
-        assert!(frame.new_parameters.is_some());
-        let p = frame.new_parameters.unwrap();
-        assert_eq!(p.pixel_dimensions(), (640, 480));
+        assert!(frame.has_new_parameters);
         match d.parameters() {
             Some(crate::codec::Parameters::Video(v)) => {
                 assert_eq!(v.pixel_dimensions(), (640, 480));
@@ -1538,7 +1532,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
-        assert!(frame.new_parameters.is_some());
+        assert!(frame.has_new_parameters);
         assert!(d.parameters().is_some());
     }
 }

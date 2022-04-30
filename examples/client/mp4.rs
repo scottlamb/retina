@@ -550,9 +550,9 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             &frame.timestamp(),
             frame.data().remaining(),
         );
-        let sample_description_index = if let (Some(i), None) = (
+        let sample_description_index = if let (Some(i), true) = (
             self.cur_video_params_sample_description_index,
-            frame.new_parameters.as_ref(),
+            frame.has_new_parameters(),
         ) {
             // Use the most recent sample description index for most frames, without having to
             // scan through self.video_sample_index.
