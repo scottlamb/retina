@@ -636,7 +636,7 @@ impl PlayOptions {
 
 #[derive(Debug)]
 pub(crate) struct Presentation {
-    pub streams: Vec<Stream>,
+    pub streams: Box<[Stream]>,
     base_url: Url,
     pub control: Url,
     tool: Option<Tool>,
@@ -1842,7 +1842,7 @@ impl Session<Playing> {
             .conn
             .as_ref()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        for s in &mut inner.presentation.streams {
+        for s in &mut *inner.presentation.streams {
             if matches!(s.state, StreamState::Playing { .. }) {
                 if let Err(ref description) = s.depacketizer {
                     bail!(ErrorInt::RtspResponseError {

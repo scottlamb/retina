@@ -464,7 +464,7 @@ pub(crate) fn parse_describe(
                 )
             })
         })
-        .collect::<Result<Vec<Stream>, String>>()?;
+        .collect::<Result<_, String>>()?;
 
     Ok(Presentation {
         streams,
