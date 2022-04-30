@@ -679,9 +679,42 @@ impl std::ops::Deref for Tool {
 ///
 /// Currently if multiple formats are offered, this only describes the first.
 pub struct Stream {
-    /// Media type, as specified in the [IANA SDP parameters media
+    depacketizer: Result<crate::codec::Depacketizer, String>,
+    state: StreamState,
+
+    // See the matching accessors for descriptions of these fields.
+    media: Box<str>,
+    encoding_name: Box<str>,
+    rtp_payload_type: u8,
+    clock_rate_hz: u32,
+    channels: Option<NonZeroU16>,
+    framerate: Option<f32>,
+    control: Option<Url>,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("Stream")
+            .field("media", &self.media)
+            .field("control", &self.control.as_ref().map(Url::as_str))
+            .field("encoding_name", &self.encoding_name)
+            .field("rtp_payload_type", &self.rtp_payload_type)
+            .field("clock_rate", &self.clock_rate_hz)
+            .field("channels", &self.channels)
+            .field("framerate", &self.framerate)
+            .field("depacketizer", &self.depacketizer)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl Stream {
+    /// Returns the media type, as specified in the [IANA SDP parameters media
     /// registry](https://www.iana.org/assignments/sdp-parameters/sdp-parameters.xhtml#sdp-parameters-1).
-    pub media: String,
+    #[inline]
+    pub fn media(&self) -> &str {
+        &self.media
+    }
 
     /// An encoding name, as specified in the [IANA media type
     /// registry](https://www.iana.org/assignments/media-types/media-types.xhtml), with
@@ -694,49 +727,47 @@ pub struct Stream {
     /// *   `vnd.onvif.metadata.gzip`,
     /// *   `vnd.onvif.metadata.exi.onvif`
     /// *   `vnd.onvif.metadata.exi.ext`
-    pub encoding_name: String,
+    #[inline]
+    pub fn encoding_name(&self) -> &str {
+        &self.encoding_name
+    }
 
-    /// RTP payload type.
+    /// Returns the RTP payload type.
     ///
     /// See the [registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
     /// It's common to use one of the dynamically assigned values, 96–127.
-    pub rtp_payload_type: u8,
+    #[inline]
+    pub fn rtp_payload_type(&self) -> u8 {
+        self.rtp_payload_type
+    }
 
-    /// RTP clock rate, in Hz.
-    pub clock_rate: u32,
+    /// Returns the RTP clock rate, in Hz.
+    #[inline]
+    pub fn clock_rate_hz(&self) -> u32 {
+        self.clock_rate_hz
+    }
 
-    /// Number of audio channels, if applicable (`media` is `audio`) and known.
-    pub channels: Option<NonZeroU16>,
+    /// Returns the number of audio channels, if applicable (`media` is `audio`) and known.
+    #[inline]
+    pub fn channels(&self) -> Option<NonZeroU16> {
+        self.channels
+    }
 
-    /// Video framerate if present in SDP attributes
-    pub framerate: Option<f32>,
+    /// Returns the video framerate if present in SDP attributes.
+    #[inline]
+    pub fn framerate(&self) -> Option<f32> {
+        self.framerate
+    }
 
-    depacketizer: Result<crate::codec::Depacketizer, String>,
-
-    /// The specified control URL.
+    /// Returns the specified control URL.
     ///
     /// This is needed with multiple streams to send `SETUP` requests and
     /// interpret the `PLAY` response's `RTP-Info` header.
     /// [RFC 2326 section C.3](https://datatracker.ietf.org/doc/html/rfc2326#appendix-C.3)
     /// says the server is allowed to omit it when there is only a single stream.
-    pub control: Option<Url>,
-
-    state: StreamState,
-}
-
-impl std::fmt::Debug for Stream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.debug_struct("Stream")
-            .field("media", &self.media)
-            .field("control", &self.control.as_ref().map(Url::as_str))
-            .field("encoding_name", &self.encoding_name)
-            .field("rtp_payload_type", &self.rtp_payload_type)
-            .field("clock_rate", &self.clock_rate)
-            .field("channels", &self.channels)
-            .field("framerate", &self.framerate)
-            .field("depacketizer", &self.depacketizer)
-            .field("state", &self.state)
-            .finish()
+    #[inline]
+    pub fn control(&self) -> Option<&Url> {
+        self.control.as_ref()
     }
 }
 
@@ -1642,7 +1673,7 @@ impl Session<Described> {
                     s.state = StreamState::Playing {
                         timeline: Timeline::new(
                             initial_rtptime,
-                            s.clock_rate,
+                            s.clock_rate_hz,
                             policy.enforce_timestamps_with_max_jump_secs,
                         )
                         .map_err(|description| {

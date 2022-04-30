@@ -224,7 +224,7 @@ pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
 fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, String> {
-    let media = media_description.media.clone();
+    let media = media_description.media.clone().into_boxed_str();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
     // sub-field is "RTP/AVP" or "RTP/SAVP" the <fmt> sub-fields contain RTP
@@ -355,7 +355,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
             encoding_name = type_.encoding;
             clock_rate = type_.clock_rate;
             channels = type_.channels;
-            if type_.media != media {
+            if type_.media != &*media {
                 return Err(format!(
                     "SDP media type {} must match RTP payload type {:#?}",
                     &media, type_
@@ -364,14 +364,14 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         }
     }
 
-    let encoding_name = encoding_name.to_ascii_lowercase();
+    let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
     let depacketizer =
         crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp);
 
     Ok(Stream {
         media,
         encoding_name,
-        clock_rate,
+        clock_rate_hz: clock_rate,
         rtp_payload_type,
         depacketizer,
         control,
@@ -738,10 +738,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=0")
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.64001E");
@@ -757,10 +757,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=1")
         );
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "mpeg4-generic");
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "mpeg4-generic");
         assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate, 48_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 48_000);
         match p.streams[1].parameters() {
             Some(Parameters::Audio(_)) => {}
             _ => panic!(),
@@ -771,10 +771,10 @@ mod tests {
             p.streams[2].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=4")
         );
-        assert_eq!(p.streams[2].media, "application");
-        assert_eq!(p.streams[2].encoding_name, "vnd.onvif.metadata");
+        assert_eq!(p.streams[2].media(), "application");
+        assert_eq!(p.streams[2].encoding_name(), "vnd.onvif.metadata");
         assert_eq!(p.streams[2].rtp_payload_type, 107);
-        assert_eq!(p.streams[2].clock_rate, 90_000);
+        assert_eq!(p.streams[2].clock_rate_hz, 90_000);
         assert!(matches!(
             p.streams[2].parameters(),
             Some(Parameters::Message(_))
@@ -816,12 +816,12 @@ mod tests {
 
         // Abridged test; similar to the other Dahua test.
         assert_eq!(p.streams.len(), 2);
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h265");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h265");
         assert_eq!(p.streams[0].rtp_payload_type, 98);
         assert!(p.streams[0].parameters().is_none());
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "pcma");
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "pcma");
         assert_eq!(p.streams[1].rtp_payload_type, 8);
         match p.streams[1].parameters().unwrap() {
             Parameters::Audio(_) => {}
@@ -850,10 +850,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=1?transportmode=unicast&profile=Profile_1")
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D0029");
@@ -869,10 +869,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=3?transportmode=unicast&profile=Profile_1")
         );
-        assert_eq!(p.streams[1].media, "application");
-        assert_eq!(p.streams[1].encoding_name, "vnd.onvif.metadata");
+        assert_eq!(p.streams[1].media(), "application");
+        assert_eq!(p.streams[1].encoding_name(), "vnd.onvif.metadata");
         assert_eq!(p.streams[1].rtp_payload_type, 107);
-        assert_eq!(p.streams[1].clock_rate, 90_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
         assert!(matches!(
             p.streams[1].parameters(),
             Some(Parameters::Message(_))
@@ -930,10 +930,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             &(base.to_string() + "trackID=1")
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.640033");
@@ -949,10 +949,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(base.to_string() + "trackID=2")
         );
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "mpeg4-generic");
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "mpeg4-generic");
         assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate, 16_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 16_000);
         match p.streams[1].parameters() {
             Some(Parameters::Audio(_)) => {}
             _ => panic!(),
@@ -1012,10 +1012,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=1")
         );
-        assert_eq!(p.streams[0].media, "audio");
-        assert_eq!(p.streams[0].encoding_name, "mpeg4-generic");
+        assert_eq!(p.streams[0].media(), "audio");
+        assert_eq!(p.streams[0].encoding_name(), "mpeg4-generic");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 12_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 12_000);
         assert_eq!(p.streams[0].channels, NonZeroU16::new(2));
         match p.streams[0].parameters() {
             Some(Parameters::Audio(_)) => {}
@@ -1027,10 +1027,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/trackID=2")
         );
-        assert_eq!(p.streams[1].media, "video");
-        assert_eq!(p.streams[1].encoding_name, "h264");
+        assert_eq!(p.streams[1].media(), "video");
+        assert_eq!(p.streams[1].encoding_name(), "h264");
         assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate, 90_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
         match p.streams[1].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.42C01E");
@@ -1086,10 +1086,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/track1")
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D001F");
@@ -1105,10 +1105,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/track2")
         );
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "pcmu");
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "pcmu");
         assert_eq!(p.streams[1].rtp_payload_type, 0);
-        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
             Parameters::Audio(_) => {}
@@ -1131,11 +1131,11 @@ mod tests {
             &(prefix.to_string() + "/track0")
         );
 
-        assert_eq!(p.streams[0].media, "video");
+        assert_eq!(p.streams[0].media(), "video");
 
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
 
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
@@ -1152,10 +1152,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             &(prefix.to_string() + "/track1")
         );
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "pcma");
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "pcma");
         assert_eq!(p.streams[1].rtp_payload_type, 8);
-        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
             Parameters::Audio(_) => {}
@@ -1179,10 +1179,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/video"
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
@@ -1198,10 +1198,10 @@ mod tests {
             p.streams[1].control.as_ref().unwrap().as_str(),
             "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/audio"
         );
-        assert_eq!(p.streams[1].media, "audio");
-        assert_eq!(p.streams[1].encoding_name, "pcmu"); // rtpmap wins over static list.
+        assert_eq!(p.streams[1].media(), "audio");
+        assert_eq!(p.streams[1].encoding_name(), "pcmu"); // rtpmap wins over static list.
         assert_eq!(p.streams[1].rtp_payload_type, 8);
-        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
             Parameters::Audio(_) => {}
@@ -1276,10 +1276,10 @@ mod tests {
             p.streams[0].control.as_ref().unwrap().as_str(),
             "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif/video"
         );
-        assert_eq!(p.streams[0].media, "video");
-        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate, 90_000);
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
             Parameters::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D001E");

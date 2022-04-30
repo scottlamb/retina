@@ -745,14 +745,14 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     .await?;
     let video_stream_i = if !opts.no_video {
         let s = session.streams().iter().position(|s| {
-            if s.media == "video" {
-                if s.encoding_name == "h264" {
+            if s.media() == "video" {
+                if s.encoding_name() == "h264" {
                     log::info!("Using h264 video stream");
                     return true;
                 }
                 log::info!(
                     "Ignoring {} video stream because it's unsupported",
-                    &s.encoding_name
+                    s.encoding_name(),
                 );
             }
             false
@@ -779,11 +779,11 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
                 Some(retina::codec::Parameters::Audio(a)) if a.sample_entry().is_some() => {
-                    log::info!("Using {} audio stream (rfc 6381 codec {})", &s.encoding_name, a.rfc6381_codec().unwrap());
+                    log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
                     Some((i, Box::new(a.clone())))
                 }
-                _ if s.media == "audio" => {
-                    log::info!("Ignoring {} audio stream because it can't be placed into a .mp4 file without transcoding", &s.encoding_name);
+                _ if s.media() == "audio" => {
+                    log::info!("Ignoring {} audio stream because it can't be placed into a .mp4 file without transcoding", s.encoding_name());
                     None
                 }
                 _ => None,
