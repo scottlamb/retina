@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bytes::Bytes;
-use log::debug;
+use log::{debug, warn};
 use sdp_types::Media;
 use std::{net::IpAddr, num::NonZeroU16};
 use url::Url;
@@ -640,11 +640,10 @@ pub(crate) fn parse_play(
                         .map_err(|_| format!("bad seq {:?}", value))?;
                     state.initial_seq = Some(seq);
                 }
-                "rtptime" => {
-                    let rtptime = u32::from_str_radix(value, 10)
-                        .map_err(|_| format!("bad rtptime {:?}", value))?;
-                    state.initial_rtptime = Some(rtptime);
-                }
+                "rtptime" => match u32::from_str_radix(value, 10) {
+                    Ok(v) => state.initial_rtptime = Some(v),
+                    Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
+                },
                 "ssrc" => {
                     let ssrc = u32::from_str_radix(value, 16)
                         .map_err(|_| format!("Unparseable ssrc {}", value))?;
@@ -1056,6 +1055,32 @@ mod tests {
         match p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(0));
+                assert_eq!(state.initial_seq, Some(1));
+                assert_eq!(state.ssrc, None);
+            }
+            _ => panic!(),
+        };
+    }
+
+    /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
+    /// 2812 in [scottlamb/moonfire-nvr#224](https://github.com/scottlamb/moonfire-nvr/issues/224).
+    ///
+    /// The rest of the data is copied from the `bunny` test above.
+    ///
+    /// This is currently treated as if the `rtptime` parameter were absent.
+    #[test]
+    fn bad_rtptime() {
+        let prefix = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
+        let mut p = parse_describe(prefix, include_bytes!("testdata/bunny_describe.txt")).unwrap();
+        p.streams[0].state = StreamState::Init(StreamStateInit::default());
+        super::parse_play(
+            &response(include_bytes!("testdata/bad_rtptime.txt")),
+            &mut p,
+        )
+        .unwrap();
+        match p.streams[0].state {
+            StreamState::Init(state) => {
+                assert_eq!(state.initial_rtptime, None);
                 assert_eq!(state.initial_seq, Some(1));
                 assert_eq!(state.ssrc, None);
             }
