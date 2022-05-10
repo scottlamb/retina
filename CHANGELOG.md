@@ -24,6 +24,12 @@
     Likewise `retina::codec::CodecItem`.
 *   minimum Rust version is now 1.56.
 
+## `v0.3.10` (2022-05-09)
+
+*   ignore unparseable `rtptime` values in the `PLAY` response's `RTP-Info` header.
+    This improves compatibility with the OMNY M5S2A 2812 camera, as described in
+    [scottlamb/moonfire-nvr#224](https://github.com/scottlamb/moonfire-nvr/issues/224).
+
 ## `v0.3.9` (2022-04-12)
 
 *   camera interop: eliminate `bad clockrate in rtpmap` errors with cameras that
