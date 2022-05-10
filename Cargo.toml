@@ -9,7 +9,7 @@ categories = ["network-programming", "multimedia"]
 description = "high-level RTSP multimedia streaming library"
 repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
-rust-version = "1.56"
+rust-version = "1.59"
 
 [dependencies]
 base64 = "0.13.0"

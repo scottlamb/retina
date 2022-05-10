@@ -12,7 +12,7 @@ jobs:
       matrix:
         rust:
           - stable
-          - 1.56
+          - 1.59
         include:
           - rust: stable
             extra_components: rustfmt
