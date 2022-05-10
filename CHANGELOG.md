@@ -17,6 +17,11 @@
 *   BREAKING: `retina::client::rtp::Packet` is now
     `retina::rtp::ReceivedPacket`, and field access has been removed in favor
     of accessors.
+*   BREAKING: `retina::client::PacketItem::RtpPacket` has been renamed to
+    `retina::client::PacketItem::Rtp`.
+*   BREAKING: `retina::client::PacketItem::SenderReport` has been replaced with
+    `retina::client::PacketItem::Rtcp`, to expose full RTCP compound packets.
+    Likewise `retina::codec::CodecItem`.
 *   minimum Rust version is now 1.56.
 
 ## `v0.3.9` (2022-04-12)

@@ -1828,8 +1828,8 @@ async fn punch_firewall_hole(
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PacketItem {
-    RtpPacket(crate::rtp::ReceivedPacket),
-    SenderReport(rtp::SenderReport),
+    Rtp(crate::rtp::ReceivedPacket),
+    Rtcp(crate::rtcp::ReceivedCompoundPacket),
 }
 
 impl Session<Playing> {
@@ -2345,9 +2345,9 @@ impl futures::Stream for Demuxed {
         loop {
             let (stream_id, pkt) = match self.state {
                 DemuxedState::Waiting => match ready!(Pin::new(&mut self.session).poll_next(cx)) {
-                    Some(Ok(PacketItem::RtpPacket(p))) => (p.stream_id(), Some(p)),
-                    Some(Ok(PacketItem::SenderReport(p))) => {
-                        return Poll::Ready(Some(Ok(CodecItem::SenderReport(p))))
+                    Some(Ok(PacketItem::Rtp(p))) => (p.stream_id(), Some(p)),
+                    Some(Ok(PacketItem::Rtcp(p))) => {
+                        return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))))
                     }
                     Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                     None => return Poll::Ready(None),
@@ -2536,7 +2536,7 @@ mod tests {
             tokio::join!(
                 async {
                     match session.next().await {
-                        Some(Ok(PacketItem::RtpPacket(p))) => {
+                        Some(Ok(PacketItem::Rtp(p))) => {
                             assert_eq!(p.ssrc(), 0xdcc4a0d8);
                             assert_eq!(p.sequence_number(), 0x41d4);
                             assert_eq!(&p.payload()[..], b"hello world");
@@ -2646,7 +2646,7 @@ mod tests {
             tokio::join!(
                 async {
                     match session.next().await {
-                        Some(Ok(PacketItem::RtpPacket(p))) => {
+                        Some(Ok(PacketItem::Rtp(p))) => {
                             assert_eq!(p.ssrc(), 0xdcc4a0d8);
                             assert_eq!(p.sequence_number(), 0x41d4);
                             assert_eq!(&p.payload()[..], b"hello world");

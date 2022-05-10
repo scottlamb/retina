@@ -31,7 +31,7 @@ pub enum CodecItem {
     VideoFrame(VideoFrame),
     AudioFrame(AudioFrame),
     MessageFrame(MessageFrame),
-    SenderReport(crate::client::rtp::SenderReport),
+    Rtcp(crate::rtcp::ReceivedCompoundPacket),
 }
 
 /// Parameters which describe a stream.

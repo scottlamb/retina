@@ -5,20 +5,110 @@
 /// [RFC 3550 section 6](https://datatracker.ietf.org/doc/html/rfc3550#section-6).
 use std::convert::TryInto;
 
-pub enum Packet<'a> {
-    SenderReport(SenderReport<'a>),
-    Unknown(GenericPacket<'a>),
+use bytes::Bytes;
+
+use crate::PacketContext;
+
+/// A single received RTCP compound packet.
+///
+/// The contents have been validated at least as specified in [RFC 3550 appendix
+/// A.2](https://datatracker.ietf.org/doc/html/rfc3550#appendix-A.2), updated
+/// by [RFC 5506](https://datatracker.ietf.org/doc/html/rfc5506)):
+///
+/// *   There is at least one RTCP packet within the compound packet.
+/// *   All packets are RTCP version 2.
+/// *   Non-final packets have no padding.
+/// *   The packets' lengths add up to the compound packet's length.
+///
+/// Contained packets may additionally have been validated via payload
+/// type-specific rules.
+pub struct ReceivedCompoundPacket {
+    pub(crate) ctx: PacketContext,
+    pub(crate) stream_id: usize,
+    pub(crate) rtp_timestamp: Option<crate::Timestamp>,
+    pub(crate) raw: Bytes,
 }
 
-impl<'a> Packet<'a> {
-    pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), String> {
-        let (pkt, rest) = GenericPacket::parse(buf)?;
-        let pkt = match pkt.payload_type() {
-            200 => Packet::SenderReport(SenderReport::validate(pkt)?),
-            _ => Packet::Unknown(pkt),
-        };
-        Ok((pkt, rest))
+impl ReceivedCompoundPacket {
+    /// Validates the supplied compound packet.
+    ///
+    /// Returns the first packet on success so the caller doesn't need to
+    /// recaculate its lengths.
+    pub(crate) fn validate(raw: &[u8]) -> Result<PacketRef, String> {
+        let (first_pkt, mut rest) = PacketRef::parse(raw)?;
+        let mut pkt = first_pkt;
+        loop {
+            if rest.is_empty() {
+                break;
+            } else if pkt.has_padding() {
+                return Err("padding on non-final packet within RTCP compound packet".to_owned());
+            }
+            (pkt, rest) = PacketRef::parse(rest)?;
+        }
+        Ok(first_pkt)
     }
+
+    #[inline]
+    pub fn context(&self) -> &PacketContext {
+        &self.ctx
+    }
+
+    #[inline]
+    pub fn stream_id(&self) -> usize {
+        self.stream_id
+    }
+
+    /// Returns an RTP timestamp iff this compound packet begins with a valid Sender Report.
+    #[inline]
+    pub fn rtp_timestamp(&self) -> Option<crate::Timestamp> {
+        self.rtp_timestamp
+    }
+
+    /// Returns the full raw compound packet, including headers of all packets.
+    #[inline]
+    pub fn raw(&self) -> &[u8] {
+        &self.raw[..]
+    }
+
+    /// Returns an iterator through all contained packets.
+    #[inline]
+    pub fn pkts(&self) -> impl Iterator<Item = PacketRef> {
+        CompoundPacketIterator(&self.raw[..])
+    }
+}
+
+impl std::fmt::Debug for ReceivedCompoundPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceivedCompoundPacket")
+            .field("ctx", &self.ctx)
+            .field("stream_id", &self.stream_id)
+            .field("rtp_timestamp", &self.rtp_timestamp)
+            .field("raw", &crate::hex::LimitedHex::new(&self.raw[..], 64))
+            .finish()
+    }
+}
+
+/// Internal type returned from [`ReceivedCompoundPacket::pkts`].
+struct CompoundPacketIterator<'a>(&'a [u8]);
+
+impl<'a> Iterator for CompoundPacketIterator<'a> {
+    type Item = PacketRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+
+        let (pkt, rest) =
+            PacketRef::parse(self.0).expect("failed to parse previously validated packet");
+        self.0 = rest;
+        Some(pkt)
+    }
+}
+
+#[non_exhaustive]
+pub enum TypedPacketRef<'a> {
+    SenderReport(SenderReportRef<'a>),
 }
 
 /// A RTCP sender report, as defined in
@@ -61,10 +151,10 @@ impl<'a> Packet<'a> {
 ///        |                  profile-specific extensions                  |
 ///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-pub struct SenderReport<'a>(GenericPacket<'a>);
+pub struct SenderReportRef<'a>(PacketRef<'a>);
 
-impl<'a> SenderReport<'a> {
-    fn validate(pkt: GenericPacket<'a>) -> Result<Self, String> {
+impl<'a> SenderReportRef<'a> {
+    fn validate(pkt: PacketRef<'a>) -> Result<Self, String> {
         let count = usize::from(pkt.count());
         const HEADER_LEN: usize = 8;
         const SENDER_INFO_LEN: usize = 20;
@@ -76,7 +166,7 @@ impl<'a> SenderReport<'a> {
                 count, pkt.payload_end
             ));
         }
-        Ok(SenderReport(pkt))
+        Ok(SenderReportRef(pkt))
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -94,7 +184,7 @@ impl<'a> SenderReport<'a> {
 
 /// A generic packet, not parsed as any particular payload type.
 ///
-/// This only inteprets the leading four bytes:
+/// This only interprets the leading four bytes:
 ///
 /// ```text
 ///  0                   1                   2                   3
@@ -103,14 +193,15 @@ impl<'a> SenderReport<'a> {
 /// |V=2|P|         |   PT          |             length            |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-pub struct GenericPacket<'a> {
+#[derive(Copy, Clone)]
+pub struct PacketRef<'a> {
     buf: &'a [u8],
     payload_end: usize,
 }
 
 const COMMON_HEADER_LEN: usize = 4;
 
-impl<'a> GenericPacket<'a> {
+impl<'a> PacketRef<'a> {
     /// Parses a buffer into this packet and rest, doing only basic validation
     /// of the version, padding, and length.
     pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), String> {
@@ -151,7 +242,7 @@ impl<'a> GenericPacket<'a> {
                 ));
             }
             Ok((
-                GenericPacket {
+                PacketRef {
                     buf: this,
                     payload_end: len - padding_bytes,
                 },
@@ -159,7 +250,7 @@ impl<'a> GenericPacket<'a> {
             ))
         } else {
             Ok((
-                GenericPacket {
+                PacketRef {
                     buf: this,
                     payload_end: len,
                 },
@@ -169,12 +260,38 @@ impl<'a> GenericPacket<'a> {
     }
 
     /// Returns the uninterpreted payload type of this RTCP packet.
+    #[inline]
     pub fn payload_type(&self) -> u8 {
         self.buf[1]
     }
 
+    /// Parses to a `TypedPacketRef` if the payload type is supported.
+    pub fn as_typed(self) -> Result<Option<TypedPacketRef<'a>>, String> {
+        match self.payload_type() {
+            200 => Ok(Some(TypedPacketRef::SenderReport(
+                SenderReportRef::validate(self)?,
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Parses as a sender report, if the type matches.
+    pub fn as_sender_report(self) -> Result<Option<SenderReportRef<'a>>, String> {
+        if self.payload_type() == 200 {
+            return Ok(Some(SenderReportRef::validate(self)?));
+        }
+        Ok(None)
+    }
+
+    /// Returns true iff this packet has padding.
+    #[inline]
+    pub fn has_padding(&self) -> bool {
+        (self.buf[0] & 0b0010_0000) != 0
+    }
+
     /// Returns the low 5 bits of the first octet, which is typically a count
     /// or subtype.
+    #[inline]
     pub fn count(&self) -> u8 {
         self.buf[0] & 0b0001_1111
     }
@@ -194,26 +311,19 @@ mod tests {
                     \x81\xca\x00\x04\x66\x42\x6a\xe1\
                     \x01\x06\x28\x6e\x6f\x6e\x65\x29\
                     \x00\x00\x00\x00";
-        let (sr, buf) = Packet::parse(buf).unwrap();
-        match sr {
-            Packet::SenderReport(p) => {
-                assert_eq!(p.ntp_timestamp(), crate::NtpTimestamp(0xe4362f99cccccccc));
-                assert_eq!(p.rtp_timestamp(), 0x852ef807);
-            }
-            _ => panic!(),
-        }
-        let (sdes, buf) = Packet::parse(buf).unwrap();
-        match sdes {
-            Packet::Unknown(p) => assert_eq!(p.payload_type(), 202),
-            _ => panic!(),
-        }
+        let (pkt, buf) = PacketRef::parse(buf).unwrap();
+        let sr = pkt.as_sender_report().unwrap().unwrap();
+        assert_eq!(sr.ntp_timestamp(), crate::NtpTimestamp(0xe4362f99cccccccc));
+        assert_eq!(sr.rtp_timestamp(), 0x852ef807);
+        let (pkt, buf) = PacketRef::parse(buf).unwrap();
+        assert_eq!(pkt.payload_type(), 202);
         assert_eq!(buf.len(), 0);
     }
 
     #[test]
     fn padding() {
         let buf = b"\xa7\x00\x00\x02asdf\x00\x00\x00\x04rest";
-        let (pkt, rest) = GenericPacket::parse(buf).unwrap();
+        let (pkt, rest) = PacketRef::parse(buf).unwrap();
         assert_eq!(pkt.count(), 7);
         assert_eq!(&pkt.buf[4..pkt.payload_end], b"asdf");
         assert_eq!(b"rest", rest);

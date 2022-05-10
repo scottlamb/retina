@@ -58,7 +58,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
             stream_id,
             data,
         ) {
-            Ok(Some(retina::client::PacketItem::RtpPacket(rtp))) => rtp,
+            Ok(Some(retina::client::PacketItem::Rtp(rtp))) => rtp,
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();

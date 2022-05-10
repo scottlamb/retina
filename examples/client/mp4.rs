@@ -654,8 +654,10 @@ async fn copy<'a>(
                         mp4.audio(f).await.with_context(
                             || format!("Error processing audio frame, {}", ctx))?;
                     },
-                    CodecItem::SenderReport(sr) => {
-                        println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
+                    CodecItem::Rtcp(rtcp) => {
+                        if let (Some(t), Some(Ok(Some(sr)))) = (rtcp.rtp_timestamp(), rtcp.pkts().next().map(retina::rtcp::PacketRef::as_sender_report)) {
+                            println!("{}: SR ts={}", t, sr.ntp_timestamp());
+                        }
                     },
                     _ => continue,
                 };

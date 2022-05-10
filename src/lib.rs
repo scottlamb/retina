@@ -20,9 +20,9 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 
 mod error;
-mod rtcp;
 
 mod hex;
+pub mod rtcp;
 pub mod rtp;
 
 #[cfg(test)]

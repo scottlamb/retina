@@ -4,9 +4,10 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::Bytes;
-use log::{debug, trace};
+use log::debug;
 
 use crate::client::PacketItem;
+use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{RawPacket, ReceivedPacket};
 use crate::{
     ConnectionContext, Error, ErrorInt, PacketContext, StreamContextRef, StreamContextRefInner,
@@ -162,7 +163,7 @@ impl InorderParser {
         self.ssrc = Some(ssrc);
         self.next_seq = Some(sequence_number.wrapping_add(1));
         self.seen_packets += 1;
-        Ok(Some(PacketItem::RtpPacket(ReceivedPacket {
+        Ok(Some(PacketItem::Rtp(ReceivedPacket {
             ctx: *pkt_ctx,
             stream_id,
             timestamp,
@@ -183,49 +184,34 @@ impl InorderParser {
         stream_id: usize,
         data: Bytes,
     ) -> Result<Option<PacketItem>, String> {
-        let mut sr = None;
-        let mut i = 0;
-        let mut data = &data[..];
-        while !data.is_empty() {
-            let (pkt, rest) = crate::rtcp::Packet::parse(data)?;
-            data = rest;
-            match pkt {
-                crate::rtcp::Packet::SenderReport(pkt) => {
-                    if i > 0 {
-                        return Err("RTCP SR must be first in packet".into());
-                    }
-                    let timestamp =
-                        timeline
-                            .place(pkt.rtp_timestamp())
-                            .map_err(|mut description| {
-                                description.push_str(" in RTCP SR");
-                                description
-                            })?;
+        let first_pkt = crate::rtcp::ReceivedCompoundPacket::validate(&data[..])?;
+        let mut rtp_timestamp = None;
+        if let Ok(Some(sr)) = first_pkt.as_sender_report() {
+            rtp_timestamp = Some(timeline.place(sr.rtp_timestamp()).map_err(
+                |mut description| {
+                    description.push_str(" in RTCP SR");
+                    description
+                },
+            )?);
 
-                    let ssrc = pkt.ssrc();
-                    if matches!(self.ssrc, Some(s) if s != ssrc) {
-                        if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
-                            super::note_stale_live555_data(tool, session_options);
-                        }
-                        return Err(format!(
-                            "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
-                            self.ssrc, ssrc
-                        ));
-                    }
-                    self.ssrc = Some(ssrc);
-
-                    sr = Some(SenderReport {
-                        stream_id,
-                        ctx: *pkt_ctx,
-                        timestamp,
-                        ntp_timestamp: pkt.ntp_timestamp(),
-                    });
+            let ssrc = sr.ssrc();
+            if matches!(self.ssrc, Some(s) if s != ssrc) {
+                if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
+                    super::note_stale_live555_data(tool, session_options);
                 }
-                crate::rtcp::Packet::Unknown(pkt) => trace!("rtcp: pt {:?}", pkt.payload_type()),
+                return Err(format!(
+                    "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                    self.ssrc, ssrc
+                ));
             }
-            i += 1;
+            self.ssrc = Some(ssrc);
         }
-        Ok(sr.map(PacketItem::SenderReport))
+        Ok(Some(PacketItem::Rtcp(ReceivedCompoundPacket {
+            ctx: *pkt_ctx,
+            stream_id,
+            rtp_timestamp,
+            raw: data,
+        })))
     }
 }
 
@@ -267,7 +253,7 @@ mod tests {
             0,
             pkt.0,
         ) {
-            Ok(Some(PacketItem::RtpPacket(_))) => {}
+            Ok(Some(PacketItem::Rtp(_))) => {}
             o => panic!("unexpected packet 1 result: {:#?}", o),
         }
 
@@ -327,7 +313,7 @@ mod tests {
             0,
             pkt.0,
         ) {
-            Ok(Some(PacketItem::RtpPacket(p))) => {
+            Ok(Some(PacketItem::Rtp(p))) => {
                 assert_eq!(p.timestamp().elapsed(), 0);
             }
             o => panic!("unexpected packet 2 result: {:#?}", o),
@@ -375,7 +361,7 @@ mod tests {
             0,
             pkt.0,
         ) {
-            Ok(Some(PacketItem::RtpPacket(p))) => {
+            Ok(Some(PacketItem::Rtp(p))) => {
                 // The missing timestamp shouldn't have adjusted time.
                 assert_eq!(p.timestamp().elapsed(), 1);
             }
