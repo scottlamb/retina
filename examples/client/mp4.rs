@@ -550,7 +550,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             &frame.timestamp(),
             frame.data().remaining(),
         );
-        let sample_description_index = if let (Some(i), true) = (
+        let sample_description_index = if let (Some(i), false) = (
             self.cur_video_params_sample_description_index,
             frame.has_new_parameters(),
         ) {
