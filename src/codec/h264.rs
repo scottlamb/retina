@@ -492,7 +492,6 @@ impl Depacketizer {
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
-        let data = Bytes::from(data);
         self.nals.clear();
         self.pieces.clear();
 

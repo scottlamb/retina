@@ -93,17 +93,6 @@ macro_rules! write_box {
     }};
 }
 
-async fn write_all_buf<W: AsyncWrite + Unpin, B: Buf>(
-    writer: &mut W,
-    buf: &mut B,
-) -> Result<(), Error> {
-    // TODO: this doesn't use vectored I/O. Annoying.
-    while buf.has_remaining() {
-        writer.write_buf(buf).await?;
-    }
-    Ok(())
-}
-
 /// Writes `.mp4` data to a sink.
 /// See module-level documentation for details.
 pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
@@ -262,7 +251,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         });
         buf.extend_from_slice(&b"\0\0\0\0mdat"[..]);
         let mdat_start = u32::try_from(buf.len())?;
-        write_all_buf(&mut inner, &mut buf).await?;
+        inner.write_all(&buf).await?;
         Ok(Mp4Writer {
             inner,
             video_params: Vec::new(),
@@ -311,7 +300,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                 self.write_audio_trak(&mut buf, self.audio_params.as_ref().unwrap())?;
             }
         });
-        write_all_buf(&mut self.inner, &mut buf.freeze()).await?;
+        self.inner.write_all(&buf).await?;
         self.inner
             .seek(SeekFrom::Start(u64::from(self.mdat_start - 8)))
             .await?;
@@ -594,8 +583,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             self.video_sync_sample_nums
                 .push(u32::try_from(self.video_trak.samples)?);
         }
-        let mut data = frame.into_data();
-        write_all_buf(&mut self.inner, &mut data).await?;
+        self.inner.write_all(frame.data()).await?;
         Ok(())
     }
 
@@ -618,8 +606,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             .mdat_pos
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
-        let mut data = frame.into_data();
-        write_all_buf(&mut self.inner, &mut data).await?;
+        self.inner.write_all(frame.data()).await?;
         Ok(())
     }
 }

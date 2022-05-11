@@ -9,11 +9,12 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
+use bytes::Bytes;
+
 use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContext;
-use bytes::Bytes;
 
 pub(crate) mod aac;
 pub(crate) mod g723;
@@ -112,7 +113,7 @@ impl VideoParameters {
 
     /// The codec-specific "extra data" to feed to eg ffmpeg to decode the video frames.
     /// *   H.264: an AvcDecoderConfig.
-    pub fn extra_data(&self) -> &Bytes {
+    pub fn extra_data(&self) -> &[u8] {
         &self.extra_data
     }
 }
@@ -226,13 +227,8 @@ impl AudioFrame {
     }
 
     #[inline]
-    pub fn data(&self) -> &Bytes {
+    pub fn data(&self) -> &[u8] {
         &self.data
-    }
-
-    #[inline]
-    pub fn into_data(self) -> Bytes {
-        self.data
     }
 }
 
@@ -301,13 +297,8 @@ impl MessageFrame {
     }
 
     #[inline]
-    pub fn data(&self) -> &Bytes {
+    pub fn data(&self) -> &[u8] {
         &self.data
-    }
-
-    #[inline]
-    pub fn into_data(self) -> Bytes {
-        self.data
     }
 }
 
@@ -330,7 +321,7 @@ pub struct VideoFrame {
     stream_id: usize,
     is_random_access_point: bool,
     is_disposable: bool,
-    data: bytes::Bytes,
+    data: Vec<u8>,
 }
 
 impl VideoFrame {
@@ -400,12 +391,12 @@ impl VideoFrame {
     /// In the future, a configuration parameter may allow the caller to request Annex B encoding
     /// instead.  See [#44](https://github.com/scottlamb/retina/issues/44).
     #[inline]
-    pub fn data(&self) -> &Bytes {
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
 
     #[inline]
-    pub fn into_data(self) -> Bytes {
+    pub fn into_data(self) -> Vec<u8> {
         self.data
     }
 }
