@@ -1,27 +1,25 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/// Handles RTCP data as described in
-/// [RFC 3550 section 6](https://datatracker.ietf.org/doc/html/rfc3550#section-6).
+//! Handles RTCP data as described in
+//! [RFC 3550 section 6](https://datatracker.ietf.org/doc/html/rfc3550#section-6).
+
 use std::convert::TryInto;
 
 use bytes::Bytes;
 
 use crate::PacketContext;
 
-/// A single received RTCP compound packet.
+/// A received RTCP compound packet.
 ///
 /// The contents have been validated at least as specified in [RFC 3550 appendix
 /// A.2](https://datatracker.ietf.org/doc/html/rfc3550#appendix-A.2), updated
-/// by [RFC 5506](https://datatracker.ietf.org/doc/html/rfc5506)):
+/// by [RFC 5506](https://datatracker.ietf.org/doc/html/rfc5506):
 ///
 /// *   There is at least one RTCP packet within the compound packet.
 /// *   All packets are RTCP version 2.
 /// *   Non-final packets have no padding.
 /// *   The packets' lengths add up to the compound packet's length.
-///
-/// Contained packets may additionally have been validated via payload
-/// type-specific rules.
 pub struct ReceivedCompoundPacket {
     pub(crate) ctx: PacketContext,
     pub(crate) stream_id: usize,
@@ -30,6 +28,17 @@ pub struct ReceivedCompoundPacket {
 }
 
 impl ReceivedCompoundPacket {
+    /// For tests.
+    #[doc(hidden)]
+    pub fn dummy(rtp_timestamp: Option<crate::Timestamp>, data: &[u8]) -> Self {
+        Self {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            rtp_timestamp,
+            raw: Bytes::copy_from_slice(data),
+        }
+    }
+
     /// Validates the supplied compound packet.
     ///
     /// Returns the first packet on success so the caller doesn't need to
@@ -59,6 +68,22 @@ impl ReceivedCompoundPacket {
     }
 
     /// Returns an RTP timestamp iff this compound packet begins with a valid Sender Report.
+    ///
+    /// Iff this returns `Some`, other fields of the sender report can be accessed as follows:
+    ///
+    /// ```
+    /// # let compound = retina::rtcp::ReceivedCompoundPacket::dummy(
+    /// #     retina::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0),
+    /// #     b"\x80\xc8\x00\x06\x66\x42\x6a\xe1\
+    /// #       \xe4\x36\x2f\x99\xcc\xcc\xcc\xcc\
+    /// #       \x85\x2e\xf8\x07\x00\x2a\x43\x33\
+    /// #       \x2f\x4c\x34\x1d\
+    /// #       \x81\xca\x00\x04\x66\x42\x6a\xe1\
+    /// #       \x01\x06\x28\x6e\x6f\x6e\x65\x29\
+    /// #       \x00\x00\x00\x00",
+    /// # );
+    /// let sender_report = compound.pkts().next().unwrap().as_sender_report().unwrap();
+    /// ```
     #[inline]
     pub fn rtp_timestamp(&self) -> Option<crate::Timestamp> {
         self.rtp_timestamp
@@ -106,12 +131,13 @@ impl<'a> Iterator for CompoundPacketIterator<'a> {
     }
 }
 
+/// A payload type-specific accessor for a packet.
 #[non_exhaustive]
 pub enum TypedPacketRef<'a> {
     SenderReport(SenderReportRef<'a>),
 }
 
-/// A RTCP sender report, as defined in
+/// A sender report, as defined in
 /// [RFC 3550 section 6.4.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1).
 ///
 /// ```text
@@ -179,6 +205,14 @@ impl<'a> SenderReportRef<'a> {
 
     pub fn rtp_timestamp(&self) -> u32 {
         u32::from_be_bytes(self.0.buf[16..20].try_into().unwrap())
+    }
+}
+
+impl<'a> std::ops::Deref for SenderReportRef<'a> {
+    type Target = PacketRef<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -294,6 +328,12 @@ impl<'a> PacketRef<'a> {
     #[inline]
     pub fn count(&self) -> u8 {
         self.buf[0] & 0b0001_1111
+    }
+
+    /// Returns the full raw data, including headers.
+    #[inline]
+    pub fn raw(&self) -> &[u8] {
+        &self.buf
     }
 }
 
