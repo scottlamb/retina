@@ -333,7 +333,7 @@ impl<'a> PacketRef<'a> {
     /// Returns the full raw data, including headers.
     #[inline]
     pub fn raw(&self) -> &[u8] {
-        &self.buf
+        self.buf
     }
 }
 
