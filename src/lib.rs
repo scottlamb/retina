@@ -61,16 +61,17 @@ struct ReceivedMessage {
 ///
 /// This couples together three pieces of information:
 ///
-/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
-///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
-///     than `i32::MAX` from previous timestamps are treated as backwards jumps.
-///
-/// *   The codec-specific clock rate.
-///
 /// *   The stream's starting time. In client use, this is often as received in the RTSP
 ///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`].
 ///     According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial
 ///     value of the timestamp SHOULD be random".
+///
+/// *   The codec-specific clock rate.
+///
+/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
+///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
+///     than `i32::MAX` from previous timestamps are treated as backwards jumps. It's allowed for
+///     a timestamp to indicate a time *before* the stream's starting point.
 ///
 /// In combination, these allow conversion to "normal play time" (NPT): seconds since start of
 /// the stream.
@@ -79,11 +80,6 @@ struct ReceivedMessage {
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
 /// many RTP servers violate this. The Retina client allows such violations unless
 /// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
-///
-/// In client use, the top bits should be inferred from wraparounds of 32-bit RTP timestamps.
-/// The Retina client's policy is that timestamps that differ by more than `i32::MAX` from
-/// previous timestamps are treated as backwards jumps. It's allowed for a timestamp to
-/// indicate a time *before* the stream's starting point.
 ///
 /// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
 /// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return
