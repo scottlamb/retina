@@ -9,9 +9,7 @@ use log::debug;
 use crate::client::PacketItem;
 use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{RawPacket, ReceivedPacket};
-use crate::{
-    ConnectionContext, Error, ErrorInt, PacketContext, StreamContextRef, StreamContextRefInner,
-};
+use crate::{ConnectionContext, Error, ErrorInt, PacketContext, StreamContext, StreamContextInner};
 
 use super::{SessionOptions, Timeline};
 
@@ -69,7 +67,7 @@ impl InorderParser {
     pub fn rtp(
         &mut self,
         session_options: &SessionOptions,
-        stream_ctx: StreamContextRef,
+        stream_ctx: &StreamContext,
         tool: Option<&super::Tool>,
         conn_ctx: &ConnectionContext,
         pkt_ctx: &PacketContext,
@@ -107,7 +105,7 @@ impl InorderParser {
         let ssrc = raw.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s != ssrc) {
-            if matches!(stream_ctx.0, StreamContextRefInner::Udp(_)) {
+            if matches!(stream_ctx.0, StreamContextInner::Udp(_)) {
                 super::note_stale_live555_data(tool, session_options);
             }
             bail!(ErrorInt::RtpPacketError {
@@ -125,7 +123,7 @@ impl InorderParser {
             });
         }
         if loss > 0x80_00 {
-            if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
+            if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
                 bail!(ErrorInt::RtpPacketError {
                     conn_ctx: *conn_ctx,
                     pkt_ctx: *pkt_ctx,
@@ -177,7 +175,7 @@ impl InorderParser {
     pub fn rtcp(
         &mut self,
         session_options: &SessionOptions,
-        stream_ctx: StreamContextRef,
+        stream_ctx: &StreamContext,
         tool: Option<&super::Tool>,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
@@ -196,7 +194,7 @@ impl InorderParser {
 
             let ssrc = sr.ssrc();
             if matches!(self.ssrc, Some(s) if s != ssrc) {
-                if matches!(stream_ctx.0, StreamContextRefInner::Tcp { .. }) {
+                if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
                     super::note_stale_live555_data(tool, session_options);
                 }
                 return Err(format!(
@@ -231,7 +229,7 @@ mod tests {
     fn geovision_pt50_packet() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
         let mut parser = InorderParser::new(Some(0xd25614e), None);
-        let stream_ctx = StreamContextRef::dummy();
+        let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
         let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
@@ -245,7 +243,7 @@ mod tests {
         .unwrap();
         match parser.rtp(
             &SessionOptions::default(),
-            stream_ctx,
+            &stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -269,7 +267,7 @@ mod tests {
         .unwrap();
         match parser.rtp(
             &SessionOptions::default(),
-            stream_ctx,
+            &stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -286,13 +284,12 @@ mod tests {
     fn out_of_order() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
         let mut parser = InorderParser::new(Some(0xd25614e), None);
-        let udp = UdpStreamContext {
+        let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
             local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             local_rtp_port: 0,
             peer_rtp_port: 0,
-        };
-        let stream_ctx = StreamContextRef(StreamContextRefInner::Udp(&udp));
+        }));
         let session_options = SessionOptions::default();
         let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
             sequence_number: 2,
@@ -305,7 +302,7 @@ mod tests {
         .unwrap();
         match parser.rtp(
             &session_options,
-            stream_ctx,
+            &stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -330,7 +327,7 @@ mod tests {
         .unwrap();
         match parser.rtp(
             &session_options,
-            stream_ctx,
+            &stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),
@@ -353,7 +350,7 @@ mod tests {
         .unwrap();
         match parser.rtp(
             &session_options,
-            stream_ctx,
+            &stream_ctx,
             None,
             &ConnectionContext::dummy(),
             &PacketContext::dummy(),

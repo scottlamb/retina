@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
     let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContextRef::dummy();
+    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     loop {
         let (hdr, rest) = match data.split_first() {
@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         if depacketizer.push(pkt).is_err() {
             return;
         }
-        while let Some(item) = depacketizer.pull(&conn_ctx, stream_ctx).transpose() {
+        while let Some(item) = depacketizer.pull(&conn_ctx, &stream_ctx).transpose() {
             if item.is_err() {
                 return;
             }

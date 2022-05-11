@@ -669,9 +669,8 @@ mod tests {
     use bytes::Bytes;
     use url::Url;
 
-    use crate::client::StreamTransport;
-    use crate::TcpStreamContext;
     use crate::{client::StreamStateInit, codec::Parameters};
+    use crate::{StreamContext, StreamContextInner, TcpStreamContext};
 
     use super::super::StreamState;
     use super::SessionHeader;
@@ -690,7 +689,10 @@ mod tests {
             ssrc,
             initial_seq: None,
             initial_rtptime: None,
-            transport: StreamTransport::Tcp(TcpStreamContext { rtp_channel_id: 0 }),
+            ctx: StreamContext(StreamContextInner::Tcp(TcpStreamContext {
+                rtp_channel_id: 0,
+            })),
+            udp_sockets: None,
         })
     }
 

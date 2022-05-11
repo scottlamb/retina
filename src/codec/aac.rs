@@ -21,7 +21,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32},
 };
 
-use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContextRef};
+use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContext};
 
 use super::CodecItem;
 
@@ -652,7 +652,7 @@ impl Depacketizer {
     pub(super) fn pull(
         &mut self,
         conn_ctx: &ConnectionContext,
-        stream_ctx: StreamContextRef,
+        stream_ctx: &StreamContext,
     ) -> Result<Option<super::CodecItem>, Error> {
         match std::mem::take(&mut self.state) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
@@ -770,13 +770,13 @@ impl Depacketizer {
 
 fn error(
     conn_ctx: ConnectionContext,
-    stream_ctx: StreamContextRef,
+    stream_ctx: &StreamContext,
     agg: Aggregate,
     description: String,
 ) -> Error {
     Error(std::sync::Arc::new(ErrorInt::RtpPacketError {
         conn_ctx,
-        stream_ctx: stream_ctx.to_owned(),
+        stream_ctx: *stream_ctx,
         pkt_ctx: *agg.pkt.ctx(),
         stream_id: agg.pkt.stream_id(),
         ssrc: agg.pkt.ssrc(),
@@ -842,7 +842,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"asdf");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -880,7 +880,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foo");
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(a.timestamp, timestamp.try_add(1_024).unwrap());
         assert_eq!(&a.data[..], b"bar");
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -907,7 +907,7 @@ mod tests {
         assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
         assert_eq!(&a.data[..], b"baz");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -935,7 +935,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
         d.push(
@@ -961,7 +961,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
         d.push(
@@ -987,7 +987,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foobarbaz");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
     }
@@ -1038,7 +1038,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
         d.push(
@@ -1063,7 +1063,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -1091,7 +1091,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -1100,7 +1100,7 @@ mod tests {
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
     }
@@ -1142,7 +1142,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
         // Fragment 2/3 is lost
@@ -1169,7 +1169,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -1197,7 +1197,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
     }
@@ -1248,7 +1248,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
         // Fragment 2/3 is lost
@@ -1275,7 +1275,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -1303,7 +1303,7 @@ mod tests {
         )
         .unwrap();
         let a = match d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
         {
             Some(CodecItem::AudioFrame(a)) => a,
@@ -1312,7 +1312,7 @@ mod tests {
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
     }
@@ -1357,7 +1357,7 @@ mod tests {
         )
         .unwrap();
         assert!(d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap()
             .is_none());
 
@@ -1385,7 +1385,7 @@ mod tests {
         )
         .unwrap();
         let e = d
-            .pull(&ConnectionContext::dummy(), StreamContextRef::dummy())
+            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
             .unwrap_err();
         let e_str = e.to_string();
         assert!(

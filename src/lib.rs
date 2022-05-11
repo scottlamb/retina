@@ -367,34 +367,6 @@ enum StreamContextInner {
     Dummy,
 }
 
-/// Context for an active stream (RTP+RTCP session), either TCP or UDP. Reference version.
-#[derive(Copy, Clone, Debug)]
-pub struct StreamContextRef<'a>(StreamContextRefInner<'a>);
-
-impl StreamContextRef<'_> {
-    #[doc(hidden)]
-    pub fn dummy() -> Self {
-        StreamContextRef(StreamContextRefInner::Dummy)
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum StreamContextRefInner<'a> {
-    Tcp(TcpStreamContext), // this one is by value because TcpStreamContext is small.
-    Udp(&'a UdpStreamContext),
-    Dummy,
-}
-
-impl StreamContextRef<'_> {
-    fn to_owned(self) -> StreamContext {
-        StreamContext(match self.0 {
-            StreamContextRefInner::Tcp(tcp) => StreamContextInner::Tcp(tcp),
-            StreamContextRefInner::Udp(udp) => StreamContextInner::Udp(*udp),
-            StreamContextRefInner::Dummy => StreamContextInner::Dummy,
-        })
-    }
-}
-
 /// Context for a UDP stream (aka UDP-based RTP transport). Unstable/internal. Exposed for benchmarks.
 ///
 /// This stores only the RTP addresses; the RTCP addresses are assumed to use

@@ -12,7 +12,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
-use crate::StreamContextRef;
+use crate::StreamContext;
 use bytes::Bytes;
 
 pub(crate) mod aac;
@@ -555,7 +555,7 @@ impl Depacketizer {
     pub fn pull(
         &mut self,
         conn_ctx: &ConnectionContext,
-        stream_ctx: StreamContextRef,
+        stream_ctx: &StreamContext,
     ) -> Result<Option<CodecItem>, Error> {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.pull(conn_ctx, stream_ctx),

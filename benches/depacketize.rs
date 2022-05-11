@@ -32,7 +32,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         Depacketizer::new("video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap(),
     ];
     let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContextRef::dummy();
+    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     while !remaining.is_empty() {
         assert!(remaining.len() > 4);
@@ -50,7 +50,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         };
         let pkt = match rtps[stream_id].rtp(
             &retina::client::SessionOptions::default(),
-            stream_ctx,
+            &stream_ctx,
             None,
             &conn_ctx,
             &pkt_ctx,
@@ -63,7 +63,7 @@ fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
         };
         depacketizers[stream_id].push(pkt).unwrap();
         while let Some(pkt) = depacketizers[stream_id]
-            .pull(&conn_ctx, stream_ctx)
+            .pull(&conn_ctx, &stream_ctx)
             .unwrap()
         {
             f(pkt);
