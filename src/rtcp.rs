@@ -49,7 +49,7 @@ impl ReceivedCompoundPacket {
     }
 
     #[inline]
-    pub fn context(&self) -> &PacketContext {
+    pub fn ctx(&self) -> &PacketContext {
         &self.ctx
     }
 
