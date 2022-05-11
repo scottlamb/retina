@@ -68,7 +68,7 @@ fuzz_target!(|data: &[u8]| {
             Err(_) => return,
         }
     };
-    assert_eq!(&data[2..], &frame.data()[..]);
+    assert_eq!(&data[2..], frame.data());
     assert!(matches!(d.pull(&conn_ctx, &stream_ctx), Ok(None)));
     assert!(matches!(p.pull(), Ok(None)));
 });
