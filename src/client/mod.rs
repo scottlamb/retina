@@ -31,7 +31,11 @@ use crate::{
 
 mod channel_mapping;
 mod parse;
+
+/// Internal API, public for a benchmark only.
+#[doc(hidden)]
 pub mod rtp;
+
 mod teardown;
 mod timeline;
 
@@ -2805,10 +2809,6 @@ mod tests {
             ("SessionOptions", std::mem::size_of::<SessionOptions>()),
             ("Demuxed", std::mem::size_of::<Demuxed>()),
             ("Stream", std::mem::size_of::<Stream>()),
-            (
-                "rtp::SenderReport",
-                std::mem::size_of::<rtp::SenderReport>(),
-            ),
         ] {
             println!("{:-40} {:4}", name, size);
         }

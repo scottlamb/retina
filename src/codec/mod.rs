@@ -591,10 +591,6 @@ mod tests {
             ("VideoFrame", std::mem::size_of::<VideoFrame>()),
             ("AudioFrame", std::mem::size_of::<AudioFrame>()),
             ("MessageFrame", std::mem::size_of::<MessageFrame>()),
-            (
-                "SenderReport",
-                std::mem::size_of::<crate::client::rtp::SenderReport>(),
-            ),
             ("VideoParameters", std::mem::size_of::<VideoParameters>()),
             ("AudioParameters", std::mem::size_of::<AudioParameters>()),
             (

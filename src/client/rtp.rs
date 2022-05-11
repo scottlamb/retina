@@ -13,15 +13,6 @@ use crate::{ConnectionContext, Error, ErrorInt, PacketContext, StreamContext, St
 
 use super::{SessionOptions, Timeline};
 
-/// An RTCP sender report.
-#[derive(Debug)]
-pub struct SenderReport {
-    pub stream_id: usize,
-    pub ctx: PacketContext,
-    pub timestamp: crate::Timestamp,
-    pub ntp_timestamp: crate::NtpTimestamp,
-}
-
 /// RTP/RTCP demarshaller which ensures packets have the correct SSRC and
 /// monotonically increasing SEQ. Unstable; exposed for benchmark.
 ///
