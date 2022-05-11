@@ -30,13 +30,9 @@ use super::{AudioParameters, CodecItem};
 /// Currently stores the raw form and a few fields of interest.
 #[derive(Clone, Debug)]
 struct AudioSpecificConfig {
-    raw: Bytes,
-    sample_entry: Bytes,
+    parameters: AudioParameters,
 
-    /// See ISO/IEC 14496-3 Table 1.3.
-    audio_object_type: u8,
     frame_length: NonZeroU16,
-    sampling_frequency: u32,
     channels: &'static ChannelConfig,
 }
 
@@ -159,27 +155,21 @@ impl AudioSpecificConfig {
             (_, true) => NonZeroU16::new(960).expect("non-zero"),
         };
 
+        // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
+        let rfc6381_codec = Some(format!("mp4a.40.{}", audio_object_type));
+
         Ok(AudioSpecificConfig {
-            raw: Bytes::copy_from_slice(raw),
-            sample_entry: make_sample_entry(channels, sampling_frequency, raw)?,
-            audio_object_type,
+            parameters: AudioParameters {
+                // See also TODO asking if clock_rate and sampling_frequency must match.
+                clock_rate: sampling_frequency,
+                rfc6381_codec,
+                frame_length: Some(NonZeroU32::from(frame_length)),
+                extra_data: raw.to_owned(),
+                sample_entry: Some(make_sample_entry(channels, sampling_frequency, raw)?),
+            },
             frame_length,
-            sampling_frequency,
             channels,
         })
-    }
-
-    fn to_parameters(&self) -> super::AudioParameters {
-        // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
-        let rfc6381_codec = Some(format!("mp4a.40.{}", self.audio_object_type));
-        super::AudioParameters {
-            // See also TODO asking if clock_rate and sampling_frequency must match.
-            clock_rate: self.sampling_frequency,
-            rfc6381_codec,
-            frame_length: Some(NonZeroU32::from(self.frame_length)),
-            extra_data: self.raw.clone(),
-            sample_entry: Some(self.sample_entry.clone()),
-        }
     }
 }
 
@@ -220,7 +210,7 @@ macro_rules! write_box {
         // is expected to reference `$buf` via the original name.
         #[allow(clippy::unnecessary_mut_passed)]
         {
-            let _: &mut BytesMut = $buf; // type-check.
+            let _: &mut Vec<u8> = $buf; // type-check.
 
             let pos_start = $buf.len();
             let fourcc: &[u8; 4] = $fourcc;
@@ -244,7 +234,7 @@ macro_rules! write_box {
 /// scope. See ISO/IEC 14496-1 Table 1 for the `tag`.
 macro_rules! write_descriptor {
     ($buf:expr, $tag:expr, $b:block) => {{
-        let _: &mut BytesMut = $buf; // type-check.
+        let _: &mut Vec<u8> = $buf; // type-check.
         let _: u8 = $tag;
         let pos_start = $buf.len();
 
@@ -274,8 +264,8 @@ fn make_sample_entry(
     channels: &ChannelConfig,
     sampling_frequency: u32,
     config: &[u8],
-) -> Result<Bytes, String> {
-    let mut buf = BytesMut::new();
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
 
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
     // It's based on AudioSampleEntry, ISO/IEC 14496-12 section 12.2.3.2,
@@ -354,7 +344,7 @@ fn make_sample_entry(
             });
         });
     });
-    Ok(buf.freeze())
+    Ok(buf)
 }
 
 /// Parses metadata from the `format-specific-params` of a SDP `fmtp` media attribute.
@@ -418,11 +408,12 @@ fn parse_format_specific_params(
 
     let config = AudioSpecificConfig::parse(&config[..])?;
 
-    // TODO: is this a requirement? I might have read somewhere one can be a multiple of the other.
-    if clock_rate != config.sampling_frequency {
+    // TODO: is this a requirement? I might have read somewhere that the RTP clock rate can be
+    // a multiple of the AudioSpecificConfig sampling_frequency or vice versa.
+    if clock_rate != config.parameters.clock_rate {
         return Err(format!(
             "Expected RTP clock rate {} and AAC sampling frequency {} to match",
-            clock_rate, config.sampling_frequency
+            clock_rate, config.parameters.clock_rate,
         ));
     }
 
@@ -432,7 +423,6 @@ fn parse_format_specific_params(
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     config: AudioSpecificConfig,
-    parameters: AudioParameters,
     state: DepacketizerState,
 }
 
@@ -528,16 +518,14 @@ impl Depacketizer {
                 channels, config.channels
             ));
         }
-        let parameters = config.to_parameters();
         Ok(Self {
             config,
-            parameters,
             state: DepacketizerState::default(),
         })
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
-        Some(super::ParametersRef::Audio(&self.parameters))
+        Some(super::ParametersRef::Audio(&self.config.parameters))
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
@@ -797,15 +785,15 @@ mod tests {
     #[test]
     fn parse_audio_specific_config() {
         let dahua = AudioSpecificConfig::parse(&[0x11, 0x88]).unwrap();
-        assert_eq!(dahua.sampling_frequency, 48_000);
+        assert_eq!(dahua.parameters.clock_rate, 48_000);
         assert_eq!(dahua.channels.name, "mono");
 
         let bunny = AudioSpecificConfig::parse(&[0x14, 0x90]).unwrap();
-        assert_eq!(bunny.sampling_frequency, 12_000);
+        assert_eq!(bunny.parameters.clock_rate, 12_000);
         assert_eq!(bunny.channels.name, "stereo");
 
         let rfc3640 = AudioSpecificConfig::parse(&[0x11, 0xB0]).unwrap();
-        assert_eq!(rfc3640.sampling_frequency, 48_000);
+        assert_eq!(rfc3640.parameters.clock_rate, 48_000);
         assert_eq!(rfc3640.channels.name, "5.1");
     }
 

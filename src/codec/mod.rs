@@ -139,8 +139,8 @@ pub struct AudioParameters {
     rfc6381_codec: Option<String>,
     frame_length: Option<NonZeroU32>,
     clock_rate: u32,
-    extra_data: Bytes,
-    sample_entry: Option<Bytes>,
+    extra_data: Vec<u8>,
+    sample_entry: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for AudioParameters {
@@ -172,7 +172,7 @@ impl AudioParameters {
 
     /// The codec-specific "extra data" to feed to eg ffmpeg to decode the audio.
     /// *   AAC: a serialized `AudioSpecificConfig`.
-    pub fn extra_data(&self) -> &Bytes {
+    pub fn extra_data(&self) -> &[u8] {
         &self.extra_data
     }
 
@@ -180,8 +180,8 @@ impl AudioParameters {
     ///
     /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
     /// may be unsupported edge cases.
-    pub fn sample_entry(&self) -> Option<&Bytes> {
-        self.sample_entry.as_ref()
+    pub fn sample_entry(&self) -> Option<&[u8]> {
+        self.sample_entry.as_deref()
     }
 }
 

@@ -6,8 +6,6 @@
 
 use std::num::NonZeroU32;
 
-use bytes::Bytes;
-
 use super::{AudioParameters, CodecItem};
 
 #[derive(Debug)]
@@ -25,7 +23,7 @@ impl Depacketizer {
                 rfc6381_codec: None,
                 frame_length: None, // variable
                 clock_rate,
-                extra_data: Bytes::new(),
+                extra_data: Vec::new(),
                 sample_entry: None,
             },
             bits_per_sample,

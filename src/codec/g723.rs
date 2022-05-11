@@ -5,8 +5,6 @@
 
 use std::num::NonZeroU32;
 
-use bytes::Bytes;
-
 use super::AudioParameters;
 
 const FIXED_CLOCK_RATE: u32 = 8_000;
@@ -32,7 +30,7 @@ impl Depacketizer {
                 rfc6381_codec: None,
                 frame_length: NonZeroU32::new(240),
                 clock_rate: FIXED_CLOCK_RATE,
-                extra_data: Bytes::new(),
+                extra_data: Vec::new(),
                 sample_entry: None,
             },
         })
