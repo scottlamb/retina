@@ -814,7 +814,7 @@ impl Stream {
     /// When directly using [`Session`]'s packet-by-packet `futures::Stream` impl, codec
     /// depacketization logic is bypassed. The parameters returned by this function may be out of
     /// date.
-    pub fn parameters(&self) -> Option<crate::codec::Parameters> {
+    pub fn parameters(&self) -> Option<crate::codec::ParametersRef> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }
 

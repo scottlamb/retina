@@ -35,7 +35,7 @@ pub enum CodecItem {
     Rtcp(crate::rtcp::ReceivedCompoundPacket),
 }
 
-/// Parameters which describe a stream.
+/// Reference to parameters which describe a stream.
 ///
 /// Parameters are often, but not always, available immediately
 /// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
@@ -47,10 +47,10 @@ pub enum CodecItem {
 ///
 /// Currently audio and message streams' parameters never change mid-stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Parameters {
-    Video(VideoParameters),
-    Audio(AudioParameters),
-    Message(MessageParameters),
+pub enum ParametersRef<'a> {
+    Video(&'a VideoParameters),
+    Audio(&'a AudioParameters),
+    Message(&'a MessageParameters),
 }
 
 /// Parameters which describe a video stream.
@@ -514,7 +514,7 @@ impl Depacketizer {
     /// If the caller has called `push` more recently than `pull`, it's currently undefined
     /// whether the depacketizer returns parameters as of the most recently pulled or the upcoming
     /// frame.
-    pub fn parameters(&self) -> Option<Parameters> {
+    pub fn parameters(&self) -> Option<ParametersRef> {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
@@ -595,7 +595,6 @@ mod tests {
                 "SenderReport",
                 std::mem::size_of::<crate::client::rtp::SenderReport>(),
             ),
-            ("Parameters", std::mem::size_of::<Parameters>()),
             ("VideoParameters", std::mem::size_of::<VideoParameters>()),
             ("AudioParameters", std::mem::size_of::<AudioParameters>()),
             (

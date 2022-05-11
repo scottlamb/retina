@@ -127,10 +127,10 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
         self.parameters
             .as_ref()
-            .map(|p| super::Parameters::Video(p.generic_parameters.clone()))
+            .map(|p| super::ParametersRef::Video(&p.generic_parameters))
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
@@ -1360,7 +1360,7 @@ mod tests {
     fn depacketize_parameter_change() {
         let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 profile-level-id=420029; packetization-mode=1; sprop-parameter-sets=Z01AHppkBYHv/lBgYGQAAA+gAAE4gBA=,aO48gA==")).unwrap();
         match d.parameters() {
-            Some(crate::codec::Parameters::Video(v)) => {
+            Some(crate::codec::ParametersRef::Video(v)) => {
                 assert_eq!(v.pixel_dimensions(), (704, 480));
             }
             _ => unreachable!(),
@@ -1426,7 +1426,7 @@ mod tests {
         // After pull, new_parameters and parameters() both reflect the change.
         assert!(frame.has_new_parameters);
         match d.parameters() {
-            Some(crate::codec::Parameters::Video(v)) => {
+            Some(crate::codec::ParametersRef::Video(v)) => {
                 assert_eq!(v.pixel_dimensions(), (640, 480));
             }
             _ => unreachable!(),

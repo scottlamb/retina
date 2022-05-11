@@ -669,7 +669,7 @@ mod tests {
     use bytes::Bytes;
     use url::Url;
 
-    use crate::{client::StreamStateInit, codec::Parameters};
+    use crate::{client::StreamStateInit, codec::ParametersRef};
     use crate::{StreamContext, StreamContextInner, TcpStreamContext};
 
     use super::super::StreamState;
@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.64001E");
                 assert_eq!(v.pixel_dimensions(), (704, 480));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(p.streams[1].rtp_payload_type, 97);
         assert_eq!(p.streams[1].clock_rate_hz, 48_000);
         match p.streams[1].parameters() {
-            Some(Parameters::Audio(_)) => {}
+            Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
 
@@ -778,7 +778,7 @@ mod tests {
         assert_eq!(p.streams[2].clock_rate_hz, 90_000);
         assert!(matches!(
             p.streams[2].parameters(),
-            Some(Parameters::Message(_))
+            Some(ParametersRef::Message(_))
         ));
 
         // SETUP.
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(p.streams[1].encoding_name(), "pcma");
         assert_eq!(p.streams[1].rtp_payload_type, 8);
         match p.streams[1].parameters().unwrap() {
-            Parameters::Audio(_) => {}
+            ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
     }
@@ -856,7 +856,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D0029");
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(p.streams[1].clock_rate_hz, 90_000);
         assert!(matches!(
             p.streams[1].parameters(),
-            Some(Parameters::Message(_))
+            Some(ParametersRef::Message(_))
         ));
 
         // SETUP.
@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.640033");
                 assert_eq!(v.pixel_dimensions(), (2560, 1440));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(p.streams[1].rtp_payload_type, 97);
         assert_eq!(p.streams[1].clock_rate_hz, 16_000);
         match p.streams[1].parameters() {
-            Some(Parameters::Audio(_)) => {}
+            Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
 
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(p.streams[0].clock_rate_hz, 12_000);
         assert_eq!(p.streams[0].channels, NonZeroU16::new(2));
         match p.streams[0].parameters() {
-            Some(Parameters::Audio(_)) => {}
+            Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
 
@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!(p.streams[1].rtp_payload_type, 97);
         assert_eq!(p.streams[1].clock_rate_hz, 90_000);
         match p.streams[1].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.42C01E");
                 assert_eq!(v.pixel_dimensions(), (240, 160));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D001F");
                 assert_eq!(v.pixel_dimensions(), (1280, 720));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
-            Parameters::Audio(_) => {}
+            ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
     }
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
 
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
-            Parameters::Audio(_) => {}
+            ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
     }
@@ -1211,7 +1211,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
                 assert_eq!(v.pixel_aspect_ratio(), None);
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(p.streams[1].clock_rate_hz, 8_000);
         assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
         match p.streams[1].parameters().unwrap() {
-            Parameters::Audio(_) => {}
+            ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
 
@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
         match p.streams[0].parameters().unwrap() {
-            Parameters::Video(v) => {
+            ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D001E");
                 assert_eq!(v.pixel_dimensions(), (720, 480));
                 assert_eq!(v.pixel_aspect_ratio(), None);

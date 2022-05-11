@@ -23,7 +23,7 @@ use std::{
 
 use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContext};
 
-use super::CodecItem;
+use super::{AudioParameters, CodecItem};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -432,6 +432,7 @@ fn parse_format_specific_params(
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     config: AudioSpecificConfig,
+    parameters: AudioParameters,
     state: DepacketizerState,
 }
 
@@ -527,14 +528,16 @@ impl Depacketizer {
                 channels, config.channels
             ));
         }
+        let parameters = config.to_parameters();
         Ok(Self {
             config,
+            parameters,
             state: DepacketizerState::default(),
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::Parameters> {
-        Some(super::Parameters::Audio(self.config.to_parameters()))
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+        Some(super::ParametersRef::Audio(&self.parameters))
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {

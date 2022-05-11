@@ -23,7 +23,7 @@ use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
     client::{SetupOptions, Transport},
-    codec::{AudioParameters, CodecItem, Parameters, VideoParameters},
+    codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters},
 };
 
 use std::num::NonZeroU32;
@@ -98,7 +98,7 @@ macro_rules! write_box {
 pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
     mdat_start: u32,
     mdat_pos: u32,
-    video_params: Vec<Box<VideoParameters>>,
+    video_params: Vec<VideoParameters>,
 
     /// The most recently used 1-based index within `video_params`.
     cur_video_params_sample_description_index: Option<u32>,
@@ -548,13 +548,13 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             i
         } else {
             match stream.parameters() {
-                Some(Parameters::Video(params)) => {
+                Some(ParametersRef::Video(params)) => {
                     log::info!("new video params: {:?}", params);
-                    let pos = self.video_params.iter().position(|p| **p == params);
+                    let pos = self.video_params.iter().position(|p| p == params);
                     if let Some(pos) = pos {
                         u32::try_from(pos + 1)?
                     } else {
-                        self.video_params.push(Box::new(params));
+                        self.video_params.push(params.clone());
                         u32::try_from(self.video_params.len())?
                     }
                 }
@@ -767,7 +767,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .find_map(|(i, s)| match s.parameters() {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
-                Some(retina::codec::Parameters::Audio(a)) if a.sample_entry().is_some() => {
+                Some(retina::codec::ParametersRef::Audio(a)) if a.sample_entry().is_some() => {
                     log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
                     Some((i, Box::new(a.clone())))
                 }

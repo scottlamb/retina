@@ -7,11 +7,14 @@ use std::num::NonZeroU32;
 
 use bytes::Bytes;
 
+use super::AudioParameters;
+
 const FIXED_CLOCK_RATE: u32 = 8_000;
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     pending: Option<super::AudioFrame>,
+    parameters: AudioParameters,
 }
 
 impl Depacketizer {
@@ -23,17 +26,20 @@ impl Depacketizer {
                 FIXED_CLOCK_RATE, clock_rate
             ));
         }
-        Ok(Self { pending: None })
+        Ok(Self {
+            pending: None,
+            parameters: AudioParameters {
+                rfc6381_codec: None,
+                frame_length: NonZeroU32::new(240),
+                clock_rate: FIXED_CLOCK_RATE,
+                extra_data: Bytes::new(),
+                sample_entry: None,
+            },
+        })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::Parameters> {
-        Some(super::Parameters::Audio(super::AudioParameters {
-            rfc6381_codec: None,
-            frame_length: NonZeroU32::new(240),
-            clock_rate: FIXED_CLOCK_RATE,
-            extra_data: Bytes::new(),
-            sample_entry: None,
-        }))
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+        Some(super::ParametersRef::Audio(&self.parameters))
     }
 
     fn validate(pkt: &crate::rtp::ReceivedPacket) -> bool {

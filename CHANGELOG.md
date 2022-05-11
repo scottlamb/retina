@@ -22,6 +22,8 @@
 *   BREAKING: `retina::client::PacketItem::SenderReport` has been replaced with
     `retina::client::PacketItem::Rtcp`, to expose full RTCP compound packets.
     Likewise `retina::codec::CodecItem`.
+*   BREAKING: `retina::codec::Parameters` is now `retina::codec::ParametersRef`,
+    which references parameters stored within the `Stream` to reduce copying.
 *   minimum Rust version is now 1.59.
 
 ## `v0.3.10` (2022-05-09)
