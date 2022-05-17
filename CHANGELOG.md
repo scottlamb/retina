@@ -1,4 +1,4 @@
-## next
+## `v0.4.0` (2022-05-17)
 
 *   BREAKING: remove deprecated `retina::client::Session<Playing>::teardown` and
     `retina::client::Demuxed::teardown`; made private some items already

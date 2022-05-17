@@ -9,8 +9,7 @@ ONVIF RTSP/1.0 IP surveillance cameras, as needed by
 [Moonfire NVR](https://github.com/scottlamb/moonfire-nvr). Works around
 brokenness in cheap closed-source cameras.
 
-Status: In production use in Moonfire NVR. Many missing features. Some breaking
-changes needed to clean up APIs (see [#47](https://github.com/scottlamb/retina/issues/47).)
+Status: In production use in Moonfire NVR. Many missing features.
 
 Progress:
 
