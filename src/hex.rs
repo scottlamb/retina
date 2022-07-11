@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Quick wrapper around `pretty-hex` to limit output.
-//!
-//! TODO: remove this if [wolandr/pretty-hex#9](https://github.com/wolandr/pretty-hex/pull/9)
-//! is merged.
 
 use pretty_hex::PrettyHex;
 
@@ -21,24 +18,13 @@ impl<'a> LimitedHex<'a> {
 
 impl<'a> std::fmt::Debug for LimitedHex<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let omitted = self.inner.len().checked_sub(self.max_bytes);
-        let print = if omitted.is_some() {
-            &self.inner[..self.max_bytes]
-        } else {
-            self.inner
-        };
-        writeln!(f, "Length: {0} (0x{0:x}) bytes", self.inner.len())?;
         write!(
             f,
             "{:#?}",
-            print.hex_conf(pretty_hex::HexConfig {
-                title: false,
+            self.inner.hex_conf(pretty_hex::HexConfig {
+                max_bytes: self.max_bytes,
                 ..Default::default()
             })
-        )?;
-        if let Some(o) = omitted {
-            write!(f, "\n...{0} (0x{0:x}) bytes not shown...", o)?;
-        }
-        Ok(())
+        )
     }
 }
