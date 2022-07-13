@@ -80,13 +80,13 @@ pub struct Opts {
 macro_rules! write_box {
     ($buf:expr, $fourcc:expr, $b:block) => {{
         let _: &mut BytesMut = $buf; // type-check.
-        let pos_start = $buf.len();
+        let pos_start = ($buf as &BytesMut).len();
         let fourcc: &[u8; 4] = $fourcc;
         $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
         let r = {
             $b;
         };
-        let pos_end = $buf.len();
+        let pos_end = ($buf as &BytesMut).len();
         let len = pos_end.checked_sub(pos_start).unwrap();
         $buf[pos_start..pos_start + 4].copy_from_slice(&u32::try_from(len)?.to_be_bytes()[..]);
         r
@@ -305,7 +305,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             .seek(SeekFrom::Start(u64::from(self.mdat_start - 8)))
             .await?;
         self.inner
-            .write_all(&u32::try_from(self.mdat_pos + 8 - self.mdat_start)?.to_be_bytes()[..])
+            .write_all(&(self.mdat_pos + 8 - self.mdat_start).to_be_bytes()[..])
             .await?;
         Ok(())
     }
@@ -462,9 +462,9 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(1); // entry_count
                             buf.extend_from_slice(
-                                &parameters
+                                parameters
                                     .sample_entry()
-                                    .expect("all added streams have sample entries")[..],
+                                    .expect("all added streams have sample entries"),
                             );
                         });
                         self.audio_trak.write_common_stbl_parts(buf)?;
@@ -580,8 +580,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
         if frame.is_random_access_point() {
-            self.video_sync_sample_nums
-                .push(u32::try_from(self.video_trak.samples)?);
+            self.video_sync_sample_nums.push(self.video_trak.samples);
         }
         self.inner.write_all(frame.data()).await?;
         Ok(())
@@ -663,8 +662,8 @@ async fn copy<'a>(
 }
 
 /// Writes the `.mp4`, including trying to finish or clean up the file.
-async fn write_mp4<'a>(
-    opts: &'a Opts,
+async fn write_mp4(
+    opts: &Opts,
     session: retina::client::Session<retina::client::Described>,
     audio_params: Option<Box<AudioParameters>>,
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
@@ -694,10 +693,8 @@ async fn write_mp4<'a>(
             if let Err(e) = tokio::fs::remove_file(&tmp_filename).await {
                 log::error!("and removing .mp4 failed too: {}", e);
             }
-        } else {
-            if let Err(e) = tokio::fs::rename(&tmp_filename, &opts.out).await {
-                log::error!("unable to move completed .mp4 into place: {}", e);
-            }
+        } else if let Err(e) = tokio::fs::rename(&tmp_filename, &opts.out).await {
+            log::error!("unable to move completed .mp4 into place: {}", e);
         }
         Err(e)
     } else {
