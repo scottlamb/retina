@@ -138,6 +138,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "itertools",
+ "log",
+ "mylog",
+ "retina",
+ "structopt",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "cookie-factory"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,7 +916,6 @@ checksum = "a3f87b73ce11b1619a3c6332f45341e0047173771e8b8b73f87bfeefb7b56244"
 name = "retina"
 version = "0.4.0"
 dependencies = [
- "anyhow",
  "base64",
  "bitreader",
  "bytes",
@@ -909,7 +924,6 @@ dependencies = [
  "h264-reader",
  "hex",
  "http-auth",
- "itertools",
  "log",
  "mylog",
  "once_cell",
@@ -919,7 +933,6 @@ dependencies = [
  "rtsp-types",
  "sdp-types",
  "smallvec",
- "structopt",
  "thiserror",
  "time",
  "tokio",
@@ -1194,7 +1207,6 @@ dependencies = [
  "mio",
  "num_cpus",
  "once_cell",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

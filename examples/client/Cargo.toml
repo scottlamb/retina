@@ -1,0 +1,18 @@
+[package]
+name = "client"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.59"
+
+[dependencies]
+bytes = "1.0.1"
+futures = "0.3.14"
+log = "0.4.8"
+retina = { path = "../../" }
+tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
+url = "2.2.1"
+anyhow = "1.0.41"
+itertools = "0.10.1"
+mylog = { git = "https://github.com/scottlamb/mylog" }
+structopt = "0.3.21"

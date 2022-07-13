@@ -35,22 +35,24 @@ jobs:
         toolchain: ${{ matrix.rust }}
         override: true
         components: ${{ matrix.extra_components }}
+    - name: Build
+      run: cargo build --all-features --all-targets --workspace
     - name: Test
-      run: cargo test --all-features --all-targets
+      run: cargo test --all-features --all-targets --workspace
     - name: Check fuzz tests
-      run: cd fuzz && cargo check
+      run: cd fuzz && cargo check --workspace
     - name: Check main crate formatting
       if: matrix.rust == 'stable'
       run: cargo fmt -- --check
     - name: Check fuzz crate formatting
       if: matrix.rust == 'stable'
-      run: cd fuzz && cargo fmt -- --check
+      run: cd fuzz && cargo fmt -- --check --all
     - name: Clippy on main crate
       if: matrix.rust == 'stable'
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --workspace -- -D warnings
     - name: Clippy on fuzz crate
       if: matrix.rust == 'stable'
-      run: cd fuzz && cargo clippy -- -D warnings
+      run: cd fuzz && cargo clippy --workspace -- -D warnings
         
   license:
     name: Check copyright/license headers
