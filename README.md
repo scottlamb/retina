@@ -81,6 +81,15 @@ Where CMD:
 * **mp4** - Writes RTSP streams to mp4 file; exit with Ctrl+C.
 * **onvif** - Gets realtime onvif metadata if available; exit with Ctrl+C.
 
+## Example WebRTC proxy
+
+This allows viewing a H.264 video stream from your browser, with the help of
+[`webrtc-rs`](https://crates.io/crates/webrtc).
+
+```shell
+$ cargo run --package webrtc-proxy -- --help
+```
+
 ## Acknowledgements
 
 This builds on the whole Rust ecosystem. A couple folks have been especially

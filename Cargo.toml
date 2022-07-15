@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/client"]
+members = [".", "examples/client", "examples/webrtc-proxy"]
 default-members = ["."]
 
 [package]
@@ -44,6 +44,11 @@ tokio = { version = "1.5.0", features = ["io-util", "macros", "rt-multi-thread",
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+rtp = { path = " ../../../crates/webrtc-rs/webrtc/crates/rtp" }
+webrtc = { path = " ../../../crates/webrtc-rs/webrtc" }
+webrtc-srtp = { path = " ../../../crates/webrtc-rs/webrtc/crates/srtp" }
 
 [[bench]]
 name = "client"
