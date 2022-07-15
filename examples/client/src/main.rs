@@ -8,7 +8,7 @@ mod mp4;
 mod onvif;
 
 use anyhow::Error;
-use log::error;
+use log::{error, info};
 use std::str::FromStr;
 use structopt::StructOpt;
 

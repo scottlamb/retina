@@ -1857,10 +1857,11 @@ dependencies = [
 [[package]]
 name = "rtp"
 version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5110c12c9f7d1e76eba80076cce4ccb82ee085bd10a62472468de0663240f8b5"
 dependencies = [
  "async-trait",
  "bytes",
- "log",
  "rand",
  "thiserror",
  "webrtc-util",
@@ -2642,6 +2643,8 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d31ce825629e0a7b91c881d6b0a911cd65a7ebb6325fa94fbbddf1c7486f33"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2731,16 +2734,14 @@ dependencies = [
 
 [[package]]
 name = "webrtc-ice"
-version = "0.7.0"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8c20824d5b1f223b71b5db70ae327015756eb83af42f07869409cb7473a168b"
+checksum = "08f2a4a1ae47cdce72c648d94895131a80f0ec96d8c78d9187b37d777b9c18cf"
 dependencies = [
  "async-trait",
  "crc",
  "log",
  "rand",
- "serde",
- "serde_json",
  "stun",
  "thiserror",
  "tokio",
@@ -2819,6 +2820,8 @@ dependencies = [
 [[package]]
 name = "webrtc-srtp"
 version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9d21403708d58bf8532393d92be2c84d7ffee5b7847a2cc57147d88f4693227"
 dependencies = [
  "aead 0.4.3",
  "aes 0.7.5",
