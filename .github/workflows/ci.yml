@@ -35,6 +35,8 @@ jobs:
         toolchain: ${{ matrix.rust }}
         override: true
         components: ${{ matrix.extra_components }}
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkgconf
     - name: Build
       run: cargo build --all-features --all-targets --workspace
     - name: Test
