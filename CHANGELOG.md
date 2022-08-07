@@ -1,3 +1,9 @@
+## unreleased
+
+*   Send keepalives at every half-session-timeout rather than a fixed 30-second
+    interval. This should improve compatibility with servers that have session
+    timeouts under 30 seconds.
+
 ## `v0.4.0` (2022-05-17)
 
 *   BREAKING: remove deprecated `retina::client::Session<Playing>::teardown` and

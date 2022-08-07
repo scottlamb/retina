@@ -524,6 +524,14 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
             if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
                 let timeout_sec =
                     u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {}", v))?;
+
+                if timeout_sec == 0 {
+                    // This would make Retina send keepalives at an absurd rate; reject.
+                    return Err(format!(
+                        "Invalid timeout=0 in Session header {:?}",
+                        session.as_str()
+                    ));
+                }
                 SessionHeader {
                     id: id.into(),
                     timeout_sec,
