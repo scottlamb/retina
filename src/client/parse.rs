@@ -670,6 +670,35 @@ pub(crate) fn parse_play(
     Ok(())
 }
 
+#[derive(Default)]
+pub(crate) struct OptionsResponse {
+    pub(crate) set_parameter_supported: bool,
+    pub(crate) get_parameter_supported: bool,
+}
+
+/// Parses an `OPTIONS` response.
+pub(crate) fn parse_options(
+    response: &rtsp_types::Response<Bytes>,
+) -> Result<OptionsResponse, String> {
+    let mut interpreted = OptionsResponse::default();
+
+    // RTSP/1.0 OPTIONS method: https://tools.ietf.org/html/rfc2326#section-10.1
+    // HTTP/1.1 OPTIONS method: https://www.rfc-editor.org/rfc/rfc2616.html#section-9.2
+    // RTSP/1.0 Public header: https://www.rfc-editor.org/rfc/rfc2326.html#section-12.28
+    // HTTP/1.1 Public header: https://www.rfc-editor.org/rfc/rfc2068#section-14.35
+    if let Some(public) = response.header(&rtsp_types::headers::PUBLIC) {
+        for method in public.as_str().split(',') {
+            let method = method.trim();
+            match method {
+                "SET_PARAMETER" => interpreted.set_parameter_supported = true,
+                "GET_PARAMETER" => interpreted.get_parameter_supported = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(interpreted)
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
@@ -813,6 +842,11 @@ mod tests {
             _ => panic!(),
         };
         // The other streams don't get filled in because they're in state Uninit.
+
+        // OPTIONS.
+        let opts =
+            super::parse_options(&response(include_bytes!("testdata/dahua_options.txt"))).unwrap();
+        assert!(opts.set_parameter_supported);
     }
 
     #[test]

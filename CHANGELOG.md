@@ -1,8 +1,12 @@
 ## unreleased
 
 *   Send keepalives at every half-session-timeout rather than a fixed 30-second
-    interval. This should improve compatibility with servers that have session
-    timeouts under 30 seconds.
+    interval. This allows persistent connections to servers that have timeouts
+    shorter than 30 seconds.
+*   Use `OPTIONS` for initial keepalive, and only switch to `SET_PARAMETER` if
+    the server advertises its support. This allows persistent connections to
+    `rtsp-simple-server` v0.19.3, which does not support the latter method and
+    drops the connection on receiving unsupported methods.
 
 ## `v0.4.0` (2022-05-17)
 
