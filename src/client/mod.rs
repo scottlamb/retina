@@ -2358,8 +2358,14 @@ impl futures::Stream for Session<Playing> {
                             request);
                     }
                 },
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => {
+                    debug!("RTSP connection error: {:?}", e);
+                    return Poll::Ready(Some(Err(e)))
+                },
+                Poll::Ready(None) => {
+                    debug!("Server closed RTSP connection");
+                    return Poll::Ready(None)
+                },
                 std::task::Poll::Pending => {}
             }
 
