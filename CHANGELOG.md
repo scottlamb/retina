@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.1` (2022-08-09)
 
 *   Send keepalives at every half-session-timeout rather than a fixed 30-second
     interval. This allows persistent connections to servers that have timeouts
