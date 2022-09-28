@@ -1,3 +1,8 @@
+## `v0.4.2` (2022-09-28)
+
+*   ignore unparseable SDP media, improving compatibility with TP-Link cameras,
+    as described in [scottlamb/moonfire-nvr#238](https://github.com/scottlamb/moonfire-nvr/issues/238).
+
 ## `v0.4.1` (2022-08-09)
 
 *   Send keepalives at every half-session-timeout rather than a fixed 30-second

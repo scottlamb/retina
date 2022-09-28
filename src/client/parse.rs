@@ -452,19 +452,30 @@ pub(crate) fn parse_describe(
     }
     let control = control.unwrap_or(request_url);
 
-    let streams = sdp
+    let streams: Box<[Stream]> = sdp
         .medias
         .iter()
         .enumerate()
-        .map(|(i, m)| {
-            parse_media(&base_url, m).map_err(|e| {
-                format!(
-                    "Unable to parse stream {}: {}\nraw SDP: {:#?}",
-                    i, &e, raw_sdp
-                )
-            })
+        .filter_map(|(i, m)| {
+            parse_media(&base_url, m).map_or_else(
+                |e| {
+                    warn!(
+                        "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
+                        i, &e, raw_sdp
+                    );
+                    None
+                },
+                Some,
+            )
         })
-        .collect::<Result<_, String>>()?;
+        .collect();
+
+    if streams.is_empty() {
+        return Err(format!(
+            "No parseable streams (and {} unparseable streams)",
+            sdp.medias.len()
+        ));
+    }
 
     Ok(Presentation {
         streams,
@@ -755,6 +766,23 @@ mod tests {
                     "testdata/geovision_sdp.txt"
                 )));
         super::parse_describe(url, &response).unwrap();
+    }
+
+    /// Parses SDP taken from a TP-LINK TL-IPC44AW-COLOR 4.0 camera running firmware
+    /// FW: 1.0.10 Build 220330 Rel.35741n, which has a stream with a string where an RTP
+    /// payload description is expected.
+    /// https://github.com/scottlamb/moonfire-nvr/issues/238
+    #[test]
+    fn tplink_sdp() {
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let response =
+            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
+                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
+                .build(Bytes::from_static(include_bytes!(
+                    "testdata/tplink_sdp.txt"
+                )));
+        let p = super::parse_describe(url, &response).unwrap();
+        assert_eq!(p.streams.len(), 2);
     }
 
     #[test]
