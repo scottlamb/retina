@@ -196,7 +196,7 @@ fn set_length(len: usize, data: &mut [u8]) -> Result<usize, String> {
         Ok(4)
     } else {
         // BaseDescriptor sets a maximum length of 2**28 - 1.
-        return Err(format!("length {} too long", len));
+        Err(format!("length {} too long", len))
     }
 }
 

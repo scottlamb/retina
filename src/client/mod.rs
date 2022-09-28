@@ -1614,7 +1614,7 @@ impl Session<Described> {
                     "Connecting via TCP to known-broken RTSP server {:?}. \
                         See <https://github.com/scottlamb/retina/issues/17>. \
                         Consider using UDP instead!",
-                    &*t
+                    t
                 );
             }
         }
