@@ -677,16 +677,18 @@ impl InternalParameters {
     }
 
     fn parse_sps_and_pps(sps_nal: &[u8], pps_nal: &[u8]) -> Result<InternalParameters, String> {
-        let sps_rbsp = h264_reader::rbsp::decode_nal(&sps_nal[1..]);
-        if sps_rbsp.len() < 4 {
+        let sps_rbsp = h264_reader::rbsp::decode_nal(sps_nal).map_err(|_| "bad sps")?;
+        if sps_rbsp.len() < 5 {
             return Err("bad sps".into());
         }
         let rfc6381_codec = format!(
             "avc1.{:02X}{:02X}{:02X}",
             sps_rbsp[0], sps_rbsp[1], sps_rbsp[2]
         );
-        let sps = h264_reader::nal::sps::SeqParameterSet::from_bytes(&sps_rbsp)
-            .map_err(|e| format!("Bad SPS: {:?}", e))?;
+        let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(
+            h264_reader::rbsp::BitReader::new(&*sps_rbsp),
+        )
+        .map_err(|e| format!("Bad SPS: {:?}", e))?;
         debug!("sps: {:#?}", &sps);
 
         let pixel_dimensions = sps
@@ -1011,6 +1013,7 @@ enum PacketizerState {
 mod tests {
     use std::num::NonZeroU32;
 
+    use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     /*
@@ -1068,6 +1071,7 @@ mod tests {
 
     #[test]
     fn depacketize() {
+        init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -1176,6 +1180,7 @@ mod tests {
     /// suppress incorrect access unit changes after the SPS and PPS.
     #[test]
     fn depacketize_reolink_bad_framing_at_start() {
+        init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
             timestamp: 0,
@@ -1259,6 +1264,7 @@ mod tests {
     /// suppress incorrect access unit changes after the SPS and PPS.
     #[test]
     fn depacketize_reolink_gop_boundary() {
+        init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
             timestamp: 0,
@@ -1358,12 +1364,13 @@ mod tests {
 
     #[test]
     fn depacketize_parameter_change() {
-        let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 profile-level-id=420029; packetization-mode=1; sprop-parameter-sets=Z01AHppkBYHv/lBgYGQAAA+gAAE4gBA=,aO48gA==")).unwrap();
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 packetization-mode=1;profile-level-id=4d002a;sprop-parameter-sets=Z00AKp2oHgCJ+WbgICAoAAADAAgAAAMAfCA=,aO48gA==")).unwrap();
         match d.parameters() {
             Some(crate::codec::ParametersRef::Video(v)) => {
-                assert_eq!(v.pixel_dimensions(), (704, 480));
+                assert_eq!(v.pixel_dimensions(), (1920, 1080));
             }
-            _ => unreachable!(),
+            o => panic!("{:?}", o),
         }
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -1438,6 +1445,7 @@ mod tests {
     /// (Mostly that it should not panic.)
     #[test]
     fn depacketize_empty() {
+        init_logging();
         assert!(super::InternalParameters::parse_format_specific_params("").is_err());
         assert!(super::InternalParameters::parse_format_specific_params(" ").is_err());
     }
@@ -1446,6 +1454,7 @@ mod tests {
     /// an Annex B NAL separator at the end of each of the `sprop-parameter-sets` NALs.
     #[test]
     fn gw_security_params() {
+        init_logging();
         let params = super::InternalParameters::parse_format_specific_params(
             "packetization-mode=1;\
              profile-level-id=5046302;\
@@ -1461,6 +1470,7 @@ mod tests {
 
     #[test]
     fn bad_format_specific_params() {
+        init_logging();
         // These bad parameters are taken from a VStarcam camera. The sprop-parameter-sets
         // don't start with proper NAL headers. (They look almost like the raw RBSP of each
         // NAL plus extra trailing NUL bytes?)

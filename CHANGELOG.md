@@ -1,3 +1,11 @@
+## `v0.4.3` (2022-09-28)
+
+*   upgrade version of `h264-reader` crate. Compatibility note: Retina may now
+    be stricter about parsing H.264 parameters (SPS/PPS). In practice, with some
+    cameras this means unparseable "out-of-line" parameters (specified in the
+    SDP) will be ignored in favor of parseable "in-line" parameters (specified
+    within the RTP data stream).
+
 ## `v0.4.2` (2022-09-28)
 
 *   ignore unparseable SDP media, improving compatibility with TP-Link cameras,

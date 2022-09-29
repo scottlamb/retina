@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "retina"
-version = "0.4.2"
+version = "0.4.3"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
 edition = "2021"
@@ -17,10 +17,10 @@ rust-version = "1.59"
 
 [dependencies]
 base64 = "0.13.0"
-bitreader = "0.3.3"
+bitstream-io = "1.1"
 bytes = "1.0.1"
 futures = "0.3.14"
-h264-reader = "0.5.0"
+h264-reader = "0.6.0"
 hex = "0.4.3"
 http-auth = "0.1.2"
 log = "0.4.8"
