@@ -14,6 +14,7 @@
 //!         ISO base media file format.
 //!     *   ISO/IEC 14496-14: MP4 File Format.
 
+use bitstream_io::BitRead;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::{
     convert::TryFrom,
@@ -66,14 +67,14 @@ const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
 impl AudioSpecificConfig {
     /// Parses from raw bytes.
     fn parse(raw: &[u8]) -> Result<Self, String> {
-        let mut r = bitreader::BitReader::new(raw);
+        let mut r = bitstream_io::BitReader::endian(raw, bitstream_io::BigEndian);
         let audio_object_type = match r
-            .read_u8(5)
+            .read::<u8>(5)
             .map_err(|e| format!("unable to read audio_object_type: {}", e))?
         {
             31 => {
                 32 + r
-                    .read_u8(6)
+                    .read::<u8>(6)
                     .map_err(|e| format!("unable to read audio_object_type ext: {}", e))?
             }
             o => o,
@@ -81,7 +82,7 @@ impl AudioSpecificConfig {
 
         // ISO/IEC 14496-3 section 1.6.3.3.
         let sampling_frequency = match r
-            .read_u8(4)
+            .read::<u8>(4)
             .map_err(|e| format!("unable to read sampling_frequency: {}", e))?
         {
             0x0 => 96_000,
@@ -101,13 +102,13 @@ impl AudioSpecificConfig {
                 return Err(format!("reserved sampling_frequency_index value 0x{:x}", v))
             }
             0xf => r
-                .read_u32(24)
+                .read::<u32>(24)
                 .map_err(|e| format!("unable to read sampling_frequency ext: {}", e))?,
             0x10..=0xff => unreachable!(),
         };
         let channels = {
             let c = r
-                .read_u8(4)
+                .read::<u8>(4)
                 .map_err(|e| format!("unable to read channels: {}", e))?;
             CHANNEL_CONFIGS
                 .get(usize::from(c))
@@ -117,7 +118,7 @@ impl AudioSpecificConfig {
         };
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
-            if r.read_u8(4)
+            if r.read::<u8>(4)
                 .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {}", e))?
                 == 0xf
             {
@@ -125,7 +126,7 @@ impl AudioSpecificConfig {
                     .map_err(|e| format!("unable to read extensionSamplingFrequency: {}", e))?;
             }
             // audioObjectType (a different one) + extensionChannelConfiguration.
-            if r.read_u8(5)
+            if r.read::<u8>(5)
                 .map_err(|e| format!("unable to read second audioObjectType: {}", e))?
                 == 22
             {
@@ -142,7 +143,7 @@ impl AudioSpecificConfig {
 
         // GASpecificConfig, ISO/IEC 14496-3 section 4.4.1.
         let frame_length_flag = r
-            .read_bool()
+            .read_bit()
             .map_err(|e| format!("unable to read frame_length_flag: {}", e))?;
         let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
@@ -787,14 +788,17 @@ mod tests {
         let dahua = AudioSpecificConfig::parse(&[0x11, 0x88]).unwrap();
         assert_eq!(dahua.parameters.clock_rate, 48_000);
         assert_eq!(dahua.channels.name, "mono");
+        assert_eq!(dahua.parameters.rfc6381_codec(), Some("mp4a.40.2"));
 
         let bunny = AudioSpecificConfig::parse(&[0x14, 0x90]).unwrap();
         assert_eq!(bunny.parameters.clock_rate, 12_000);
         assert_eq!(bunny.channels.name, "stereo");
+        assert_eq!(bunny.parameters.rfc6381_codec(), Some("mp4a.40.2"));
 
         let rfc3640 = AudioSpecificConfig::parse(&[0x11, 0xB0]).unwrap();
         assert_eq!(rfc3640.parameters.clock_rate, 48_000);
         assert_eq!(rfc3640.channels.name, "5.1");
+        assert_eq!(rfc3640.parameters.rfc6381_codec(), Some("mp4a.40.2"));
     }
 
     #[test]

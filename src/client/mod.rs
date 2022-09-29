@@ -2508,10 +2508,8 @@ impl futures::Stream for Demuxed {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use super::*;
-    use crate::testutil::response;
+    use crate::testutil::{init_logging, response};
 
     /// Cross-platform, tokio equivalent of `socketpair(2)`.
     async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
@@ -2535,19 +2533,6 @@ mod tests {
             seen_unassigned: false,
         };
         (client, server)
-    }
-
-    fn init_logging() {
-        let h = mylog::Builder::new()
-            .set_format(
-                ::std::env::var("MOONFIRE_FORMAT")
-                    .map_err(|_| ())
-                    .and_then(|s| mylog::Format::from_str(&s))
-                    .unwrap_or(mylog::Format::Google),
-            )
-            .set_spec(::std::env::var("MOONFIRE_LOG").as_deref().unwrap_or("info"))
-            .build();
-        let _ = h.install();
     }
 
     /// Receives a request and sends a response, filling in the matching `CSeq`.

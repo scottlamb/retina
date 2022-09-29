@@ -21,13 +21,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "904dfeac50f3cdaba28fc6f57fdcddb75f49ed61346676a78c4ffe55877802fd"
 
 [[package]]
-name = "bitreader"
-version = "0.3.4"
+name = "bitstream-io"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9178181a7d44239c6c8eaafa8688558a2ab5fa04b8855381f2681e9591fb941b"
-dependencies = [
- "cfg-if",
-]
+checksum = "97d524fdb78bf6dc6d2dc4c02043e4b4962ede0a17ae3e13f0ed211a7eda5897"
 
 [[package]]
 name = "block-buffer"
@@ -230,11 +227,12 @@ dependencies = [
 
 [[package]]
 name = "h264-reader"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8d87669bdeca3d51902f1bf1f2c71c8f514a8f3011d9b81e63719b374091da1"
+checksum = "a3c095862f1b74a6021f766321767e64fbec34fa76503debbe1da2c04ce23c2c"
 dependencies = [
- "bitreader",
+ "bitstream-io",
+ "hex-slice",
  "log",
  "memchr",
  "rfc6381-codec",
@@ -245,6 +243,12 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hex-slice"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5491a308e0214554f07a81d8944abe45f552871c12e3c3c6e7e5d354039a6c4c"
 
 [[package]]
 name = "http-auth"
@@ -511,10 +515,10 @@ checksum = "6c230d73fb8d8c1b9c0b3135c5142a8acee3a0558fb8db5cf1cb65f8d7862132"
 
 [[package]]
 name = "retina"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
- "bitreader",
+ "bitstream-io",
  "bytes",
  "futures",
  "h264-reader",
