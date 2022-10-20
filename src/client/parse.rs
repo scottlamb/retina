@@ -288,16 +288,20 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                 }
             }
             "fmtp" => {
-                // Similarly starts with payload-type SP.
+                // Similarly should start with payload-type SP.
                 let v = a
                     .value
                     .as_ref()
                     .ok_or_else(|| "fmtp attribute with no value".to_string())?;
-                let (fmtp_payload_type, v) = v
-                    .split_once(' ')
-                    .ok_or_else(|| "invalid fmtp attribute".to_string())?;
-                if fmtp_payload_type == rtp_payload_type_str {
-                    fmtp = Some(v);
+
+                if let Some((fmtp_payload_type, v)) = v.split_once(' ') {
+                    if fmtp_payload_type == rtp_payload_type_str {
+                        fmtp = Some(v);
+                    }
+                } else {
+                    // Ubiquiti cameras sometimes have e.g. "a=fmtp:96": payload
+                    // type only, no actual attributes. Don't fail on this.
+                    warn!("ignoring invalid fmtp attribute value {:?}", v);
                 }
             }
             "control" => {
@@ -722,7 +726,7 @@ mod tests {
 
     use super::super::StreamState;
     use super::SessionHeader;
-    use crate::testutil::response;
+    use crate::testutil::{init_logging, response};
 
     fn parse_describe(
         raw_url: &str,
@@ -746,6 +750,7 @@ mod tests {
 
     #[test]
     fn anvpiz_sdp() {
+        init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let response =
             rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
@@ -758,6 +763,7 @@ mod tests {
 
     #[test]
     fn geovision_sdp() {
+        init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let response =
             rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
@@ -768,12 +774,27 @@ mod tests {
         super::parse_describe(url, &response).unwrap();
     }
 
+    #[test]
+    fn ubiquiti_sdp() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let response =
+            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
+                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
+                .build(Bytes::from_static(include_bytes!(
+                    "testdata/ubiquiti_sdp.txt"
+                )));
+        let d = super::parse_describe(url, &response).unwrap();
+        assert_eq!(d.streams.len(), 3);
+    }
+
     /// Parses SDP taken from a TP-LINK TL-IPC44AW-COLOR 4.0 camera running firmware
     /// FW: 1.0.10 Build 220330 Rel.35741n, which has a stream with a string where an RTP
     /// payload description is expected.
     /// https://github.com/scottlamb/moonfire-nvr/issues/238
     #[test]
     fn tplink_sdp() {
+        init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let response =
             rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
@@ -787,6 +808,7 @@ mod tests {
 
     #[test]
     fn dahua_h264_aac_onvif() {
+        init_logging();
         // DESCRIBE.
         let prefix =
             "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
@@ -879,6 +901,7 @@ mod tests {
 
     #[test]
     fn dahua_h265_pcma() {
+        init_logging();
         let p = parse_describe(
             "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=2",
             include_bytes!("testdata/dahua_describe_h265_pcma.txt"),
@@ -902,6 +925,7 @@ mod tests {
 
     #[test]
     fn hikvision() {
+        init_logging();
         // DESCRIBE.
         let prefix = "rtsp://192.168.5.106:554/Streaming/Channels/101";
         let mut p = parse_describe(
@@ -981,6 +1005,7 @@ mod tests {
 
     #[test]
     fn reolink() {
+        init_logging();
         // DESCRIBE.
         let mut p = parse_describe(
             "rtsp://192.168.5.206:554/h264Preview_01_main",
@@ -1068,6 +1093,7 @@ mod tests {
 
     #[test]
     fn bunny() {
+        init_logging();
         // This is a public test server for Wowza Streaming Engine.
         // https://www.wowza.com/html/mobile.html
 
@@ -1147,6 +1173,7 @@ mod tests {
     /// This is currently treated as if the `rtptime` parameter were absent.
     #[test]
     fn bad_rtptime() {
+        init_logging();
         let prefix = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
         let mut p = parse_describe(prefix, include_bytes!("testdata/bunny_describe.txt")).unwrap();
         p.streams[0].state = dummy_stream_state_init(None);
@@ -1167,6 +1194,7 @@ mod tests {
 
     #[test]
     fn foscam() {
+        init_logging();
         // DESCRIBE.
         let prefix = "rtsp://192.168.5.107:65534/videoMain";
         let p = parse_describe(prefix, include_bytes!("testdata/foscam_describe.txt")).unwrap();
@@ -1215,6 +1243,7 @@ mod tests {
 
     #[test]
     fn vstarcam() {
+        init_logging();
         // DESCRIBE.
         let prefix = "rtsp://192.168.1.198:10554/tcp/av0_0";
         let p = parse_describe(prefix, include_bytes!("testdata/vstarcam_describe.txt")).unwrap();
@@ -1264,6 +1293,7 @@ mod tests {
     /// main stream (high-res, audio).
     #[test]
     fn gw_main() {
+        init_logging();
         // DESCRIBE.
         let base = "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_main_describe.txt")).unwrap();
@@ -1359,6 +1389,7 @@ mod tests {
     /// sub stream (low-res, no audio).
     #[test]
     fn gw_sub() {
+        init_logging();
         // DESCRIBE.
         let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
@@ -1419,6 +1450,7 @@ mod tests {
     /// Tests parsing SDP from `the macro-video rtsp server`, with missing origin line.
     #[test]
     fn macrovideo() {
+        init_logging();
         // DESCRIBE.
         let p = parse_describe(
             "rtsp://camera",
@@ -1434,6 +1466,7 @@ mod tests {
     /// This camera notably sends a trailing space in its `rtpmap` attribute.
     #[test]
     fn ipcam() {
+        init_logging();
         // DESCRIBE.
         let p = parse_describe(
             "rtsp://camera",
