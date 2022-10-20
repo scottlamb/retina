@@ -1,3 +1,8 @@
+## unreleased
+
+*   improve interop with Ubiquiti cameras by ignoring `fmtp` attributes in
+    SDP which have nothing (no required SP, no data) after the payload type.
+
 ## `v0.4.3` (2022-09-28)
 
 *   upgrade version of `h264-reader` crate. Compatibility note: Retina may now
