@@ -2377,11 +2377,11 @@ impl futures::Stream for Session<Playing> {
             }
 
             // Then check if it's time for a new keepalive.
-            if matches!(
-                self.0.keepalive_timer.as_mut().unwrap().as_mut().poll(cx),
-                Poll::Ready(())
-            ) {
-                self.as_mut().handle_keepalive_timer(cx)?;
+            // Note: in production keepalive_timer is always Some. Tests may disable it.
+            if let Some(t) = self.0.keepalive_timer.as_mut() {
+                if matches!(t.as_mut().poll(cx), Poll::Ready(())) {
+                    self.as_mut().handle_keepalive_timer(cx)?;
+                }
             }
 
             // Then finish flushing the current keepalive if necessary.
@@ -2608,6 +2608,11 @@ mod tests {
             let session = session.unwrap();
             tokio::pin!(session);
 
+            // XXX: tokio will "auto-advance" paused time when timers are polled.
+            // This is not great for this test. Disable keepalives to prevent it.
+            // <https://github.com/tokio-rs/tokio/issues/4522>
+            session.0.keepalive_timer = None;
+
             // Packets: first ignored one (unassigned channel), then one passed through.
             tokio::join!(
                 async {
@@ -2658,8 +2663,9 @@ mod tests {
         );
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        // elapsed is not zero because tokio advances the time unnecessarily, grr.
-        // https://github.com/tokio-rs/tokio/issues/3108
+        // XXX: tokio will "auto-advance" paused time when timers are polled,
+        // including background_teardown's timer_at, so elapsed > 0.
+        // <https://github.com/tokio-rs/tokio/issues/4522>
         let elapsed = tokio::time::Instant::now() - drop_time;
         assert!(
             elapsed < std::time::Duration::from_secs(60),
