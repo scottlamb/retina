@@ -37,6 +37,14 @@ pub(crate) struct Depacketizer {
 
     parameters: Option<InternalParameters>,
 
+    /// Holds NALs from RTP packets.
+    nal_parser: NalParser,
+}
+
+/// Contains logic that converts RTP payload into NALs.
+/// [Depacketizer] delegates the conversion to this struct.
+#[derive(Debug)]
+struct NalParser {
     /// In state `PreMark`, pieces of NALs, excluding their header bytes.
     /// Kept around (empty) in other states to re-use the backing allocation.
     pieces: Vec<Bytes>,
@@ -44,6 +52,56 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+}
+
+impl NalParser {
+    /// Creates `NalParser` with empty vectors.
+    fn new() -> Self {
+        NalParser {
+            pieces: Vec::new(),
+            nals: Vec::new(),
+        }
+    }
+
+    /// Helper function to clear `NalParser::nals` and `NalParser::pieces` vectors.
+    fn clear(&mut self) {
+        self.nals.clear();
+        self.pieces.clear()
+    }
+
+    /// Adds a piece to `self.pieces`. Returns the total length of pieces after adding,
+    /// erroring if it becomes absurdly large.
+    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
+        self.pieces.push(piece);
+        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
+    }
+
+    /// Creates NAL from RTP packet
+    fn start_rtp_nal(
+        &mut self,
+        nal_header: NalHeader,
+        data: Bytes,
+        u32_len: u32,
+    ) -> Result<(), String> {
+        self.add_piece(data)?;
+        self.nals.push(Nal {
+            hdr: nal_header,
+            next_piece_idx: u32::MAX, // should be overwritten later.
+            len: 1 + u32_len,
+        });
+        Ok(())
+    }
+
+    /// Appends data from RTP packet to `NalParser::pieces`
+    fn append_rtp_nal(&mut self, piece: Bytes) -> Result<u32, String> {
+        self.add_piece(piece)
+    }
+
+    /// Updates last `Nal::next_piece_idx`
+    fn end_rtp_nal(&mut self, pieces: u32) {
+        let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
+        nal.next_piece_idx = pieces;
+    }
 }
 
 #[derive(Debug)]
@@ -121,9 +179,8 @@ impl Depacketizer {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             pending: None,
-            pieces: Vec::new(),
-            nals: Vec::new(),
             parameters,
+            nal_parser: NalParser::new(),
         })
     }
 
@@ -142,15 +199,14 @@ impl Depacketizer {
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     AccessUnit::start(&pkt, 0, false)
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
                     let loss = pkt.loss();
                     if loss > 0 {
-                        self.nals.clear();
-                        self.pieces.clear();
+                        self.nal_parser.clear();
                         if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             self.input_state = if pkt.mark() {
@@ -159,8 +215,7 @@ impl Depacketizer {
                                     loss,
                                 }
                             } else {
-                                self.pieces.clear();
-                                self.nals.clear();
+                                self.nal_parser.clear();
                                 DepacketizerInputState::Loss {
                                     timestamp: pkt.timestamp(),
                                     pkts: loss,
@@ -179,7 +234,7 @@ impl Depacketizer {
                                 pkt.timestamp()
                             ));
                         }
-                        let last_nal_hdr = self.nals.last().unwrap().hdr;
+                        let last_nal_hdr = self.nal_parser.nals.last().unwrap().hdr;
                         if can_end_au(last_nal_hdr.nal_unit_type()) {
                             access_unit.end_ctx = *pkt.ctx();
                             self.pending =
@@ -201,16 +256,16 @@ impl Depacketizer {
                     timestamp: state_ts,
                     loss,
                 } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
                     mut pkts,
                 } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     if pkt.timestamp().timestamp == timestamp.timestamp {
                         pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
@@ -242,8 +297,8 @@ impl Depacketizer {
                     ));
                 }
                 let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
-                let next_piece_idx = self.add_piece(data)?;
-                self.nals.push(Nal {
+                let next_piece_idx = self.nal_parser.add_piece(data)?;
+                self.nal_parser.nals.push(Nal {
                     hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
                     next_piece_idx,
                     len,
@@ -274,8 +329,8 @@ impl Depacketizer {
                         }
                         std::cmp::Ordering::Equal => {
                             data.advance(1);
-                            let next_piece_idx = self.add_piece(data)?;
-                            self.nals.push(Nal {
+                            let next_piece_idx = self.nal_parser.add_piece(data)?;
+                            self.nal_parser.nals.push(Nal {
                                 hdr,
                                 next_piece_idx,
                                 len: u32::from(len),
@@ -285,8 +340,8 @@ impl Depacketizer {
                         std::cmp::Ordering::Greater => {
                             let mut piece = data.split_to(usize::from(len));
                             piece.advance(1);
-                            let next_piece_idx = self.add_piece(piece)?;
-                            self.nals.push(Nal {
+                            let next_piece_idx = self.nal_parser.add_piece(piece)?;
+                            self.nal_parser.nals.push(Nal {
                                 hdr,
                                 next_piece_idx,
                                 len: u32::from(len),
@@ -323,17 +378,16 @@ impl Depacketizer {
                 match (start, access_unit.in_fu_a) {
                     (true, true) => return Err("FU-A with start bit while frag in progress".into()),
                     (true, false) => {
-                        self.add_piece(data)?;
-                        self.nals.push(Nal {
-                            hdr: nal_header,
-                            next_piece_idx: u32::MAX, // should be overwritten later.
-                            len: 1 + u32_len,
-                        });
+                        self.nal_parser.start_rtp_nal(nal_header, data, u32_len)?;
                         access_unit.in_fu_a = true;
                     }
                     (false, true) => {
-                        let pieces = self.add_piece(data)?;
-                        let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
+                        let pieces = self.nal_parser.append_rtp_nal(data)?;
+                        let nal = self
+                            .nal_parser
+                            .nals
+                            .last_mut()
+                            .expect("nals non-empty while in fu-a");
                         if u8::from(nal_header) != u8::from(nal.hdr) {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
@@ -342,7 +396,7 @@ impl Depacketizer {
                         }
                         nal.len += u32_len;
                         if end {
-                            nal.next_piece_idx = pieces;
+                            self.nal_parser.end_rtp_nal(pieces);
                             access_unit.in_fu_a = false;
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
@@ -350,8 +404,7 @@ impl Depacketizer {
                     }
                     (false, false) => {
                         if loss > 0 {
-                            self.pieces.clear();
-                            self.nals.clear();
+                            self.nal_parser.clear();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
                                 pkts: loss,
@@ -365,7 +418,7 @@ impl Depacketizer {
             _ => return Err(format!("bad nal header {nal_header:02x}")),
         }
         self.input_state = if mark {
-            let last_nal_hdr = self.nals.last().unwrap().hdr;
+            let last_nal_hdr = self.nal_parser.nals.last().unwrap().hdr;
             if can_end_au(last_nal_hdr.nal_unit_type()) {
                 access_unit.end_ctx = ctx;
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
@@ -388,12 +441,6 @@ impl Depacketizer {
         self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
-    /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
-    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
-        self.pieces.push(piece);
-        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
-    }
-
     /// Logs information about each access unit.
     /// Currently, "bad" access units (violating certain specification rules)
     /// are logged at debug priority, and others are logged at trace priority.
@@ -402,10 +449,10 @@ impl Depacketizer {
         if au.same_ts_as_prev {
             errs.push_str("\n* same timestamp as previous access unit");
         }
-        validate_order(&self.nals, &mut errs);
+        validate_order(&self.nal_parser.nals, &mut errs);
         if !errs.is_empty() {
             let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
+            for (i, nal) in self.nal_parser.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
             debug!(
@@ -414,7 +461,7 @@ impl Depacketizer {
             );
         } else if log_enabled!(log::Level::Trace) {
             let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
+            for (i, nal) in self.nal_parser.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
             trace!(
@@ -437,9 +484,9 @@ impl Depacketizer {
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
         }
-        for nal in &self.nals {
+        for nal in &self.nal_parser.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            let nal_pieces = &self.nal_parser.pieces[piece_idx..next_piece_idx];
             match nal.hdr.nal_unit_type() {
                 UnitType::SeqParameterSet => {
                     if self
@@ -473,9 +520,9 @@ impl Depacketizer {
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
-        for nal in &self.nals {
+        for nal in &self.nal_parser.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            let nal_pieces = &self.nal_parser.pieces[piece_idx..next_piece_idx];
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
             let mut actual_len = 1;
@@ -490,8 +537,7 @@ impl Depacketizer {
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
-        self.nals.clear();
-        self.pieces.clear();
+        self.nal_parser.clear();
 
         let has_new_parameters = match (
             new_sps.as_deref(),
