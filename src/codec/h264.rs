@@ -12,6 +12,7 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
+    hex,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
     Error, Timestamp,
 };
@@ -52,6 +53,17 @@ struct NalParser {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// Some V380 cams send a weird FU-A at first, which contains Annex B stream of
+    /// SPS,PPS and IDR. The next FU-A fragment header informs that it is for the
+    /// same type that was in the first FU-A fragment, which is false.
+    /// For that case, we are to continue adding the next RTP data into the last
+    /// NAL that was saved.
+    ///
+    /// NOTE that we are to move this back to false after finishing each FU-A, because
+    /// this weird behavious spans only for a single FU-A. So we're not to keep this
+    /// global but maintain this state for each FU-A only.
+    ignore_fu_a_headers: bool,
 }
 
 impl NalParser {
@@ -60,6 +72,7 @@ impl NalParser {
         NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
+            ignore_fu_a_headers: false,
         }
     }
 
@@ -76,6 +89,86 @@ impl NalParser {
         u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
     }
 
+    /// Some V380 cams send an Annex B stream in initial FU-A. This fn breaks them into
+    /// NALs if there is an Annex B stream, returns whether it broke an Annex B stream
+    fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
+        let mut seen_one_zero_at = 0;
+        let mut seen_two_zeros_at = 0;
+        let mut start = 0;
+        let mut found_boundary: bool = false;
+        for (idx, byte) in data.iter().enumerate() {
+            if byte == &0x00 {
+                if seen_one_zero_at == 0 {
+                    seen_one_zero_at = idx;
+                    continue;
+                }
+
+                if seen_two_zeros_at == 0 {
+                    seen_two_zeros_at = idx;
+                    continue;
+                }
+
+                if seen_two_zeros_at - seen_one_zero_at == 1 && idx - seen_two_zeros_at == 1 {
+                    debug!("Found boundary");
+                    found_boundary = true;
+                    // we found a boundary, let NalParser know that it should now keep adding
+                    // to last NAL even if the next FU-As header byte tells that it is for a
+                    // different NAL type.
+                    self.ignore_fu_a_headers = true;
+                    let nal: Bytes;
+                    let nal_len: usize;
+                    if start == 0 {
+                        nal = data.slice(start..idx - 2);
+                        nal_len = nal.len();
+                    } else {
+                        // ignore the first two bytes when saving NAL (FU header & NAL header)
+                        nal = data.slice(start + 2..idx - 2);
+                        nal_len = nal.len();
+                    }
+                    debug!("NAL: {:?}", hex::LimitedHex::new(&nal[..], 64));
+                    let pieces = self.add_piece(nal)?;
+                    let last_nal_saved = self.nals.last_mut().expect("nals empty while in fu-a");
+
+                    // close previous nal
+                    last_nal_saved.next_piece_idx = pieces;
+                    last_nal_saved.len =
+                        u32::try_from(nal_len).expect("couldn't convert to u32") + 1;
+
+                    // reset zero watcher to start fresh scan
+                    seen_one_zero_at = 0;
+                    seen_two_zeros_at = 0;
+                    start = idx + 1; // update next starting index, + 1 to ignore the FU Header
+
+                    // create new nal to continue
+                    let fu_header = data[idx + 1];
+                    debug!("Inner FU header: {:x}", fu_header);
+                    let nal_header = data[idx + 2];
+                    debug!("Next NAL header: {:x}", nal_header);
+                    let next_nal = data.slice(idx + 3..);
+                    debug!("Saving next nal: {:?}", hex::LimitedHex::new(&next_nal, 64));
+                    self.nals.push(Nal {
+                        hdr: NalHeader::new(nal_header).expect("couldn't create NAL header"),
+                        len: u32::try_from(next_nal.len()).expect("couldn't convert to u32") + 1,
+                        next_piece_idx: u32::MAX,
+                    });
+                    continue;
+                }
+            }
+
+            // if we didn't match a zero, reset zero wathcer to start fresh again
+            seen_one_zero_at = 0;
+            seen_two_zeros_at = 0;
+        }
+
+        // if we had found a boundary, we need to add the last NAL to pieces, because we only added the NAL
+        // but not the pieces, since NAL is easy to update, but didn't want to keep updating `pieces` back and forth
+        if found_boundary {
+            self.add_piece(data.slice(start + 2..))?;
+        }
+
+        Ok(found_boundary)
+    }
+
     /// Creates NAL from RTP packet
     fn start_rtp_nal(
         &mut self,
@@ -83,12 +176,24 @@ impl NalParser {
         data: Bytes,
         u32_len: u32,
     ) -> Result<(), String> {
-        self.add_piece(data)?;
+        // Normal FU-A flow which conforms to the spec.
         self.nals.push(Nal {
             hdr: nal_header,
             next_piece_idx: u32::MAX, // should be overwritten later.
-            len: 1 + u32_len,
+            len: 1 + u32_len,         // should be overwritten in case of Annex B stream in FU-A
         });
+
+        // Some V380 cams send aggregated packets in initial FU-A, handle it here
+        let did_find_boundary = self.break_apart_nals(data.clone())?;
+
+        // if we had found boundary, we already handled adding pieces, so no need
+        // to add pieces again
+        if did_find_boundary {
+            return Ok(());
+        }
+
+        // otherwise, add pieces as per normal flow
+        self.add_piece(data)?;
         Ok(())
     }
 
@@ -388,16 +493,21 @@ impl Depacketizer {
                             .nals
                             .last_mut()
                             .expect("nals non-empty while in fu-a");
-                        if u8::from(nal_header) != u8::from(nal.hdr) {
-                            return Err(format!(
-                                "FU-A has inconsistent NAL type: {:?} then {:?}",
-                                nal.hdr, nal_header,
-                            ));
+
+                        // ignore strict FU-A header checking b/w frags if they contain Annex B stream
+                        if !self.nal_parser.ignore_fu_a_headers {
+                            if u8::from(nal_header) != u8::from(nal.hdr) {
+                                return Err(format!(
+                                    "FU-A has inconsistent NAL type: {:?} then {:?}",
+                                    nal.hdr, nal_header,
+                                ));
+                            }
                         }
                         nal.len += u32_len;
                         if end {
                             self.nal_parser.end_rtp_nal(pieces);
                             access_unit.in_fu_a = false;
+                            self.nal_parser.ignore_fu_a_headers = false;
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
                         }
