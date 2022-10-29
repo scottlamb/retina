@@ -64,6 +64,10 @@ struct NalParser {
     /// this weird behavious spans only for a single FU-A. So we're not to keep this
     /// global but maintain this state for each FU-A only.
     ignore_fu_a_headers: bool,
+
+    // annex b delimiter watcher state
+    seen_one_zero_at: Option<usize>,
+    seen_two_zeros_at: Option<usize>,
 }
 
 impl NalParser {
@@ -73,6 +77,8 @@ impl NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
             ignore_fu_a_headers: false,
+            seen_one_zero_at: None,
+            seen_two_zeros_at: None,
         }
     }
 
@@ -92,23 +98,23 @@ impl NalParser {
     /// Some V380 cams send an Annex B stream in initial FU-A. This fn breaks them into
     /// NALs if there is an Annex B stream, returns whether it broke an Annex B stream
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
-        let mut seen_one_zero_at = 0;
-        let mut seen_two_zeros_at = 0;
         let mut start = 0;
         let mut found_boundary: bool = false;
         for (idx, byte) in data.iter().enumerate() {
             if byte == &0x00 {
-                if seen_one_zero_at == 0 {
-                    seen_one_zero_at = idx;
+                if self.seen_one_zero_at.is_none() {
+                    self.seen_one_zero_at = Some(idx);
                     continue;
                 }
 
-                if seen_two_zeros_at == 0 {
-                    seen_two_zeros_at = idx;
+                if self.seen_two_zeros_at.is_none() {
+                    self.seen_two_zeros_at = Some(idx);
                     continue;
                 }
 
-                if seen_two_zeros_at - seen_one_zero_at == 1 && idx - seen_two_zeros_at == 1 {
+                if self.seen_two_zeros_at.unwrap_or(0) - self.seen_one_zero_at.unwrap_or(0) == 1
+                    && idx - self.seen_two_zeros_at.unwrap_or(0) == 1
+                {
                     debug!("Found boundary");
                     found_boundary = true;
                     // we found a boundary, let NalParser know that it should now keep adding
@@ -135,8 +141,8 @@ impl NalParser {
                         u32::try_from(nal_len).expect("couldn't convert to u32") + 1;
 
                     // reset zero watcher to start fresh scan
-                    seen_one_zero_at = 0;
-                    seen_two_zeros_at = 0;
+                    self.seen_one_zero_at = None;
+                    self.seen_two_zeros_at = None;
                     start = idx + 1; // update next starting index, + 1 to ignore the FU Header
 
                     // create new nal to continue
@@ -156,8 +162,8 @@ impl NalParser {
             }
 
             // if we didn't match a zero, reset zero wathcer to start fresh again
-            seen_one_zero_at = 0;
-            seen_two_zeros_at = 0;
+            self.seen_one_zero_at = None;
+            self.seen_two_zeros_at = None;
         }
 
         // if we had found a boundary, we need to add the last NAL to pieces, because we only added the NAL
