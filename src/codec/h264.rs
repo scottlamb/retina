@@ -92,7 +92,7 @@ impl NalParser {
     /// boundaries (i.e. three consecutive 0x00). If it finds a boundary, it splits on it
     /// to break apart NALs from the Annex B stream.
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
-        let mut start = 0;
+        let mut nal_start_idx = 0;
         for (idx, byte) in data.iter().enumerate() {
             if byte == &0x00 {
                 if self.seen_one_zero_at.is_none() {
@@ -109,19 +109,23 @@ impl NalParser {
                     && idx - self.seen_second_zero_at.unwrap_or(0) == 1
                 {
                     debug!("Found boundary, idx range: {} - {}", idx - 2, idx);
-                    self.did_find_boundary = true;
                     // we found a boundary, let NalParser know that it should now keep adding
                     // to last NAL even if the next FU-A frag header byte does not match the
                     // header of the last saved NAL.
+                    self.did_find_boundary = true;
                     self.ignore_inconsistent_fu_a_headers = true;
                     let nal: Bytes;
                     let nal_len: usize;
-                    if start == 0 {
-                        nal = data.slice(start..idx - 2); // - 2 as idx is at 3rd 0x00, we need to end before first 0x00
+                    let nal_end_idx = idx - 2; // - 2 as idx is at 3rd 0x00, we need to end just before the first 0x00
+
+                    if nal_start_idx == 0 {
+                        // this is only for the first boundary, since `data` passed already has advanced 2 bytes
+                        // to skip the packet type and NAL header
+                        nal = data.slice(nal_start_idx..nal_end_idx);
                         nal_len = nal.len();
                     } else {
-                        // ignore the first two bytes when saving NAL (FU header & NAL header)
-                        nal = data.slice(start + 2..idx - 2);
+                        // ignore the first two bytes when saving NAL (Packet type header & NAL header)
+                        nal = data.slice(nal_start_idx + 2..nal_end_idx);
                         nal_len = nal.len();
                     }
                     let pieces = self.add_piece(nal)?;
@@ -135,7 +139,7 @@ impl NalParser {
                     // reset zero watcher to start fresh on next iteration
                     self.seen_one_zero_at = None;
                     self.seen_second_zero_at = None;
-                    start = idx + 1; // update starting index, + 1 to skip current idx which is 0x00
+                    nal_start_idx = idx + 1; // update starting index, + 1 to skip current idx which is last 0x00
 
                     // create new nal which'll get updated
                     let nal_header = data[idx + 2];
@@ -156,7 +160,7 @@ impl NalParser {
 
         // if we had found a boundary, we need to add the last NAL to pieces now
         if self.did_find_boundary {
-            self.add_piece(data.slice(start + 2..))?;
+            self.add_piece(data.slice(nal_start_idx + 2..))?;
         }
 
         Ok(self.did_find_boundary)
