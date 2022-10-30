@@ -12,7 +12,6 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
-    hex,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
     Error, Timestamp,
 };
@@ -54,32 +53,24 @@ struct NalParser {
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
 
-    /// Some V380 cams send a weird FU-A at first, which contains Annex B stream of
-    /// SPS,PPS and IDR. The next FU-A fragment header informs that it is for the
-    /// same type that was in the first FU-A fragment, which is false.
-    /// For that case, we are to continue adding the next RTP data into the last
-    /// NAL that was saved.
-    ///
-    /// NOTE that we are to move this back to false after finishing each FU-A, because
-    /// this weird behavious spans only for a single FU-A. So we're not to keep this
-    /// global but maintain this state for each FU-A only.
-    ignore_fu_a_headers: bool,
+    // If true, retina does not panic when the header of a FU-A frag does not match
+    // the header of the last NAL saved.
+    ignore_inconsistent_fu_a_headers: bool,
 
     // annex b delimiter watcher state
     seen_one_zero_at: Option<usize>,
-    seen_two_zeros_at: Option<usize>,
+    seen_second_zero_at: Option<usize>,
     did_find_boundary: bool,
 }
 
 impl NalParser {
-    /// Creates `NalParser` with empty vectors.
     fn new() -> Self {
         NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
-            ignore_fu_a_headers: false,
+            ignore_inconsistent_fu_a_headers: false,
             seen_one_zero_at: None,
-            seen_two_zeros_at: None,
+            seen_second_zero_at: None,
             did_find_boundary: false,
         }
     }
@@ -97,8 +88,9 @@ impl NalParser {
         u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
     }
 
-    /// Some V380 cams send an Annex B stream in initial FU-A. This fn breaks them into
-    /// NALs if there is an Annex B stream, returns whether it broke an Annex B stream
+    /// Given a byte buffer, it checks if the buffer is an Annex B stream by looking for
+    /// boundaries (i.e. three consecutive 0x00). If it finds a boundary, it splits on it
+    /// to break apart NALs from the Annex B stream.
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
         let mut start = 0;
         for (idx, byte) in data.iter().enumerate() {
@@ -108,31 +100,30 @@ impl NalParser {
                     continue;
                 }
 
-                if self.seen_two_zeros_at.is_none() {
-                    self.seen_two_zeros_at = Some(idx);
+                if self.seen_second_zero_at.is_none() {
+                    self.seen_second_zero_at = Some(idx);
                     continue;
                 }
 
-                if self.seen_two_zeros_at.unwrap_or(0) - self.seen_one_zero_at.unwrap_or(0) == 1
-                    && idx - self.seen_two_zeros_at.unwrap_or(0) == 1
+                if self.seen_second_zero_at.unwrap_or(0) - self.seen_one_zero_at.unwrap_or(0) == 1
+                    && idx - self.seen_second_zero_at.unwrap_or(0) == 1
                 {
-                    debug!("Found boundary");
+                    debug!("Found boundary, idx range: {} - {}", idx - 2, idx);
                     self.did_find_boundary = true;
                     // we found a boundary, let NalParser know that it should now keep adding
-                    // to last NAL even if the next FU-As header byte tells that it is for a
-                    // different NAL type.
-                    self.ignore_fu_a_headers = true;
+                    // to last NAL even if the next FU-A frag header byte does not match the
+                    // header of the last saved NAL.
+                    self.ignore_inconsistent_fu_a_headers = true;
                     let nal: Bytes;
                     let nal_len: usize;
                     if start == 0 {
-                        nal = data.slice(start..idx - 2);
+                        nal = data.slice(start..idx - 2); // - 2 as idx is at 3rd 0x00, we need to end before first 0x00
                         nal_len = nal.len();
                     } else {
                         // ignore the first two bytes when saving NAL (FU header & NAL header)
                         nal = data.slice(start + 2..idx - 2);
                         nal_len = nal.len();
                     }
-                    debug!("NAL: {:?}", hex::LimitedHex::new(&nal[..], 64));
                     let pieces = self.add_piece(nal)?;
                     let last_nal_saved = self.nals.last_mut().expect("nals empty while in fu-a");
 
@@ -141,18 +132,14 @@ impl NalParser {
                     last_nal_saved.len =
                         u32::try_from(nal_len).expect("couldn't convert to u32") + 1;
 
-                    // reset zero watcher to start fresh scan
+                    // reset zero watcher to start fresh on next iteration
                     self.seen_one_zero_at = None;
-                    self.seen_two_zeros_at = None;
-                    start = idx + 1; // update next starting index, + 1 to ignore the FU Header
+                    self.seen_second_zero_at = None;
+                    start = idx + 1; // update starting index, + 1 to skip current idx which is 0x00
 
-                    // create new nal to continue
-                    let fu_header = data[idx + 1];
-                    debug!("Inner FU header: {:x}", fu_header);
+                    // create new nal which'll get updated
                     let nal_header = data[idx + 2];
-                    debug!("Next NAL header: {:x}", nal_header);
-                    let next_nal = data.slice(idx + 3..);
-                    debug!("Saving next nal: {:?}", hex::LimitedHex::new(&next_nal, 64));
+                    let next_nal = data.slice(idx + 3..); // will update either by appending or closed after reaching boundary
                     self.nals.push(Nal {
                         hdr: NalHeader::new(nal_header).expect("couldn't create NAL header"),
                         len: u32::try_from(next_nal.len()).expect("couldn't convert to u32") + 1,
@@ -162,13 +149,12 @@ impl NalParser {
                 }
             }
 
-            // if we didn't match a zero, reset zero wathcer to start fresh again
+            // didn't match a zero, reset zero watcher for next iteration
             self.seen_one_zero_at = None;
-            self.seen_two_zeros_at = None;
+            self.seen_second_zero_at = None;
         }
 
-        // if we had found a boundary, we need to add the last NAL to pieces, because we only added the NAL
-        // but not the pieces, since NAL is easy to update, but didn't want to keep updating `pieces` back and forth
+        // if we had found a boundary, we need to add the last NAL to pieces now
         if self.did_find_boundary {
             self.add_piece(data.slice(start + 2..))?;
         }
@@ -190,14 +176,14 @@ impl NalParser {
             len: 1 + u32_len,         // should be overwritten in case of Annex B stream in FU-A
         });
 
-        // Some V380 cams send aggregated packets in initial FU-A, handle it here
+        // handle Annex B stream if present (https://github.com/scottlamb/retina/issues/68)
         let did_find_boundary = self.break_apart_nals(data.clone())?;
 
         // if we had found boundary, we already handled adding pieces, so no need
         // to add pieces again
         if did_find_boundary {
             // reset annex b watcher state
-            self.did_find_boundary = false;
+            self.reset_annex_b_watcher();
             return Ok(());
         }
 
@@ -206,12 +192,19 @@ impl NalParser {
         Ok(())
     }
 
+    /// Helper function to reset Annex B watcher so it can start fresh on new RTP packets
+    fn reset_annex_b_watcher(&mut self) {
+        self.did_find_boundary = false;
+        self.seen_one_zero_at = None;
+        self.seen_second_zero_at = None;
+    }
+
     /// Appends data from RTP packet to `NalParser::pieces`
     fn append_rtp_nal(&mut self, piece: Bytes) -> Result<u32, String> {
         self.add_piece(piece)
     }
 
-    /// Updates last `Nal::next_piece_idx`
+    /// Updates last `Nal::next_piece_idx`, panicking if it finds no saved NAL
     fn end_rtp_nal(&mut self, pieces: u32) {
         let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
         nal.next_piece_idx = pieces;
@@ -503,8 +496,7 @@ impl Depacketizer {
                             .last_mut()
                             .expect("nals non-empty while in fu-a");
 
-                        // ignore strict FU-A header checking b/w frags if they contain Annex B stream
-                        if !self.nal_parser.ignore_fu_a_headers {
+                        if !self.nal_parser.ignore_inconsistent_fu_a_headers {
                             if u8::from(nal_header) != u8::from(nal.hdr) {
                                 return Err(format!(
                                     "FU-A has inconsistent NAL type: {:?} then {:?}",
@@ -516,7 +508,11 @@ impl Depacketizer {
                         if end {
                             self.nal_parser.end_rtp_nal(pieces);
                             access_unit.in_fu_a = false;
-                            self.nal_parser.ignore_fu_a_headers = false;
+
+                            // turn FU-A header checking back on because this FU-A has ended
+                            if self.nal_parser.ignore_inconsistent_fu_a_headers {
+                                self.nal_parser.ignore_inconsistent_fu_a_headers = false;
+                            }
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
                         }
@@ -1820,7 +1816,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // FU-A start fragment which includes Annex B stream of 3 NALs
+                // FU-A start fragment
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
