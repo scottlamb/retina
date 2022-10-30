@@ -68,6 +68,7 @@ struct NalParser {
     // annex b delimiter watcher state
     seen_one_zero_at: Option<usize>,
     seen_two_zeros_at: Option<usize>,
+    did_find_boundary: bool,
 }
 
 impl NalParser {
@@ -79,6 +80,7 @@ impl NalParser {
             ignore_fu_a_headers: false,
             seen_one_zero_at: None,
             seen_two_zeros_at: None,
+            did_find_boundary: false,
         }
     }
 
@@ -99,7 +101,6 @@ impl NalParser {
     /// NALs if there is an Annex B stream, returns whether it broke an Annex B stream
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
         let mut start = 0;
-        let mut found_boundary: bool = false;
         for (idx, byte) in data.iter().enumerate() {
             if byte == &0x00 {
                 if self.seen_one_zero_at.is_none() {
@@ -116,7 +117,7 @@ impl NalParser {
                     && idx - self.seen_two_zeros_at.unwrap_or(0) == 1
                 {
                     debug!("Found boundary");
-                    found_boundary = true;
+                    self.did_find_boundary = true;
                     // we found a boundary, let NalParser know that it should now keep adding
                     // to last NAL even if the next FU-As header byte tells that it is for a
                     // different NAL type.
@@ -168,11 +169,11 @@ impl NalParser {
 
         // if we had found a boundary, we need to add the last NAL to pieces, because we only added the NAL
         // but not the pieces, since NAL is easy to update, but didn't want to keep updating `pieces` back and forth
-        if found_boundary {
+        if self.did_find_boundary {
             self.add_piece(data.slice(start + 2..))?;
         }
 
-        Ok(found_boundary)
+        Ok(self.did_find_boundary)
     }
 
     /// Creates NAL from RTP packet
@@ -195,6 +196,8 @@ impl NalParser {
         // if we had found boundary, we already handled adding pieces, so no need
         // to add pieces again
         if did_find_boundary {
+            // reset annex b watcher state
+            self.did_find_boundary = false;
             return Ok(());
         }
 
