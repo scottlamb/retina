@@ -479,17 +479,16 @@ impl Depacketizer {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
                 let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
-                match (start, access_unit.in_fu_a.is_some()) {
-                    (true, true) => return Err("FU-A with start bit while frag in progress".into()),
-                    (true, false) => {
+                match (start, access_unit.in_fu_a) {
+                    (true, Some(_)) => {
+                        return Err("FU-A with start bit while frag in progress".into())
+                    }
+                    (true, None) => {
                         self.nal_parser.start_rtp_nal(nal_header, data, u32_len)?;
                         access_unit.in_fu_a = Some(nal_header);
                     }
-                    (false, true) => {
+                    (false, Some(header_of_starting_fu_a)) => {
                         let pieces = self.nal_parser.append_rtp_nal(data)?;
-                        let header_of_starting_fu_a = access_unit.in_fu_a.expect(
-                            "Nal header should be set because starting FU-A is processed before middle FU-A",
-                        );
                         if u8::from(nal_header) != u8::from(header_of_starting_fu_a) {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
@@ -509,7 +508,7 @@ impl Depacketizer {
                             return Err("FU-A has MARK and no END".into());
                         }
                     }
-                    (false, false) => {
+                    (false, None) => {
                         if loss > 0 {
                             self.nal_parser.clear();
                             self.input_state = DepacketizerInputState::Loss {
