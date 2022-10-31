@@ -129,12 +129,11 @@ impl NalParser {
                         nal_len = nal.len();
                     }
                     let pieces = self.add_piece(nal)?;
-                    let last_nal_saved = self.nals.last_mut().expect("nals empty while in fu-a");
+                    let last_nal_saved = self.nals.last_mut().expect("nals should be non-empty because start_rtp_nal should be called before append_rtp_nal");
 
                     // close previous nal
                     last_nal_saved.next_piece_idx = pieces;
-                    last_nal_saved.len =
-                        u32::try_from(nal_len).expect("couldn't convert to u32") + 1;
+                    last_nal_saved.len = u32::try_from(nal_len).expect("data len < u16::MAX") + 1;
 
                     // reset zero watcher to start fresh on next iteration
                     self.seen_one_zero_at = None;
@@ -145,8 +144,8 @@ impl NalParser {
                     let nal_header = data[idx + 2];
                     let next_nal = data.slice(idx + 3..); // will update either by appending or closed after reaching boundary
                     self.nals.push(Nal {
-                        hdr: NalHeader::new(nal_header).expect("couldn't create NAL header"),
-                        len: u32::try_from(next_nal.len()).expect("couldn't convert to u32") + 1,
+                        hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
+                        len: u32::try_from(next_nal.len()).expect("data len < u16::MAX") + 1,
                         next_piece_idx: u32::MAX,
                     });
                     continue;
