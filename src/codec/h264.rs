@@ -53,10 +53,6 @@ struct NalParser {
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
 
-    // If true, retina does not panic when the header of a FU-A frag does not match
-    // the header of the last NAL saved.
-    ignore_inconsistent_fu_a_headers: bool,
-
     // annex b delimiter watcher state
     seen_one_zero_at: Option<usize>,
     seen_second_zero_at: Option<usize>,
@@ -68,7 +64,6 @@ impl NalParser {
         NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
-            ignore_inconsistent_fu_a_headers: false,
             seen_one_zero_at: None,
             seen_second_zero_at: None,
             did_find_boundary: false,
@@ -113,7 +108,6 @@ impl NalParser {
                     // to last NAL even if the next FU-A frag header byte does not match the
                     // header of the last saved NAL.
                     self.did_find_boundary = true;
-                    self.ignore_inconsistent_fu_a_headers = true;
                     let nal: Bytes;
                     let nal_len: usize;
                     let nal_end_idx = idx - 2; // - 2 as idx is at 3rd 0x00, we need to end just before the first 0x00
@@ -233,8 +227,8 @@ struct AccessUnit {
     timestamp: crate::Timestamp,
     stream_id: usize,
 
-    /// True iff currently processing a FU-A.
-    in_fu_a: bool,
+    /// Holds a value iff currently processing a FU-A. Stores the first [NalHeader] of the starting FU-A.
+    in_fu_a: Option<NalHeader>,
 
     /// RTP packets lost as this access unit was starting.
     loss: u16,
@@ -337,7 +331,7 @@ impl Depacketizer {
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
-                        if access_unit.in_fu_a {
+                        if access_unit.in_fu_a.is_some() {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 access_unit.timestamp,
@@ -401,7 +395,7 @@ impl Depacketizer {
         data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
-                if access_unit.in_fu_a {
+                if access_unit.in_fu_a.is_some() {
                     return Err(format!(
                         "Non-fragmented NAL {nal_header:02x} while fragment in progress"
                     ));
@@ -485,37 +479,32 @@ impl Depacketizer {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
                 let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
-                match (start, access_unit.in_fu_a) {
+                match (start, access_unit.in_fu_a.is_some()) {
                     (true, true) => return Err("FU-A with start bit while frag in progress".into()),
                     (true, false) => {
                         self.nal_parser.start_rtp_nal(nal_header, data, u32_len)?;
-                        access_unit.in_fu_a = true;
+                        access_unit.in_fu_a = Some(nal_header);
                     }
                     (false, true) => {
                         let pieces = self.nal_parser.append_rtp_nal(data)?;
+                        let header_of_starting_fu_a = access_unit.in_fu_a.expect(
+                            "Nal header should be set because starting FU-A is processed before middle FU-A",
+                        );
+                        if u8::from(nal_header) != u8::from(header_of_starting_fu_a) {
+                            return Err(format!(
+                                "FU-A has inconsistent NAL type: {:?} then {:?}",
+                                header_of_starting_fu_a, nal_header,
+                            ));
+                        }
                         let nal = self
                             .nal_parser
                             .nals
                             .last_mut()
                             .expect("nals non-empty while in fu-a");
-
-                        if !self.nal_parser.ignore_inconsistent_fu_a_headers {
-                            if u8::from(nal_header) != u8::from(nal.hdr) {
-                                return Err(format!(
-                                    "FU-A has inconsistent NAL type: {:?} then {:?}",
-                                    nal.hdr, nal_header,
-                                ));
-                            }
-                        }
                         nal.len += u32_len;
                         if end {
                             self.nal_parser.end_rtp_nal(pieces);
-                            access_unit.in_fu_a = false;
-
-                            // turn FU-A header checking back on because this FU-A has ended
-                            if self.nal_parser.ignore_inconsistent_fu_a_headers {
-                                self.nal_parser.ignore_inconsistent_fu_a_headers = false;
-                            }
+                            access_unit.in_fu_a = None;
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
                         }
@@ -715,7 +704,7 @@ impl AccessUnit {
             end_ctx: *pkt.ctx(),
             timestamp: pkt.timestamp(),
             stream_id: pkt.stream_id(),
-            in_fu_a: false,
+            in_fu_a: None,
 
             // TODO: overflow?
             loss: pkt.loss() + additional_loss,
