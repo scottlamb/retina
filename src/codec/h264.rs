@@ -108,7 +108,7 @@ impl NalParser {
                 if self.seen_second_zero_at.unwrap_or(0) - self.seen_one_zero_at.unwrap_or(0) == 1
                     && idx - self.seen_second_zero_at.unwrap_or(0) == 1
                 {
-                    debug!("Found boundary, idx range: {} - {}", idx - 2, idx);
+                    debug!("Found boundary with index range: {} - {}.", idx - 2, idx);
                     // we found a boundary, let NalParser know that it should now keep adding
                     // to last NAL even if the next FU-A frag header byte does not match the
                     // header of the last saved NAL.
