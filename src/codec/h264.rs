@@ -62,8 +62,8 @@ struct NalParser {
     nals: Vec<Nal>,
 
     // annex b delimiter watcher state
-    seen_one_zero_at: Option<usize>,
-    seen_second_zero_at: Option<usize>,
+    seen_one_zero: bool,
+    seen_two_zeros: bool,
     did_find_boundary: bool,
 }
 
@@ -72,8 +72,8 @@ impl NalParser {
         NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
-            seen_one_zero_at: None,
-            seen_second_zero_at: None,
+            seen_one_zero: false,
+            seen_two_zeros: false,
             did_find_boundary: false,
         }
     }
@@ -98,19 +98,17 @@ impl NalParser {
         let mut nal_start_idx = 0;
         for (idx, byte) in data.iter().enumerate() {
             if byte == &0x00 {
-                if self.seen_one_zero_at.is_none() {
-                    self.seen_one_zero_at = Some(idx);
+                if !self.seen_one_zero {
+                    self.seen_one_zero = true;
                     continue;
                 }
 
-                if self.seen_second_zero_at.is_none() {
-                    self.seen_second_zero_at = Some(idx);
+                if !self.seen_two_zeros {
+                    self.seen_two_zeros = true;
                     continue;
                 }
 
-                if self.seen_second_zero_at.unwrap_or(0) - self.seen_one_zero_at.unwrap_or(0) == 1
-                    && idx - self.seen_second_zero_at.unwrap_or(0) == 1
-                {
+                if self.seen_two_zeros {
                     debug!("Found boundary with index range: {} - {}.", idx - 2, idx);
                     // we found a boundary, let NalParser know that it should now keep adding
                     // to last NAL even if the next FU-A frag header byte does not match the
@@ -138,8 +136,8 @@ impl NalParser {
                     last_nal_saved.len = u32::try_from(nal_len).expect("data len < u16::MAX") + 1;
 
                     // reset zero watcher to start fresh on next iteration
-                    self.seen_one_zero_at = None;
-                    self.seen_second_zero_at = None;
+                    self.seen_one_zero = false;
+                    self.seen_two_zeros = false;
                     nal_start_idx = idx + 1; // update starting index, + 1 to skip current idx which is last 0x00
 
                     // create new nal which'll get updated
@@ -155,8 +153,8 @@ impl NalParser {
             }
 
             // didn't match a zero, reset zero watcher for next iteration
-            self.seen_one_zero_at = None;
-            self.seen_second_zero_at = None;
+            self.seen_one_zero = false;
+            self.seen_two_zeros = false;
         }
 
         // if we had found a boundary, we need to add the last NAL to pieces now
@@ -199,9 +197,9 @@ impl NalParser {
 
     /// Helper function to reset Annex B watcher so it can start fresh on new RTP packets
     fn reset_annex_b_watcher(&mut self) {
+        self.seen_one_zero = false;
+        self.seen_two_zeros = false;
         self.did_find_boundary = false;
-        self.seen_one_zero_at = None;
-        self.seen_second_zero_at = None;
     }
 
     /// Appends data from RTP packet to `NalParser::pieces`
