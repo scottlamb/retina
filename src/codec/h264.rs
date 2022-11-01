@@ -41,8 +41,16 @@ pub(crate) struct Depacketizer {
     nal_parser: NalParser,
 }
 
-/// Contains logic that converts RTP payload into NALs.
-/// [Depacketizer] delegates the conversion to this struct.
+/// Parses Annex B sequences from RTP NAL data.
+///
+/// RFC 6184 describes how NAL units should be represented by RTP packets. `Depacketizer` should map each
+/// such NAL unit to 1 call to `NalParser::start_rtp_nal`, then 1 or more calls to `NalParser::append_rtp_nal`,
+/// then 1 call to `NalParser::end_rtp_nal`.
+///
+/// If the camera complies with the RFC, this will add exactly one NAL unit. However, what some cameras
+/// call a single NAL unit is actually a sequence of multiple NAL units with Annex B separators. `NalParser`
+/// looks for these separators and adds multiple NAL units as needed.
+/// See [scottlamb/retina#68](https://github.com/scottlamb/retina/issues/68).
 #[derive(Debug)]
 struct NalParser {
     /// In state `PreMark`, pieces of NALs, excluding their header bytes.
