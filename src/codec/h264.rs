@@ -60,9 +60,6 @@ struct NalParser {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
-
-    // annex b delimiter watcher state
-    did_find_boundary: bool,
 }
 
 impl NalParser {
@@ -70,7 +67,6 @@ impl NalParser {
         NalParser {
             pieces: Vec::new(),
             nals: Vec::new(),
-            did_find_boundary: false,
         }
     }
 
@@ -92,13 +88,15 @@ impl NalParser {
     /// to break apart NALs from the Annex B stream.
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
         let mut nal_start_idx = 0;
+        let mut did_find_boundary = false;
+
         for (idx, byte) in data.iter().enumerate() {
             if byte == &0x00 && idx + 2 < data.len() && &data[idx..idx + 3] == &[0x00; 3] {
                 debug!("Found boundary with index range: {} - {}.", idx, idx + 2);
                 // we found a boundary, let NalParser know that it should now keep adding
                 // to last NAL even if the next FU-A frag header byte does not match the
                 // header of the last saved NAL.
-                self.did_find_boundary = true;
+                did_find_boundary = true;
                 let nal_end_idx = idx;
 
                 let nal = data.slice(
@@ -128,11 +126,11 @@ impl NalParser {
         }
 
         // if we had found a boundary, we need to add the last NAL to pieces now
-        if self.did_find_boundary {
+        if did_find_boundary {
             self.push(data.slice(nal_start_idx + 2..))?;
         }
 
-        Ok(self.did_find_boundary)
+        Ok(did_find_boundary)
     }
 
     /// Creates NAL from RTP packet
@@ -155,8 +153,6 @@ impl NalParser {
         // if we had found boundary, we already handled adding pieces, so no need
         // to add pieces again
         if did_find_boundary {
-            // reset annex b watcher state
-            self.reset_annex_b_watcher();
             return Ok(());
         }
 
@@ -172,11 +168,6 @@ impl NalParser {
         last_nal.next_piece_idx = pieces;
         last_nal.len += u32::try_from(data.len()).expect("u16 < u32::MAX");
         Ok(())
-    }
-
-    /// Helper function to reset Annex B watcher so it can start fresh on new RTP packets
-    fn reset_annex_b_watcher(&mut self) {
-        self.did_find_boundary = false;
     }
 }
 
