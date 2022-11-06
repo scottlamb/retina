@@ -133,7 +133,7 @@ impl NalParser {
 
                     // close previous nal
                     last_nal_saved.next_piece_idx = pieces;
-                    last_nal_saved.len = u32::try_from(nal_len).expect("data len < u16::MAX") + 1;
+                    last_nal_saved.len += u32::try_from(nal_len).expect("data len < u16::MAX");
 
                     // reset zero watcher to start fresh on next iteration
                     self.seen_one_zero = false;
@@ -142,11 +142,10 @@ impl NalParser {
 
                     // create new nal which'll get updated
                     let nal_header = data[idx + 2];
-                    let next_nal = data.slice(idx + 3..); // will update either by appending or closed after reaching boundary
                     self.nals.push(Nal {
                         hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
-                        len: u32::try_from(next_nal.len()).expect("data len < u16::MAX") + 1,
                         next_piece_idx: u32::MAX,
+                        len: 1,
                     });
                     continue;
                 }
@@ -159,26 +158,26 @@ impl NalParser {
 
         // if we had found a boundary, we need to add the last NAL to pieces now
         if self.did_find_boundary {
-            self.add_piece(data.slice(nal_start_idx + 2..))?;
+            self.push(data.slice(nal_start_idx + 2..))?;
         }
 
         Ok(self.did_find_boundary)
     }
 
     /// Creates NAL from RTP packet
-    fn start_rtp_nal(
-        &mut self,
-        nal_header: NalHeader,
-        data: Bytes,
-        u32_len: u32,
-    ) -> Result<(), String> {
+    fn start_rtp_nal(&mut self, nal_header: NalHeader) -> Result<(), String> {
         // Normal FU-A flow which conforms to the spec.
         self.nals.push(Nal {
             hdr: nal_header,
             next_piece_idx: u32::MAX, // should be overwritten later.
-            len: 1 + u32_len,         // should be overwritten in case of Annex B stream in FU-A
+            len: 1,                   // should be overwritten in case of Annex B stream in FU-A
         });
 
+        Ok(())
+    }
+
+    /// Appends data from RTP packet to `NalParser::pieces`
+    fn append_rtp_nal(&mut self, data: Bytes) -> Result<(), String> {
         // handle Annex B stream if present (https://github.com/scottlamb/retina/issues/68)
         let did_find_boundary = self.break_apart_nals(data.clone())?;
 
@@ -191,7 +190,16 @@ impl NalParser {
         }
 
         // otherwise, add pieces as per normal flow
-        self.add_piece(data)?;
+        self.push(data)?;
+        Ok(())
+    }
+
+    /// Adds bytes to `pieces` and updates last `Nal`.
+    fn push(&mut self, data: Bytes) -> Result<(), String> {
+        let pieces = self.add_piece(data.clone())?;
+        let last_nal = self.nals.last_mut().expect("nals non-empty while in FU-A");
+        last_nal.next_piece_idx = pieces;
+        last_nal.len += u32::try_from(data.len()).expect("u16 < u32::MAX");
         Ok(())
     }
 
@@ -200,17 +208,6 @@ impl NalParser {
         self.seen_one_zero = false;
         self.seen_two_zeros = false;
         self.did_find_boundary = false;
-    }
-
-    /// Appends data from RTP packet to `NalParser::pieces`
-    fn append_rtp_nal(&mut self, piece: Bytes) -> Result<u32, String> {
-        self.add_piece(piece)
-    }
-
-    /// Updates last `Nal::next_piece_idx`, panicking if it finds no saved NAL
-    fn end_rtp_nal(&mut self, pieces: u32) {
-        let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
-        nal.next_piece_idx = pieces;
     }
 }
 
@@ -484,31 +481,24 @@ impl Depacketizer {
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
-                let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
                 match (start, access_unit.in_fu_a) {
                     (true, Some(_)) => {
                         return Err("FU-A with start bit while frag in progress".into())
                     }
                     (true, None) => {
-                        self.nal_parser.start_rtp_nal(nal_header, data, u32_len)?;
+                        self.nal_parser.start_rtp_nal(nal_header)?;
+                        self.nal_parser.append_rtp_nal(data)?;
                         access_unit.in_fu_a = Some(nal_header);
                     }
                     (false, Some(header_of_starting_fu_a)) => {
-                        let pieces = self.nal_parser.append_rtp_nal(data)?;
+                        self.nal_parser.append_rtp_nal(data)?;
                         if u8::from(nal_header) != u8::from(header_of_starting_fu_a) {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
                                 header_of_starting_fu_a, nal_header,
                             ));
                         }
-                        let nal = self
-                            .nal_parser
-                            .nals
-                            .last_mut()
-                            .expect("nals non-empty while in fu-a");
-                        nal.len += u32_len;
                         if end {
-                            self.nal_parser.end_rtp_nal(pieces);
                             access_unit.in_fu_a = None;
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
