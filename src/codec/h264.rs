@@ -94,7 +94,7 @@ impl NalParser {
             // If the current FU-A has a boundary that splits at end, ignore the last or
             // last two zeros because this boundary will be handled when the start of
             // next packet is being read, and these zeros will be removed on walk-back.
-            if byte == &0x00 && idx + 2 < data.len() && &data[idx..idx + 3] == &[0x00; 3] {
+            if byte == &0x00 && idx + 2 < data.len() && data[idx..idx + 3] == [0x00; 3] {
                 debug!("Found boundary with index range: {} - {}.", idx, idx + 2);
                 // we found a boundary, let NalParser know that it should now keep adding
                 // to last NAL even if the next FU-A frag header byte does not match the
