@@ -1741,7 +1741,7 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(
-            &frame.data()[..],
+            frame.data(),
             b"\
             \x00\x00\x00\x26\
             \x27\
