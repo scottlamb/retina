@@ -91,6 +91,7 @@ impl NalParser {
         let mut did_find_boundary = false;
 
         for (idx, byte) in data.iter().enumerate() {
+            // TODO: Handle boundaries split b/w packets.
             // If the current FU-A has a boundary that splits at end, ignore the last or
             // last two zeros because this boundary will be handled when the start of
             // next packet is being read, and these zeros will be removed on walk-back.
