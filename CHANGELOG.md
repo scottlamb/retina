@@ -2,6 +2,7 @@
 
 *   improve interop with Ubiquiti cameras by ignoring `fmtp` attributes in
     SDP which have nothing (no required SP, no data) after the payload type.
+*   fix parsing of RTP packets with extensions.
 
 ## `v0.4.3` (2022-09-28)
 
