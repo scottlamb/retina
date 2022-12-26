@@ -83,17 +83,32 @@ impl RawPacket {
         let csrc_count = data[0] & 0b0000_1111;
         let csrc_end = MIN_HEADER_LEN + (4 * u16::from(csrc_count));
         let payload_start = if has_extension {
+            // https://datatracker.ietf.org/doc/html/rfc3550#section-5.3.1
+            //  0                   1                   2                   3
+            //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            // |      defined by profile       |           length              |
+            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            // |                        header extension                       |
+            // |                             ....                              |
             if data.len() < usize::from(csrc_end + 4) {
                 return Err(RawPacketError {
                     reason: "extension is after end of packet",
                     data,
                 });
             }
+
+            // The header extension contains a 16-bit length field that counts the number of 32-bit
+            // words in the extension, excluding the four-octet extension header (therefore zero is
+            // a valid length).
             let extension_len = u16::from_be_bytes([
-                data[usize::from(csrc_end) + 1],
                 data[usize::from(csrc_end) + 2],
+                data[usize::from(csrc_end) + 3],
             ]);
-            match csrc_end.checked_add(extension_len) {
+            match extension_len
+                .checked_mul(4)
+                .and_then(|e| e.checked_add(csrc_end + 4))
+            {
                 Some(s) => s,
                 None => {
                     return Err(RawPacketError {
@@ -341,5 +356,24 @@ impl ReceivedPacketBuilder {
             payload_range,
             loss: self.loss,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::init_logging;
+
+    #[test]
+    pub fn pkt_with_extension() {
+        init_logging();
+        let data = b"\x90\x60\x4c\x62\x01\xbb\x3c\xb5\x1c\x04\x15\xb1\xab\xac\x00\x03\
+                     \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x67\x64\x00\x32\
+                     \xac\x3c\x6b\x81\x7c\x05\x46\x9b\x82\x80\x82\xa0\x00\x00\x03\x00\
+                     \x20\x00\x00\x07\x90\x80\x00";
+        let (pkt, payload_range) = RawPacket::new(Bytes::from_static(data)).unwrap();
+        let payload = &pkt.0[payload_range.start as usize..payload_range.end as usize];
+        assert_eq!(payload_range, 28..55);
+        assert_eq!(payload[0], 0x67);
     }
 }
