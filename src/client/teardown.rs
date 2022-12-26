@@ -37,7 +37,7 @@ pub(super) async fn background_teardown(
         teardown_loop_forever(
             base_url,
             tool,
-            &*session_id,
+            &session_id,
             just_try_once,
             &options,
             requested_auth,

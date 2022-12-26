@@ -681,7 +681,7 @@ impl std::ops::Deref for Tool {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
