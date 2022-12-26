@@ -1,8 +1,9 @@
-## unreleased
+## `v0.4.4` (2022-12-26)
 
 *   improve interop with Ubiquiti cameras by ignoring `fmtp` attributes in
     SDP which have nothing (no required SP, no data) after the payload type.
-*   fix parsing of RTP packets with extensions.
+*   fix parsing of RTP packets with extensions, which broke with `v0.4.0`
+    (2e34bf92).
 
 ## `v0.4.3` (2022-09-28)
 
