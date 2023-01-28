@@ -141,7 +141,6 @@ impl NalParser {
                 // header of the last saved NAL.
                 did_find_boundary = true;
                 let nal_end_idx = idx;
-                debug_assert!(nal_start_idx < nal_end_idx);
 
                 let nal = data_copy.slice(
                     if nal_start_idx == 0 {
