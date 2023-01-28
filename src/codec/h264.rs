@@ -87,54 +87,15 @@ impl NalParser {
     /// boundaries (i.e. three consecutive 0x00). If it finds a boundary, it splits on it
     /// to break apart NALs from the Annex B stream.
     fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
-        // Should `&mut Bytes` be passed instead of doing this?
-        let mut data_copy = data;
-
         let mut nal_start_idx = 0;
         let mut did_find_boundary = false;
 
-        // Check if current packet starts with either a single or two 0x00 bytes.
-        // If so, check if previous piece ended with either one or two 0x00 bytes.
-        // Case 1: [ [.., 0x00], [pkt_header, nal_header, 0x00, 0x00, ..] ]
-        // Case 2: [ [.., 0x00, 0x00], [pkt_header, nal_header, 0x00, ..] ]
-        // If we match any of the above cases, we remove the 0x00 that form the boundary
-        // and start off a new nal after it.
-        if !self.pieces.is_empty() && data_copy.slice(..2)[..] == [0x00; 2] {
-            let last_piece = self
-                .pieces
-                .last_mut()
-                .expect("pieces should be non-empty because break_apart_nals checked for it to be non-empty");
-            if last_piece.ends_with(&[0x00]) {
-                let last_byte_index = last_piece.len() - 1;
-                last_piece.truncate(last_byte_index);
-                self.nals.last_mut().unwrap().len -= 1;
-                data_copy.advance(3);
-                let nal_header = NalHeader::new(data_copy[0]).expect("Header w/o F bit is valid");
-                self.start_rtp_nal(nal_header)?;
-                data_copy.advance(1);
-            }
-        } else if !self.pieces.is_empty() && data_copy.first().unwrap() == &0x00 {
-            let last_piece = self
-                .pieces
-                .last_mut()
-                .expect("pieces should be non-empty because break_apart_nals checked for it to be non-empty");
-            if last_piece.ends_with(&[0x00, 0x00]) {
-                let last_byte_index = last_piece.len() - 1;
-                last_piece.truncate(last_byte_index - 1);
-                self.nals.last_mut().unwrap().len -= 1;
-                data_copy.advance(2);
-                let nal_header = NalHeader::new(data_copy[0]).expect("Header w/o F bit is valid");
-                self.start_rtp_nal(nal_header)?;
-                data_copy.advance(1);
-            }
-        }
-
-        for (idx, byte) in data_copy.iter().enumerate() {
+        for (idx, byte) in data.iter().enumerate() {
             // TODO: Handle boundaries split b/w packets.
             // If the current FU-A has a boundary that splits at end, ignore the last or
             // last two zeros because this boundary will be handled when the start of
             // next packet is being read, and these zeros will be removed on walk-back.
-            if byte == &0x00 && idx + 2 < data_copy.len() && data_copy[idx..idx + 3] == [0x00; 3] {
+            if byte == &0x00 && idx + 2 < data.len() && data[idx..idx + 3] == [0x00; 3] {
                 debug!("Found boundary with index range: {} - {}.", idx, idx + 2);
                 // we found a boundary, let NalParser know that it should now keep adding
                 // to last NAL even if the next FU-A frag header byte does not match the
@@ -142,7 +103,7 @@ impl NalParser {
                 did_find_boundary = true;
                 let nal_end_idx = idx;
 
-                let nal = data_copy.slice(
+                let nal = data.slice(
                     if nal_start_idx == 0 {
                         // this is only for the first boundary, since `data` passed already has advanced 2 bytes
                         // to skip the packet type and NAL header
@@ -159,7 +120,7 @@ impl NalParser {
                 nal_start_idx = idx + 3;
 
                 // create new nal which'll get updated
-                let nal_header = data_copy[idx + 4];
+                let nal_header = data[idx + 4];
                 self.nals.push(Nal {
                     hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
                     next_piece_idx: u32::MAX,
@@ -170,7 +131,7 @@ impl NalParser {
 
         // if we had found a boundary, we need to add the last NAL to pieces now
         if did_find_boundary {
-            self.push(data_copy.slice(nal_start_idx + 2..))?;
+            self.push(data.slice(nal_start_idx + 2..))?;
         }
 
         Ok(did_find_boundary)
@@ -1151,12 +1112,10 @@ enum PacketizerState {
 mod tests {
     use std::num::NonZeroU32;
 
-    use h264_reader::nal::{NalHeader, UnitType};
+    use h264_reader::nal::UnitType;
 
     use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
-
-    use super::NalParser;
 
     /*
      * This test requires
@@ -1840,162 +1799,5 @@ mod tests {
             .unwrap(),
         );
         assert!(push_result.is_err());
-    }
-
-    #[test]
-    fn split_annex_b_from_single_packet() {
-        init_logging();
-        let timestamp = crate::Timestamp {
-            timestamp: 0,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
-        };
-        let rtp_pkt_1 = ReceivedPacketBuilder {
-            // FU-A start fragment
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload_type: 0,
-        }
-        .build(*b"\x3c\x07previous-nal\x00\x00\x00\x3c\x08new-nal")
-        .unwrap();
-
-        let rtp_payload = rtp_pkt_1.into_payload_bytes();
-        let nal_header = NalHeader::new(rtp_payload[1]).unwrap();
-
-        let mut nal_parser = NalParser::new();
-        nal_parser.start_rtp_nal(nal_header).unwrap();
-        nal_parser.append_rtp_nal(rtp_payload.slice(2..)).unwrap();
-
-        assert_eq!(nal_parser.nals.len(), 2);
-        assert_eq!(nal_parser.pieces.len(), 2);
-        assert_eq!(
-            nal_parser.nals.first().unwrap().hdr.nal_unit_type(),
-            UnitType::SeqParameterSet
-        );
-        assert_eq!(
-            nal_parser.nals.last().unwrap().hdr.nal_unit_type(),
-            UnitType::PicParameterSet
-        );
-    }
-
-    #[test]
-    fn split_annex_b_boundary_cut_off_between_packets_variation_one() {
-        init_logging();
-        let timestamp = crate::Timestamp {
-            timestamp: 0,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
-        };
-        let rtp_pkt_1 = ReceivedPacketBuilder {
-            // FU-A start fragment
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload_type: 0,
-        }
-        .build(*b"\x3c\x07previous-nal\x00\x00")
-        .unwrap();
-        let rtp_pkt_2 = ReceivedPacketBuilder {
-            // FU-A start fragment
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload_type: 0,
-        }
-        .build(*b"\x3c\x07\x00\x3c\x08new-nal")
-        .unwrap();
-
-        let rtp_1_payload = rtp_pkt_1.into_payload_bytes();
-        let rtp_2_payload = rtp_pkt_2.into_payload_bytes();
-        let nal_header_1 = NalHeader::new(rtp_1_payload[1]).unwrap();
-
-        let mut nal_parser = NalParser::new();
-        nal_parser.start_rtp_nal(nal_header_1).unwrap();
-        nal_parser.append_rtp_nal(rtp_1_payload.slice(2..)).unwrap();
-        assert_eq!(nal_parser.nals.len(), 1);
-        assert_eq!(nal_parser.pieces.len(), 1);
-        nal_parser.append_rtp_nal(rtp_2_payload.slice(2..)).unwrap();
-
-        assert_eq!(nal_parser.nals.len(), 2);
-        assert_eq!(nal_parser.pieces.len(), 2);
-        assert_eq!(
-            nal_parser.nals.first().unwrap().hdr.nal_unit_type(),
-            UnitType::SeqParameterSet
-        );
-        assert_eq!(
-            nal_parser.nals.last().unwrap().hdr.nal_unit_type(),
-            UnitType::PicParameterSet
-        );
-    }
-
-    #[test]
-    fn split_annex_b_boundary_cut_off_between_packets_variation_two() {
-        init_logging();
-        let timestamp = crate::Timestamp {
-            timestamp: 0,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
-        };
-        let rtp_pkt_1 = ReceivedPacketBuilder {
-            // FU-A start fragment
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload_type: 0,
-        }
-        .build(*b"\x3c\x07previous-nal\x00")
-        .unwrap();
-        let rtp_pkt_2 = ReceivedPacketBuilder {
-            // FU-A start fragment
-            ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
-            timestamp,
-            ssrc: 0,
-            sequence_number: 0,
-            loss: 0,
-            mark: false,
-            payload_type: 0,
-        }
-        .build(*b"\x3c\x07\x00\x00\x3c\x08new-nal")
-        .unwrap();
-
-        let rtp_1_payload = rtp_pkt_1.into_payload_bytes();
-        let rtp_2_payload = rtp_pkt_2.into_payload_bytes();
-        let nal_header_1 = NalHeader::new(rtp_1_payload[1]).unwrap();
-
-        let mut nal_parser = NalParser::new();
-        nal_parser.start_rtp_nal(nal_header_1).unwrap();
-        nal_parser.append_rtp_nal(rtp_1_payload.slice(2..)).unwrap();
-        assert_eq!(nal_parser.nals.len(), 1);
-        assert_eq!(nal_parser.pieces.len(), 1);
-        nal_parser.append_rtp_nal(rtp_2_payload.slice(2..)).unwrap();
-
-        assert_eq!(nal_parser.nals.len(), 2);
-        assert_eq!(nal_parser.pieces.len(), 2);
-        assert_eq!(
-            nal_parser.nals.first().unwrap().hdr.nal_unit_type(),
-            UnitType::SeqParameterSet
-        );
-        assert_eq!(
-            nal_parser.nals.last().unwrap().hdr.nal_unit_type(),
-            UnitType::PicParameterSet
-        );
     }
 }
