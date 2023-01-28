@@ -107,21 +107,13 @@ impl NalParser {
             if last_piece.ends_with(&[0x00]) {
                 let last_byte_index = last_piece.len() - 1;
                 last_piece.truncate(last_byte_index);
-                self.nals
-                    .last_mut()
-                    .expect("nals should be non-empty because pieces is non-empty")
-                    .len -= 1;
+                self.nals.last_mut().unwrap().len -= 1;
                 data_copy.advance(3);
                 let nal_header = NalHeader::new(data_copy[0]).expect("Header w/o F bit is valid");
                 self.start_rtp_nal(nal_header)?;
                 data_copy.advance(1);
             }
-        } else if !self.pieces.is_empty()
-            && data_copy
-                .first()
-                .expect("rtp payload should be non-empty because it passes through a len() check")
-                == &0x00
-        {
+        } else if !self.pieces.is_empty() && data_copy.first().unwrap() == &0x00 {
             let last_piece = self
                 .pieces
                 .last_mut()
@@ -129,10 +121,7 @@ impl NalParser {
             if last_piece.ends_with(&[0x00, 0x00]) {
                 let last_byte_index = last_piece.len() - 1;
                 last_piece.truncate(last_byte_index - 1);
-                self.nals
-                    .last_mut()
-                    .expect("nals should be non-empty because pieces is non-empty")
-                    .len -= 1;
+                self.nals.last_mut().unwrap().len -= 1;
                 data_copy.advance(2);
                 let nal_header = NalHeader::new(data_copy[0]).expect("Header w/o F bit is valid");
                 self.start_rtp_nal(nal_header)?;
