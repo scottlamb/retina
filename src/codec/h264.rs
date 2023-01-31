@@ -1012,6 +1012,7 @@ mod tests {
         use crate::Timestamp;
         use pretty_hex::PrettyHex;
         use std::convert::TryFrom;
+        crate::testutil::init_logging();
         let mut p = super::Packetizer::new(1400, 0, 0).unwrap();
         let mut d = super::Depacketizer::new(
             90_000,
@@ -1020,8 +1021,8 @@ mod tests {
         let mut f = mp4::read_mp4(std::fs::File::open("src/codec/testdata/big_buck_bunny_480p_h264.mov").unwrap()).unwrap();
         let h264_track = f.tracks().iter().find_map(|t| {
             if matches!(t.media_type(), Ok(mp4::MediaType::H264)) {
-                println!("sps: {:?}", t.sequence_parameter_set().unwrap().hex_dump());
-                println!("pps: {:?}", t.picture_parameter_set().unwrap().hex_dump());
+                log::info!("sps: {:?}", t.sequence_parameter_set().unwrap().hex_dump());
+                log::info!("pps: {:?}", t.picture_parameter_set().unwrap().hex_dump());
                 Some(t.track_id())
             } else {
                 None
@@ -1030,8 +1031,8 @@ mod tests {
         let samples = f.sample_count(h264_track).unwrap();
         for i in 1..=samples {
             let sample = f.read_sample(h264_track, i).unwrap().unwrap();
-            //println!("packetizing {:#?}", sample.bytes.hex_dump());
-            println!("\n\npacketizing frame");
+            //log::info!("packetizing {:#?}", sample.bytes.hex_dump());
+            log::info!("\n\npacketizing frame");
             let mut frame = None;
             p.push(Timestamp::new(i64::try_from(sample.start_time).unwrap(), NonZeroU32::new(90_000).unwrap(), 0).unwrap(), sample.bytes.clone()).unwrap();
             while let Some(pkt) = p.pull().unwrap() {

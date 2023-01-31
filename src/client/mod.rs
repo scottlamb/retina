@@ -2883,7 +2883,7 @@ mod tests {
             ("Demuxed", std::mem::size_of::<Demuxed>()),
             ("Stream", std::mem::size_of::<Stream>()),
         ] {
-            println!("{name:-40} {size:4}");
+            log::info!("{name:-40} {size:4}");
         }
     }
 

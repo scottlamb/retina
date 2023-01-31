@@ -564,6 +564,7 @@ mod tests {
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
     fn print_sizes() {
+        crate::testutil::init_logging();
         for (name, size) in &[
             ("Depacketizer", std::mem::size_of::<Depacketizer>()),
             (
@@ -597,7 +598,7 @@ mod tests {
                 std::mem::size_of::<MessageParameters>(),
             ),
         ] {
-            println!("{name:-40} {size:4}");
+            log::info!("{name:-40} {size:4}");
         }
     }
 }
