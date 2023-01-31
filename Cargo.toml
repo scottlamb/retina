@@ -38,7 +38,7 @@ tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
 
 [dev-dependencies]
-criterion = { version = "0.3.4", features = ["async_tokio"] }
+criterion = { version = "0.4.0", features = ["async_tokio"] }
 mylog = { git = "https://github.com/scottlamb/mylog" }
 tokio = { version = "1.5.0", features = ["io-util", "macros", "rt-multi-thread", "test-util"] }
 
