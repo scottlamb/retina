@@ -1,3 +1,9 @@
+## unreleased
+
+*   remove obsolete workaround for GW security GW security GW4089IP's bad out-of-band parameters.
+    Instead, we treat them as unparseable and ignore them as described in the
+    `v0.4.2` notes below.
+
 ## `v0.4.4` (2022-12-26)
 
 *   improve interop with Ubiquiti cameras by ignoring `fmtp` attributes in

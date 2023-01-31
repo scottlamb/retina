@@ -662,18 +662,7 @@ impl InternalParameters {
         }
         let sps_nal = sps_nal.ok_or_else(|| "no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "no pps".to_string())?;
-
-        // GW security GW4089IP leaves Annex B start codes at the end of both
-        // SPS and PPS in the sprop-parameter-sets. Leaving them in means
-        // there's an immediate parameter change (from in-band parameters) once
-        // the first frame is received. Strip them out.
-        let sps_nal = sps_nal
-            .strip_suffix(b"\x00\x00\x00\x01")
-            .unwrap_or(&sps_nal);
-        let pps_nal = pps_nal
-            .strip_suffix(b"\x00\x00\x00\x01")
-            .unwrap_or(&pps_nal);
-        Self::parse_sps_and_pps(sps_nal, pps_nal)
+        Self::parse_sps_and_pps(&sps_nal, &pps_nal)
     }
 
     fn parse_sps_and_pps(sps_nal: &[u8], pps_nal: &[u8]) -> Result<InternalParameters, String> {
@@ -1455,17 +1444,12 @@ mod tests {
     #[test]
     fn gw_security_params() {
         init_logging();
-        let params = super::InternalParameters::parse_format_specific_params(
+        super::InternalParameters::parse_format_specific_params(
             "packetization-mode=1;\
              profile-level-id=5046302;\
              sprop-parameter-sets=Z00AHpWoLQ9puAgICBAAAAAB,aO48gAAAAAE=",
         )
-        .unwrap();
-        assert_eq!(
-            &params.sps_nal[..],
-            b"\x67\x4d\x00\x1e\x95\xa8\x2d\x0f\x69\xb8\x08\x08\x08\x10"
-        );
-        assert_eq!(&params.pps_nal[..], b"\x68\xee\x3c\x80");
+        .unwrap_err();
     }
 
     #[test]

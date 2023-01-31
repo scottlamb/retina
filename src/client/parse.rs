@@ -1310,15 +1310,7 @@ mod tests {
         assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
-            ParametersRef::Video(v) => {
-                assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
-                assert_eq!(v.pixel_dimensions(), (1920, 1080));
-                assert_eq!(v.pixel_aspect_ratio(), None);
-                assert_eq!(v.frame_rate(), None);
-            }
-            _ => panic!(),
-        }
+        assert!(p.streams[0].parameters().is_none()); // unparseable; erroneous trailing 00 00 01.
 
         // audio stream
         assert_eq!(
@@ -1408,15 +1400,7 @@ mod tests {
         assert_eq!(p.streams[0].encoding_name(), "h264");
         assert_eq!(p.streams[0].rtp_payload_type, 96);
         assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
-            ParametersRef::Video(v) => {
-                assert_eq!(v.rfc6381_codec(), "avc1.4D001E");
-                assert_eq!(v.pixel_dimensions(), (720, 480));
-                assert_eq!(v.pixel_aspect_ratio(), None);
-                assert_eq!(v.frame_rate(), None);
-            }
-            _ => panic!(),
-        }
+        assert!(p.streams[0].parameters().is_none()); // unparseable; erroneous trailing 00 00 01.
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/gw_sub_setup.txt"));
