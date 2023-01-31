@@ -500,8 +500,7 @@ impl Depacketizer {
                     encoding_name
                 );
                 return Err(format!(
-                    "no depacketizer for media/encoding_name {}/{}",
-                    media, encoding_name
+                    "no depacketizer for media/encoding_name {media}/{encoding_name}"
                 ));
             }
         }))
@@ -598,7 +597,7 @@ mod tests {
                 std::mem::size_of::<MessageParameters>(),
             ),
         ] {
-            println!("{:-40} {:4}", name, size);
+            println!("{name:-40} {size:4}");
         }
     }
 }

@@ -207,8 +207,7 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
     ))
     .map_err(|e| {
         format!(
-            "unable to join base url {} with control url {:?}: {}",
-            base_url, control, e
+            "unable to join base url {base_url} with control url {control:?}: {e}"
         )
     })
 }
@@ -247,9 +246,9 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         .next()
         .unwrap();
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
-        .map_err(|_| format!("invalid RTP payload type {:?}", rtp_payload_type_str))?;
+        .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
     if (rtp_payload_type & 0x80) != 0 {
-        return Err(format!("invalid RTP payload type {}", rtp_payload_type));
+        return Err(format!("invalid RTP payload type {rtp_payload_type}"));
     }
 
     // Capture interesting attributes.
@@ -342,7 +341,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                     u16::from_str_radix(c, 10)
                         .ok()
                         .and_then(NonZeroU16::new)
-                        .ok_or_else(|| format!("Invalid channels specification {:?}", c))
+                        .ok_or_else(|| format!("Invalid channels specification {c:?}"))
                 })
                 .transpose()?;
         }
@@ -352,8 +351,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                 .and_then(Option::as_ref)
                 .ok_or_else(|| {
                     format!(
-                        "Expected rtpmap parameter or assigned static payload type (got {})",
-                        rtp_payload_type
+                        "Expected rtpmap parameter or assigned static payload type (got {rtp_payload_type})"
                     )
                 })?;
             encoding_name = type_.encoding;
@@ -402,7 +400,7 @@ impl<'a> std::fmt::Debug for MostlyAscii<'a> {
                 b'\r' => write!(f, "\\r")?,
                 // Note this writes newlines in unescaped form.
                 b' ' | b'\n' | 0x20..=0x7E => write!(f, "{}", b as char)?,
-                _ => write!(f, "\\x{:02X}", b)?,
+                _ => write!(f, "\\x{b:02X}")?,
             }
         }
         write!(f, "\"")?;
@@ -426,7 +424,7 @@ pub(crate) fn parse_describe(
 
     let raw_sdp = MostlyAscii(&response.body()[..]);
     let sdp = sdp_types::Session::parse(raw_sdp.0)
-        .map_err(|e| format!("Unable to parse SDP: {}\n\n{:#?}", e, raw_sdp,))?;
+        .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
@@ -437,7 +435,7 @@ pub(crate) fn parse_describe(
                 .header(&rtsp_types::headers::CONTENT_LOCATION)
                 .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
         })
-        .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
+        .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {h} {v:?}: {e}")))
         .unwrap_or_else(|| Ok(request_url.clone()))?;
 
     let mut control = None;
@@ -538,7 +536,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
         Some((id, timeout_str)) => {
             if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
                 let timeout_sec =
-                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {}", v))?;
+                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {v}"))?;
 
                 if timeout_sec == 0 {
                     // This would make Retina send keepalives at an absurd rate; reject.
@@ -565,25 +563,25 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
     let mut server_port = None;
     for part in transport.as_str().split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
-            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {}", v))?;
+            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
             ssrc = Some(v);
             break;
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
-            let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {}", n))?;
+            let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {n}"))?;
             if let Some(m) = channels.next() {
                 let m = u8::from_str_radix(m, 10)
-                    .map_err(|_| format!("bad second channel number {}", m))?;
+                    .map_err(|_| format!("bad second channel number {m}"))?;
                 if n.checked_add(1) != Some(m) {
-                    format!("Expected adjacent channels; got {}-{}", n, m);
+                    format!("Expected adjacent channels; got {n}-{m}");
                 }
             }
             channel_id = Some(n);
         } else if let Some(s) = part.strip_prefix("source=") {
             source = Some(
                 s.parse()
-                    .map_err(|_| format!("Transport header has unparseable source {:?}", s))?,
+                    .map_err(|_| format!("Transport header has unparseable source {s:?}"))?,
             );
         } else if let Some(s) = part.strip_prefix("server_port=") {
             server_port = Some(parse_server_port(s).map_err(|()| {
@@ -666,7 +664,7 @@ pub(crate) fn parse_play(
             match key {
                 "seq" => {
                     let seq = u16::from_str_radix(value, 10)
-                        .map_err(|_| format!("bad seq {:?}", value))?;
+                        .map_err(|_| format!("bad seq {value:?}"))?;
                     state.initial_seq = Some(seq);
                 }
                 "rtptime" => match u32::from_str_radix(value, 10) {
@@ -675,7 +673,7 @@ pub(crate) fn parse_play(
                 },
                 "ssrc" => {
                     let ssrc = u32::from_str_radix(value, 16)
-                        .map_err(|_| format!("Unparseable ssrc {}", value))?;
+                        .map_err(|_| format!("Unparseable ssrc {value}"))?;
                     state.ssrc = Some(ssrc);
                 }
                 _ => {}

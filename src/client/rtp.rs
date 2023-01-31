@@ -243,7 +243,7 @@ mod tests {
             pkt.0,
         ) {
             Ok(Some(PacketItem::Rtp(_))) => {}
-            o => panic!("unexpected packet 1 result: {:#?}", o),
+            o => panic!("unexpected packet 1 result: {o:#?}"),
         }
 
         // Mystery pt=50 packet with same sequence number.
@@ -267,7 +267,7 @@ mod tests {
             pkt.0,
         ) {
             Ok(None) => {}
-            o => panic!("unexpected packet 2 result: {:#?}", o),
+            o => panic!("unexpected packet 2 result: {o:#?}"),
         }
     }
 
@@ -304,7 +304,7 @@ mod tests {
             Ok(Some(PacketItem::Rtp(p))) => {
                 assert_eq!(p.timestamp().elapsed(), 0);
             }
-            o => panic!("unexpected packet 2 result: {:#?}", o),
+            o => panic!("unexpected packet 2 result: {o:#?}"),
         }
 
         let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
@@ -327,7 +327,7 @@ mod tests {
             pkt.0,
         ) {
             Ok(None) => {}
-            o => panic!("unexpected packet 1 result: {:#?}", o),
+            o => panic!("unexpected packet 1 result: {o:#?}"),
         }
 
         let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
@@ -353,7 +353,7 @@ mod tests {
                 // The missing timestamp shouldn't have adjusted time.
                 assert_eq!(p.timestamp().elapsed(), 1);
             }
-            o => panic!("unexpected packet 2 result: {:#?}", o),
+            o => panic!("unexpected packet 2 result: {o:#?}"),
         }
     }
 }

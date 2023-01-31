@@ -70,12 +70,12 @@ impl AudioSpecificConfig {
         let mut r = bitstream_io::BitReader::endian(raw, bitstream_io::BigEndian);
         let audio_object_type = match r
             .read::<u8>(5)
-            .map_err(|e| format!("unable to read audio_object_type: {}", e))?
+            .map_err(|e| format!("unable to read audio_object_type: {e}"))?
         {
             31 => {
                 32 + r
                     .read::<u8>(6)
-                    .map_err(|e| format!("unable to read audio_object_type ext: {}", e))?
+                    .map_err(|e| format!("unable to read audio_object_type ext: {e}"))?
             }
             o => o,
         };
@@ -83,7 +83,7 @@ impl AudioSpecificConfig {
         // ISO/IEC 14496-3 section 1.6.3.3.
         let sampling_frequency = match r
             .read::<u8>(4)
-            .map_err(|e| format!("unable to read sampling_frequency: {}", e))?
+            .map_err(|e| format!("unable to read sampling_frequency: {e}"))?
         {
             0x0 => 96_000,
             0x1 => 88_200,
@@ -99,52 +99,52 @@ impl AudioSpecificConfig {
             0xb => 8_000,
             0xc => 7_350,
             v @ 0xd | v @ 0xe => {
-                return Err(format!("reserved sampling_frequency_index value 0x{:x}", v))
+                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"))
             }
             0xf => r
                 .read::<u32>(24)
-                .map_err(|e| format!("unable to read sampling_frequency ext: {}", e))?,
+                .map_err(|e| format!("unable to read sampling_frequency ext: {e}"))?,
             0x10..=0xff => unreachable!(),
         };
         let channels = {
             let c = r
                 .read::<u8>(4)
-                .map_err(|e| format!("unable to read channels: {}", e))?;
+                .map_err(|e| format!("unable to read channels: {e}"))?;
             CHANNEL_CONFIGS
                 .get(usize::from(c))
-                .ok_or_else(|| format!("reserved channelConfiguration 0x{:x}", c))?
+                .ok_or_else(|| format!("reserved channelConfiguration 0x{c:x}"))?
                 .as_ref()
                 .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?
         };
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
             if r.read::<u8>(4)
-                .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {}", e))?
+                .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {e}"))?
                 == 0xf
             {
                 r.skip(24)
-                    .map_err(|e| format!("unable to read extensionSamplingFrequency: {}", e))?;
+                    .map_err(|e| format!("unable to read extensionSamplingFrequency: {e}"))?;
             }
             // audioObjectType (a different one) + extensionChannelConfiguration.
             if r.read::<u8>(5)
-                .map_err(|e| format!("unable to read second audioObjectType: {}", e))?
+                .map_err(|e| format!("unable to read second audioObjectType: {e}"))?
                 == 22
             {
                 r.skip(4)
-                    .map_err(|e| format!("unable to read extensionChannelConfiguration: {}", e))?;
+                    .map_err(|e| format!("unable to read extensionChannelConfiguration: {e}"))?;
             }
         }
 
         // The supported types here are the ones that use GASpecificConfig.
         match audio_object_type {
             1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23 => {}
-            o => return Err(format!("unsupported audio_object_type {}", o)),
+            o => return Err(format!("unsupported audio_object_type {o}")),
         }
 
         // GASpecificConfig, ISO/IEC 14496-3 section 4.4.1.
         let frame_length_flag = r
             .read_bit()
-            .map_err(|e| format!("unable to read frame_length_flag: {}", e))?;
+            .map_err(|e| format!("unable to read frame_length_flag: {e}"))?;
         let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
             (3 /* AAC SR */, true) => {
@@ -157,7 +157,7 @@ impl AudioSpecificConfig {
         };
 
         // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
-        let rfc6381_codec = Some(format!("mp4a.40.{}", audio_object_type));
+        let rfc6381_codec = Some(format!("mp4a.40.{audio_object_type}"));
 
         Ok(AudioSpecificConfig {
             parameters: AudioParameters {
@@ -197,7 +197,7 @@ fn set_length(len: usize, data: &mut [u8]) -> Result<usize, String> {
         Ok(4)
     } else {
         // BaseDescriptor sets a maximum length of 2**28 - 1.
-        Err(format!("length {} too long", len))
+        Err(format!("length {len} too long"))
     }
 }
 
@@ -290,7 +290,7 @@ fn make_sample_entry(
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
         let sampling_frequency = u16::try_from(sampling_frequency)
-            .map_err(|_| format!("aac sampling_frequency={} unsupported", sampling_frequency))?;
+            .map_err(|_| format!("aac sampling_frequency={sampling_frequency} unsupported"))?;
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -368,7 +368,7 @@ fn parse_format_specific_params(
         }
         let (key, value) = p
             .split_once('=')
-            .ok_or_else(|| format!("bad format-specific-param {}", p))?;
+            .ok_or_else(|| format!("bad format-specific-param {p}"))?;
         match &key.to_ascii_lowercase()[..] {
             "config" => {
                 config = Some(
@@ -397,13 +397,12 @@ fn parse_format_specific_params(
     }
     // https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6 AAC-hbr
     if mode != Some("AAC-hbr") {
-        return Err(format!("Expected mode AAC-hbr, got {:#?}", mode));
+        return Err(format!("Expected mode AAC-hbr, got {mode:#?}"));
     }
     let config = config.ok_or_else(|| "config must be specified".to_string())?;
     if size_length != Some(13) || index_length != Some(3) || index_delta_length != Some(3) {
         return Err(format!(
-            "Unexpected sizeLength={:?} indexLength={:?} indexDeltaLength={:?}",
-            size_length, index_length, index_delta_length
+            "Unexpected sizeLength={size_length:?} indexLength={index_length:?} indexDeltaLength={index_delta_length:?}"
         ));
     }
 
@@ -552,7 +551,7 @@ impl Depacketizer {
 
         // AAC-hbr requires 16-bit AU headers: 13-bit size, 3-bit index.
         if (au_headers_length_bits & 0x7) != 0 {
-            return Err(format!("bad au-headers-length {}", au_headers_length_bits));
+            return Err(format!("bad au-headers-length {au_headers_length_bits}"));
         }
         let au_headers_count = au_headers_length_bits >> 4;
         let data_off = 2 + (usize::from(au_headers_count) << 1);
@@ -563,8 +562,7 @@ impl Depacketizer {
             DepacketizerState::Fragmented(ref mut frag) => {
                 if au_headers_count != 1 {
                     return Err(format!(
-                        "Got {}-AU packet while fragment in progress",
-                        au_headers_count
+                        "Got {au_headers_count}-AU packet while fragment in progress"
                     ));
                 }
                 if (pkt.timestamp().timestamp as u16) != frag.rtp_timestamp {
@@ -740,8 +738,7 @@ impl Depacketizer {
                                 stream_ctx,
                                 agg,
                                 format!(
-                                    "aggregate timestamp {} + {} overflows",
-                                    agg_timestamp, delta
+                                    "aggregate timestamp {agg_timestamp} + {delta} overflows"
                                 ),
                             ))
                         }

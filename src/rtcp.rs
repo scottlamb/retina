@@ -248,7 +248,7 @@ impl<'a> PacketRef<'a> {
         }
         let ver = buf[0] >> 6;
         if ver != 2 {
-            return Err(format!("RTCP packets must be version 2; got {}", ver));
+            return Err(format!("RTCP packets must be version 2; got {ver}"));
         }
 
         // raw_len is "The length of this RTCP packet in 32-bit words minus one,
@@ -271,8 +271,7 @@ impl<'a> PacketRef<'a> {
             let padding_bytes = usize::from(this[len - 1]);
             if padding_bytes == 0 || padding_bytes > len - COMMON_HEADER_LEN {
                 return Err(format!(
-                    "RTCP packet of len {} states invalid {} padding bytes",
-                    len, padding_bytes
+                    "RTCP packet of len {len} states invalid {padding_bytes} padding bytes"
                 ));
             }
             Ok((

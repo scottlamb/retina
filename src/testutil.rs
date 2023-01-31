@@ -22,7 +22,7 @@ pub(crate) fn response(raw: &'static [u8]) -> rtsp_types::Response<Bytes> {
     let (msg, len) = rtsp_types::Message::parse(raw).unwrap();
     assert_eq!(len, raw.len());
     match msg {
-        rtsp_types::Message::Response(r) => r.map_body(|b| Bytes::from_static(b)),
+        rtsp_types::Message::Response(r) => r.map_body(Bytes::from_static),
         _ => panic!("unexpected message type"),
     }
 }

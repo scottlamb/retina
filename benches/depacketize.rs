@@ -17,7 +17,7 @@ const BUNNY: &[u8] = include_bytes!("bunny.rtsp");
 
 // TODO: it'd be nice to have a slick way of loading saved RTSP flows for testing.
 // For now, this builds state via several internal interfaces.
-fn h264_aac<F: FnMut(CodecItem) -> ()>(mut f: F) {
+fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
     let mut remaining = BUNNY;
     let mut timelines = [
         Timeline::new(Some(0), 12_000, None).unwrap(),
@@ -91,7 +91,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                     CodecItem::VideoFrame(v) => v,
                     _ => return,
                 };
-                w.write_all(&v.data()[..]).unwrap();
+                w.write_all(v.data()).unwrap();
             })
         })
     });

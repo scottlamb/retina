@@ -20,8 +20,7 @@ impl Depacketizer {
     pub(super) fn new(clock_rate: u32) -> Result<Self, String> {
         if clock_rate != FIXED_CLOCK_RATE {
             return Err(format!(
-                "Expected clock rate of {} for G.723, got {}",
-                FIXED_CLOCK_RATE, clock_rate
+                "Expected clock rate of {FIXED_CLOCK_RATE} for G.723, got {clock_rate}"
             ));
         }
         Ok(Self {

@@ -103,8 +103,7 @@ impl Depacketizer {
     ) -> Result<Self, String> {
         if clock_rate != 90_000 {
             return Err(format!(
-                "invalid H.264 clock rate {}; must always be 90000",
-                clock_rate
+                "invalid H.264 clock rate {clock_rate}; must always be 90000"
             ));
         }
 
@@ -136,7 +135,7 @@ impl Depacketizer {
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
         // Push shouldn't be called until pull is exhausted.
         if let Some(p) = self.pending.as_ref() {
-            panic!("push with data already pending: {:?}", p);
+            panic!("push with data already pending: {p:?}");
         }
 
         let mut access_unit =
@@ -231,15 +230,14 @@ impl Depacketizer {
         // https://tools.ietf.org/html/rfc6184#section-5.2
         let nal_header = data[0];
         if (nal_header >> 7) != 0 {
-            return Err(format!("NAL header {:02x} has F bit set", nal_header));
+            return Err(format!("NAL header {nal_header:02x} has F bit set"));
         }
         data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
                 if access_unit.in_fu_a {
                     return Err(format!(
-                        "Non-fragmented NAL {:02x} while fragment in progress",
-                        nal_header
+                        "Non-fragmented NAL {nal_header:02x} while fragment in progress"
                     ));
                 }
                 let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
@@ -298,8 +296,7 @@ impl Depacketizer {
             }
             25..=27 | 29 => {
                 return Err(format!(
-                    "unimplemented/unexpected interleaved mode NAL ({:02x})",
-                    nal_header,
+                    "unimplemented/unexpected interleaved mode NAL ({nal_header:02x})",
                 ))
             }
             28 => {
@@ -316,7 +313,7 @@ impl Depacketizer {
                         .expect("NalHeader is valid");
                 data.advance(1);
                 if (start && end) || reserved {
-                    return Err(format!("Invalid FU-A header {:02x}", fu_header));
+                    return Err(format!("Invalid FU-A header {fu_header:02x}"));
                 }
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
@@ -364,7 +361,7 @@ impl Depacketizer {
                     }
                 }
             }
-            _ => return Err(format!("bad nal header {:02x}", nal_header)),
+            _ => return Err(format!("bad nal header {nal_header:02x}")),
         }
         self.input_state = if mark {
             let last_nal_hdr = self.nals.last().unwrap().hdr;
@@ -677,12 +674,12 @@ impl InternalParameters {
         let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(
             h264_reader::rbsp::BitReader::new(&*sps_rbsp),
         )
-        .map_err(|e| format!("Bad SPS: {:?}", e))?;
+        .map_err(|e| format!("Bad SPS: {e:?}"))?;
         debug!("sps: {:#?}", &sps);
 
         let pixel_dimensions = sps
             .pixel_dimensions()
-            .map_err(|e| format!("SPS has invalid pixel dimensions: {:?}", e))?;
+            .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
 
         // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
         // The beginning of the AVCDecoderConfiguration takes a few values from
@@ -860,7 +857,7 @@ impl Packetizer {
                 let hdr = NalHeader::new(data[0]).map_err(|_| "F bit in NAL header".to_owned())?;
                 if matches!(hdr.nal_unit_type(), UnitType::Unspecified(_)) {
                     // This can clash with fragmentation/aggregation NAL types.
-                    return Err(format!("bad NAL header {:?}", hdr));
+                    return Err(format!("bad NAL header {hdr:?}"));
                 }
                 if usize_len > max_payload_size {
                     // start a FU-A.
@@ -1156,7 +1153,7 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(
-            &frame.data()[..],
+            frame.data(),
             b"\x00\x00\x00\x06\x06plain\
                      \x00\x00\x00\x09\x06stap-a 1\
                      \x00\x00\x00\x09\x06stap-a 2\
@@ -1237,10 +1234,10 @@ mod tests {
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
-            o => panic!("unexpected pull result {:#?}", o),
+            o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq!(
-            &frame.data()[..],
+            frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
@@ -1284,9 +1281,9 @@ mod tests {
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
-            o => panic!("unexpected pull result {:#?}", o),
+            o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(&frame.data()[..], b"\x00\x00\x00\x06\x01slice");
+        assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
         assert_eq!(frame.timestamp, ts1);
         d.push(
             ReceivedPacketBuilder {
@@ -1340,10 +1337,10 @@ mod tests {
         .unwrap();
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
-            o => panic!("unexpected pull result {:#?}", o),
+            o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq!(
-            &frame.data()[..],
+            frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
@@ -1359,7 +1356,7 @@ mod tests {
             Some(crate::codec::ParametersRef::Video(v)) => {
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
             }
-            o => panic!("{:?}", o),
+            o => panic!("{o:?}"),
         }
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -1416,7 +1413,7 @@ mod tests {
 
         let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
-            o => panic!("unexpected pull result {:#?}", o),
+            o => panic!("unexpected pull result {o:#?}"),
         };
 
         // After pull, new_parameters and parameters() both reflect the change.

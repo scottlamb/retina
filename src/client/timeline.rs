@@ -39,8 +39,7 @@ impl Timeline {
             .transpose()
             .map_err(|_| {
                 format!(
-                    "clock_rate={} rejected because max forward jump of {} sec exceeds i32::MAX",
-                    clock_rate, MAX_FORWARD_TIME_JUMP_SECS
+                    "clock_rate={clock_rate} rejected because max forward jump of {MAX_FORWARD_TIME_JUMP_SECS} sec exceeds i32::MAX"
                 )
             })?
             .map(|j| NonZeroI32::new(j).expect("non-zero times non-zero must be non-zero"));

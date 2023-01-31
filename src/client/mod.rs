@@ -331,8 +331,7 @@ impl std::str::FromStr for TeardownPolicy {
             "never" => TeardownPolicy::Never,
             "always" => TeardownPolicy::Always,
             _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad TeardownPolicy {}; expected auto, never, or always",
-                s
+                "bad TeardownPolicy {s}; expected auto, never, or always"
             ))),
         })
     }
@@ -389,9 +388,8 @@ impl std::str::FromStr for InitialTimestampPolicy {
             "ignore" => InitialTimestampPolicy::Ignore,
             "permissive" => InitialTimestampPolicy::Permissive,
             _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad InitialTimestampPolicy {}; \
-                 expected default, require, ignore or permissive",
-                s
+                "bad InitialTimestampPolicy {s}; \
+                 expected default, require, ignore or permissive"
             ))),
         })
     }
@@ -478,9 +476,8 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
             "error" => UnassignedChannelDataPolicy::Error,
             "ignore" => UnassignedChannelDataPolicy::Ignore,
             _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad UnassignedChannelDataPolicy {}; expected auto, assume-stale-session, error, \
-                 or ignore",
-                s
+                "bad UnassignedChannelDataPolicy {s}; expected auto, assume-stale-session, error, \
+                 or ignore"
             ))),
         })
     }
@@ -528,9 +525,8 @@ impl std::str::FromStr for Transport {
             "tcp" => Transport::Tcp(TcpTransportOptions::default()),
             "udp" => Transport::Udp(UdpTransportOptions::default()),
             _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad Transport {}; \
-                 expected tcp or udp",
-                s
+                "bad Transport {s}; \
+                 expected tcp or udp"
             ))),
         })
     }
@@ -1100,7 +1096,7 @@ impl RtspConnection {
                         msg_ctx: self.inner.eof_ctx(),
                         source: std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            format!("EOF while expecting response to {} CSeq {}", method, cseq),
+                            format!("EOF while expecting response to {method} CSeq {cseq}"),
                         ),
                     })
                 })?;
@@ -1146,8 +1142,7 @@ impl RtspConnection {
                     conn_ctx: *self.inner.ctx(),
                     msg_ctx,
                     description: format!(
-                        "Expected response to {} CSeq {}, got {}",
-                        method, cseq, description,
+                        "Expected response to {method} CSeq {cseq}, got {description}",
                     ),
                 });
             };
@@ -1195,7 +1190,7 @@ impl RtspConnection {
                         method: req.method().clone(),
                         cseq,
                         status: resp.status(),
-                        description: format!("Can't understand WWW-Authenticate header: {}", e),
+                        description: format!("Can't understand WWW-Authenticate header: {e}"),
                     }),
                 };
                 continue;
@@ -1919,8 +1914,7 @@ impl Session<Playing> {
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "Unable to write keepalive {} within {:?}",
-                        cseq, keepalive_interval,
+                        "Unable to write keepalive {cseq} within {keepalive_interval:?}",
                     ),
                 ),
             }),
@@ -1930,8 +1924,7 @@ impl Session<Playing> {
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!(
-                        "Server failed to respond to keepalive {} within {:?}",
-                        cseq, keepalive_interval,
+                        "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
                     ),
                 ),
             }),
@@ -2038,7 +2031,7 @@ impl Session<Playing> {
                 .inner
                 .ctx(),
             msg_ctx: *msg_ctx,
-            description: format!("Unexpected RTSP response {:#?}", response),
+            description: format!("Unexpected RTSP response {response:#?}"),
         })
     }
 
@@ -2620,9 +2613,9 @@ mod tests {
                         Some(Ok(PacketItem::Rtp(p))) => {
                             assert_eq!(p.ssrc(), 0xdcc4a0d8);
                             assert_eq!(p.sequence_number(), 0x41d4);
-                            assert_eq!(&p.payload()[..], b"hello world");
+                            assert_eq!(p.payload(), b"hello world");
                         }
-                        o => panic!("unexpected item: {:#?}", o),
+                        o => panic!("unexpected item: {o:#?}"),
                     }
                 },
                 async {
@@ -2669,8 +2662,7 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - drop_time;
         assert!(
             elapsed < std::time::Duration::from_secs(60),
-            "elapsed={:?}",
-            elapsed
+            "elapsed={elapsed:?}"
         );
     }
 
@@ -2731,9 +2723,9 @@ mod tests {
                         Some(Ok(PacketItem::Rtp(p))) => {
                             assert_eq!(p.ssrc(), 0xdcc4a0d8);
                             assert_eq!(p.sequence_number(), 0x41d4);
-                            assert_eq!(&p.payload()[..], b"hello world");
+                            assert_eq!(p.payload(), b"hello world");
                         }
-                        o => panic!("unexpected item: {:#?}", o),
+                        o => panic!("unexpected item: {o:#?}"),
                     }
                 },
                 async {
@@ -2768,8 +2760,7 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - drop_time;
         assert!(
             elapsed >= std::time::Duration::from_secs(60),
-            "elapsed={:?}",
-            elapsed
+            "elapsed={elapsed:?}"
         );
     }
 
@@ -2815,8 +2806,7 @@ mod tests {
 
         assert!(
             elapsed >= std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC),
-            "elapsed={:?}",
-            elapsed
+            "elapsed={elapsed:?}"
         );
     }
 
@@ -2893,7 +2883,7 @@ mod tests {
             ("Demuxed", std::mem::size_of::<Demuxed>()),
             ("Stream", std::mem::size_of::<Stream>()),
         ] {
-            println!("{:-40} {:4}", name, size);
+            println!("{name:-40} {size:4}");
         }
     }
 

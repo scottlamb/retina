@@ -51,12 +51,11 @@ impl ChannelMappings {
     /// Assigns an even channel id (to RTP) and its odd successor (to RTCP) or errors.
     pub fn assign(&mut self, channel_id: u8, stream_i: usize) -> Result<(), String> {
         if (channel_id & 1) != 0 {
-            return Err(format!("Can't assign odd channel id {}", channel_id));
+            return Err(format!("Can't assign odd channel id {channel_id}"));
         }
         if stream_i >= 255 {
             return Err(format!(
-                "Can't assign channel to stream id {} because it's >= 255",
-                stream_i
+                "Can't assign channel to stream id {stream_i} because it's >= 255"
             ));
         }
         let i = usize::from(channel_id >> 1);

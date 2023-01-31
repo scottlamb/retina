@@ -92,7 +92,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
                 data.push(b'$'); // interleaved data
                 data.push(0); // channel 0
                 data.extend_from_slice(&u16::try_from(pkt.len()).unwrap().to_be_bytes()[..]);
-                data.extend_from_slice(&pkt);
+                data.extend_from_slice(pkt);
             }
             timestamp = timestamp.try_add(3000).unwrap();
         }
@@ -118,7 +118,7 @@ async fn read_to_eof(addr: SocketAddr) {
     while let Some(item) = session.next().await {
         match item {
             Ok(CodecItem::VideoFrame(_)) => i += 1,
-            o => panic!("bad item: {:#?}", o),
+            o => panic!("bad item: {o:#?}"),
         }
     }
     assert_eq!(i, 30 * 60);
