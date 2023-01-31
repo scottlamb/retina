@@ -212,7 +212,7 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
 pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
     response
         .header(&rtsp_types::headers::CSEQ)
-        .and_then(|cseq| u32::from_str_radix(cseq.as_str(), 10).ok())
+        .and_then(|cseq| u32::from_str_radix(cseq.as_str().trim(), 10).ok())
 }
 
 /// Parses a [MediaDescription] to a [Stream].
