@@ -4,18 +4,19 @@
 //! Gets info about available streams and exits.
 
 use anyhow::Error;
+use clap::Parser;
 
-#[derive(structopt::StructOpt)]
+#[derive(Parser)]
 pub struct Opts {
-    #[structopt(flatten)]
+    #[command(flatten)]
     src: super::Source,
 
     /// Prints the SDP (Session Description Protocol) session description.
-    #[structopt(long)]
+    #[arg(long)]
     print_sdp: bool,
 
     /// Prints debug output for each decoded stream.
-    #[structopt(long)]
+    #[arg(long)]
     print_streams: bool,
 }
 

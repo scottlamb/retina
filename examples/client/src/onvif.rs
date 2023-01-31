@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::{anyhow, Error};
+use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
 use retina::client::{SessionGroup, SetupOptions};
 use retina::codec::CodecItem;
 use std::sync::Arc;
 
-#[derive(structopt::StructOpt)]
+#[derive(Parser)]
 pub struct Opts {
-    #[structopt(flatten)]
+    #[command(flatten)]
     src: super::Source,
 }
 

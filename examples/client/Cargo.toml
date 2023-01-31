@@ -15,4 +15,4 @@ url = "2.2.1"
 anyhow = "1.0.41"
 itertools = "0.10.1"
 mylog = { git = "https://github.com/scottlamb/mylog" }
-structopt = "0.3.21"
+clap = { version = "4.1.4", features = ["derive"] }

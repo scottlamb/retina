@@ -19,6 +19,7 @@
 
 use anyhow::{anyhow, bail, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
+use clap::Parser;
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
@@ -35,44 +36,43 @@ use tokio::{
     io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
 
-#[derive(structopt::StructOpt)]
+#[derive(Parser)]
 pub struct Opts {
-    #[structopt(flatten)]
+    #[command(flatten)]
     src: super::Source,
 
     /// Policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
     /// One of `default`, `require`, `ignore`, `permissive`.
-    #[structopt(default_value, long)]
+    #[arg(default_value_t, long)]
     initial_timestamp: retina::client::InitialTimestampPolicy,
 
     /// Don't attempt to include video streams.
-    #[structopt(long)]
+    #[arg(long)]
     no_video: bool,
 
     /// Don't attempt to include audio streams.
-    #[structopt(long)]
+    #[arg(long)]
     no_audio: bool,
 
     /// Allow lost packets mid-stream without aborting.
-    #[structopt(long)]
+    #[arg(long)]
     allow_loss: bool,
 
     /// When to issue a `TEARDOWN` request: `auto`, `always`, or `never`.
-    #[structopt(default_value, long)]
+    #[arg(default_value_t, long)]
     teardown: retina::client::TeardownPolicy,
 
     /// Duration after which to exit automatically, in seconds.
-    #[structopt(long, name = "secs")]
+    #[arg(long, name = "secs")]
     duration: Option<u64>,
 
     /// The transport to use: `tcp` or `udp` (experimental).
     ///
     /// Note: `--allow-loss` is strongly recommended with `udp`.
-    #[structopt(default_value, long)]
+    #[arg(default_value_t, long)]
     transport: retina::client::Transport,
 
     /// Path to `.mp4` file to write.
-    #[structopt(parse(try_from_str))]
     out: PathBuf,
 }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::{anyhow, bail, Error};
+use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
 use retina::{
@@ -9,7 +10,6 @@ use retina::{
     codec::{CodecItem, VideoFrame},
 };
 use std::{str::FromStr, sync::Arc};
-use structopt::StructOpt;
 use webrtc::{
     api::{interceptor_registry::register_default_interceptors, APIBuilder},
     ice_transport::{ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer},
@@ -33,26 +33,26 @@ use webrtc::{
 ///
 /// A future version might embed a webserver so you can just go to the supplied
 /// URL and have everything work.
-#[derive(StructOpt)]
+#[derive(Parser)]
 struct Opts {
     /// `rtsp://` URL to connect to.
-    #[structopt(long, parse(try_from_str))]
+    #[arg(long)]
     url: url::Url,
 
     /// Username to send if the server requires authentication.
-    #[structopt(long)]
+    #[arg(long)]
     username: Option<String>,
 
     /// Password; requires username.
-    #[structopt(long, requires = "username")]
+    #[arg(long, requires = "username")]
     password: Option<String>,
 
     /// When to issue a `TEARDOWN` request: `auto`, `always`, or `never`.
-    #[structopt(default_value, long)]
+    #[arg(default_value_t, long)]
     teardown: retina::client::TeardownPolicy,
 
     /// The transport to use: `tcp` or `udp` (experimental).
-    #[structopt(default_value, long)]
+    #[arg(default_value_t, long)]
     transport: retina::client::Transport,
 }
 
@@ -93,7 +93,7 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
 }
 
 async fn run() -> Result<(), Error> {
-    let opts = Opts::from_args();
+    let opts = Opts::parse();
     let creds = match (opts.username, opts.password) {
         (Some(username), password) => Some(retina::client::Credentials {
             username,

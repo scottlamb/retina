@@ -8,26 +8,26 @@ mod mp4;
 mod onvif;
 
 use anyhow::Error;
+use clap::Parser;
 use log::{error, info};
 use std::str::FromStr;
-use structopt::StructOpt;
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 struct Source {
     /// `rtsp://` URL to connect to.
-    #[structopt(long, parse(try_from_str))]
+    #[clap(long)]
     url: url::Url,
 
     /// Username to send if the server requires authentication.
-    #[structopt(long)]
+    #[clap(long)]
     username: Option<String>,
 
     /// Password; requires username.
-    #[structopt(long, requires = "username")]
+    #[clap(long, requires = "username")]
     password: Option<String>,
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 enum Cmd {
     /// Gets info about available streams and exits.
     Info(info::Opts),
@@ -75,12 +75,12 @@ fn creds(
             password: password.unwrap_or_default(),
         }),
         (None, None) => None,
-        _ => unreachable!(), // structopt/clap enforce that password requires username.
+        _ => unreachable!(), // clap enforces that password requires username.
     }
 }
 
 async fn main_inner() -> Result<(), Error> {
-    let cmd = Cmd::from_args();
+    let cmd = Cmd::parse();
     match cmd {
         Cmd::Info(opts) => info::run(opts).await,
         Cmd::Mp4(opts) => mp4::run(opts).await,
