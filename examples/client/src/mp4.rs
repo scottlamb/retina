@@ -633,12 +633,12 @@ async fn copy<'a>(
                         let stream = &session.streams()[f.stream_id()];
                         let start_ctx = *f.start_ctx();
                         mp4.video(stream, f).await.with_context(
-                            || format!("Error processing video frame starting with {}", start_ctx))?;
+                            || format!("Error processing video frame starting with {start_ctx}"))?;
                     },
                     CodecItem::AudioFrame(f) => {
                         let ctx = *f.ctx();
                         mp4.audio(f).await.with_context(
-                            || format!("Error processing audio frame, {}", ctx))?;
+                            || format!("Error processing audio frame, {ctx}"))?;
                     },
                     CodecItem::Rtcp(rtcp) => {
                         if let (Some(t), Some(Ok(Some(sr)))) = (rtcp.rtp_timestamp(), rtcp.pkts().next().map(retina::rtcp::PacketRef::as_sender_report)) {

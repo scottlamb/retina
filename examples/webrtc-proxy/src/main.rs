@@ -174,7 +174,7 @@ async fn run() -> Result<(), Error> {
                 mime_type: "video/h264".to_owned(),
                 ..Default::default()
             },
-            format!("{}-video", i),
+            format!("{i}-video"),
             "retina-webrtc-proxy".to_owned(),
         ));
         let sender = downstream_conn

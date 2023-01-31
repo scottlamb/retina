@@ -34,7 +34,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     }
     if opts.print_streams {
         for (i, stream) in session.streams().iter().enumerate() {
-            println!("stream {}:\n{:#?}\n\n", i, stream);
+            println!("stream {i}:\n{stream:#?}\n\n");
         }
     }
     if !opts.print_sdp && !opts.print_streams {
