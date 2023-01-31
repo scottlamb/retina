@@ -205,11 +205,7 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
         },
         control
     ))
-    .map_err(|e| {
-        format!(
-            "unable to join base url {base_url} with control url {control:?}: {e}"
-        )
-    })
+    .map_err(|e| format!("unable to join base url {base_url} with control url {control:?}: {e}"))
 }
 
 /// Returns the `CSeq` from an RTSP response as a `u32`, or `None` if missing/unparseable.
@@ -663,8 +659,8 @@ pub(crate) fn parse_play(
                 .ok_or_else(|| "RTP-Info param has no =".to_string())?;
             match key {
                 "seq" => {
-                    let seq = u16::from_str_radix(value, 10)
-                        .map_err(|_| format!("bad seq {value:?}"))?;
+                    let seq =
+                        u16::from_str_radix(value, 10).map_err(|_| format!("bad seq {value:?}"))?;
                     state.initial_seq = Some(seq);
                 }
                 "rtptime" => match u32::from_str_radix(value, 10) {

@@ -737,9 +737,7 @@ impl Depacketizer {
                                 *conn_ctx,
                                 stream_ctx,
                                 agg,
-                                format!(
-                                    "aggregate timestamp {agg_timestamp} + {delta} overflows"
-                                ),
+                                format!("aggregate timestamp {agg_timestamp} + {delta} overflows"),
                             ))
                         }
                     },
