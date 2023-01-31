@@ -1,5 +1,6 @@
 ## unreleased
 
+*   minimum Rust version is now 1.64.
 *   remove obsolete workaround for GW security GW security GW4089IP's bad out-of-band parameters.
     Instead, we treat them as unparseable and ignore them as described in the
     `v0.4.2` notes below.
