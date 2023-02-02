@@ -1,6 +1,9 @@
-## unreleased
+## `v0.4.5` (2023-02-02)
 
 *   minimum Rust version is now 1.64.
+*   upgrade to `rtsp-types` 0.0.5, which ignores trailing whitespace in RTSP
+    headers. This fixes errors when communicating with some Longse cameras
+    ([#77](https://github.com/scottlamb/retina/pull/77)).
 *   remove obsolete workaround for GW security GW security GW4089IP's bad out-of-band parameters.
     Instead, we treat them as unparseable and ignore them as described in the
     `v0.4.2` notes below.

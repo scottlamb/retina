@@ -742,6 +742,26 @@ mod tests {
         })
     }
 
+    /// Longse cameras, for whatever reason, have trailing whitespace in their `CSeq` header lines.
+    ///
+    /// This test ensures this is correctly stripped. RTSP follows HTTP's lead for request/response
+    /// parsing (see [RFC 2326 section
+    /// 4.1](https://www.rfc-editor.org/rfc/rfc2326.html#page-19)), and HTTP [RFC
+    /// 9110 section 5.5](https://www.rfc-editor.org/rfc/rfc9110#name-field-values) says the following:
+    ///
+    /// > A field value does not include leading or trailing whitespace. When a
+    /// > specific version of HTTP allows such whitespace to appear in a message,
+    /// > a field parsing implementation MUST exclude such whitespace prior to
+    /// > evaluating the field value.
+    ///
+    /// Currently we rely on `rtsp-types` doing the stripping.
+    #[test]
+    fn longse_cseq() {
+        init_logging();
+        let response = response(include_bytes!("testdata/longse_unauthorized.txt"));
+        assert_eq!(super::get_cseq(&response), Some(1));
+    }
+
     #[test]
     fn anvpiz_sdp() {
         init_logging();
