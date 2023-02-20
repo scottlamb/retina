@@ -1041,10 +1041,10 @@ enum SessionFlag {
 
 impl RtspConnection {
     async fn connect(url: &Url) -> Result<Self, Error> {
-        let host =
+        let (host, use_tls) =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port)
+        let inner = crate::tokio::Connection::connect(host, port, use_tls)
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
@@ -1055,21 +1055,16 @@ impl RtspConnection {
         })
     }
 
-    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
+    fn validate_url(url: &Url) -> Result<(url::Host<&str>, bool), String> {
+        if url.scheme() != "rtsp" && url.scheme() != "rtsps" {
             return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
+                "Bad URL {}; only scheme rtsp[s] supported",
                 url.as_str()
             ));
         }
-        if url.username() != "" || url.password().is_some() {
-            // Url apparently doesn't even have a way to clear the credentials,
-            // so this has to be an error.
-            // TODO: that's not true; revisit this.
-            return Err("URL must not contain credentials".to_owned());
-        }
         url.host()
-            .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
+            .map(|h| (h, url.scheme() == "rtsps"))
+            .ok_or_else(|| format!("Must specify host in rtsp[s] url {}", &url))
     }
 
     /// Sends a request and expects an upcoming message from the peer to be its response.
@@ -1181,18 +1176,27 @@ impl RtspConnection {
                             .to_owned(),
                     })
                 }
-                let www_authenticate = www_authenticate.as_str();
-                *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
-                    Ok(c) => Some(c),
-                    Err(e) => bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status(),
-                        description: format!("Can't understand WWW-Authenticate header: {e}"),
-                    }),
-                };
+
+                //AB: This is a hack to work around some devices returning the realm attribute without a terminating double-quote
+                let mut www_authenticate = www_authenticate.as_str().trim().to_string();
+                if !www_authenticate.ends_with('"') {
+                    www_authenticate.push('"');
+                    warn!(
+                        "Added missing double-quote to WWW-Authenticate header: {www_authenticate}"
+                    );
+                }
+                *requested_auth =
+                    match http_auth::PasswordClient::try_from(www_authenticate.as_str()) {
+                        Ok(c) => Some(c),
+                        Err(e) => bail!(ErrorInt::RtspResponseError {
+                            conn_ctx: *self.inner.ctx(),
+                            msg_ctx,
+                            method: req.method().clone(),
+                            cseq,
+                            status: resp.status(),
+                            description: format!("Can't understand WWW-Authenticate header: {e}"),
+                        }),
+                    };
                 continue;
             } else if !resp.status().is_success() {
                 bail!(ErrorInt::RtspResponseError {

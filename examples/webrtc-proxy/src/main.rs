@@ -35,7 +35,7 @@ use webrtc::{
 /// URL and have everything work.
 #[derive(Parser)]
 struct Opts {
-    /// `rtsp://` URL to connect to.
+    /// `rtsp:// | rtsps://` URL to connect to.
     #[arg(long)]
     url: url::Url,
 
@@ -94,6 +94,11 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
 
 async fn run() -> Result<(), Error> {
     let opts = Opts::parse();
+
+    // Try to get credentials
+    // 1) From cli args --username --password
+    //      OR ELSE
+    // 2) From URL
     let creds = match (opts.username, opts.password) {
         (Some(username), password) => Some(retina::client::Credentials {
             username,
@@ -101,7 +106,23 @@ async fn run() -> Result<(), Error> {
         }),
         (None, None) => None,
         _ => unreachable!(), // structopt/clap enforce that password requires username.
-    };
+    }
+    .or_else(|| {
+        let creds_from_url = match (opts.url.username(), opts.url.password()) {
+            (user, pwd) if !user.is_empty() => Some(retina::client::Credentials {
+                username: user.to_owned(),
+                password: pwd.unwrap_or_default().into(),
+            }),
+            _ => None,
+        }
+        .map(|creds| {
+            log::debug!("using credentials from URL: {creds:?}");
+            creds
+        });
+
+        creds_from_url
+    });
+
     let stop_signal = tokio::signal::ctrl_c();
     tokio::pin!(stop_signal);
     let upstream_session_group = Arc::new(retina::client::SessionGroup::default());

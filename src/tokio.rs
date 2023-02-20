@@ -9,8 +9,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use rtsp_types::{Data, Message};
 use std::convert::TryFrom;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::rustls::{self, OwnedTrustAnchor};
+use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_util::codec::Framed;
 use url::Host;
 
@@ -18,44 +21,89 @@ use crate::{Error, ErrorInt, RtspMessageContext};
 
 use super::{ConnectionContext, ReceivedMessage, WallTime};
 
-/// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
-pub(crate) struct Connection(Framed<TcpStream, Codec>);
+/// A RTSP[S] connection which implements `Stream`, `Sink`, and `Unpin`.
+pub(crate) struct Connection(GenericFramed);
+
+enum GenericFramed {
+    Secure(Framed<TlsStream<TcpStream>, Codec>),
+    Insecure(Framed<TcpStream, Codec>),
+}
+
+impl std::ops::Deref for GenericFramed {
+    type Target = Codec;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            GenericFramed::Secure(f) => f.codec(),
+            GenericFramed::Insecure(f) => f.codec(),
+        }
+    }
+}
 
 impl Connection {
-    pub(crate) async fn connect(host: Host<&str>, port: u16) -> Result<Self, std::io::Error> {
-        let stream = match host {
-            Host::Domain(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv4(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv6(h) => TcpStream::connect((h, port)).await,
+    pub(crate) async fn connect(
+        host: Host<&str>,
+        port: u16,
+        use_tls: bool,
+    ) -> Result<Self, std::io::Error> {
+        let stream = match (use_tls, &host) {
+            //Domain supported in both tls and non-tls case
+            (_, Host::Domain(h)) => TcpStream::connect((*h, port)).await,
+            //Numeric IP only supported in non-tls case
+            (false, Host::Ipv4(h)) => TcpStream::connect((*h, port)).await,
+            (false, Host::Ipv6(h)) => TcpStream::connect((*h, port)).await,
+            (true, _) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Only FQDNs supported with tls",
+                ))
+            }
         }?;
-        Self::from_stream(stream)
-    }
 
-    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
-        let established_wall = WallTime::now();
-        let local_addr = stream.local_addr()?;
-        let peer_addr = stream.peer_addr()?;
-        Ok(Self(Framed::new(
-            stream,
-            Codec {
-                ctx: ConnectionContext {
-                    local_addr,
-                    peer_addr,
-                    established_wall,
+        if use_tls {
+            let mut root_cert_store = rustls::RootCertStore::empty();
+            root_cert_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(
+                |ta| {
+                    OwnedTrustAnchor::from_subject_spki_name_constraints(
+                        ta.subject,
+                        ta.spki,
+                        ta.name_constraints,
+                    )
                 },
-                read_pos: 0,
-            },
-        )))
+            ));
+            let config = rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+
+            let connector = TlsConnector::from(Arc::new(config));
+
+            let Host::Domain(domain) = host else {
+                unreachable!(); // checked above: Host::Domain is the only variant accpted when use_tls is true
+            };
+            let domain = rustls::ServerName::try_from(domain).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid dnsname")
+            })?;
+
+            let stream = connector.connect(domain, stream).await?;
+
+            Self::from_tls_stream(stream)
+        } else {
+            Self::from_stream(stream)
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
-        &self.0.codec().ctx
+        &self.0.ctx
     }
 
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
+        let remaining = match &self.0 {
+            GenericFramed::Secure(f) => f.read_buffer().remaining(),
+            GenericFramed::Insecure(f) => f.read_buffer().remaining(),
+        };
         RtspMessageContext {
-            pos: self.0.codec().read_pos
-                + u64::try_from(self.0.read_buffer().remaining()).expect("usize fits in u64"),
+            pos: self.0.read_pos + u64::try_from(remaining).expect("usize fits in u64"),
             received_wall: WallTime::now(),
             received: Instant::now(),
         }
@@ -68,6 +116,54 @@ impl Connection {
                 source,
             },
             CodecError::ParseError { .. } => unreachable!(),
+        }
+    }
+
+    pub(crate) fn from_tls_stream(stream: TlsStream<TcpStream>) -> Result<Self, std::io::Error> {
+        let established_wall = WallTime::now();
+        let local_addr = stream.get_ref().0.local_addr()?;
+        let peer_addr = stream.get_ref().0.peer_addr()?;
+        Ok(Self(GenericFramed::Secure(Framed::new(
+            stream,
+            Codec {
+                ctx: ConnectionContext {
+                    local_addr,
+                    peer_addr,
+                    established_wall,
+                },
+                read_pos: 0,
+            },
+        ))))
+    }
+
+    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
+        let established_wall = WallTime::now();
+        let local_addr = stream.local_addr()?;
+        let peer_addr = stream.peer_addr()?;
+
+        Ok(Self(GenericFramed::Insecure(Framed::new(
+            stream,
+            Codec {
+                ctx: ConnectionContext {
+                    local_addr,
+                    peer_addr,
+                    established_wall,
+                },
+                read_pos: 0,
+            },
+        ))))
+    }
+}
+impl Stream for GenericFramed {
+    type Item = Result<ReceivedMessage, CodecError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            GenericFramed::Secure(f) => f.poll_next_unpin(cx),
+            GenericFramed::Insecure(f) => f.poll_next_unpin(cx),
         }
     }
 }
@@ -100,6 +196,46 @@ impl Stream for Connection {
     }
 }
 
+impl Sink<Message<Bytes>> for GenericFramed {
+    type Error = CodecError;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            GenericFramed::Secure(f) => f.poll_ready_unpin(cx),
+            GenericFramed::Insecure(f) => f.poll_ready_unpin(cx),
+        }
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, item: Message<Bytes>) -> Result<(), Self::Error> {
+        match self.get_mut() {
+            GenericFramed::Secure(f) => f.start_send_unpin(item),
+            GenericFramed::Insecure(f) => f.start_send_unpin(item),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            GenericFramed::Secure(f) => f.poll_flush_unpin(cx),
+            GenericFramed::Insecure(f) => f.poll_flush_unpin(cx),
+        }
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.get_mut() {
+            GenericFramed::Secure(f) => f.poll_close_unpin(cx),
+            GenericFramed::Insecure(f) => f.poll_close_unpin(cx),
+        }
+    }
+}
 impl Sink<Message<Bytes>> for Connection {
     type Error = ErrorInt;
 
