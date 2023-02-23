@@ -494,7 +494,9 @@ pub enum Transport {
 
     /// Sends RTP packets over UDP (experimental).
     ///
-    /// This support is currently only suitable for a LAN for a couple reasons:
+    /// This support is
+    /// 1)  currently only for RTSP (i.e. insecure) and _NOT_ for RTSPS (i.e. TLS-secured)
+    /// 2)  currently only suitable for a LAN for a couple reasons:
     /// *   There's no reorder buffer, so out-of-order packets are all dropped.
     /// *   There's no support for sending RTCP RRs (receiver reports), so
     ///     servers won't have the correct information to measure packet loss
@@ -1039,12 +1041,22 @@ enum SessionFlag {
     GetParameterSupported = 0x10,
 }
 
+trait UrlExt {
+    fn use_tls(&self) -> bool;
+}
+
+impl UrlExt for Url {
+    fn use_tls(&self) -> bool {
+        self.scheme() == "rtsps"
+    }
+}
+
 impl RtspConnection {
     async fn connect(url: &Url) -> Result<Self, Error> {
-        let (host, use_tls) =
+        let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port, use_tls)
+        let inner = crate::tokio::Connection::connect(host, port, url.use_tls())
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
@@ -1055,7 +1067,7 @@ impl RtspConnection {
         })
     }
 
-    fn validate_url(url: &Url) -> Result<(url::Host<&str>, bool), String> {
+    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
         if url.scheme() != "rtsp" && url.scheme() != "rtsps" {
             return Err(format!(
                 "Bad URL {}; only scheme rtsp[s] supported",
@@ -1063,7 +1075,6 @@ impl RtspConnection {
             ));
         }
         url.host()
-            .map(|h| (h, url.scheme() == "rtsps"))
             .ok_or_else(|| format!("Must specify host in rtsp[s] url {}", &url))
     }
 
@@ -1413,6 +1424,13 @@ impl Session<Described> {
             .as_ref()
             .unwrap_or(&inner.presentation.control)
             .clone();
+
+        if url.use_tls() && matches!(options.transport, Transport::Udp(_)) {
+            bail!(ErrorInt::InvalidArgument(
+                "RTSPS currently only supported with TCP transport".into(),
+            ));
+        }
+
         let mut req =
             rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0).request_uri(url);
         let udp = match options.transport {
