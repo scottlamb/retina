@@ -505,6 +505,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    back_channel: bool,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -706,6 +707,11 @@ impl SessionOptions {
 
     pub fn unassigned_channel_data(mut self, policy: UnassignedChannelDataPolicy) -> Self {
         self.unassigned_channel_data = policy;
+        self
+    }
+
+    pub fn back_channel(mut self, back_channel: bool) -> Self {
+        self.back_channel = back_channel;
         self
     }
 
@@ -1498,8 +1504,12 @@ impl Session<Described> {
     ) -> Result<Self, Error> {
         let mut req = rtsp_types::Request::builder(Method::Describe, rtsp_types::Version::V1_0)
             .header(rtsp_types::headers::ACCEPT, "application/sdp")
-            .request_uri(url.clone())
-            .build(Bytes::new());
+            .request_uri(url.clone());
+        if options.back_channel{
+           req= req.header(rtsp_types::headers::REQUIRE, "www.onvif.org/ver20/backchannel");
+        }
+
+        let mut req = req.build(Bytes::new());
         let mut requested_auth = None;
         let (msg_ctx, cseq, response) = conn
             .send(
