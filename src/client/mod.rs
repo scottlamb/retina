@@ -4,6 +4,7 @@
 //! RTSP client: connect to a server via [`Session`].
 
 use std::convert::TryFrom;
+use std::io;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
@@ -2212,6 +2213,13 @@ impl Session<Playing> {
                         }
                     }
                 }
+                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
+                    // The packets sent by `punch_firewall_hole` can elicit a
+                    // 'destination unreachable' ICMP response from the server,
+                    // which gets turned into a 'connection refused' error. This
+                    // is not actually a problem so just ignore it.
+                    debug!("Ignoring UDP connection refused error");
+                }
                 Err(source) => {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
                         conn_ctx: *conn_ctx,
@@ -2244,6 +2252,10 @@ impl Session<Playing> {
                         Ok(None) => buf.clear(),
                         Err(e) => return Poll::Ready(Some(Err(e))),
                     }
+                }
+                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
+                    // See comment above
+                    debug!("Ignoring UDP connection refused error");
                 }
                 Err(source) => {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
