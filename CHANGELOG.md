@@ -1,3 +1,8 @@
+## unreleased
+
+*   add policy for handling session IDs. Required for some broken cameras which
+    can change the session ID between `SETUP` calls.
+
 ## `v0.4.5` (2023-02-02)
 
 *   minimum Rust version is now 1.64.

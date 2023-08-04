@@ -279,7 +279,7 @@ impl SessionGroup {
 /// Policy for when to send `TEARDOWN` requests.
 ///
 /// Specify via [`SessionOptions::teardown`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum TeardownPolicy {
     /// Automatic.
     ///
@@ -294,6 +294,7 @@ pub enum TeardownPolicy {
     ///     on the existing connection. This is just in case; some servers appear
     ///     to be buggy but don't advertise buggy versions. After the single attempt,
     ///     closes the TCP connection and considers the session done.
+    #[default]
     Auto,
 
     /// Always send `TEARDOWN` requests, regardless of transport.
@@ -304,12 +305,6 @@ pub enum TeardownPolicy {
 
     /// Never send `TEARDOWN` or track stale sessions.
     Never,
-}
-
-impl Default for TeardownPolicy {
-    fn default() -> Self {
-        TeardownPolicy::Auto
-    }
 }
 
 impl std::fmt::Display for TeardownPolicy {
@@ -340,10 +335,11 @@ impl std::str::FromStr for TeardownPolicy {
 /// Policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum InitialTimestampPolicy {
     /// Default policy: currently `Require` when playing multiple streams,
     /// `Ignore` otherwise.
+    #[default]
     Default,
 
     /// Require the `rtptime` parameter be present and use it to set NPT. Use
@@ -359,12 +355,6 @@ pub enum InitialTimestampPolicy {
     /// specified for all of them; otherwise assume the first received packet
     /// for each stream is at NPT 0.
     Permissive,
-}
-
-impl Default for InitialTimestampPolicy {
-    fn default() -> Self {
-        InitialTimestampPolicy::Default
-    }
 }
 
 impl std::fmt::Display for InitialTimestampPolicy {
@@ -414,6 +404,7 @@ pub struct SessionOptions {
     session_group: Option<Arc<SessionGroup>>,
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
+    session_id: SessionIdPolicy,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -478,6 +469,49 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
             _ => bail!(ErrorInt::InvalidArgument(format!(
                 "bad UnassignedChannelDataPolicy {s}; expected auto, assume-stale-session, error, \
                  or ignore"
+            ))),
+        })
+    }
+}
+
+/// Policy for handling the session ID returned by the server in response to
+/// `SETUP` requests.
+#[derive(Copy, Clone, Debug, Default)]
+pub enum SessionIdPolicy {
+    /// Default policy: currently `RequireMatch`.
+    #[default]
+    Default,
+
+    /// Requires the server to return the same session ID for all `SETUP`
+    /// requests in the session.
+    RequireMatch,
+
+    /// Uses the session ID returned from the first `SETUP` request and ignores
+    /// any subsequent changes. Required for some broken cameras.
+    UseFirst,
+}
+
+impl std::fmt::Display for SessionIdPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            SessionIdPolicy::Default => "default",
+            SessionIdPolicy::RequireMatch => "require-match",
+            SessionIdPolicy::UseFirst => "use-first",
+        })
+    }
+}
+
+impl std::str::FromStr for SessionIdPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "default" => SessionIdPolicy::Default,
+            "require-match" => SessionIdPolicy::RequireMatch,
+            "use-first" => SessionIdPolicy::UseFirst,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad SessionIdPolicy {s}; \
+                 expected default, require-match or use-first"
             ))),
         })
     }
@@ -572,6 +606,11 @@ impl SessionOptions {
 
     pub fn unassigned_channel_data(mut self, policy: UnassignedChannelDataPolicy) -> Self {
         self.unassigned_channel_data = policy;
+        self
+    }
+
+    pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
+        self.session_id = policy;
         self
     }
 }
@@ -1485,17 +1524,22 @@ impl Session<Described> {
         })?;
         match inner.session.as_ref() {
             Some(SessionHeader { id, .. }) if id.as_ref() != &*response.session.id => {
-                bail!(ErrorInt::RtspResponseError {
-                    conn_ctx: *conn.inner.ctx(),
-                    msg_ctx,
-                    method: rtsp_types::Method::Setup,
-                    cseq,
-                    status,
-                    description: format!(
-                        "session id changed from {:?} to {:?}",
-                        id, response.session.id,
-                    ),
-                });
+                match inner.options.session_id {
+                    SessionIdPolicy::UseFirst => (),
+                    _ => {
+                        bail!(ErrorInt::RtspResponseError {
+                            conn_ctx: *conn.inner.ctx(),
+                            msg_ctx,
+                            method: rtsp_types::Method::Setup,
+                            cseq,
+                            status,
+                            description: format!(
+                                "session id changed from {:?} to {:?}",
+                                id, response.session.id,
+                            ),
+                        });
+                    }
+                }
             }
             Some(_) => {}
             None => {
@@ -2864,6 +2908,83 @@ mod tests {
             .await
         },);
         let _session = session.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reject_session_id_change() {
+        session_id_change(SessionIdPolicy::RequireMatch, true).await
+    }
+
+    #[tokio::test]
+    async fn ignore_session_id_change() {
+        session_id_change(SessionIdPolicy::UseFirst, false).await
+    }
+
+    async fn session_id_change(policy: SessionIdPolicy, expect_error: bool) {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://127.0.0.1:554/camera").unwrap();
+        let group = Arc::new(SessionGroup::default());
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default()
+                    .session_group(group.clone())
+                    .session_id(policy),
+                url
+            ),
+            req_response(
+                &mut server,
+                rtsp_types::Method::Describe,
+                response(include_bytes!("testdata/h264dvr_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        assert_eq!(session.streams().len(), 2);
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session
+                    .setup(
+                        0,
+                        SetupOptions::default()
+                            .transport(Transport::Udp(UdpTransportOptions::default())),
+                    )
+                    .await
+                    .unwrap();
+            },
+            req_response(
+                &mut server,
+                rtsp_types::Method::Setup,
+                response(include_bytes!("testdata/h264dvr_setup_video.txt"))
+            ),
+        );
+
+        tokio::join!(
+            async {
+                let r = session
+                    .setup(
+                        1,
+                        SetupOptions::default()
+                            .transport(Transport::Udp(UdpTransportOptions::default())),
+                    )
+                    .await;
+                if expect_error {
+                    let e = r.unwrap_err();
+                    assert!(matches!(*e.0, ErrorInt::RtspResponseError { .. }));
+                } else {
+                    r.unwrap();
+                }
+            },
+            req_response(
+                &mut server,
+                rtsp_types::Method::Setup,
+                response(include_bytes!("testdata/h264dvr_setup_audio.txt"))
+            ),
+        );
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes
