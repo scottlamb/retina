@@ -279,7 +279,7 @@ impl SessionGroup {
 /// Policy for when to send `TEARDOWN` requests.
 ///
 /// Specify via [`SessionOptions::teardown`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum TeardownPolicy {
     /// Automatic.
     ///
@@ -294,6 +294,7 @@ pub enum TeardownPolicy {
     ///     on the existing connection. This is just in case; some servers appear
     ///     to be buggy but don't advertise buggy versions. After the single attempt,
     ///     closes the TCP connection and considers the session done.
+    #[default]
     Auto,
 
     /// Always send `TEARDOWN` requests, regardless of transport.
@@ -304,12 +305,6 @@ pub enum TeardownPolicy {
 
     /// Never send `TEARDOWN` or track stale sessions.
     Never,
-}
-
-impl Default for TeardownPolicy {
-    fn default() -> Self {
-        TeardownPolicy::Auto
-    }
 }
 
 impl std::fmt::Display for TeardownPolicy {
@@ -340,10 +335,11 @@ impl std::str::FromStr for TeardownPolicy {
 /// Policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub enum InitialTimestampPolicy {
     /// Default policy: currently `Require` when playing multiple streams,
     /// `Ignore` otherwise.
+    #[default]
     Default,
 
     /// Require the `rtptime` parameter be present and use it to set NPT. Use
@@ -359,12 +355,6 @@ pub enum InitialTimestampPolicy {
     /// specified for all of them; otherwise assume the first received packet
     /// for each stream is at NPT 0.
     Permissive,
-}
-
-impl Default for InitialTimestampPolicy {
-    fn default() -> Self {
-        InitialTimestampPolicy::Default
-    }
 }
 
 impl std::fmt::Display for InitialTimestampPolicy {
