@@ -1,5 +1,6 @@
 ## unreleased
 
+*   add default User-Agent header
 *   add policy for handling session IDs. Required for some broken cameras which
     can change the session ID between `SETUP` calls.
 *   ignore connection refused errors triggered by the firewall punch-through
