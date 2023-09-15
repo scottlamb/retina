@@ -454,6 +454,7 @@ impl Depacketizer {
                 format_specific_params,
             )?)),
             ("image", "jpeg") => DepacketizerInner::Jpeg(Box::new(jpeg::Depacketizer::new())),
+            ("video", "jpeg") => DepacketizerInner::Jpeg(Box::new(jpeg::Depacketizer::new())),
             ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
