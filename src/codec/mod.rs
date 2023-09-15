@@ -22,6 +22,8 @@ pub(crate) mod g723;
 #[doc(hidden)]
 pub mod h264;
 
+pub mod jpeg;
+
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
@@ -431,6 +433,7 @@ enum DepacketizerInner {
     G723(Box<g723::Depacketizer>),
     H264(Box<h264::Depacketizer>),
     Onvif(Box<onvif::Depacketizer>),
+    Jpeg(Box<jpeg::Depacketizer>),
 }
 
 impl Depacketizer {
@@ -450,6 +453,7 @@ impl Depacketizer {
                 clock_rate,
                 format_specific_params,
             )?)),
+            ("image", "jpeg") => DepacketizerInner::Jpeg(Box::new(jpeg::Depacketizer::new())),
             ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
@@ -520,6 +524,7 @@ impl Depacketizer {
             DepacketizerInner::H264(d) => d.parameters(),
             DepacketizerInner::Onvif(d) => d.parameters(),
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
+            DepacketizerInner::Jpeg(d) => d.parameters(),
         }
     }
 
@@ -535,6 +540,7 @@ impl Depacketizer {
             DepacketizerInner::H264(d) => d.push(input),
             DepacketizerInner::Onvif(d) => d.push(input),
             DepacketizerInner::SimpleAudio(d) => d.push(input),
+            DepacketizerInner::Jpeg(d) => d.push(input),
         }
     }
 
@@ -553,6 +559,7 @@ impl Depacketizer {
             DepacketizerInner::H264(d) => Ok(d.pull()),
             DepacketizerInner::Onvif(d) => Ok(d.pull()),
             DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
+            DepacketizerInner::Jpeg(d) => Ok(d.pull()),
         }
     }
 }
