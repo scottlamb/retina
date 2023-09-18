@@ -1,6 +1,5 @@
 use super::{VideoFrame, VideoParameters};
 use crate::rtp::ReceivedPacket;
-use bitstream_io::Numeric;
 use bytes::{Buf, Bytes};
 
 #[rustfmt::skip]
@@ -272,7 +271,6 @@ impl Depacketizer {
         let loss = pkt.loss();
         let stream_id = pkt.stream_id();
         let timestamp = pkt.timestamp();
-        log::debug!("Got packet with timestamp: {timestamp}");
 
         let last_packet_in_frame = pkt.mark();
 
@@ -285,18 +283,20 @@ impl Depacketizer {
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         // |      Type     |       Q       |     Width     |     Height    |
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        let frag_offset = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]); // TODO: verify
+        let frag_offset = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
         let type_specific = payload[4];
         let q = payload[5];
         let width = payload[6] as u16 * 8;
         let height = payload[7] as u16 * 8;
+
+        log::debug!("Got packet with frag_offset: {frag_offset}, type: {type_specific}, q: {q}, width: {width}, height: {height}");
 
         let length;
         let mut dri: u16 = 0;
         let mut precision;
         let mut qtable;
 
-        if frag_offset > 0 && !self.frame.is_empty() {
+        if frag_offset == 0 && !self.frame.is_empty() {
             self.frame.clear();
 
             return Ok(());
@@ -341,19 +341,22 @@ impl Depacketizer {
             length = (payload[2] as u16) << 8 | payload[3] as u16;
 
             if q == 255 && length == 0 {
+                log::debug!("Empty packet");
                 return Ok(());
             }
 
             payload.advance(4);
 
             if length as usize > payload.len() {
+                log::debug!("Length larger than payload");
                 return Ok(());
             }
 
             if length > 0 {
+                log::debug!("Setting qtable to payload");
                 qtable = Some(payload.clone());
             } else {
-                qtable = self.qtables.get(q as usize).and_then(|b| b.clone());
+                qtable = self.qtables[q as usize].clone();
             }
 
             payload.advance(length as usize);
@@ -367,10 +370,13 @@ impl Depacketizer {
             log::debug!("First packet, length: {length}");
 
             if length == 0 {
+                log::debug!("Length == 0");
                 if q < 128 {
                     qtable = self.qtables[q as usize].clone();
 
                     if qtable.is_none() {
+                        log::debug!("Making Q {q} table");
+
                         let table = Bytes::copy_from_slice(&make_tables(q));
                         self.qtables[q as usize].replace(table);
 
@@ -388,7 +394,7 @@ impl Depacketizer {
 
             match qtable {
                 Some(qtable) => {
-                    self.frame = Vec::with_capacity(1000);
+                    self.frame = Vec::with_capacity(1024);
 
                     make_headers(
                         &mut self.frame,
@@ -407,6 +413,7 @@ impl Depacketizer {
             }
         }
 
+        log::debug!("Adding {} bytes to frame", payload.len());
         self.frame.extend_from_slice(&payload);
 
         // Check if we have all pieces of our frame
@@ -421,6 +428,8 @@ impl Depacketizer {
             if end[0] != 0xff && end[1] != 0xd9 {
                 self.frame.extend_from_slice(&[0xff, 0xd9]);
             }
+
+            log::debug!("Got marker, setting frame to pending");
 
             self.pending = Some(VideoFrame {
                 start_ctx: ctx,
