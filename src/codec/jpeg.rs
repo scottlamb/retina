@@ -1,5 +1,5 @@
 use super::{VideoFrame, VideoParameters};
-use crate::{rtp::ReceivedPacket, PacketContext};
+use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
 use bytes::{Buf, Bytes};
 
 #[rustfmt::skip]
@@ -43,8 +43,7 @@ const JPEG_CHROMA_QUANTIZER: [i32; 8 * 8] = [
 ];
 
 /// Calculate luma and chroma quantizer tables based on the given quality factor.
-fn make_tables(q: u8) -> [u8; 128] {
-    let q = q as i32;
+fn make_tables(q: i32) -> [u8; 128] {
     let factor = q.clamp(1, 99);
     let q = if factor < 50 {
         5000 / factor
@@ -166,22 +165,28 @@ fn make_headers(
     image_type: u8,
     width: u16,
     height: u16,
-    mut qt: Bytes,
+    mut qtable: Bytes,
     precision: u8,
     dri: u16,
-) {
+) -> Result<(), String> {
     log::trace!("Making headers: {width}x{height}, precision {precision}, dri: {dri}");
 
     p.push(0xff);
     p.push(0xd8); // SOI
 
     let size = if (precision & 1) > 0 { 128 } else { 64 };
-    make_quant_header(p, &qt[..size], 0);
-    qt.advance(size);
+    if qtable.remaining() < size {
+        return Err("Qtable too small".to_string());
+    }
+    make_quant_header(p, &qtable[..size], 0);
+    qtable.advance(size);
 
     let size = if (precision & 2) > 0 { 128 } else { 64 };
-    make_quant_header(p, &qt[..size], 1);
-    qt.advance(size);
+    if qtable.remaining() < size {
+        return Err("Qtable too small".to_string());
+    }
+    make_quant_header(p, &qtable[..size], 1);
+    qtable.advance(size);
 
     if dri != 0 {
         make_dri_header(p, dri);
@@ -237,13 +242,16 @@ fn make_headers(
     p.push(0); // first DCT coeff
     p.push(63); // last DCT coeff
     p.push(0); // successive approx.
+
+    Ok(())
 }
 
 #[derive(Debug)]
 struct JpegFrame {
-    headers: Vec<u8>,
     data: Vec<u8>,
     start_ctx: PacketContext,
+    timestamp: Timestamp,
+    parameters: VideoParameters,
 }
 
 #[derive(Debug)]
@@ -259,13 +267,12 @@ impl Depacketizer {
         Depacketizer {
             frame: None,
             pending: None,
-            parameters: None,
             qtables: vec![None; 255],
+            parameters: None,
         }
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
-        // Push shouldn't be called until pull is exhausted.
         if let Some(p) = self.pending.as_ref() {
             panic!("push with data already pending: {p:?}");
         }
@@ -305,33 +312,7 @@ impl Depacketizer {
         let mut qtable;
 
         if frag_offset == 0 && self.frame.is_some() {
-            if let Some(mut frame) = self.frame.take() {
-                if frame.data.len() < 2 {
-                    return Ok(());
-                }
-
-                let end = &frame.data[frame.data.len() - 2..];
-
-                if end[0] != 0xff && end[1] != 0xd9 {
-                    frame.data.extend_from_slice(&[0xff, 0xd9]);
-                }
-
-                let mut complete_frame = std::mem::take(&mut frame.headers);
-                complete_frame.extend(std::mem::take(&mut frame.data));
-
-                self.pending = Some(VideoFrame {
-                    start_ctx: frame.start_ctx,
-                    end_ctx: ctx,
-                    has_new_parameters: false,
-                    loss,
-                    timestamp,
-                    stream_id,
-                    is_random_access_point: false,
-                    is_disposable: false,
-                    data: complete_frame,
-                });
-            }
-
+            let _ = self.frame.take();
             return Ok(());
         }
 
@@ -410,7 +391,7 @@ impl Depacketizer {
                     if qtable.is_none() {
                         log::trace!("Making Q {q} table");
 
-                        let table = Bytes::copy_from_slice(&make_tables(q));
+                        let table = Bytes::copy_from_slice(&make_tables(q as i32));
                         self.qtables[q as usize].replace(table);
 
                         qtable = self.qtables[q as usize].clone();
@@ -427,26 +408,29 @@ impl Depacketizer {
 
             match qtable {
                 Some(qtable) => {
-                    let mut headers = Vec::with_capacity(1024);
-
-                    if qtable.len() < 128 {
-                        return Ok(());
-                    }
+                    let mut data = Vec::with_capacity(1024);
 
                     make_headers(
-                        &mut headers,
+                        &mut data,
                         type_specific,
                         width,
                         height,
                         qtable,
                         precision,
                         dri,
-                    );
+                    )?;
 
                     self.frame.replace(JpegFrame {
-                        headers,
-                        data: Vec::new(),
+                        data,
                         start_ctx: ctx,
+                        timestamp,
+                        parameters: VideoParameters {
+                            pixel_dimensions: (width as u32, height as u32),
+                            rfc6381_codec: "".to_string(), // RFC 6381 is not applicable to MJPEG
+                            pixel_aspect_ratio: None,
+                            frame_rate: None,
+                            extra_data: Bytes::new(),
+                        },
                     });
                 }
                 None => {
@@ -460,21 +444,14 @@ impl Depacketizer {
             return Ok(());
         };
 
-        log::trace!("Adding {} bytes to frame", payload.len());
-
-        // TODO: add to proper location based on frag_offset
-
-        if frame.data.len() < frag_offset as usize + payload.len() {
-            frame.data.resize(frag_offset as usize + payload.len(), 0);
+        if frame.timestamp != timestamp {
+            log::trace!("Dropping due to invalid timestamp");
+            return Ok(());
         }
 
-        frame.data.as_mut_slice()[(frag_offset as usize)..(frag_offset as usize + payload.len())]
-            .copy_from_slice(&payload);
+        log::trace!("Adding {} bytes to frame", payload.len());
+        frame.data.extend_from_slice(&payload);
 
-        // frame.data.extend_from_slice(&payload);
-
-        // Check if we have all pieces of our frame
-        // This is a placeholder condition, replace with actual condition
         if last_packet_in_frame {
             if frame.data.len() < 2 {
                 return Ok(());
@@ -488,19 +465,23 @@ impl Depacketizer {
 
             log::trace!("Got marker, setting frame to pending");
 
-            let mut complete_frame = std::mem::take(&mut frame.headers);
-            complete_frame.extend(std::mem::take(&mut frame.data));
+            let has_new_parameters = match &self.parameters {
+                Some(old_parameters) => old_parameters != &frame.parameters,
+                None => false,
+            };
+
+            self.parameters.replace(frame.parameters.clone());
 
             self.pending = Some(VideoFrame {
                 start_ctx: frame.start_ctx,
                 end_ctx: ctx,
-                has_new_parameters: false,
+                has_new_parameters,
                 loss,
                 timestamp,
                 stream_id,
                 is_random_access_point: false,
                 is_disposable: false,
-                data: complete_frame,
+                data: std::mem::take(&mut frame.data),
             });
 
             let _ = self.frame.take();

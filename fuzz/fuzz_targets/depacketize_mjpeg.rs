@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 
 fuzz_target!(|data: &[u8]| {
     let mut data = data;
-    let mut depacketizer = retina::codec::Depacketizer::new(
-        "video", "jpeg", 90_000, None, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+    let mut depacketizer =
+        retina::codec::Depacketizer::new("video", "jpeg", 90_000, None, None).unwrap();
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
     let conn_ctx = retina::ConnectionContext::dummy();
