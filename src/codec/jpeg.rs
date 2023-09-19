@@ -1,3 +1,9 @@
+// Copyright (C) 2023 Niclas Olmenius
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+// RTP JPEG-compressed Video Depacketizer, RFC 2435
+// https://www.rfc-editor.org/rfc/rfc2435.txt
+
 use super::{VideoFrame, VideoParameters};
 use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
 use bytes::{Buf, Bytes};
