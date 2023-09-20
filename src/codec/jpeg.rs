@@ -331,11 +331,11 @@ impl Depacketizer {
         let mut precision;
         let mut qtable;
 
-        if frag_offset == 0 && self.metadata.is_some() {
+        if frag_offset > 0 && self.metadata.is_none() {
             let _ = self.metadata.take();
             self.data.clear();
 
-            return Err("Got new frame while frame is in progress".to_string());
+            return Err("Got JPEG fragment when we have no header".to_string());
         }
 
         payload.advance(8);
@@ -452,8 +452,10 @@ impl Depacketizer {
             return Err("Invalid RTP/JPEG packet. Missing start packet".to_string());
         };
 
-        if metadata.timestamp != timestamp {
-            return Err("RTP timestamps don't match".to_string());
+        if metadata.timestamp.timestamp != timestamp.timestamp {
+            // This seems to happen when you connect to certain cameras.
+            // We return Ok here instead of an error to not spam the log.
+            return Ok(());
         }
 
         self.data.extend_from_slice(&payload);
