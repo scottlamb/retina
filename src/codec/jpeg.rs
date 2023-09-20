@@ -181,8 +181,6 @@ fn make_headers(
     precision: u8,
     dri: u16,
 ) -> Result<(), String> {
-    log::trace!("Making headers: {width}x{height}, precision {precision}, dri: {dri}");
-
     p.push(0xff);
     p.push(0xd8); // SOI
 
@@ -304,15 +302,13 @@ impl Depacketizer {
         }
 
         if pkt.payload().len() < 8 {
-            return Ok(());
+            return Err("Too short RTP/JPEG packet".to_string());
         }
 
         let ctx = *pkt.ctx();
         let loss = pkt.loss();
-
         let stream_id = pkt.stream_id();
         let timestamp = pkt.timestamp();
-
         let last_packet_in_frame = pkt.mark();
 
         let mut payload = pkt.into_payload_bytes();
@@ -330,8 +326,6 @@ impl Depacketizer {
         let width = payload[6] as u16 * 8;
         let height = payload[7] as u16 * 8;
 
-        log::trace!("Got packet with frag_offset: {frag_offset}, type: {type_specific}, q: {q}, width: {width}, height: {height}");
-
         let length;
         let mut dri: u16 = 0;
         let mut precision;
@@ -339,18 +333,16 @@ impl Depacketizer {
 
         if frag_offset == 0 && self.metadata.is_some() {
             let _ = self.metadata.take();
-            return Ok(());
-        }
+            self.data.clear();
 
-        if width == 0 || height == 0 {
-            return Ok(());
+            return Err("Got new frame while frame is in progress".to_string());
         }
 
         payload.advance(8);
 
         if type_specific > 63 {
             if payload.remaining() < 4 {
-                return Ok(());
+                return Err("Too short RTP/JPEG packet".to_string());
             }
 
             //  0                   1                   2                   3
@@ -365,7 +357,7 @@ impl Depacketizer {
 
         if q >= 128 && frag_offset == 0 {
             if payload.len() < 4 {
-                return Ok(());
+                return Err("Too short RTP/JPEG packet".to_string());
             }
 
             //  0                   1                   2                   3
@@ -381,19 +373,19 @@ impl Depacketizer {
             length = (payload[2] as u16) << 8 | payload[3] as u16;
 
             if q == 255 && length == 0 {
-                log::trace!("Empty packet");
-                return Ok(());
+                return Err("Invalid RTP/JPEG packet. Quantization tables not found".to_string());
             }
 
             payload.advance(4);
 
             if length as usize > payload.len() {
-                log::trace!("Length larger than payload");
-                return Ok(());
+                return Err(format!(
+                    "Invalid RTP/JPEG packet. Length {length} larger than payload {}",
+                    payload.len()
+                ));
             }
 
             if length > 0 {
-                log::trace!("Setting qtable to payload");
                 qtable = Some(payload.clone());
             } else {
                 qtable = self.qtables[q as usize].clone();
@@ -407,28 +399,20 @@ impl Depacketizer {
         }
 
         if frag_offset == 0 {
-            log::trace!("First packet, length: {length}");
-
             if length == 0 {
-                log::trace!("Length == 0");
                 if q < 128 {
                     qtable = self.qtables[q as usize].clone();
 
                     if qtable.is_none() {
-                        log::trace!("Making Q {q} table");
-
                         let table = Bytes::copy_from_slice(&make_tables(q as i32));
                         self.qtables[q as usize].replace(table);
 
                         qtable = self.qtables[q as usize].clone();
-                    } else {
-                        log::trace!("Using cached qtable for Q {q}");
                     }
 
                     precision = 0;
                 } else if qtable.is_none() {
-                    log::warn!("No qtable");
-                    return Ok(());
+                    return Err("Invalid RTP/JPEG packet. Missing quantization tables".to_string());
                 }
             }
 
@@ -459,19 +443,17 @@ impl Depacketizer {
                     });
                 }
                 None => {
-                    log::warn!("No qtable");
-                    return Ok(());
+                    return Err("Invalid RTP/JPEG packet. Missing quantization tables".to_string());
                 }
             }
         }
 
         let Some(metadata) = &self.metadata else {
-            return Ok(());
+            return Err("Invalid RTP/JPEG packet. Missing start packet".to_string());
         };
 
         if metadata.timestamp != timestamp {
-            log::trace!("Dropping due to invalid timestamp");
-            return Ok(());
+            return Err("RTP timestamps don't match".to_string());
         }
 
         self.data.extend_from_slice(&payload);
