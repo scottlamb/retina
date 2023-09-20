@@ -1,12 +1,13 @@
 // Copyright (C) 2023 Niclas Olmenius
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// RTP JPEG-compressed Video Depacketizer, RFC 2435
-// https://www.rfc-editor.org/rfc/rfc2435.txt
+//! [JPEG](https://www.itu.int/rec/T-REC-T.81-199209-I/en)-encoded video.
+
+use bytes::{Buf, Bytes};
+
+use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
 
 use super::{VideoFrame, VideoParameters};
-use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
-use bytes::{Buf, Bytes};
 
 #[rustfmt::skip]
 const ZIGZAG : [usize; 64] = [
@@ -19,6 +20,9 @@ const ZIGZAG : [usize; 64] = [
     58, 59, 52, 45, 38, 31, 39, 46,
     53, 60, 61, 54, 47, 55, 62, 63
 ];
+
+// The following constants and functions are ported from the reference
+// C code in RFC 2435 Appendix A and B.
 
 // Appendix A. from RFC 2435
 
@@ -69,6 +73,8 @@ fn make_tables(q: i32) -> [u8; 128] {
 
     qtable
 }
+
+// End of Appendix A.
 
 // Appendix B. from RFC 2435
 
@@ -252,6 +258,8 @@ fn make_headers(
     Ok(())
 }
 
+// End of Appendix B.
+
 #[derive(Debug)]
 struct JpegFrame {
     data: Vec<u8>,
@@ -260,11 +268,19 @@ struct JpegFrame {
     parameters: VideoParameters,
 }
 
+/// A [super::Depacketizer] implementation which combines fragmented RTP/JPEG
+/// into complete image frames as specified in [RFC
+/// 2435](https://www.rfc-editor.org/rfc/rfc2435.txt).
 #[derive(Debug)]
 pub struct Depacketizer {
     frame: Option<JpegFrame>,
+
+    /// Cached quantization tables
     qtables: Vec<Option<Bytes>>,
+
+    /// A complete video frame ready for pull.
     pending: Option<VideoFrame>,
+
     parameters: Option<VideoParameters>,
 }
 

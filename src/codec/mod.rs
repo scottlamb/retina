@@ -18,11 +18,10 @@ use crate::StreamContext;
 
 pub(crate) mod aac;
 pub(crate) mod g723;
+pub(crate) mod jpeg;
 
 #[doc(hidden)]
 pub mod h264;
-
-pub mod jpeg;
 
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
