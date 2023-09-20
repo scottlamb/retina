@@ -9,6 +9,8 @@ use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
 
 use super::{VideoFrame, VideoParameters};
 
+const MAX_FRAME_LEN: usize = 2_000_000;
+
 #[rustfmt::skip]
 const ZIGZAG : [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10,
@@ -491,6 +493,11 @@ impl Depacketizer {
                     self.parameters = metadata.parameters;
                 }
             }
+        }
+
+        if self.data.len() > MAX_FRAME_LEN {
+            let _ = self.metadata.take();
+            self.data.clear();
         }
 
         Ok(())

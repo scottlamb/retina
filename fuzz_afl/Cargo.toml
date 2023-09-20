@@ -1,0 +1,20 @@
+[package]
+name = "retina-fuzz-afl"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+afl = "0.14"
+bytes = "1"
+
+[dependencies.retina]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "depacketize_jpeg"
+path = "src/depacketize_jpeg.rs"
