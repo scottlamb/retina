@@ -261,11 +261,10 @@ fn make_headers(
 // End of Appendix B.
 
 #[derive(Debug)]
-struct JpegFrame {
-    data: Vec<u8>,
+struct JpegFrameMetadata {
     start_ctx: PacketContext,
     timestamp: Timestamp,
-    parameters: VideoParameters,
+    parameters: Option<VideoParameters>,
 }
 
 /// A [super::Depacketizer] implementation which combines fragmented RTP/JPEG
@@ -273,9 +272,13 @@ struct JpegFrame {
 /// 2435](https://www.rfc-editor.org/rfc/rfc2435.txt).
 #[derive(Debug)]
 pub struct Depacketizer {
-    frame: Option<JpegFrame>,
+    /// Holds metadata for the current frame.
+    metadata: Option<JpegFrameMetadata>,
 
-    /// Cached quantization tables
+    /// Backing storage to the assembled frame.
+    data: Vec<u8>,
+
+    /// Cached quantization tables.
     qtables: Vec<Option<Bytes>>,
 
     /// A complete video frame ready for pull.
@@ -287,7 +290,8 @@ pub struct Depacketizer {
 impl Depacketizer {
     pub fn new() -> Self {
         Depacketizer {
-            frame: None,
+            metadata: None,
+            data: Vec::new(),
             pending: None,
             qtables: vec![None; 255],
             parameters: None,
@@ -333,8 +337,8 @@ impl Depacketizer {
         let mut precision;
         let mut qtable;
 
-        if frag_offset == 0 && self.frame.is_some() {
-            let _ = self.frame.take();
+        if frag_offset == 0 && self.metadata.is_some() {
+            let _ = self.metadata.take();
             return Ok(());
         }
 
@@ -430,10 +434,10 @@ impl Depacketizer {
 
             match qtable {
                 Some(qtable) => {
-                    let mut data = Vec::with_capacity(1024);
+                    self.data.clear();
 
                     make_headers(
-                        &mut data,
+                        &mut self.data,
                         type_specific,
                         width,
                         height,
@@ -442,17 +446,16 @@ impl Depacketizer {
                         dri,
                     )?;
 
-                    self.frame.replace(JpegFrame {
-                        data,
+                    self.metadata.replace(JpegFrameMetadata {
                         start_ctx: ctx,
                         timestamp,
-                        parameters: VideoParameters {
+                        parameters: Some(VideoParameters {
                             pixel_dimensions: (width as u32, height as u32),
                             rfc6381_codec: "".to_string(), // RFC 6381 is not applicable to MJPEG
                             pixel_aspect_ratio: None,
                             frame_rate: None,
                             extra_data: Bytes::new(),
-                        },
+                        }),
                     });
                 }
                 None => {
@@ -462,40 +465,32 @@ impl Depacketizer {
             }
         }
 
-        let Some(frame) = &mut self.frame else {
+        let Some(metadata) = &self.metadata else {
             return Ok(());
         };
 
-        if frame.timestamp != timestamp {
+        if metadata.timestamp != timestamp {
             log::trace!("Dropping due to invalid timestamp");
             return Ok(());
         }
 
-        log::trace!("Adding {} bytes to frame", payload.len());
-        frame.data.extend_from_slice(&payload);
+        self.data.extend_from_slice(&payload);
 
         if last_packet_in_frame {
-            if frame.data.len() < 2 {
+            if self.data.len() < 2 {
                 return Ok(());
             }
 
-            let end = &frame.data[frame.data.len() - 2..];
-
+            // Adding EOI marker if necessary.
+            let end = &self.data[self.data.len() - 2..];
             if end[0] != 0xff && end[1] != 0xd9 {
-                frame.data.extend_from_slice(&[0xff, 0xd9]);
+                self.data.extend_from_slice(&[0xff, 0xd9]);
             }
 
-            log::trace!("Got marker, setting frame to pending");
-
-            let has_new_parameters = match &self.parameters {
-                Some(old_parameters) => old_parameters != &frame.parameters,
-                None => false,
-            };
-
-            self.parameters.replace(frame.parameters.clone());
+            let has_new_parameters = self.parameters != metadata.parameters;
 
             self.pending = Some(VideoFrame {
-                start_ctx: frame.start_ctx,
+                start_ctx: metadata.start_ctx,
                 end_ctx: ctx,
                 has_new_parameters,
                 loss,
@@ -503,10 +498,15 @@ impl Depacketizer {
                 stream_id,
                 is_random_access_point: false,
                 is_disposable: false,
-                data: std::mem::take(&mut frame.data),
+                data: std::mem::take(&mut self.data),
             });
 
-            let _ = self.frame.take();
+            let metadata = self.metadata.take();
+            if let Some(metadata) = metadata {
+                if has_new_parameters {
+                    self.parameters = metadata.parameters;
+                }
+            }
         }
 
         Ok(())
