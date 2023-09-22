@@ -556,7 +556,6 @@ name = "retina-fuzz"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "lazy_static",
  "libfuzzer-sys",
  "retina",
 ]

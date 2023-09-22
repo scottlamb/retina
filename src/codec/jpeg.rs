@@ -496,7 +496,7 @@ impl Depacketizer {
         }
 
         if self.data.len() > MAX_FRAME_LEN {
-            let _ = self.metadata.take();
+            self.metadata = None;
             self.data.clear();
         }
 
