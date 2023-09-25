@@ -450,8 +450,9 @@ impl Depacketizer {
             }
         }
 
-        let Some(metadata) = &self.metadata else {
-            return Err("Invalid RTP/JPEG packet. Missing start packet".to_string());
+        let metadata = match &self.metadata {
+            Some(metadata) => metadata,
+            None => return Err("Invalid RTP/JPEG packet. Missing start packet".to_string()),
         };
 
         if metadata.timestamp.timestamp != timestamp.timestamp {
