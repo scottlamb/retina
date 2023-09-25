@@ -1,3 +1,6 @@
+// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use std::num::NonZeroU32;

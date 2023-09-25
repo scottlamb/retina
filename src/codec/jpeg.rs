@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Niclas Olmenius
+// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [JPEG](https://www.itu.int/rec/T-REC-T.81-199209-I/en)-encoded video.
