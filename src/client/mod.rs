@@ -724,7 +724,7 @@ impl PlayOptions {
         Self {
             initial_seq: match ignore_zero_seq {
                 true => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
-                false => InitialSequenceNumberPoliy::Respect,
+                false => InitialSequenceNumberPolicy::Respect,
             },
             ..self
         }
