@@ -1291,11 +1291,11 @@ impl RtspConnection {
             }
         };
 
+        let channel_id = data.channel_id();
         if live555 {
-            note_stale_live555_data(tool, options);
+            note_stale_live555_data(tool, options, self.inner.ctx(), channel_id, &msg_ctx);
         }
 
-        let channel_id = data.channel_id();
         let data = data.into_body();
         bail!(ErrorInt::RtspUnassignedChannelError {
             conn_ctx: *self.inner.ctx(),
@@ -1784,14 +1784,22 @@ impl Session<Described> {
 /// to a since-closed RTSP connection, as described in case 2 of "Stale sessions"
 /// at [`SessionGroup`]. If there's no known session which explains this,
 /// adds an unknown session with live555's default timeout.
-fn note_stale_live555_data(tool: Option<&Tool>, options: &SessionOptions) {
+fn note_stale_live555_data(
+    tool: Option<&Tool>,
+    options: &SessionOptions,
+    conn_ctx: &crate::ConnectionContext,
+    channel_id: u8,
+    msg_ctx: &RtspMessageContext,
+) {
     let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
     if !known_to_have_live555_tcp_bug {
         log::warn!(
-            "Saw unexpected RTSP packet. This is presumed to be due to a bug in old live555 \
-                    servers' TCP handling, though tool attribute {:?} does not refer to a \
-                    known-buggy version. Consider switching to UDP.",
-            tool
+            "saw unexpected RTSP packet at. This is presumed to be due to a bug in old
+             live555 servers' TCP handling, though tool attribute {tool:?} does not refer to a \
+             known-buggy version. Consider switching to UDP.\n\n\
+             conn: {conn_ctx:?}\n\
+             channel: {channel_id}\n\
+             msg: {msg_ctx:?}"
         );
     }
 
@@ -2133,6 +2141,7 @@ impl Session<Playing> {
                     inner.options,
                     stream_ctx,
                     inner.presentation.tool.as_ref(),
+                    conn.inner.ctx(),
                     &pkt_ctx,
                     timeline,
                     m.stream_i,
@@ -2195,6 +2204,7 @@ impl Session<Playing> {
                         inner.options,
                         stream_ctx,
                         inner.presentation.tool.as_ref(),
+                        conn_ctx,
                         &pkt_ctx,
                         timeline,
                         i,

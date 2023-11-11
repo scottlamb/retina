@@ -9,7 +9,10 @@ use log::debug;
 use crate::client::PacketItem;
 use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{RawPacket, ReceivedPacket};
-use crate::{ConnectionContext, Error, ErrorInt, PacketContext, StreamContext, StreamContextInner};
+use crate::{
+    ConnectionContext, Error, ErrorInt, PacketContext, PacketContextInner, StreamContext,
+    StreamContextInner,
+};
 
 use super::{SessionOptions, Timeline};
 
@@ -73,6 +76,28 @@ pub struct InorderParser {
     seen_rtcp_packets: u64,
 }
 
+fn note_stale_live555_data_if_tcp(
+    tool: Option<&super::Tool>,
+    session_options: &SessionOptions,
+    conn_ctx: &crate::ConnectionContext,
+    stream_ctx: &StreamContext,
+    pkt_ctx: &PacketContext,
+) {
+    if let (
+        StreamContext(StreamContextInner::Tcp(stream_ctx)),
+        PacketContext(PacketContextInner::Tcp { msg_ctx }),
+    ) = (stream_ctx, pkt_ctx)
+    {
+        super::note_stale_live555_data(
+            tool,
+            session_options,
+            conn_ctx,
+            stream_ctx.rtp_channel_id,
+            msg_ctx,
+        );
+    }
+}
+
 impl InorderParser {
     pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
         Self {
@@ -132,9 +157,7 @@ impl InorderParser {
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-            if matches!(stream_ctx.0, StreamContextInner::Udp(_)) {
-                super::note_stale_live555_data(tool, session_options);
-            }
+            note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
                 pkt_ctx: *pkt_ctx,
@@ -213,6 +236,7 @@ impl InorderParser {
         session_options: &SessionOptions,
         stream_ctx: &StreamContext,
         tool: Option<&super::Tool>,
+        conn_ctx: &ConnectionContext,
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
         stream_id: usize,
@@ -230,9 +254,13 @@ impl InorderParser {
 
             let ssrc = sr.ssrc();
             if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-                if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
-                    super::note_stale_live555_data(tool, session_options);
-                }
+                note_stale_live555_data_if_tcp(
+                    tool,
+                    session_options,
+                    conn_ctx,
+                    stream_ctx,
+                    pkt_ctx,
+                );
                 return Err(format!(
                     "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
                     self.ssrc, ssrc
