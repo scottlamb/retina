@@ -791,6 +791,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         bail!("Exiting because no video or audio stream was selected; see info log messages above");
     }
     let result = write_mp4(&opts, session, audio_stream.map(|(_i, p)| p), stop_signal).await;
+    if result.is_err() {
+        log::info!(
+            "writing MP4 failed; \
+                    details will be logged with `Fatal:` after RTSP session teardown"
+        );
+    }
 
     // Session has now been dropped, on success or failure. A TEARDOWN should
     // be pending if necessary. session_group.await_teardown() will wait for it.

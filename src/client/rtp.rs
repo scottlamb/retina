@@ -13,6 +13,35 @@ use crate::{ConnectionContext, Error, ErrorInt, PacketContext, StreamContext, St
 
 use super::{SessionOptions, Timeline};
 
+/// Describes how Retina formed its initial expectation for the stream's `ssrc` or `seq`.
+#[derive(Copy, Clone, Debug)]
+enum InitialExpectation {
+    PlayResponseHeader,
+    RtpPacket,
+    RtcpPacket,
+}
+
+#[derive(Copy, Clone)]
+struct Ssrc {
+    init: InitialExpectation,
+    ssrc: u32,
+}
+
+impl std::fmt::Debug for Ssrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("Ssrc")
+            .field("init", &self.init)
+            .field("ssrc", &format_args!("0x{:08x}", self.ssrc))
+            .finish()
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Seq {
+    init: InitialExpectation,
+    next: u16,
+}
+
 /// RTP/RTCP demarshaller which ensures packets have the correct SSRC and
 /// monotonically increasing SEQ. Unstable; exposed for benchmark.
 ///
@@ -34,23 +63,29 @@ use super::{SessionOptions, Timeline};
 #[doc(hidden)] // pub only for the benchmarks; not a stable API.
 #[derive(Debug)]
 pub struct InorderParser {
-    ssrc: Option<u32>,
-    next_seq: Option<u16>,
+    ssrc: Option<Ssrc>,
+    seq: Option<Seq>,
 
-    /// True iff `ssrc` was set from the beginning via a `RTP-Info` header.
-    initial_ssrc: bool,
+    /// Total RTP packets seen in this stream.
+    seen_rtp_packets: u64,
 
-    /// Total packets seen in this stream.
-    seen_packets: u64,
+    /// Total RTCP packets seen in this stream.
+    seen_rtcp_packets: u64,
 }
 
 impl InorderParser {
     pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
         Self {
-            ssrc,
-            next_seq,
-            initial_ssrc: ssrc.is_some(),
-            seen_packets: 0,
+            ssrc: ssrc.map(|ssrc| Ssrc {
+                init: InitialExpectation::PlayResponseHeader,
+                ssrc,
+            }),
+            seq: next_seq.map(|next| Seq {
+                init: InitialExpectation::PlayResponseHeader,
+                next,
+            }),
+            seen_rtp_packets: 0,
+            seen_rtcp_packets: 0,
         }
     }
 
@@ -73,8 +108,8 @@ impl InorderParser {
                 pkt_ctx: *pkt_ctx,
                 stream_id,
                 description: format!(
-                    "corrupt RTP header while expecting seq={:04x?}: {:?}\n{:#?}",
-                    &self.next_seq,
+                    "corrupt RTP header while expecting seq={:?}: {:?}\n{:#?}",
+                    &self.seq,
                     e.reason,
                     crate::hex::LimitedHex::new(&e.data[..], 64),
                 ),
@@ -94,8 +129,9 @@ impl InorderParser {
 
         let sequence_number = raw.sequence_number();
         let ssrc = raw.ssrc();
-        let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s != ssrc) {
+        let loss =
+            sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
+        if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
             if matches!(stream_ctx.0, StreamContextInner::Udp(_)) {
                 super::note_stale_live555_data(tool, session_options);
             }
@@ -107,10 +143,14 @@ impl InorderParser {
                 ssrc,
                 sequence_number,
                 description: format!(
-                    "Wrong ssrc after {} packets; expecting ssrc={:08x?} seq={:04x?} \
-                     (initial ssrc: {:?})",
-                    self.seen_packets, self.ssrc, self.next_seq, self.initial_ssrc,
+                    "wrong ssrc after {} RTP pkts + {} RTCP pkts; expecting ssrc={:?} seq={:?}",
+                    self.seen_rtp_packets, self.seen_rtcp_packets, self.ssrc, self.seq,
                 ),
+            });
+        } else if self.ssrc.is_none() {
+            self.ssrc = Some(Ssrc {
+                init: InitialExpectation::RtpPacket,
+                ssrc,
             });
         }
         if loss > 0x80_00 {
@@ -123,16 +163,16 @@ impl InorderParser {
                     ssrc,
                     sequence_number,
                     description: format!(
-                        "Out-of-order packet or large loss; expecting ssrc={:08x?} seq={:04x?}",
-                        self.ssrc, self.next_seq
+                        "Out-of-order packet or large loss; expecting ssrc={:08x?} seq={:?}",
+                        self.ssrc, self.seq
                     ),
                 });
             } else {
                 log::info!(
-                    "Skipping out-of-order seq={:04x} when expecting ssrc={:08x?} seq={:04x?}",
+                    "Skipping out-of-order seq={} when expecting ssrc={:08x?} seq={:?}",
                     sequence_number,
                     self.ssrc,
-                    self.next_seq,
+                    self.seq,
                 );
                 return Ok(None);
             }
@@ -149,9 +189,14 @@ impl InorderParser {
                 description,
             }),
         };
-        self.ssrc = Some(ssrc);
-        self.next_seq = Some(sequence_number.wrapping_add(1));
-        self.seen_packets += 1;
+        self.seq = Some(Seq {
+            init: self
+                .seq
+                .map(|s| s.init)
+                .unwrap_or(InitialExpectation::RtpPacket),
+            next: sequence_number.wrapping_add(1),
+        });
+        self.seen_rtp_packets += 1;
         Ok(Some(PacketItem::Rtp(ReceivedPacket {
             ctx: *pkt_ctx,
             stream_id,
@@ -184,7 +229,7 @@ impl InorderParser {
             )?);
 
             let ssrc = sr.ssrc();
-            if matches!(self.ssrc, Some(s) if s != ssrc) {
+            if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
                 if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
                     super::note_stale_live555_data(tool, session_options);
                 }
@@ -192,9 +237,14 @@ impl InorderParser {
                     "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
                     self.ssrc, ssrc
                 ));
+            } else if self.ssrc.is_none() {
+                self.ssrc = Some(Ssrc {
+                    init: InitialExpectation::RtcpPacket,
+                    ssrc: ssrc,
+                });
             }
-            self.ssrc = Some(ssrc);
         }
+        self.seen_rtcp_packets += 1;
         Ok(Some(PacketItem::Rtcp(ReceivedCompoundPacket {
             ctx: *pkt_ctx,
             stream_id,

@@ -4,6 +4,7 @@
     can change the session ID between `SETUP` calls.
 *   ignore connection refused errors triggered by the firewall punch-through
     packets.
+*   improve several vague or misleading log messages.
 
 ## `v0.4.5` (2023-02-02)
 
