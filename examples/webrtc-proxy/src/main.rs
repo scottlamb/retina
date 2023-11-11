@@ -207,7 +207,7 @@ async fn run() -> Result<(), Error> {
     }
 
     let mut upstream_session = upstream_session
-        .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
+        .play(retina::client::PlayOptions::default())
         .await?
         .demuxed()?;
 

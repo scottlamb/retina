@@ -333,7 +333,7 @@ impl std::str::FromStr for TeardownPolicy {
     }
 }
 
-/// Policy for handling the `rtptime` parameter normally seem in the `RTP-Info` header.
+/// Policy for handling the `rtptime` parameter normally seen in the `RTP-Info` header.
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
 #[derive(Copy, Clone, Debug, Default)]
@@ -381,6 +381,59 @@ impl std::str::FromStr for InitialTimestampPolicy {
             _ => bail!(ErrorInt::InvalidArgument(format!(
                 "bad InitialTimestampPolicy {s}; \
                  expected default, require, ignore or permissive"
+            ))),
+        })
+    }
+}
+
+/// Policy for handling the `seq` parameter normally seen in the `RTP-Info` header.
+#[derive(Copy, Clone, Debug, Default)]
+#[non_exhaustive]
+pub enum InitialSequenceNumberPolicy {
+    /// Default policy: currently same as `IgnoreSuspiciousValues`.
+    #[default]
+    Default,
+
+    /// Always respect the value in the header if present.
+    Respect,
+
+    /// Ignore `0` and `1` values, which we consider "suspicious".
+    ///
+    /// Some cameras appear to send these fixed values then a completely
+    /// different sequence number in the first RTP packet.
+    ///
+    /// *   The Hikvision DS-2CD2032-I appears to always send `seq=0` on its
+    ///     metadata stream.
+    /// *   The Tapo C320WS appears to always send `seq=1` in all streams.
+    IgnoreSuspiciousValues,
+
+    /// Always ignore, starting the sequence number from observed RTP packets.
+    Ignore,
+}
+
+impl std::fmt::Display for InitialSequenceNumberPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            InitialSequenceNumberPolicy::Default => "default",
+            InitialSequenceNumberPolicy::Respect => "respect",
+            InitialSequenceNumberPolicy::IgnoreSuspiciousValues => "ignore-suspicious-values",
+            InitialSequenceNumberPolicy::Ignore => "ignore",
+        })
+    }
+}
+
+impl std::str::FromStr for InitialSequenceNumberPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "default" => InitialSequenceNumberPolicy::Default,
+            "respect" => InitialSequenceNumberPolicy::Respect,
+            "ignore-suspicious-values" => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
+            "ignore" => InitialSequenceNumberPolicy::Ignore,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad InitialSequenceNumberPolicy {s}; \
+                 expected default, respect, ignore-suspicious-values, or ignore"
             ))),
         })
     }
@@ -641,7 +694,7 @@ impl SetupOptions {
 #[derive(Default)]
 pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
-    ignore_zero_seq: bool,
+    initial_seq: InitialSequenceNumberPolicy,
     enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
 }
 
@@ -654,14 +707,25 @@ impl PlayOptions {
         }
     }
 
-    /// If the `RTP-Time` specifies `seq=0`, ignore it.
+    pub fn initial_seq(self, initial_seq: InitialSequenceNumberPolicy) -> Self {
+        Self {
+            initial_seq,
+            ..self
+        }
+    }
+
+    /// If the `RTP-Time` specifies `seq=0` or `seq=1`, ignore it.
     ///
-    /// Some cameras set this value then start the stream with something
-    /// dramatically different. (Eg the Hikvision DS-2CD2032-I on its metadata
-    /// stream; the other streams are fine.)
+    /// `ignore_zero_seq(true)` is an outdated spelling of
+    /// `initial_seq(InitialSequenceNumberPolicy::IgnoreSuspiciousValues)`,
+    /// which is currently the default anyway.
+    #[deprecated]
     pub fn ignore_zero_seq(self, ignore_zero_seq: bool) -> Self {
         Self {
-            ignore_zero_seq,
+            initial_seq: match ignore_zero_seq {
+                true => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
+                false => InitialSequenceNumberPoliy::Respect,
+            },
             ..self
         }
     }
@@ -1740,12 +1804,29 @@ impl Session<Described> {
                         }
                         _ => None,
                     };
-                    let initial_seq = match initial_seq {
-                        Some(0) if policy.ignore_zero_seq => {
-                            log::info!("Ignoring seq=0 on stream {}", i);
+                    let initial_seq = match (initial_seq, policy.initial_seq) {
+                        (Some(seq), InitialSequenceNumberPolicy::Ignore)
+                        | (
+                            Some(seq @ 0 | seq @ 1),
+                            InitialSequenceNumberPolicy::Default
+                            | InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
+                        ) => {
+                            log::info!(
+                                "ignoring PLAY seq={} on stream {} due to policy {:?}",
+                                seq,
+                                i,
+                                policy.initial_seq
+                            );
                             None
                         }
-                        o => o,
+                        (Some(seq), _) => {
+                            log::debug!("setting PLAY seq={} on stream {}", seq, i);
+                            Some(seq)
+                        }
+                        (None, _) => {
+                            log::debug!("no PLAY seq on stream {}", i);
+                            None
+                        }
                     };
                     let conn_ctx = conn.inner.ctx();
                     s.state = StreamState::Playing {

@@ -6,6 +6,9 @@
     packets.
 *   improve several vague or misleading log messages.
 *   fix inverted logic in live555 bug detection, introduced with `v0.3.10`.
+*   ignore `seq=0` and `seq=1` in `PLAY` response's `RTP-Info` header by default.
+    These values are known to be set erroneously by the Hikvision DS-2CD2032-I
+    and Tapo C320WS, respectively.
 
 ## `v0.4.5` (2023-02-02)
 

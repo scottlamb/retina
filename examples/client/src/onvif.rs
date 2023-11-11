@@ -50,7 +50,7 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
         .setup(onvif_stream_i, SetupOptions::default())
         .await?;
     let mut session = session
-        .play(retina::client::PlayOptions::default().ignore_zero_seq(true))
+        .play(retina::client::PlayOptions::default())
         .await?
         .demuxed()?;
 
