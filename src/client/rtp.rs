@@ -268,7 +268,7 @@ impl InorderParser {
             } else if self.ssrc.is_none() {
                 self.ssrc = Some(Ssrc {
                     init: InitialExpectation::RtcpPacket,
-                    ssrc: ssrc,
+                    ssrc,
                 });
             }
         }
