@@ -1331,12 +1331,19 @@ impl RtspConnection {
             req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
         }
         req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());
-        if let Some(ref u) = options.user_agent {
-            req.insert_header(rtsp_types::headers::USER_AGENT, u.to_string());
-        }
+
+        let user_agent = if let Some(ref u) = options.user_agent {
+            u
+        } else {
+            DEFAULT_USER_AGENT
+        };
+        req.insert_header(rtsp_types::headers::USER_AGENT, user_agent.to_string());
+
         Ok(cseq)
     }
 }
+
+const DEFAULT_USER_AGENT: &str = concat!("retina_", env!("CARGO_PKG_VERSION"));
 
 impl<S: State> Session<S> {
     /// Returns the available streams as described by the server.
