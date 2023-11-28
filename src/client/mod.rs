@@ -439,6 +439,52 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
     }
 }
 
+/// Policy for handling unknown `ssrc` value in RTCP messages.
+#[derive(Copy, Clone, Debug, Default)]
+#[non_exhaustive]
+pub enum UnknownRtcpSsrcPolicy {
+    /// Default policy: currently same as `AbortSession`.
+    #[default]
+    Default,
+
+    /// Abort the session on encountering an unknown `ssrc`.
+    AbortSession,
+
+    /// Drop RTCP packets with an unknown `ssrc`.
+    DropPackets,
+
+    /// Process the packets as if they had the expected `ssrc`.
+    ProcessPackets,
+}
+
+impl std::fmt::Display for UnknownRtcpSsrcPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            UnknownRtcpSsrcPolicy::Default => "default",
+            UnknownRtcpSsrcPolicy::AbortSession => "abort-session",
+            UnknownRtcpSsrcPolicy::DropPackets => "drop-packets",
+            UnknownRtcpSsrcPolicy::ProcessPackets => "process-packets",
+        })
+    }
+}
+
+impl std::str::FromStr for UnknownRtcpSsrcPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "default" => UnknownRtcpSsrcPolicy::Default,
+            "abort-session" => UnknownRtcpSsrcPolicy::AbortSession,
+            "drop-packets" => UnknownRtcpSsrcPolicy::DropPackets,
+            "process-packets" => UnknownRtcpSsrcPolicy::ProcessPackets,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad UnknownRtcpSsrcPolicy {s}; \
+                 expected default, abort-session, drop-packets, or process-packets"
+            ))),
+        })
+    }
+}
+
 /// Returns an appropriate keepalive interval for `session`.
 ///
 /// This generally uses half the session timeout. However, it's capped in case
@@ -696,6 +742,7 @@ pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
     initial_seq: InitialSequenceNumberPolicy,
     enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
+    unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy,
 }
 
 impl PlayOptions {
@@ -710,6 +757,13 @@ impl PlayOptions {
     pub fn initial_seq(self, initial_seq: InitialSequenceNumberPolicy) -> Self {
         Self {
             initial_seq,
+            ..self
+        }
+    }
+
+    pub fn unknown_rtcp_ssrc(self, unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy) -> Self {
+        Self {
+            unknown_rtcp_ssrc,
             ..self
         }
     }
@@ -1845,7 +1899,11 @@ impl Session<Described> {
                                 description,
                             })
                         })?,
-                        rtp_handler: rtp::InorderParser::new(ssrc, initial_seq),
+                        rtp_handler: rtp::InorderParser::new(
+                            ssrc,
+                            initial_seq,
+                            policy.unknown_rtcp_ssrc,
+                        ),
                         ctx,
                         udp_sockets,
                     };
@@ -1875,7 +1933,7 @@ fn note_stale_live555_data(
     let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
     if !known_to_have_live555_tcp_bug {
         log::warn!(
-            "saw unexpected RTSP packet at. This is presumed to be due to a bug in old
+            "saw unexpected RTSP packet. This is presumed to be due to a bug in old
              live555 servers' TCP handling, though tool attribute {tool:?} does not refer to a \
              known-buggy version. Consider switching to UDP.\n\n\
              conn: {conn_ctx:?}\n\

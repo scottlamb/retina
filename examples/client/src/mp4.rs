@@ -46,6 +46,10 @@ pub struct Opts {
     #[arg(default_value_t, long)]
     initial_timestamp: retina::client::InitialTimestampPolicy,
 
+    /// Policy for handling unknown ssrcs in RTCP packets.
+    #[arg(default_value_t, long)]
+    unknown_rtcp_ssrc: retina::client::UnknownRtcpSsrcPolicy,
+
     /// Don't attempt to include video streams.
     #[arg(long)]
     no_video: bool,
@@ -672,7 +676,8 @@ async fn write_mp4(
         .play(
             retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
+                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap())
+                .unknown_rtcp_ssrc(opts.unknown_rtcp_ssrc),
         )
         .await?
         .demuxed()?;

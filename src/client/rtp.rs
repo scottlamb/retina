@@ -4,7 +4,7 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::Bytes;
-use log::debug;
+use log::{debug, warn};
 
 use crate::client::PacketItem;
 use crate::rtcp::ReceivedCompoundPacket;
@@ -14,7 +14,7 @@ use crate::{
     StreamContextInner,
 };
 
-use super::{SessionOptions, Timeline};
+use super::{SessionOptions, Timeline, UnknownRtcpSsrcPolicy};
 
 /// Describes how Retina formed its initial expectation for the stream's `ssrc` or `seq`.
 #[derive(Copy, Clone, Debug)]
@@ -74,6 +74,9 @@ pub struct InorderParser {
 
     /// Total RTCP packets seen in this stream.
     seen_rtcp_packets: u64,
+
+    unknown_rtcp_session: UnknownRtcpSsrcPolicy,
+    seen_unknown_rtcp_session: bool,
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -99,7 +102,11 @@ fn note_stale_live555_data_if_tcp(
 }
 
 impl InorderParser {
-    pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
+    pub fn new(
+        ssrc: Option<u32>,
+        next_seq: Option<u16>,
+        unknown_rtcp_session: UnknownRtcpSsrcPolicy,
+    ) -> Self {
         Self {
             ssrc: ssrc.map(|ssrc| Ssrc {
                 init: InitialExpectation::PlayResponseHeader,
@@ -111,6 +118,8 @@ impl InorderParser {
             }),
             seen_rtp_packets: 0,
             seen_rtcp_packets: 0,
+            unknown_rtcp_session,
+            seen_unknown_rtcp_session: false,
         }
     }
 
@@ -254,18 +263,38 @@ impl InorderParser {
 
             let ssrc = sr.ssrc();
             if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-                note_stale_live555_data_if_tcp(
-                    tool,
-                    session_options,
-                    conn_ctx,
-                    stream_ctx,
-                    pkt_ctx,
-                );
-                return Err(format!(
-                    "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
-                    self.ssrc, ssrc
-                ));
-            } else if self.ssrc.is_none() {
+                match self.unknown_rtcp_session {
+                    UnknownRtcpSsrcPolicy::Default | UnknownRtcpSsrcPolicy::AbortSession => {
+                        note_stale_live555_data_if_tcp(
+                            tool,
+                            session_options,
+                            conn_ctx,
+                            stream_ctx,
+                            pkt_ctx,
+                        );
+                        return Err(format!(
+                            "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                            self.ssrc, ssrc
+                        ));
+                    }
+                    UnknownRtcpSsrcPolicy::DropPackets => {
+                        if !self.seen_unknown_rtcp_session {
+                            warn!(
+                                "saw unknown rtcp ssrc {ssrc}; rtp session has ssrc {s:?}",
+                                s = self.ssrc
+                            );
+                            self.seen_unknown_rtcp_session = true;
+                        }
+                        return Ok(None);
+                    }
+                    UnknownRtcpSsrcPolicy::ProcessPackets => {}
+                }
+            } else if self.ssrc.is_none()
+                && !matches!(
+                    self.unknown_rtcp_session,
+                    UnknownRtcpSsrcPolicy::ProcessPackets
+                )
+            {
                 self.ssrc = Some(Ssrc {
                     init: InitialExpectation::RtcpPacket,
                     ssrc,
@@ -297,7 +326,7 @@ mod tests {
     #[test]
     fn geovision_pt50_packet() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None);
+        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
         let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
@@ -352,7 +381,7 @@ mod tests {
     #[test]
     fn out_of_order() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None);
+        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
         let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
             local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),

@@ -24,8 +24,16 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
         Timeline::new(Some(0), 90_000, None).unwrap(),
     ];
     let mut rtps = [
-        InorderParser::new(None, Some(1)),
-        InorderParser::new(None, Some(1)),
+        InorderParser::new(
+            None,
+            Some(1),
+            retina::client::UnknownRtcpSsrcPolicy::Default,
+        ),
+        InorderParser::new(
+            None,
+            Some(1),
+            retina::client::UnknownRtcpSsrcPolicy::Default,
+        ),
     ];
     let mut depacketizers = [
         Depacketizer::new("audio", "mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap(),
