@@ -328,10 +328,7 @@ impl Depacketizer {
         let width = payload[6] as u16 * 8;
         let height = payload[7] as u16 * 8;
 
-        let length;
         let mut dri: u16 = 0;
-        let mut precision;
-        let mut qtable;
 
         if frag_offset > 0 && self.metadata.is_none() {
             let _ = self.metadata.take();
@@ -357,65 +354,58 @@ impl Depacketizer {
             payload.advance(4);
         }
 
-        if q >= 128 && frag_offset == 0 {
-            if payload.len() < 4 {
-                return Err("Too short RTP/JPEG packet".to_string());
-            }
-
-            //  0                   1                   2                   3
-            //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            // |      MBZ      |   Precision   |             Length            |
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            // |                    Quantization Table Data                    |
-            // |                              ...                              |
-            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-            precision = payload[1];
-            length = (payload[2] as u16) << 8 | payload[3] as u16;
-
-            if q == 255 && length == 0 {
-                return Err("Invalid RTP/JPEG packet. Quantization tables not found".to_string());
-            }
-
-            payload.advance(4);
-
-            if length as usize > payload.len() {
-                return Err(format!(
-                    "Invalid RTP/JPEG packet. Length {length} larger than payload {}",
-                    payload.len()
-                ));
-            }
-
-            if length > 0 {
-                qtable = Some(payload.clone());
-            } else {
-                qtable = self.qtables[q as usize].clone();
-            }
-
-            payload.advance(length as usize);
-        } else {
-            length = 0;
-            qtable = None;
-            precision = 0;
-        }
-
         if frag_offset == 0 {
-            if length == 0 {
-                if q < 128 {
-                    qtable = self.qtables[q as usize].clone();
+            let precision;
+            let qtable;
 
-                    if qtable.is_none() {
-                        let table = Bytes::copy_from_slice(&make_tables(q as i32));
-                        self.qtables[q as usize].replace(table);
-
-                        qtable = self.qtables[q as usize].clone();
-                    }
-
-                    precision = 0;
-                } else if qtable.is_none() {
-                    return Err("Invalid RTP/JPEG packet. Missing quantization tables".to_string());
+            if q >= 128 {
+                if payload.len() < 4 {
+                    return Err("Too short RTP/JPEG packet".to_string());
                 }
+
+                //  0                   1                   2                   3
+                //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                // |      MBZ      |   Precision   |             Length            |
+                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                // |                    Quantization Table Data                    |
+                // |                              ...                              |
+                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+                precision = payload[1];
+                let length = (payload[2] as u16) << 8 | payload[3] as u16;
+
+                if q == 255 && length == 0 {
+                    return Err(
+                        "Invalid RTP/JPEG packet. Quantization tables not found".to_string()
+                    );
+                }
+
+                payload.advance(4);
+
+                if length as usize > payload.len() {
+                    return Err(format!(
+                        "Invalid RTP/JPEG packet. Length {length} larger than payload {}",
+                        payload.len()
+                    ));
+                }
+
+                if length > 0 {
+                    qtable = Some(payload.clone());
+                } else {
+                    qtable = self.qtables[q as usize].clone();
+                }
+
+                payload.advance(length as usize);
+            } else {
+                qtable = self.qtables[q as usize].clone().or_else(|| {
+                    let table = Bytes::copy_from_slice(&make_tables(q as i32));
+                    self.qtables[q as usize].replace(table);
+
+                    self.qtables[q as usize].clone()
+                });
+
+                precision = 0;
             }
 
             match qtable {
