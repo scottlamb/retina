@@ -375,12 +375,6 @@ impl Depacketizer {
                 precision = payload[1];
                 let length = (payload[2] as u16) << 8 | payload[3] as u16;
 
-                if q == 255 && length == 0 {
-                    return Err(
-                        "Invalid RTP/JPEG packet. Quantization tables not found".to_string()
-                    );
-                }
-
                 payload.advance(4);
 
                 if length as usize > payload.len() {
@@ -390,10 +384,20 @@ impl Depacketizer {
                     ));
                 }
 
-                if length > 0 {
-                    qtable = Some(payload.clone());
-                } else {
+                if length == 0 {
+                    // RFC 2435 section 3.1.8:
+                    // "A Q value of 255 denotes that the quantization table mapping is dynamic and can change on every frame.
+                    // Decoders MUST NOT depend on any previous version of the tables, and need to reload these tables on every frame.
+                    // Packets MUST NOT contain Q = 255 and Length = 0."
+                    if q == 255 {
+                        return Err(
+                            "Invalid RTP/JPEG packet. Quantization tables not found".to_string()
+                        );
+                    }
+
                     qtable = self.qtables[q as usize].clone();
+                } else {
+                    qtable = Some(payload.clone());
                 }
 
                 payload.advance(length as usize);
