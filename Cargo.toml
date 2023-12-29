@@ -36,6 +36,8 @@ time = "0.1.43"
 tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
+tokio-rustls = "0"
+webpki-roots = "0.22"
 
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["async_tokio"] }
