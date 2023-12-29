@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.6` (2023-12-29)
 
 *   add default User-Agent header
 *   add policy for handling session IDs. Required for some broken cameras which
