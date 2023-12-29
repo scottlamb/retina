@@ -10,6 +10,9 @@
 *   ignore `seq=0` and `seq=1` in `PLAY` response's `RTP-Info` header by default.
     These values are known to be set erroneously by the Hikvision DS-2CD2032-I
     and Tapo C320WS, respectively.
+*   customizable behavior for RTCP packets with unknown ssrcs, now defaulting to
+    ignoring them. This also is necessary to interoperate with the Tapo C320WS.
+*   improve some incorrect, misleading, and/or uninformative logging.
 
 ## `v0.4.5` (2023-02-02)
 

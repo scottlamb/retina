@@ -443,7 +443,7 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
 #[derive(Copy, Clone, Debug, Default)]
 #[non_exhaustive]
 pub enum UnknownRtcpSsrcPolicy {
-    /// Default policy: currently same as `AbortSession`.
+    /// Default policy: currently same as `DropPackets`.
     #[default]
     Default,
 

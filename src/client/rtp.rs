@@ -264,7 +264,7 @@ impl InorderParser {
             let ssrc = sr.ssrc();
             if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
                 match self.unknown_rtcp_session {
-                    UnknownRtcpSsrcPolicy::Default | UnknownRtcpSsrcPolicy::AbortSession => {
+                    UnknownRtcpSsrcPolicy::AbortSession => {
                         note_stale_live555_data_if_tcp(
                             tool,
                             session_options,
@@ -277,7 +277,7 @@ impl InorderParser {
                             self.ssrc, ssrc
                         ));
                     }
-                    UnknownRtcpSsrcPolicy::DropPackets => {
+                    UnknownRtcpSsrcPolicy::Default | UnknownRtcpSsrcPolicy::DropPackets => {
                         if !self.seen_unknown_rtcp_session {
                             warn!(
                                 "saw unknown rtcp ssrc {ssrc}; rtp session has ssrc {s:?}",
