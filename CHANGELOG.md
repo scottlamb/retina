@@ -13,6 +13,7 @@
 *   customizable behavior for RTCP packets with unknown ssrcs, now defaulting to
     ignoring them. This also is necessary to interoperate with the Tapo C320WS.
 *   improve some incorrect, misleading, and/or uninformative logging.
+*   minimum Rust is now 1.67.
 
 ## `v0.4.5` (2023-02-02)
 

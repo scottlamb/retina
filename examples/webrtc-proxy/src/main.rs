@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::{anyhow, bail, Error};
+use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
@@ -88,7 +89,7 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
     let mut rl = rustyline::Editor::<()>::new();
     let line = rl.readline(">> ")?;
     let line = line.trim();
-    let raw = base64::decode(line)?;
+    let raw = general_purpose::STANDARD.decode(line)?;
     Ok(serde_json::from_slice(&raw)?)
 }
 
@@ -214,20 +215,20 @@ async fn run() -> Result<(), Error> {
     // Set the handler for ICE connection state
     // This will notify you when the peer has connected/disconnected
     let (ice_conn_state_tx, ice_conn_state_rx) = tokio::sync::mpsc::unbounded_channel();
-    downstream_conn
-        .on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+    downstream_conn.on_ice_connection_state_change(Box::new(
+        move |state: RTCIceConnectionState| {
             ice_conn_state_tx.send(state).unwrap();
             Box::pin(async {})
-        }))
-        .await;
+        },
+    ));
     tokio::pin!(ice_conn_state_rx);
     let (peer_conn_state_tx, peer_conn_state_rx) = tokio::sync::mpsc::unbounded_channel();
-    downstream_conn
-        .on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+    downstream_conn.on_peer_connection_state_change(Box::new(
+        move |state: RTCPeerConnectionState| {
             peer_conn_state_tx.send(state).unwrap();
             Box::pin(async {})
-        }))
-        .await;
+        },
+    ));
     tokio::pin!(peer_conn_state_rx);
 
     println!("Navigate to https://jsfiddle.net/9s10amwL/ in your browser.");
@@ -244,7 +245,10 @@ async fn run() -> Result<(), Error> {
         .await;
     if let Some(local_desc) = downstream_conn.local_description().await {
         println!("Paste from here to the 'Golang base64 Session Description' box:");
-        println!("{}", base64::encode(serde_json::to_string(&local_desc)?));
+        println!(
+            "{}",
+            general_purpose::STANDARD.encode(serde_json::to_string(&local_desc)?)
+        );
     } else {
         bail!("downstream_conn has no local_description");
     }

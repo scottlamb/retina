@@ -6,6 +6,7 @@
 use std::convert::TryFrom;
 use std::fmt::Write;
 
+use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
@@ -631,9 +632,11 @@ impl InternalParameters {
         let mut sps_nal = None;
         let mut pps_nal = None;
         for nal in sprop_parameter_sets.split(',') {
-            let nal = base64::decode(nal).map_err(|_| {
-                "bad sprop-parameter-sets: NAL has invalid base64 encoding".to_string()
-            })?;
+            let nal = base64::engine::general_purpose::STANDARD
+                .decode(nal)
+                .map_err(|_| {
+                    "bad sprop-parameter-sets: NAL has invalid base64 encoding".to_string()
+                })?;
             if nal.is_empty() {
                 return Err("bad sprop-parameter-sets: empty NAL".into());
             }

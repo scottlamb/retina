@@ -204,7 +204,7 @@ impl Codec {
                     pos: self.read_pos,
                 });
             }
-            Err(rtsp_types::ParseError::Incomplete) => return Ok(None),
+            Err(rtsp_types::ParseError::Incomplete(_)) => return Ok(None),
         };
 
         // Map msg's body to a Bytes representation and advance `src`. Awkward:
