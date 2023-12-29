@@ -620,9 +620,7 @@ impl InternalParameters {
         let mut sprop_parameter_sets = None;
         for p in format_specific_params.split(';') {
             match p.trim().split_once('=') {
-                Some((key, value)) if key == "sprop-parameter-sets" => {
-                    sprop_parameter_sets = Some(value)
-                }
+                Some(("sprop-parameter-sets", value)) => sprop_parameter_sets = Some(value),
                 None => return Err("key without value".into()),
                 _ => (),
             }
