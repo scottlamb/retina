@@ -7,7 +7,7 @@ use sdp_types::Media;
 use std::{net::IpAddr, num::NonZeroU16};
 use url::Url;
 
-use super::{Presentation, Stream};
+use super::{Presentation, Stream, StreamDirection};
 
 /// A static payload type in the [RTP parameters
 /// registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
@@ -257,6 +257,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     let mut fmtp = None;
     let mut control = None;
     let mut framerate = None;
+    let mut direction = StreamDirection::Receiving;
     for a in &media_description.attributes {
         match a.attribute.as_str() {
             "rtpmap" => {
@@ -312,6 +313,9 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                         framerate = Some(f);
                     }
                 }
+            }
+            "sendonly" => {
+                direction=StreamDirection::Sending;
             }
             _ => (),
         }
@@ -376,6 +380,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         channels,
         framerate,
         state: super::StreamState::Uninit,
+        direction,
     })
 }
 

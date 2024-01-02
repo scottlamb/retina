@@ -229,6 +229,21 @@ impl RawPacketBuilder {
     }
 }
 
+pub struct SendingPacket{
+    stream_id: usize,
+    raw: RawPacket,
+    payload_range: Range<u16>,    
+}
+
+impl std::fmt::Debug for SendingPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendingPacket")
+            .field("streamId", &self.stream_id)
+            .field("payload_type", &self.raw.payload_type())
+            .finish()
+    }
+}
+
 /// A received RTP packet.
 ///
 /// This holds more information than the packet itself: also a

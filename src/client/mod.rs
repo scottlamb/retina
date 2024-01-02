@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
+use crate::rtp::SendingPacket;
 use crate::{
     Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
     UdpStreamContext,
@@ -845,6 +846,13 @@ impl std::ops::Deref for Tool {
     }
 }
 
+//enum sending or Receiving
+#[derive(Copy, Clone, Debug)]
+pub enum StreamDirection{
+    Receiving,
+    Sending,
+}
+
 /// Information about a stream offered within a presentation.
 ///
 /// Currently if multiple formats are offered, this only describes the first.
@@ -860,6 +868,7 @@ pub struct Stream {
     channels: Option<NonZeroU16>,
     framerate: Option<f32>,
     control: Option<Url>,
+    direction: StreamDirection
 }
 
 impl std::fmt::Debug for Stream {
@@ -872,6 +881,7 @@ impl std::fmt::Debug for Stream {
             .field("clock_rate", &self.clock_rate_hz)
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
+            .field("direction", &self.direction)
             .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
@@ -938,6 +948,10 @@ impl Stream {
     #[inline]
     pub fn control(&self) -> Option<&Url> {
         self.control.as_ref()
+    }
+
+    pub fn direction(&self) -> StreamDirection {
+        self.direction
     }
 }
 
@@ -2541,6 +2555,28 @@ impl PinnedDrop for SessionInner {
         ));
     }
 }
+
+impl futures::Sink<SendingPacket> for Session<Playing>{
+    type Error = futures::io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: SendingPacket) -> Result<(), Self::Error> {
+        //self.0.conn.as_mut().unwrap().inner.send(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 
 impl futures::Stream for Session<Playing> {
     type Item = Result<PacketItem, Error>;
