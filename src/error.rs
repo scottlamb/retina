@@ -19,6 +19,16 @@ use thiserror::Error;
 #[derive(Clone)]
 pub struct Error(pub(crate) Arc<ErrorInt>);
 
+impl Error {
+    /// Returns the status code, if the error was generated from a response.
+    pub fn status_code(&self) -> Option<u16> {
+        match self.0.as_ref() {
+            ErrorInt::RtspResponseError { status, .. } => Some((*status).into()),
+            _ => None,
+        }
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
