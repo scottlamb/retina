@@ -1742,7 +1742,7 @@ impl Session<Described> {
                     };
                     let initial_seq = match initial_seq {
                         Some(0) if policy.ignore_zero_seq => {
-                            log::debug!("Ignoring seq=0 on stream {}", i);
+                            log::info!("Ignoring seq=0 on stream {}", i);
                             None
                         }
                         o => o,
