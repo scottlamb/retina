@@ -4,6 +4,7 @@
 //! RTSP client examples.
 
 mod info;
+mod jpeg;
 mod mp4;
 mod onvif;
 
@@ -35,6 +36,8 @@ enum Cmd {
     Mp4(mp4::Opts),
     /// Follows ONVIF metadata stream; use Ctrl+C to stop.
     Onvif(onvif::Opts),
+    /// Writes depacketized JPEG images to disk; use CTRL+C to stop.
+    Jpeg(jpeg::Opts),
 }
 
 fn init_logging() -> mylog::Handle {
@@ -85,5 +88,6 @@ async fn main_inner() -> Result<(), Error> {
         Cmd::Info(opts) => info::run(opts).await,
         Cmd::Mp4(opts) => mp4::run(opts).await,
         Cmd::Onvif(opts) => onvif::run(opts).await,
+        Cmd::Jpeg(opts) => jpeg::run(opts).await,
     }
 }
