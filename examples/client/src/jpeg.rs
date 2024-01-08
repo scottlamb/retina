@@ -1,3 +1,10 @@
+// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Proof-of-concept `.jpeg` writer.
+//!
+//! This writes depacketized RTSP MJPEG images to a specified output directory.
+
 use std::{num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{anyhow, bail, Error};
@@ -38,12 +45,21 @@ pub struct Opts {
     out_dir: PathBuf,
 }
 
-/// Copies packets from `session` to `mp4` without handling any cleanup on error.
-async fn copy<'a>(
-    opts: &'a Opts,
-    session: &'a mut retina::client::Demuxed,
+/// Writes `.jpeg` files to the specified directory.
+async fn write_jpeg(
+    opts: &Opts,
+    session: retina::client::Session<retina::client::Described>,
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
 ) -> Result<(), Error> {
+    let mut session = session
+        .play(
+            retina::client::PlayOptions::default()
+                .initial_timestamp(opts.initial_timestamp)
+                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
+        )
+        .await?
+        .demuxed()?;
+
     std::fs::create_dir_all(&opts.out_dir)?;
 
     let sleep = match opts.duration {
@@ -85,25 +101,6 @@ async fn copy<'a>(
             },
         }
     }
-    Ok(())
-}
-
-/// Writes `.jpeg` files to the specified directory.
-async fn write_jpeg(
-    opts: &Opts,
-    session: retina::client::Session<retina::client::Described>,
-    stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
-) -> Result<(), Error> {
-    let mut session = session
-        .play(
-            retina::client::PlayOptions::default()
-                .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
-        )
-        .await?
-        .demuxed()?;
-
-    copy(opts, &mut session, stop_signal).await?;
 
     Ok(())
 }
@@ -149,6 +146,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     if video_stream_i.is_none() {
         bail!("Exiting because no video or audio stream was selected; see info log messages above");
     }
+
     let result = write_jpeg(&opts, session, stop_signal).await;
 
     // Session has now been dropped, on success or failure. A TEARDOWN should
