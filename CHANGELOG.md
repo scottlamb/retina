@@ -1,3 +1,7 @@
+## `v0.4.7` (2024-01-08)
+
+*   support servers that do not set `Content-Type` on `DESCRIBE` responses
+
 ## `v0.4.6` (2023-12-29)
 
 *   add default User-Agent header

@@ -410,14 +410,25 @@ pub(crate) fn parse_describe(
     request_url: Url,
     response: &rtsp_types::Response<Bytes>,
 ) -> Result<Presentation, String> {
-    if !matches!(response.header(&rtsp_types::headers::CONTENT_TYPE), Some(v) if v.as_str() == "application/sdp")
-    {
-        return Err(format!(
-            "Describe response not of expected application/sdp content type: {:#?}",
-            &response
-        ));
+    match response.header(&rtsp_types::headers::CONTENT_TYPE) {
+        Some(v) if v.as_str() == "application/sdp" => {}
+        Some(v) => {
+            let mut buf = vec![];
+            response.write(&mut buf).map_err(|e| e.to_string())?;
+            return Err(format!(
+                "DESCRIBE response at {} has unexpected content type {}:\n{:?}",
+                request_url.as_str(),
+                v,
+                MostlyAscii(&buf)
+            ));
+        }
+        None => {
+            warn!(
+                "DESCRIBE response at {} has no content type; trying sdp anyway",
+                request_url.as_str()
+            );
+        }
     }
-
     let raw_sdp = MostlyAscii(&response.body()[..]);
     let sdp = sdp_types::Session::parse(raw_sdp.0)
         .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
@@ -1177,6 +1188,16 @@ mod tests {
             }
             _ => panic!(),
         };
+    }
+
+    #[test]
+    fn missing_contenttype_describe() {
+        let prefix = "rtsp://192.168.1.101/live/test";
+        parse_describe(
+            prefix,
+            include_bytes!("testdata/missing_content_type_describe.txt"),
+        )
+        .unwrap();
     }
 
     /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
