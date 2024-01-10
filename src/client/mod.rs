@@ -1774,7 +1774,7 @@ impl Session<Described> {
             ))
         })?;
         if let Some(ref t) = inner.presentation.tool {
-            if (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0 {
+            if (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0 && t.has_live555_tcp_bug() {
                 warn!(
                     "Connecting via TCP to known-broken RTSP server {:?}. \
                         See <https://github.com/scottlamb/retina/issues/17>. \

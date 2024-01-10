@@ -1,3 +1,8 @@
+## unreleased
+
+*   fix `Connecting via TCP to known-broken RTSP server` log line on
+    connection to a non-broken server.
+
 ## `v0.4.11` (2025-01-22)
 
 *   improve some error messages on bad H.264 `sprop-parameter-sets`
