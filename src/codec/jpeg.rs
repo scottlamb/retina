@@ -335,7 +335,9 @@ impl Depacketizer {
             let _ = self.metadata.take();
             self.data.clear();
 
-            return Err("Got JPEG fragment when we have no header".to_string());
+            // This can happen if we somehow drop the first packet in a frame
+            log::debug!("Got JPEG fragment when we have no header");
+            return Ok(());
         }
 
         payload.advance(8);
