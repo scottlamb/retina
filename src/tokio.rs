@@ -8,9 +8,11 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use rtsp_types::{Data, Message};
-use std::convert::TryFrom;
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::time::Instant;
-use tokio::net::{TcpStream, UdpSocket};
+use std::{convert::TryFrom, net::SocketAddr};
+use tokio::net::{lookup_host, TcpSocket, TcpStream, UdpSocket};
 use tokio_util::codec::Framed;
 use url::Host;
 
@@ -21,13 +23,91 @@ use super::{ConnectionContext, ReceivedMessage, WallTime};
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection(Framed<TcpStream, Codec>);
 
+pub(crate) enum Bind {
+    Device(String),
+    Ip(IpAddr),
+}
+
+impl Bind {
+    fn may_bind_socket(socket: &TcpSocket, bind: &Option<Bind>) -> Result<(), std::io::Error> {
+        match bind {
+            Some(Bind::Ip(addr)) => socket.bind(SocketAddr::new(*addr, 0))?,
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            Some(Bind::Device(ref dev)) => socket.bind_device(Some(dev.as_bytes()))?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Bind {
+    type Err = Error;
+
+    fn from_str(bind: &str) -> Result<Self, Self::Err> {
+        if let Ok(addr) = IpAddr::from_str(bind) {
+            Ok(Bind::Ip(addr))
+        } else {
+            #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+            {
+                Ok(Bind::Device(bind.to_string()))
+            }
+            #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+            {
+                Err(wrap!(ErrorInt::InvalidArgument(format!(
+                    "Invalid bind address: {}",
+                    bind
+                ))))
+            }
+        }
+    }
+}
+
 impl Connection {
-    pub(crate) async fn connect(host: Host<&str>, port: u16) -> Result<Self, std::io::Error> {
+    pub(crate) async fn connect(
+        host: Host<&str>,
+        port: u16,
+        bind: Option<Bind>,
+    ) -> Result<Self, std::io::Error> {
         let stream = match host {
-            Host::Domain(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv4(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv6(h) => TcpStream::connect((h, port)).await,
-        }?;
+            Host::Domain(h) => {
+                let mut last_err = None;
+                let mut stream = None;
+                for h in lookup_host((h, port)).await? {
+                    let socket = match h {
+                        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+                    };
+                    Bind::may_bind_socket(&socket, &bind)?;
+                    match socket.connect(h).await {
+                        Ok(s) => {
+                            stream = Some(s);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if let Some(stream) = stream {
+                    stream
+                } else {
+                    return Err(last_err.unwrap_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            "No addresses found",
+                        )
+                    }));
+                }
+            }
+            Host::Ipv4(h) => {
+                let socket = TcpSocket::new_v4()?;
+                Bind::may_bind_socket(&socket, &bind)?;
+                socket.connect(SocketAddr::new(h.into(), port)).await?
+            }
+            Host::Ipv6(h) => {
+                let socket = TcpSocket::new_v6()?;
+                Bind::may_bind_socket(&socket, &bind)?;
+                socket.connect(SocketAddr::new(h.into(), port)).await?
+            }
+        };
         Self::from_stream(stream)
     }
 
