@@ -227,7 +227,12 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     // https://www.iana.org/assignments/sdp-parameters/sdp-parameters.xhtml#sdp-parameters-2
     // shows several other variants, such as "TCP/RTP/AVP". Looking for a "RTP" component
     // seems appropriate.
-    if !media_description.proto.starts_with("RTP/") && !media_description.proto.contains("/RTP/") {
+    // https://www.ietf.org/archive/id/draft-sheedy-mmusic-rtsp-ext-01.txt
+    // adds "MP2T" as a valid proto which is used by some ISPs.
+    if !media_description.proto.starts_with("RTP/")
+        && !media_description.proto.contains("/RTP/")
+        && !media_description.proto.contains("MP2T/")
+    {
         return Err("Expected RTP-based proto".into());
     }
 
