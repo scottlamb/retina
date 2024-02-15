@@ -8,6 +8,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
@@ -25,6 +26,7 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
+use crate::tokio::Bind;
 use crate::{
     Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
     UdpStreamContext,
@@ -505,6 +507,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    bind: Option<String>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -711,6 +714,11 @@ impl SessionOptions {
 
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
+        self
+    }
+
+    pub fn bind(mut self, bind: String) -> Self {
+        self.bind = Some(bind);
         self
     }
 }
@@ -1198,11 +1206,15 @@ enum SessionFlag {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url) -> Result<Self, Error> {
+    async fn connect(url: &Url, bind: Option<&str>) -> Result<Self, Error> {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port)
+        let bind = match bind {
+            None => None,
+            Some(bind) => Some(Bind::from_str(bind)?),
+        };
+        let inner = crate::tokio::Connection::connect(host, port, bind)
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
@@ -1487,7 +1499,7 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url).await?;
+        let conn = RtspConnection::connect(&url, options.bind.as_deref()).await?;
         Self::describe_with_conn(conn, options, url).await
     }
 
