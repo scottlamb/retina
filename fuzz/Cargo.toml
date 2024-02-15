@@ -32,3 +32,8 @@ path = "fuzz_targets/roundtrip_h264.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "depacketize_jpeg"
+path = "fuzz_targets/depacketize_jpeg.rs"
+test = false
+doc = false
