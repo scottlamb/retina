@@ -29,7 +29,7 @@ pin-project = "1.0.7"
 pretty-hex = "0.4.0"
 rand = "0.8.3"
 rtsp-types = "0.1.0"
-sdp-types = "0.1.4"
+sdp-types = "0.1"
 smallvec = { version = "1.6.1", features = ["union"] }
 thiserror = "1.0.25"
 time = "0.1.43"
