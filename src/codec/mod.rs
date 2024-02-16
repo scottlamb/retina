@@ -16,13 +16,18 @@ use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContext;
 
+#[cfg(feature = "aac")]
 pub(crate) mod aac;
+#[cfg(feature = "g723")]
 pub(crate) mod g723;
 
+#[cfg(feature = "h264")]
 #[doc(hidden)]
 pub mod h264;
 
+#[cfg(feature = "onvif")]
 pub(crate) mod onvif;
+#[cfg(feature = "simple-audio")]
 pub(crate) mod simple_audio;
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
@@ -50,6 +55,7 @@ pub enum CodecItem {
 pub enum ParametersRef<'a> {
     Video(&'a VideoParameters),
     Audio(&'a AudioParameters),
+    #[cfg(feature = "onvif")]
     Message(&'a MessageParameters),
 }
 
@@ -245,6 +251,7 @@ impl std::fmt::Debug for AudioFrame {
     }
 }
 
+#[cfg(feature = "onvif")]
 /// Parameters which describe a message stream, for `application` media types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MessageParameters(onvif::CompressionType);
@@ -426,10 +433,15 @@ pub struct Depacketizer(DepacketizerInner);
 
 #[derive(Debug)]
 enum DepacketizerInner {
+    #[cfg(feature = "aac")]
     Aac(Box<aac::Depacketizer>),
+    #[cfg(feature = "simple-audio")]
     SimpleAudio(Box<simple_audio::Depacketizer>),
+    #[cfg(feature = "g723")]
     G723(Box<g723::Depacketizer>),
+    #[cfg(feature = "h264")]
     H264(Box<h264::Depacketizer>),
+    #[cfg(feature = "onvif")]
     Onvif(Box<onvif::Depacketizer>),
 }
 
@@ -437,59 +449,74 @@ impl Depacketizer {
     pub fn new(
         media: &str,
         encoding_name: &str,
-        clock_rate: u32,
-        channels: Option<NonZeroU16>,
-        format_specific_params: Option<&str>,
+        #[allow(unused_variables)] clock_rate: u32,
+        #[allow(unused_variables)] channels: Option<NonZeroU16>,
+        #[allow(unused_variables)] format_specific_params: Option<&str>,
     ) -> Result<Self, String> {
+        #[cfg(feature = "onvif")]
         use onvif::CompressionType;
 
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
+        #[allow(unreachable_code)]
         Ok(Depacketizer(match (media, encoding_name) {
+            #[cfg(feature = "h264")]
             ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
                 clock_rate,
                 format_specific_params,
             )?)),
+            #[cfg(feature = "aac")]
             ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
                 format_specific_params,
             )?)),
+            #[cfg(feature = "simple-audio")]
             ("audio", "g726-16") => DepacketizerInner::SimpleAudio(Box::new(
                 simple_audio::Depacketizer::new(clock_rate, 2),
             )),
+            #[cfg(feature = "simple-audio")]
             ("audio", "g726-24") => DepacketizerInner::SimpleAudio(Box::new(
                 simple_audio::Depacketizer::new(clock_rate, 3),
             )),
+            #[cfg(feature = "simple-audio")]
             ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(Box::new(
                 simple_audio::Depacketizer::new(clock_rate, 4),
             )),
+            #[cfg(feature = "simple-audio")]
             ("audio", "g726-40") => DepacketizerInner::SimpleAudio(Box::new(
                 simple_audio::Depacketizer::new(clock_rate, 5),
             )),
+            #[cfg(feature = "simple-audio")]
             ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
                 DepacketizerInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
                     clock_rate, 8,
                 )))
             }
+            #[cfg(feature = "simple-audio")]
             ("audio", "l16") => DepacketizerInner::SimpleAudio(Box::new(
                 simple_audio::Depacketizer::new(clock_rate, 16),
             )),
             // Dahua cameras when configured with G723 send packets with a
             // non-standard encoding-name "G723.1" and length 40, which doesn't
             // make sense. Don't try to depacketize these.
+            #[cfg(feature = "g723")]
             ("audio", "g723") => {
                 DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
             }
+            #[cfg(feature = "onvif")]
             ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::Uncompressed),
             )),
+            #[cfg(feature = "onvif")]
             ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::GzipCompressed),
             )),
+            #[cfg(feature = "onvif")]
             ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::ExiDefault),
             )),
+            #[cfg(feature = "onvif")]
             ("application", "vnd.onvif.metadata.exi.ext") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::ExiInBand),
             )),
@@ -515,11 +542,18 @@ impl Depacketizer {
     /// frame.
     pub fn parameters(&self) -> Option<ParametersRef> {
         match &self.0 {
+            #[cfg(feature = "aac")]
             DepacketizerInner::Aac(d) => d.parameters(),
+            #[cfg(feature = "g723")]
             DepacketizerInner::G723(d) => d.parameters(),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.parameters(),
+            #[cfg(feature = "onvif")]
             DepacketizerInner::Onvif(d) => d.parameters(),
+            #[cfg(feature = "simple-audio")]
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 
@@ -528,13 +562,20 @@ impl Depacketizer {
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `Ok(None)`. The later
     /// `push` call may panic or drop data if this expectation is violated.
-    pub fn push(&mut self, input: ReceivedPacket) -> Result<(), String> {
+    pub fn push(&mut self, #[allow(unused_variables)] input: ReceivedPacket) -> Result<(), String> {
         match &mut self.0 {
+            #[cfg(feature = "aac")]
             DepacketizerInner::Aac(d) => d.push(input),
+            #[cfg(feature = "g723")]
             DepacketizerInner::G723(d) => d.push(input),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.push(input),
+            #[cfg(feature = "onvif")]
             DepacketizerInner::Onvif(d) => d.push(input),
+            #[cfg(feature = "simple-audio")]
             DepacketizerInner::SimpleAudio(d) => d.push(input),
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
         }
     }
 
@@ -544,15 +585,22 @@ impl Depacketizer {
     /// `push` call may cause `pull` to return `Ok(Some(...))` more than once.
     pub fn pull(
         &mut self,
-        conn_ctx: &ConnectionContext,
-        stream_ctx: &StreamContext,
+        #[allow(unused_variables)] conn_ctx: &ConnectionContext,
+        #[allow(unused_variables)] stream_ctx: &StreamContext,
     ) -> Result<Option<CodecItem>, Error> {
         match &mut self.0 {
+            #[cfg(feature = "aac")]
             DepacketizerInner::Aac(d) => d.pull(conn_ctx, stream_ctx),
+            #[cfg(feature = "g723")]
             DepacketizerInner::G723(d) => Ok(d.pull()),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => Ok(d.pull()),
+            #[cfg(feature = "onvif")]
             DepacketizerInner::Onvif(d) => Ok(d.pull()),
+            #[cfg(feature = "simple-audio")]
             DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
+            #[allow(unreachable_patterns)]
+            _ => Ok(None),
         }
     }
 }

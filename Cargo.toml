@@ -20,7 +20,7 @@ base64 = "0.21.0"
 bitstream-io = "1.1"
 bytes = "1.0.1"
 futures = "0.3.14"
-h264-reader = "0.7.0"
+h264-reader = { version = "0.7.0", optional = true }
 hex = "0.4.3"
 http-auth = "0.1.2"
 log = "0.4.8"
@@ -36,6 +36,14 @@ time = "0.1.43"
 tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
+
+[features]
+default = ["aac", "g723", "onvif", "simple-audio", "h264"]
+aac = []
+g723 = []
+onvif = []
+simple-audio = []
+h264 = ["dep:h264-reader"]
 
 [dev-dependencies]
 criterion = { version = "0.5.0", features = ["async_tokio"] }
