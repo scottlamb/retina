@@ -475,11 +475,9 @@ impl Depacketizer {
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
-
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
             let mut actual_len = 1;
@@ -493,7 +491,6 @@ impl Depacketizer {
             );
             piece_idx = next_piece_idx;
         }
-
         debug_assert_eq!(retained_len, data.len());
         self.nals.clear();
         self.pieces.clear();
