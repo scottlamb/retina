@@ -166,12 +166,151 @@ impl Display for Timestamp {
             "{} (mod-2^32: {}), npt {:.03}",
             self.timestamp,
             self.timestamp as u32,
-            self.elapsed_secs()
+            self.elapsed_secs(),
         )
     }
 }
 
 impl Debug for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
+}
+
+/// An annotated RTP timestamp.
+///
+/// This couples together three pieces of information:
+///
+/// *   The stream's starting time. In client use, this is often as received in the RTSP
+///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`].
+///     According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial
+///     value of the timestamp SHOULD be random".
+///
+/// *   The codec-specific clock rate.
+///
+/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
+///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
+///     than `i32::MAX` from previous timestamps are treated as backwards jumps. It's allowed for
+///     a timestamp to indicate a time *before* the stream's starting point.
+///
+/// *   The decode timestamp (DTS) as an `i64`. http://dranger.com/ffmpeg/tutorial05.html TODO
+///
+/// In combination, these allow conversion to "normal play time" (NPT): seconds since start of
+/// the stream.
+///
+/// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
+/// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
+/// many RTP servers violate this. The Retina client allows such violations unless
+/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
+///
+/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
+/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return
+/// error in these cases. This should rarely cause problems. It'd take ~2^32 packets (~4 billion)
+/// to advance the time this far forward or backward even with a hostile server.
+///
+/// The [`Display`] and [`Debug`] implementations currently display:
+/// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a
+///     codec-specified clock rate.
+/// *   the full timestamp.
+/// *   NPT
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct VideoTimestamp {
+    /// A presentation timestamp which must be compared to `start`.
+    pts: i64,
+
+    /// A decode timestamp.
+    dts: i64,
+
+    /// The codec-specified clock rate, in Hz. Must be non-zero.
+    clock_rate: NonZeroU32,
+
+    /// The stream's starting time, as specified in the RTSP `RTP-Info` header.
+    start: u32,
+}
+
+impl VideoTimestamp {
+    /// Creates a new timestamp unless `timestamp - start` underflows.
+    #[inline]
+    pub fn new(pts: i64, dts: i64, clock_rate: NonZeroU32, start: u32) -> Option<Self> {
+        pts.checked_sub(i64::from(start)).map(|_| VideoTimestamp {
+            pts,
+            dts,
+            clock_rate,
+            start,
+        })
+    }
+
+    /// Returns time since some arbitrary point before the stream started.
+    #[inline]
+    pub fn pts(&self) -> i64 {
+        self.pts
+    }
+
+    #[inline]
+    pub fn dts(&self) -> i64 {
+        self.dts
+    }
+
+    /// Returns timestamp of the start of the stream.
+    #[inline]
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    /// Returns codec-specified clock rate, in Hz.
+    #[inline]
+    pub fn clock_rate(&self) -> NonZeroU32 {
+        self.clock_rate
+    }
+
+    /// Returns elapsed presentation time since the stream start in clock rate units.
+    #[inline]
+    pub fn pts_elapsed(&self) -> i64 {
+        self.pts - i64::from(self.start)
+    }
+
+    /// Returns elapsed presentation time since the stream start in seconds, aka "normal play
+    /// time" (NPT).
+    #[inline]
+    pub fn pts_elapsed_secs(&self) -> f64 {
+        (self.pts_elapsed() as f64) / (self.clock_rate.get() as f64)
+    }
+
+    /// Returns elapsed decode time since the stream start in clock rate units.
+    #[inline]
+    pub fn dts_elapsed(&self) -> i64 {
+        self.dts - i64::from(self.start)
+    }
+
+    /// Returns `self + delta` unless it would overflow.
+    pub fn try_add(&self, delta: u32) -> Option<Self> {
+        // Check for `timestamp` overflow only. We don't need to check for
+        // `timestamp - start` underflow because delta is non-negative.
+        self.pts
+            .checked_add(i64::from(delta))
+            .map(|timestamp| VideoTimestamp {
+                pts: timestamp,
+                dts: self.dts,
+                clock_rate: self.clock_rate,
+                start: self.start,
+            })
+    }
+}
+
+impl Display for VideoTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (mod-2^32: {}), npt {:.03}, dts {:?}",
+            self.pts,
+            self.pts as u32,
+            self.pts_elapsed_secs(),
+            self.dts,
+        )
+    }
+}
+
+impl Debug for VideoTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(self, f)
     }
