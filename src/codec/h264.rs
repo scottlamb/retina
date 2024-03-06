@@ -677,11 +677,9 @@ impl Depacketizer {
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
-
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
             let mut actual_len = 1;
@@ -693,7 +691,6 @@ impl Depacketizer {
             debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
-
         debug_assert_eq!(retained_len, data.len());
         self.nals.clear();
         self.pieces.clear();
