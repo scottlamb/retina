@@ -3,20 +3,19 @@
 
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video.
 
-use std::convert::TryFrom;
-use std::fmt::Write;
-
-use base64::Engine as _;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use h264_reader::nal::{NalHeader, UnitType};
-use log::{debug, log_enabled, trace};
-
-use crate::{
-    rtp::{ReceivedPacket, ReceivedPacketBuilder},
-    Error, Timestamp,
-};
+pub mod dts_extractor;
 
 use super::VideoFrame;
+use crate::{
+    codec::h264::dts_extractor::{DtsExtractor, NalUnitIter},
+    rtp::{ReceivedPacket, ReceivedPacketBuilder},
+    Error, Timestamp, VideoTimestamp,
+};
+use base64::Engine as _;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use h264_reader::nal::{sps::SeqParameterSet, NalHeader, UnitType};
+use log::{debug, log_enabled, trace};
+use std::{convert::TryFrom, fmt::Write};
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -44,6 +43,8 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    dts_extractor: Option<DtsExtractor>,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,7 @@ struct Nal {
 struct AccessUnit {
     start_ctx: crate::PacketContext,
     end_ctx: crate::PacketContext,
-    timestamp: crate::Timestamp,
+    timestamp: Timestamp,
     stream_id: usize,
 
     /// True iff currently processing a FU-A.
@@ -124,6 +125,7 @@ impl Depacketizer {
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
+            dts_extractor: None,
         })
     }
 
@@ -473,9 +475,11 @@ impl Depacketizer {
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
+
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
             let mut actual_len = 1;
@@ -489,6 +493,7 @@ impl Depacketizer {
             );
             piece_idx = next_piece_idx;
         }
+
         debug_assert_eq!(retained_len, data.len());
         self.nals.clear();
         self.pieces.clear();
@@ -522,12 +527,41 @@ impl Depacketizer {
             }
             _ => false,
         };
+
+        let mut dts = au.timestamp.timestamp;
+        if let Some(parameters) = &self.parameters {
+            // Skip samples silently until we find one with an IDR.
+            if self.dts_extractor.is_none() && is_random_access_point {
+                self.dts_extractor = Some(DtsExtractor::new());
+            }
+
+            // If first sync sample has been received.
+            if let Some(dts_extractor) = &mut self.dts_extractor {
+                let pts = au.timestamp.timestamp();
+                dts = dts_extractor
+                    .extract(
+                        &parameters.sps,
+                        is_random_access_point,
+                        NalUnitIter::new(&data),
+                        pts,
+                    )
+                    .map_err(|e| e.to_string())?;
+            };
+        }
+
+        let timestamp = VideoTimestamp {
+            pts: au.timestamp.timestamp,
+            dts,
+            clock_rate: au.timestamp.clock_rate,
+            start: au.timestamp.start,
+        };
+
         Ok(VideoFrame {
             has_new_parameters,
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,
-            timestamp: au.timestamp,
+            timestamp,
             stream_id: au.stream_id,
             is_random_access_point,
             is_disposable,
@@ -559,7 +593,7 @@ impl AccessUnit {
         AccessUnit {
             start_ctx: *pkt.ctx(),
             end_ctx: *pkt.ctx(),
-            timestamp: pkt.timestamp(),
+            timestamp: pkt.timestamp,
             stream_id: pkt.stream_id(),
             in_fu_a: false,
 
@@ -617,6 +651,7 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
 #[derive(Clone, Debug)]
 struct InternalParameters {
     generic_parameters: super::VideoParameters,
+    sps: SeqParameterSet,
 
     /// The (single) SPS NAL.
     sps_nal: Bytes,
@@ -844,6 +879,7 @@ impl InternalParameters {
         let avc_decoder_config = avc_decoder_config.freeze();
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
+
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
@@ -852,6 +888,7 @@ impl InternalParameters {
                 frame_rate,
                 extra_data: avc_decoder_config,
             },
+            sps,
             sps_nal,
             pps_nal,
             seen_extra_trailing_data,
@@ -1101,9 +1138,11 @@ enum PacketizerState {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::num::NonZeroU32;
 
     use crate::testutil::init_logging;
+    use crate::VideoTimestamp;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     /*
@@ -1347,7 +1386,13 @@ mod tests {
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
         );
-        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+        let want = VideoTimestamp {
+            pts: 1,
+            dts: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
 
     /// Test bad framing at a GOP boundary in a stream from a Reolink RLC-822A
@@ -1389,7 +1434,13 @@ mod tests {
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
-        assert_eq!(frame.timestamp, ts1);
+        let want = VideoTimestamp {
+            pts: 0,
+            dts: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        assert_eq!(frame.timestamp, want);
         d.push(
             ReceivedPacketBuilder {
                 // SPS with (incorrect) timestamp matching last frame.
@@ -1450,7 +1501,13 @@ mod tests {
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
         );
-        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+        let want = VideoTimestamp {
+            pts: 1,
+            dts: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
 
     #[test]
