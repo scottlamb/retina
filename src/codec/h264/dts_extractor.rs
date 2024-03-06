@@ -1,3 +1,6 @@
+// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // https://github.com/bluenviron/gortsplib/blob/f0540b4eee760583b2d94f022674b0f3b0f8c8b0/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
@@ -271,8 +274,8 @@ fn get_picture_order_count(
     //	return 0, fmt.Errorf("frame_mbs_only_flag = 0 is not supported")
     //}
     let FrameMbsFlags::Frames = frame_mbs_flags else {
-            return Err(DtsExtractorError::FrameMbsNotSupported);
-        };
+        return Err(DtsExtractorError::FrameMbsNotSupported);
+    };
 
     let pic_order_cnt_lsb: u32 = r
         .read_u32(
