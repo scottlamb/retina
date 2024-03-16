@@ -202,23 +202,8 @@ pub struct NtpTimestamp(pub u64);
 
 impl std::fmt::Display for NtpTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let since_epoch = self.0.wrapping_sub(UNIX_EPOCH.0);
-        let sec_since_epoch = (since_epoch >> 32) as u32;
-        let tm = time::at(time::Timespec {
-            sec: i64::from(sec_since_epoch),
-            nsec: 0,
-        });
-        let ms = ((since_epoch & 0xFFFF_FFFF) * 1_000) >> 32;
-        let zone_minutes = tm.tm_utcoff.abs() / 60;
-        write!(
-            f,
-            "{}.{:03}{}{:02}:{:02}",
-            tm.strftime("%FT%T").map_err(|_| std::fmt::Error)?,
-            ms,
-            if tm.tm_utcoff > 0 { '+' } else { '-' },
-            zone_minutes / 60,
-            zone_minutes % 60
-        )
+        let date_time: chrono::DateTime<chrono::Local> = (*self).into();
+        write!(f, "{}", date_time.format("%FT%T%.3f%:z"),)
     }
 }
 
@@ -229,26 +214,91 @@ impl std::fmt::Debug for NtpTimestamp {
     }
 }
 
+impl<TZ> TryFrom<chrono::DateTime<TZ>> for NtpTimestamp
+where
+    TZ: chrono::TimeZone,
+{
+    type Error = std::num::TryFromIntError;
+    fn try_from(orig: chrono::DateTime<TZ>) -> Result<Self, Self::Error> {
+        let epoch_naive = chrono::NaiveDate::from_ymd_opt(1900, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let epoch = chrono::TimeZone::from_local_datetime(&chrono::Utc, &epoch_naive).unwrap();
+        let elapsed: chrono::Duration = orig.with_timezone(&chrono::Utc) - epoch;
+        let sec_since_epoch: u32 = elapsed.num_seconds().try_into()?;
+        let nanos = elapsed.to_std().unwrap().subsec_nanos();
+        let frac = f64::from(nanos) / 1e9;
+        let frac_int = (frac * f64::from(u32::MAX)).round() as u32;
+        let val = (u64::from(sec_since_epoch) << 32) + u64::from(frac_int);
+        Ok(NtpTimestamp(val))
+    }
+}
+
+impl<TZ> From<NtpTimestamp> for chrono::DateTime<TZ>
+where
+    TZ: chrono::TimeZone,
+    chrono::DateTime<TZ>: From<chrono::DateTime<chrono::Utc>>,
+{
+    fn from(orig: NtpTimestamp) -> Self {
+        let since_epoch = orig.0.wrapping_sub(UNIX_EPOCH.0);
+        let sec_since_epoch = (since_epoch >> 32) as u32;
+        let frac_int = (since_epoch & 0xFFFF_FFFF) as u32;
+        let frac = frac_int as f64 / f64::from(u32::MAX);
+        let nanos = (frac * 1e9) as u32;
+        let timedelta: chrono::Duration = chrono::Duration::try_seconds(sec_since_epoch.into())
+            .unwrap()
+            + chrono::Duration::nanoseconds(nanos.into());
+        let date_time = chrono::DateTime::UNIX_EPOCH + timedelta;
+        date_time.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const ORIG_STR: &str = "2024-02-17T21:14:34.013+01:00";
+
+    #[test]
+    fn test_ntp_roundtrip() {
+        let orig: chrono::DateTime<chrono::Utc> = ORIG_STR.parse().unwrap();
+        let ntp_timestamp: NtpTimestamp = orig.try_into().unwrap();
+        let display = format!("{ntp_timestamp}");
+        let parsed: chrono::DateTime<chrono::Utc> = display.parse().unwrap();
+        assert_eq!(orig, parsed);
+    }
+
+    #[test]
+    fn test_ntp_roundtrip_raw() {
+        let orig: chrono::DateTime<chrono::Utc> = ORIG_STR.parse().unwrap();
+        let ntp_timestamp: NtpTimestamp = orig.try_into().unwrap();
+        let parsed: chrono::DateTime<chrono::Utc> = ntp_timestamp.into();
+        assert_eq!(orig, parsed);
+    }
+
+    #[test]
+    fn test_ntp_decode() {
+        let orig: chrono::DateTime<chrono::Utc> = ORIG_STR.parse().unwrap();
+        let ntp_timestamp: NtpTimestamp = orig.try_into().unwrap();
+        assert_eq!(ntp_timestamp, NtpTimestamp(16824201542114736079));
+    }
+}
+
 /// A wall time taken from the local machine's realtime clock, used in error reporting.
 ///
 /// Currently this just allows formatting via `Debug` and `Display`.
 #[derive(Copy, Clone, Debug)]
-pub struct WallTime(time::Timespec);
+pub struct WallTime(chrono::DateTime<chrono::Utc>);
 
 impl WallTime {
     fn now() -> Self {
-        Self(time::get_time())
+        Self(chrono::Utc::now())
     }
 }
 
 impl Display for WallTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(
-            &time::at(self.0)
-                .strftime("%FT%T")
-                .map_err(|_| std::fmt::Error)?,
-            f,
-        )
+        write!(f, "{}", self.0.format("%FT%T"))
     }
 }
 
