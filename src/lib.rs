@@ -245,7 +245,7 @@ where
         let sec_since_epoch = (since_epoch >> 32) as u32;
         let frac_int = (since_epoch & 0xFFFF_FFFF) as u32;
         let frac = frac_int as f64 / f64::from(u32::MAX);
-        let nanos = (frac * 1e9) as u32;
+        let nanos = (frac * 1e9).round() as u32;
         let timedelta: chrono::Duration = chrono::Duration::try_seconds(sec_since_epoch.into())
             .unwrap()
             + chrono::Duration::nanoseconds(nanos.into());
@@ -281,6 +281,28 @@ mod tests {
         let orig: chrono::DateTime<chrono::Utc> = ORIG_STR.parse().unwrap();
         let ntp_timestamp: NtpTimestamp = orig.try_into().unwrap();
         assert_eq!(ntp_timestamp, NtpTimestamp(16824201542114736079));
+    }
+
+    fn assert_roundtrip_equal(n0: NtpTimestamp) {
+        let dt1 = chrono::DateTime::<chrono::Utc>::from(n0);
+        let n1 = NtpTimestamp::try_from(dt1).unwrap();
+        let dt2: chrono::DateTime<chrono::Utc> = n1.into();
+        assert_eq!(dt1, dt2);
+    }
+
+    #[test]
+    fn test_now() {
+        let dt0 = chrono::Utc::now();
+        let n0 = NtpTimestamp::try_from(dt0).unwrap();
+        assert_roundtrip_equal(n0);
+    }
+
+    #[test]
+    fn test_float_rounding() {
+        // This magic number was found empirically to fail when conversion to a
+        // floating-point fractional second did not round correctly. The bug has
+        // now been fixed but this test ensures it does not occur again.
+        assert_roundtrip_equal(NtpTimestamp(16834755242908219071));
     }
 }
 
