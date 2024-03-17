@@ -19,6 +19,7 @@ rust-version = "1.67"
 base64 = "0.21.0"
 bitstream-io = "1.1"
 bytes = "1.0.1"
+chrono = { version = "0.4.33", default-features = false, features = ["clock"] }
 futures = "0.3.14"
 h264-reader = "0.7.0"
 hex = "0.4.3"
@@ -32,7 +33,6 @@ rtsp-types = "0.1.0"
 sdp-types = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
 thiserror = "1.0.25"
-time = "0.1.43"
 tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"
