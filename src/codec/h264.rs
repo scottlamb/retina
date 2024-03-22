@@ -37,6 +37,22 @@ pub(crate) struct Depacketizer {
 
     parameters: Option<InternalParameters>,
 
+    /// Holds NALs from RTP packets.
+    nal_parser: NalParser,
+}
+
+/// Parses Annex B sequences from RTP NAL data.
+///
+/// RFC 6184 describes how NAL units should be represented by RTP packets. `Depacketizer` should map each
+/// such NAL unit to 1 call to `NalParser::start_rtp_nal`, then 1 or more calls to `NalParser::append_rtp_nal`,
+/// then 1 call to `NalParser::end_rtp_nal`.
+///
+/// If the camera complies with the RFC, this will add exactly one NAL unit. However, what some cameras
+/// call a single NAL unit is actually a sequence of multiple NAL units with Annex B separators. `NalParser`
+/// looks for these separators and adds multiple NAL units as needed.
+/// See [scottlamb/retina#68](https://github.com/scottlamb/retina/issues/68).
+#[derive(Debug)]
+struct NalParser {
     /// In state `PreMark`, pieces of NALs, excluding their header bytes.
     /// Kept around (empty) in other states to re-use the backing allocation.
     pieces: Vec<Bytes>,
@@ -44,6 +60,119 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+}
+
+impl NalParser {
+    fn new() -> Self {
+        NalParser {
+            pieces: Vec::new(),
+            nals: Vec::new(),
+        }
+    }
+
+    /// Helper function to clear `NalParser::nals` and `NalParser::pieces` vectors.
+    fn clear(&mut self) {
+        self.nals.clear();
+        self.pieces.clear()
+    }
+
+    /// Adds a piece to `self.pieces`. Returns the total length of pieces after adding,
+    /// erroring if it becomes absurdly large.
+    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
+        self.pieces.push(piece);
+        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
+    }
+
+    /// Given a byte buffer, it checks if the buffer is an Annex B stream by looking for
+    /// boundaries (i.e. three consecutive 0x00). If it finds a boundary, it splits on it
+    /// to break apart NALs from the Annex B stream.
+    fn break_apart_nals(&mut self, data: Bytes) -> Result<bool, String> {
+        let mut nal_start_idx = 0;
+        let mut did_find_boundary = false;
+
+        for (idx, byte) in data.iter().enumerate() {
+            // TODO: Handle boundaries split b/w packets.
+            // If the current FU-A has a boundary that splits at end, ignore the last or
+            // last two zeros because this boundary will be handled when the start of
+            // next packet is being read, and these zeros will be removed on walk-back.
+            if byte == &0x00 && idx + 2 < data.len() && data[idx..idx + 3] == [0x00; 3] {
+                debug!("Found boundary with index range: {} - {}.", idx, idx + 2);
+                // we found a boundary, let NalParser know that it should now keep adding
+                // to last NAL even if the next FU-A frag header byte does not match the
+                // header of the last saved NAL.
+                did_find_boundary = true;
+                let nal_end_idx = idx;
+
+                let nal = data.slice(
+                    if nal_start_idx == 0 {
+                        // this is only for the first boundary, since `data` passed already has advanced 2 bytes
+                        // to skip the packet type and NAL header
+                        nal_start_idx
+                    } else {
+                        // ignore the first two bytes when saving NAL (Packet type header & NAL header)
+                        nal_start_idx + 2
+                    }..nal_end_idx,
+                );
+
+                // close previous nal
+                self.push(nal)?;
+
+                nal_start_idx = idx + 3;
+
+                // create new nal which'll get updated
+                let nal_header = data[idx + 4];
+                self.nals.push(Nal {
+                    hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
+                    next_piece_idx: u32::MAX,
+                    len: 1,
+                });
+            }
+        }
+
+        // if we had found a boundary, we need to add the last NAL to pieces now
+        if did_find_boundary {
+            self.push(data.slice(nal_start_idx + 2..))?;
+        }
+
+        Ok(did_find_boundary)
+    }
+
+    /// Creates NAL from RTP packet
+    fn start_rtp_nal(&mut self, nal_header: NalHeader) -> Result<(), String> {
+        // Normal FU-A flow which conforms to the spec.
+        self.nals.push(Nal {
+            hdr: nal_header,
+            next_piece_idx: u32::MAX, // should be overwritten later.
+            len: 1,                   // should be overwritten in case of Annex B stream in FU-A
+        });
+
+        Ok(())
+    }
+
+    /// Appends data from RTP packet to `NalParser::pieces`
+    fn append_rtp_nal(&mut self, data: Bytes) -> Result<(), String> {
+        // handle Annex B stream if present (https://github.com/scottlamb/retina/issues/68)
+        let did_find_boundary = self.break_apart_nals(data.clone())?;
+
+        // if we had found boundary, we already handled adding pieces, so no need
+        // to add pieces again
+        if did_find_boundary {
+            return Ok(());
+        }
+
+        // otherwise, add pieces as per normal flow
+        self.push(data)?;
+        Ok(())
+    }
+
+    /// Adds bytes to `pieces` and updates last `Nal`.
+    fn push(&mut self, data: Bytes) -> Result<(), String> {
+        let pieces = self.add_piece(data.clone())?;
+        let last_nal = self.nals.last_mut().expect("nals non-empty while in FU-A");
+        last_nal.next_piece_idx = pieces;
+        last_nal.len += u32::try_from(data.len()).expect("u16 < u32::MAX");
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -65,8 +194,8 @@ struct AccessUnit {
     timestamp: crate::Timestamp,
     stream_id: usize,
 
-    /// True iff currently processing a FU-A.
-    in_fu_a: bool,
+    /// Holds a value iff currently processing a FU-A. Stores the first [NalHeader] of the starting FU-A.
+    in_fu_a: Option<NalHeader>,
 
     /// RTP packets lost as this access unit was starting.
     loss: u16,
@@ -121,9 +250,8 @@ impl Depacketizer {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             pending: None,
-            pieces: Vec::new(),
-            nals: Vec::new(),
             parameters,
+            nal_parser: NalParser::new(),
         })
     }
 
@@ -142,15 +270,14 @@ impl Depacketizer {
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     AccessUnit::start(&pkt, 0, false)
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
                     let loss = pkt.loss();
                     if loss > 0 {
-                        self.nals.clear();
-                        self.pieces.clear();
+                        self.nal_parser.clear();
                         if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             self.input_state = if pkt.mark() {
@@ -159,8 +286,7 @@ impl Depacketizer {
                                     loss,
                                 }
                             } else {
-                                self.pieces.clear();
-                                self.nals.clear();
+                                self.nal_parser.clear();
                                 DepacketizerInputState::Loss {
                                     timestamp: pkt.timestamp(),
                                     pkts: loss,
@@ -172,14 +298,14 @@ impl Depacketizer {
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
-                        if access_unit.in_fu_a {
+                        if access_unit.in_fu_a.is_some() {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 access_unit.timestamp,
                                 pkt.timestamp()
                             ));
                         }
-                        let last_nal_hdr = self.nals.last().unwrap().hdr;
+                        let last_nal_hdr = self.nal_parser.nals.last().unwrap().hdr;
                         if can_end_au(last_nal_hdr.nal_unit_type()) {
                             access_unit.end_ctx = *pkt.ctx();
                             self.pending =
@@ -201,16 +327,16 @@ impl Depacketizer {
                     timestamp: state_ts,
                     loss,
                 } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
                     mut pkts,
                 } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                    debug_assert!(self.nal_parser.nals.is_empty());
+                    debug_assert!(self.nal_parser.pieces.is_empty());
                     if pkt.timestamp().timestamp == timestamp.timestamp {
                         pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
@@ -236,14 +362,14 @@ impl Depacketizer {
         data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
-                if access_unit.in_fu_a {
+                if access_unit.in_fu_a.is_some() {
                     return Err(format!(
                         "Non-fragmented NAL {nal_header:02x} while fragment in progress"
                     ));
                 }
                 let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
-                let next_piece_idx = self.add_piece(data)?;
-                self.nals.push(Nal {
+                let next_piece_idx = self.nal_parser.add_piece(data)?;
+                self.nal_parser.nals.push(Nal {
                     hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
                     next_piece_idx,
                     len,
@@ -274,8 +400,8 @@ impl Depacketizer {
                         }
                         std::cmp::Ordering::Equal => {
                             data.advance(1);
-                            let next_piece_idx = self.add_piece(data)?;
-                            self.nals.push(Nal {
+                            let next_piece_idx = self.nal_parser.add_piece(data)?;
+                            self.nal_parser.nals.push(Nal {
                                 hdr,
                                 next_piece_idx,
                                 len: u32::from(len),
@@ -285,8 +411,8 @@ impl Depacketizer {
                         std::cmp::Ordering::Greater => {
                             let mut piece = data.split_to(usize::from(len));
                             piece.advance(1);
-                            let next_piece_idx = self.add_piece(piece)?;
-                            self.nals.push(Nal {
+                            let next_piece_idx = self.nal_parser.add_piece(piece)?;
+                            self.nal_parser.nals.push(Nal {
                                 hdr,
                                 next_piece_idx,
                                 len: u32::from(len),
@@ -319,39 +445,32 @@ impl Depacketizer {
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
-                let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
                 match (start, access_unit.in_fu_a) {
-                    (true, true) => return Err("FU-A with start bit while frag in progress".into()),
-                    (true, false) => {
-                        self.add_piece(data)?;
-                        self.nals.push(Nal {
-                            hdr: nal_header,
-                            next_piece_idx: u32::MAX, // should be overwritten later.
-                            len: 1 + u32_len,
-                        });
-                        access_unit.in_fu_a = true;
+                    (true, Some(_)) => {
+                        return Err("FU-A with start bit while frag in progress".into())
                     }
-                    (false, true) => {
-                        let pieces = self.add_piece(data)?;
-                        let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
-                        if u8::from(nal_header) != u8::from(nal.hdr) {
+                    (true, None) => {
+                        self.nal_parser.start_rtp_nal(nal_header)?;
+                        self.nal_parser.append_rtp_nal(data)?;
+                        access_unit.in_fu_a = Some(nal_header);
+                    }
+                    (false, Some(header_of_starting_fu_a)) => {
+                        self.nal_parser.append_rtp_nal(data)?;
+                        if u8::from(nal_header) != u8::from(header_of_starting_fu_a) {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
-                                nal.hdr, nal_header,
+                                header_of_starting_fu_a, nal_header,
                             ));
                         }
-                        nal.len += u32_len;
                         if end {
-                            nal.next_piece_idx = pieces;
-                            access_unit.in_fu_a = false;
+                            access_unit.in_fu_a = None;
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
                         }
                     }
-                    (false, false) => {
+                    (false, None) => {
                         if loss > 0 {
-                            self.pieces.clear();
-                            self.nals.clear();
+                            self.nal_parser.clear();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
                                 pkts: loss,
@@ -365,7 +484,7 @@ impl Depacketizer {
             _ => return Err(format!("bad nal header {nal_header:02x}")),
         }
         self.input_state = if mark {
-            let last_nal_hdr = self.nals.last().unwrap().hdr;
+            let last_nal_hdr = self.nal_parser.nals.last().unwrap().hdr;
             if can_end_au(last_nal_hdr.nal_unit_type()) {
                 access_unit.end_ctx = ctx;
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
@@ -388,12 +507,6 @@ impl Depacketizer {
         self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
-    /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
-    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
-        self.pieces.push(piece);
-        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
-    }
-
     /// Logs information about each access unit.
     /// Currently, "bad" access units (violating certain specification rules)
     /// are logged at debug priority, and others are logged at trace priority.
@@ -402,10 +515,10 @@ impl Depacketizer {
         if au.same_ts_as_prev {
             errs.push_str("\n* same timestamp as previous access unit");
         }
-        validate_order(&self.nals, &mut errs);
+        validate_order(&self.nal_parser.nals, &mut errs);
         if !errs.is_empty() {
             let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
+            for (i, nal) in self.nal_parser.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
             debug!(
@@ -414,7 +527,7 @@ impl Depacketizer {
             );
         } else if log_enabled!(log::Level::Trace) {
             let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
+            for (i, nal) in self.nal_parser.nals.iter().enumerate() {
                 let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
             }
             trace!(
@@ -437,9 +550,9 @@ impl Depacketizer {
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
         }
-        for nal in &self.nals {
+        for nal in &self.nal_parser.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            let nal_pieces = &self.nal_parser.pieces[piece_idx..next_piece_idx];
             match nal.hdr.nal_unit_type() {
                 UnitType::SeqParameterSet => {
                     if self
@@ -473,9 +586,9 @@ impl Depacketizer {
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
-        for nal in &self.nals {
+        for nal in &self.nal_parser.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            let nal_pieces = &self.nal_parser.pieces[piece_idx..next_piece_idx];
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
             let mut actual_len = 1;
@@ -490,8 +603,7 @@ impl Depacketizer {
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
-        self.nals.clear();
-        self.pieces.clear();
+        self.nal_parser.clear();
 
         let has_new_parameters = match (
             new_sps.as_deref(),
@@ -551,7 +663,7 @@ impl AccessUnit {
             end_ctx: *pkt.ctx(),
             timestamp: pkt.timestamp(),
             stream_id: pkt.stream_id(),
-            in_fu_a: false,
+            in_fu_a: None,
 
             // TODO: overflow?
             loss: pkt.loss() + additional_loss,
@@ -999,6 +1111,8 @@ enum PacketizerState {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+
+    use h264_reader::nal::UnitType;
 
     use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
@@ -1526,5 +1640,164 @@ mod tests {
         };
         assert!(frame.has_new_parameters);
         assert!(d.parameters().is_some());
+    }
+
+    // FU-A packet containing Annex B stream (https://github.com/scottlamb/retina/issues/68)
+    #[test]
+    fn parse_annex_b_stream_in_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A start fragment which includes Annex B stream of 3 NALs
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(
+            *b"\
+            \x3c\x87\
+            \x4d\x00\x1f\xe7\x40\x28\x02\xdd\x80\xa5\x05\x05\x05\xf0\x00\x00\x03\x00\x10\x00\x00\x03\x02\x8b\x01\x00\x02\xdc\x68\x00\x02\x25\x51\x7f\xff\x02\x80\
+            \x00\x00\x00\
+            \x01\x28\
+            \xee\x3c\x80\
+            \x00\x00\x00\
+            \x01\x25\
+            idr-slice, "
+        )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        // should've parsed Annex B stream from first FU-A frag into 3 NALs (SPS, PPS & IDR slice)
+        let number_of_nals_in_first_frag = 3;
+        assert!(d.nal_parser.nals.len() == number_of_nals_in_first_frag);
+        assert!(d.nal_parser.pieces.len() == number_of_nals_in_first_frag);
+        assert!(d.nal_parser.nals[0].hdr.nal_unit_type() == UnitType::SeqParameterSet);
+        assert!(d.nal_parser.nals[1].hdr.nal_unit_type() == UnitType::PicParameterSet);
+        assert!(
+            d.nal_parser.nals[2].hdr.nal_unit_type() == UnitType::SliceLayerWithoutPartitioningIdr
+        );
+
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x07idr-slice continued, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        // For Annex B stream in FU-A, make sure we append next frags to the last nal
+        // instead of creating a new one from the frag header, since the header is of the starting
+        // NAL of previous frag, but instead is supposed to be the continuation of the last NAL from Annex B stream.
+
+        // This test will also test that retina shouldn't panic on receiving different nal headers in frags of
+        // a FU-A when the FU-A contains an Annex B stream.
+
+        // no new nals are to be created
+        assert!(d.nal_parser.nals.len() == number_of_nals_in_first_frag);
+        // data from frag will get appended
+        assert!(d.nal_parser.pieces.len() == number_of_nals_in_first_frag + 1);
+
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x47idr-slice end")
+            .unwrap(),
+        )
+        .unwrap();
+
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert_eq!(
+            frame.data(),
+            b"\
+            \x00\x00\x00\x26\
+            \x27\
+            \x4d\x00\x1f\xe7\x40\x28\x02\xdd\x80\xa5\x05\x05\x05\xf0\x00\x00\x03\x00\x10\x00\x00\x03\x02\x8b\x01\x00\x02\xdc\x68\x00\x02\x25\x51\x7f\xff\x02\x80\
+            \x00\x00\x00\
+            \x04\x28\
+            \xee\x3c\x80\
+            \x00\x00\x00\
+            \x2e\x25\
+            idr-slice, idr-slice continued, idr-slice end"
+        );
+    }
+
+    #[test]
+    fn exit_on_inconsistent_headers_between_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A start fragment
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x81start of non-idr")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        let push_result = d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x07a wild sps appeared")
+            .unwrap(),
+        );
+        assert!(push_result.is_err());
     }
 }
