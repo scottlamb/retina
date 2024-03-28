@@ -1102,6 +1102,7 @@ mod tests {
 
     use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
+    use h264_reader::nal::UnitType;
 
     /*
      * This test requires
@@ -1626,5 +1627,162 @@ mod tests {
         };
         assert!(frame.has_new_parameters);
         assert!(d.parameters().is_some());
+    }
+
+    // FU-A packet containing Annex B stream (https://github.com/scottlamb/retina/issues/68)
+    #[test]
+    fn parse_annex_b_stream_in_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A start fragment which includes Annex B stream of 3 NALs
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(
+            *b"\
+            \x3c\x87\
+            \x4d\x00\x1f\xe7\x40\x28\x02\xdd\x80\xa5\x05\x05\x05\xf0\x00\x00\x03\x00\x10\x00\x00\x03\x02\x8b\x01\x00\x02\xdc\x68\x00\x02\x25\x51\x7f\xff\x02\x80\
+            \x00\x00\x00\x01\
+            \x28\
+            \xee\x3c\x80\
+            \x00\x00\x00\x01\
+            \x25\
+            idr-slice, "
+        )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        // should've parsed Annex B stream from first FU-A frag into 3 NALs (SPS, PPS & IDR slice)
+        let number_of_nals_in_first_frag = 3;
+        assert!(d.nals.len() == number_of_nals_in_first_frag);
+        assert!(d.pieces.len() == number_of_nals_in_first_frag);
+        assert!(d.nals[0].hdr.nal_unit_type() == UnitType::SeqParameterSet);
+        assert!(d.nals[1].hdr.nal_unit_type() == UnitType::PicParameterSet);
+        assert!(d.nals[2].hdr.nal_unit_type() == UnitType::SliceLayerWithoutPartitioningIdr);
+
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x07idr-slice continued, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        // For Annex B stream in FU-A, make sure we append next frags to the last nal
+        // instead of creating a new one from the frag header, since the header is of the starting
+        // NAL of previous frag, but instead is supposed to be the continuation of the last NAL from Annex B stream.
+
+        // This test will also test that retina shouldn't panic on receiving different nal headers in frags of
+        // a FU-A when the FU-A contains an Annex B stream.
+
+        // no new nals are to be created
+        assert!(d.nals.len() == number_of_nals_in_first_frag);
+        // data from frag will get appended
+        assert!(d.pieces.len() == number_of_nals_in_first_frag + 1);
+
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x47idr-slice end")
+            .unwrap(),
+        )
+        .unwrap();
+
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert_eq!(
+            frame.data(),
+            b"\
+            \x00\x00\x00\x26\
+            \x27\
+            \x4d\x00\x1f\xe7\x40\x28\x02\xdd\x80\xa5\x05\x05\x05\xf0\x00\x00\x03\x00\x10\x00\x00\x03\x02\x8b\x01\x00\x02\xdc\x68\x00\x02\x25\x51\x7f\xff\x02\x80\
+            \x00\x00\x00\
+            \x04\x28\
+            \xee\x3c\x80\
+            \x00\x00\x00\
+            \x2e\x25\
+            idr-slice, idr-slice continued, idr-slice end"
+        );
+    }
+
+    #[test]
+    fn exit_on_inconsistent_headers_between_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A start fragment
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x81start of non-idr")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        let push_result = d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x07a wild sps appeared")
+            .unwrap(),
+        );
+        assert!(push_result.is_err());
     }
 }
