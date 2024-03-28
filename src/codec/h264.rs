@@ -44,6 +44,9 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// RTP payload is an Annex B stream.
+    has_annex_b_stream: bool,
 }
 
 #[derive(Debug)]
@@ -123,6 +126,7 @@ impl Depacketizer {
             pending: None,
             pieces: Vec::new(),
             nals: Vec::new(),
+            has_annex_b_stream: false,
             parameters,
         })
     }
@@ -323,18 +327,23 @@ impl Depacketizer {
                 match (start, access_unit.in_fu_a) {
                     (true, true) => return Err("FU-A with start bit while frag in progress".into()),
                     (true, false) => {
-                        self.add_piece(data)?;
-                        self.nals.push(Nal {
-                            hdr: nal_header,
-                            next_piece_idx: u32::MAX, // should be overwritten later.
-                            len: 1 + u32_len,
-                        });
+                        if self.is_annex_b_stream(data.clone()) {
+                            self.has_annex_b_stream = true;
+                            self.read_annex_b_stream(nal_header, &mut data)?;
+                        } else {
+                            self.add_piece(data)?;
+                            self.nals.push(Nal {
+                                hdr: nal_header,
+                                next_piece_idx: u32::MAX, // should be overwritten later.
+                                len: 1 + u32_len,
+                            });
+                        }
                         access_unit.in_fu_a = true;
                     }
                     (false, true) => {
                         let pieces = self.add_piece(data)?;
                         let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
-                        if u8::from(nal_header) != u8::from(nal.hdr) {
+                        if !self.has_annex_b_stream && u8::from(nal_header) != u8::from(nal.hdr) {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
                                 nal.hdr, nal_header,
@@ -392,6 +401,97 @@ impl Depacketizer {
     fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
         self.pieces.push(piece);
         u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
+    }
+
+    /// Checks if Annex B start code is present in payload.
+    fn is_annex_b_stream(&mut self, piece: Bytes) -> bool {
+        // TODO: should we check for 3 byte start code too?
+        let _start_code_3_byte = [0x00, 0x00, 0x01];
+
+        let start_code_4_byte = [0x00, 0x00, 0x00, 0x01];
+        let start_code_4_byte_idx = piece
+            .windows(start_code_4_byte[..].len())
+            .position(|window| window == &start_code_4_byte[..]);
+        start_code_4_byte_idx.is_some()
+    }
+
+    /// Parses an Annex B steam, splitting NALUs in it and adding them to `Depacketizer`.
+    fn read_annex_b_stream(
+        &mut self,
+        nal_header: NalHeader,
+        piece: &mut Bytes,
+    ) -> Result<(), String> {
+        const START_CODE_4_BYTE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+        assert_eq!(self.has_annex_b_stream, true);
+
+        // TODO: check for start code broken b/w two fragmented packets.
+
+        // Find start codes in payload.
+        let start_codes: Vec<_> = piece
+            .windows(START_CODE_4_BYTE[..].len())
+            .enumerate()
+            .filter_map(|(i, window)| {
+                if window == START_CODE_4_BYTE {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut start_idx = 0;
+        for (idx, start_code_idx) in start_codes.into_iter().enumerate() {
+            let start_code_end_idx = start_code_idx + 3;
+            let mut nal_piece = piece.slice(start_idx..start_code_idx);
+            start_idx = start_code_end_idx + 1;
+
+            if idx == 0 {
+                if self.pieces.is_empty() {
+                    let pieces = self.add_piece(nal_piece.clone())?;
+                    // use nal_header from argument
+                    self.nals.push(Nal {
+                        hdr: nal_header,
+                        next_piece_idx: pieces,
+                        len: 1 + u32::try_from(nal_piece.clone().len())
+                            .expect("NALU payload must be < u16::MAX"),
+                    })
+                } else {
+                    // TODO: we received a start code in a fragmented FU-A packet.
+                    // Handle it differently i.e. update the last NALU instead of
+                    // creating a new one.
+                }
+            } else {
+                let nal_header_byte = nal_piece[0];
+                nal_piece.advance(1);
+
+                let pieces = self.add_piece(nal_piece.clone())?;
+                let nal_header = NalHeader::new(nal_header_byte).expect("NalHeader is valid");
+                self.nals.push(Nal {
+                    hdr: nal_header,
+                    next_piece_idx: pieces,
+                    len: 1 + u32::try_from(nal_piece.clone().len())
+                        .expect("NALU payload must be < u16::MAX"),
+                })
+            }
+        }
+
+        // Handle payload after the last found start code.
+        if start_idx < piece.len() {
+            let mut nal_piece = piece.slice(start_idx..);
+            let nal_header_byte = nal_piece[0];
+            let nal_header = NalHeader::new(nal_header_byte).expect("NalHeader is valid");
+            nal_piece.advance(1);
+            self.add_piece(nal_piece.clone())?;
+            self.nals.push(Nal {
+                hdr: nal_header,
+                next_piece_idx: u32::MAX,
+                len: 1 + u32::try_from(nal_piece.clone().len())
+                    .expect("NALU payload must be < u16::MAX"),
+            })
+        }
+
+        Ok(())
     }
 
     /// Logs information about each access unit.
