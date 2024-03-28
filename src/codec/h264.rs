@@ -423,7 +423,7 @@ impl Depacketizer {
     ) -> Result<(), String> {
         const START_CODE_4_BYTE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
-        assert_eq!(self.has_annex_b_stream, true);
+        assert!(self.has_annex_b_stream);
 
         // TODO: check for start code broken b/w two fragmented packets.
 
