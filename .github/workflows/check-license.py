@@ -23,7 +23,7 @@ FILENAME_MATCHER = re.compile(r'.*\.rs$')
 MAX_LINE_COUNT = 10
 
 EXPECTED_LINES = [
-  re.compile(r'Copyright \(C\) 20\d{2} Scott Lamb <slamb@slamb\.org>'),
+  re.compile(r'Copyright \(C\) 20\d{2}'),
   re.compile(r'SPDX-License-Identifier: MIT OR Apache-2\.0'),
 ]
 
