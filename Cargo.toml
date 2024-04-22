@@ -15,6 +15,15 @@ repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
 rust-version = "1.67"
 
+[features]
+unstable-sample-entry = []
+
+[package.metadata.docs.rs]
+# https://docs.rs/about/metadata
+# To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
+
 [dependencies]
 base64 = "0.21.0"
 bitstream-io = "1.1"
