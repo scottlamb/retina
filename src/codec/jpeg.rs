@@ -3,10 +3,23 @@
 
 //! [JPEG](https://www.itu.int/rec/T-REC-T.81-199209-I/en)-encoded video.
 //! [RTP Payload Format for JPEG-compressed Video](https://datatracker.ietf.org/doc/html/rfc2435)
+//!
+//! # Representation in `.mp4` (ISO BMFF) container files
+//!
+//! ISO/IEC 14496-12 section C.5 ("Storage of new media types") says that media
+//! codecs should be represented either via "MPEG-4 systems constructs" and
+//! `mp4v` sample entries or via dedicated sample entry fourccs. Only the former
+//! appears to be defined for MJPEG. Other software appears to support this
+//! representation:
+//!
+//! * encoding in FFmpeg and MediaMTX
+//! * decoding in FFmpeg, VLC, and Apple QuickTime Player
+//!
+//! Retina matches this.
 
 use bytes::{Buf, Bytes};
 
-use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
+use crate::{codec::write_visual_sample_entry_body, rtp::ReceivedPacket, PacketContext, Timestamp};
 
 use super::{VideoFrame, VideoParameters};
 
@@ -433,11 +446,12 @@ impl Depacketizer {
                         start_ctx: ctx,
                         timestamp,
                         parameters: Some(VideoParameters {
-                            pixel_dimensions: (width as u32, height as u32),
-                            rfc6381_codec: "".to_string(), // RFC 6381 is not applicable to MJPEG
+                            pixel_dimensions: (u32::from(width), u32::from(height)),
+                            rfc6381_codec: "mp4v.6C".to_owned(),
                             pixel_aspect_ratio: None,
                             frame_rate: None,
                             extra_data: Bytes::new(),
+                            sample_entry: Some(make_video_sample_entry(width, height)),
                         }),
                     });
                 }
@@ -508,6 +522,53 @@ impl Depacketizer {
     pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
         self.parameters.as_ref().map(super::ParametersRef::Video)
     }
+}
+
+fn make_video_sample_entry(width: u16, height: u16) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    // Write an MP4VisualSampleEntry (`mp4v`), as in ISO/IEC 14496-14 section 5.6.1.
+    // It's based on VisualSampleEntry, ISO/IEC 14496-12 section 12.1.3.
+    // in turn based on SampleEntry, ISO/IEC 14496-12 section 8.5.2.2.
+    write_mp4_box!(&mut buf, b"mp4v", {
+        write_visual_sample_entry_body(&mut buf, (width, height));
+
+        // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
+        write_mp4_box!(&mut buf, b"esds", {
+            buf.extend_from_slice(&0u32.to_be_bytes()[..]); // version
+            write_mpeg4_descriptor!(&mut buf, 0x03 /* ES_DescrTag */, {
+                // The ESDBox contains an ES_Descriptor, defined in ISO/IEC 14496-1 section 8.3.3.
+                // ISO/IEC 14496-14 section 3.1.2 has advice on how to set its
+                // fields within the scope of a .mp4 file.
+                buf.extend_from_slice(&[
+                    0, 0,    // ES_ID=0
+                    0x00, // streamDependenceFlag, URL_Flag, OCRStreamFlag, streamPriority.
+                ]);
+
+                // DecoderConfigDescriptor, defined in ISO/IEC 14496-1 section 7.2.6.6.
+                write_mpeg4_descriptor!(&mut buf, 0x04 /* DecoderConfigDescrTag */, {
+                    buf.extend_from_slice(&[
+                        0x6C, // objectTypeIndication = Visual ISO/IEC 10918-1 (aka JPEG)
+                        0x11, // streamType = visual, upstream = false, reserved = 1
+                        // XXX: does any reader expect valid values here? They wouldn't be
+                        // trivial to calculate ahead of time.
+                        0x00, 0x00, 0x00, // bufferSizeDB
+                        0x00, 0x00, 0x00, 0x00, // maxBitrate
+                        0x00, 0x00, 0x00, 0x00, // avgBitrate
+                    ]);
+                    // No DecoderSpecificInfo.
+                    // DecoderSpecificInfo, 2 of them?
+                    // No profileLevelIndicatorIndexDescr.
+                });
+
+                // SLConfigDescriptor, ISO/IEC 14496-1 section 7.3.2.3.1.
+                write_mpeg4_descriptor!(&mut buf, 0x06 /* SLConfigDescrTag */, {
+                    buf.push(2); // predefined = reserved for use in MP4 files
+                });
+            });
+        });
+    });
+    buf
 }
 
 impl Default for Depacketizer {

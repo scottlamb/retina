@@ -174,91 +174,6 @@ impl AudioSpecificConfig {
     }
 }
 
-/// Overwrites a buffer with a varint length, returning the length of the length.
-/// See ISO/IEC 14496-1 section 8.3.3.
-fn set_length(len: usize, data: &mut [u8]) -> Result<usize, String> {
-    if len < 1 << 7 {
-        data[0] = len as u8;
-        Ok(1)
-    } else if len < 1 << 14 {
-        data[0] = ((len & 0x7F) | 0x80) as u8;
-        data[1] = (len >> 7) as u8;
-        Ok(2)
-    } else if len < 1 << 21 {
-        data[0] = ((len & 0x7F) | 0x80) as u8;
-        data[1] = (((len >> 7) & 0x7F) | 0x80) as u8;
-        data[2] = (len >> 14) as u8;
-        Ok(3)
-    } else if len < 1 << 28 {
-        data[0] = ((len & 0x7F) | 0x80) as u8;
-        data[1] = (((len >> 7) & 0x7F) | 0x80) as u8;
-        data[2] = (((len >> 14) & 0x7F) | 0x80) as u8;
-        data[3] = (len >> 21) as u8;
-        Ok(4)
-    } else {
-        // BaseDescriptor sets a maximum length of 2**28 - 1.
-        Err(format!("length {len} too long"))
-    }
-}
-
-/// Writes a box length and type (four-character code) for everything appended
-/// in the supplied scope.
-macro_rules! write_box {
-    ($buf:expr, $fourcc:expr, $b:block) => {
-        // The caller uses `&mut buf`. clippy likes to complain about the `&mut`
-        // being unnecessary for len(), but it is necessary for other things.
-        // The macro also can't store `$buf` in its own local, because `$b`
-        // is expected to reference `$buf` via the original name.
-        #[allow(clippy::unnecessary_mut_passed)]
-        {
-            let _: &mut Vec<u8> = $buf; // type-check.
-
-            let pos_start = $buf.len();
-            let fourcc: &[u8; 4] = $fourcc;
-            $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
-            let r = {
-                $b;
-            };
-            let pos_end = $buf.len();
-            let len = pos_end.checked_sub(pos_start).unwrap();
-            $buf[pos_start..pos_start + 4].copy_from_slice(
-                &u32::try_from(len)
-                    .map_err(|_| format!("box length {} exceeds u32::MAX", len))?
-                    .to_be_bytes()[..],
-            );
-            r
-        }
-    };
-}
-
-/// Writes a descriptor tag and length for everything appended in the supplied
-/// scope. See ISO/IEC 14496-1 Table 1 for the `tag`.
-macro_rules! write_descriptor {
-    ($buf:expr, $tag:expr, $b:block) => {{
-        let _: &mut Vec<u8> = $buf; // type-check.
-        let _: u8 = $tag;
-        let pos_start = $buf.len();
-
-        // Overallocate room for the varint length and append the body.
-        $buf.extend_from_slice(&[$tag, 0, 0, 0, 0]);
-        let r = {
-            $b;
-        };
-        let pos_end = $buf.len();
-
-        // Then fix it afterward: write the correct varint length and move
-        // the body backward. This approach seems better than requiring the
-        // caller to first prepare the body in a separate allocation (and
-        // awkward code ordering), or (as ffmpeg does) writing a "varint"
-        // which is padded with leading 0x80 bytes.
-        let len = pos_end.checked_sub(pos_start + 5).unwrap();
-        let len_len = set_length(len, &mut $buf[pos_start + 1..pos_start + 4])?;
-        $buf.copy_within(pos_start + 5..pos_end, pos_start + 1 + len_len);
-        $buf.truncate(pos_end + len_len - 4);
-        r
-    }};
-}
-
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
 /// `config` should be a raw AudioSpecificConfig.
 fn make_sample_entry(
@@ -271,7 +186,7 @@ fn make_sample_entry(
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
     // It's based on AudioSampleEntry, ISO/IEC 14496-12 section 12.2.3.2,
     // in turn based on SampleEntry, ISO/IEC 14496-12 section 8.5.2.2.
-    write_box!(&mut buf, b"mp4a", {
+    write_mp4_box!(&mut buf, b"mp4a", {
         buf.extend_from_slice(&[
             0, 0, 0, 0, // SampleEntry.reserved
             0, 0, 0, 1, // SampleEntry.reserved, SampleEntry.data_reference_index (1)
@@ -294,10 +209,10 @@ fn make_sample_entry(
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
-        write_box!(&mut buf, b"esds", {
+        write_mp4_box!(&mut buf, b"esds", {
             buf.put_u32(0); // version
 
-            write_descriptor!(&mut buf, 0x03 /* ES_DescrTag */, {
+            write_mpeg4_descriptor!(&mut buf, 0x03 /* ES_DescrTag */, {
                 // The ESDBox contains an ES_Descriptor, defined in ISO/IEC 14496-1 section 8.3.3.
                 // ISO/IEC 14496-14 section 3.1.2 has advice on how to set its
                 // fields within the scope of a .mp4 file.
@@ -307,7 +222,7 @@ fn make_sample_entry(
                 ]);
 
                 // DecoderConfigDescriptor, defined in ISO/IEC 14496-1 section 7.2.6.6.
-                write_descriptor!(&mut buf, 0x04 /* DecoderConfigDescrTag */, {
+                write_mpeg4_descriptor!(&mut buf, 0x04 /* DecoderConfigDescrTag */, {
                     buf.extend_from_slice(&[
                         0x40, // objectTypeIndication = Audio ISO/IEC 14496-3
                         0x15, // streamType = audio, upstream = false, reserved = 1
@@ -333,13 +248,13 @@ fn make_sample_entry(
                     buf.put_u32(0);
 
                     // AudioSpecificConfiguration, ISO/IEC 14496-3 subpart 1 section 1.6.2.
-                    write_descriptor!(&mut buf, 0x05 /* DecSpecificInfoTag */, {
+                    write_mpeg4_descriptor!(&mut buf, 0x05 /* DecSpecificInfoTag */, {
                         buf.extend_from_slice(config);
                     });
                 });
 
                 // SLConfigDescriptor, ISO/IEC 14496-1 section 7.3.2.3.1.
-                write_descriptor!(&mut buf, 0x06 /* SLConfigDescrTag */, {
+                write_mpeg4_descriptor!(&mut buf, 0x06 /* SLConfigDescrTag */, {
                     buf.put_u8(2); // predefined = reserved for use in MP4 files
                 });
             });
