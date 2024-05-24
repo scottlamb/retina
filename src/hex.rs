@@ -16,6 +16,22 @@ impl<'a> LimitedHex<'a> {
     }
 }
 
+impl<'a> std::fmt::Display for LimitedHex<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:#}",
+            self.inner.hex_conf(pretty_hex::HexConfig {
+                max_bytes: self.max_bytes,
+                width: 0,
+                group: 0,
+                chunk: 0,
+                ..Default::default()
+            })
+        )
+    }
+}
+
 impl<'a> std::fmt::Debug for LimitedHex<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

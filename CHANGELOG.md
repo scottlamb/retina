@@ -1,3 +1,8 @@
+## unreleased
+
+*   [#102](https://github.com/scottlamb/retina/102): support Reolink cameras
+    which have extraneous bytes following the SPS.
+
 ## `v0.4.7` (2024-01-08)
 
 *   support servers that do not set `Content-Type` on `DESCRIBE` responses
