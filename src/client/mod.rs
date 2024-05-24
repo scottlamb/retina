@@ -226,7 +226,7 @@ impl SessionGroup {
                     "teardown Sender shouldn't be dropped; \
                              ensure the Session's tokio runtime is still alive",
                 );
-                r = (*w.borrow()).clone();
+                r.clone_from(&*w.borrow())
             }
 
             // Now an attempt has finished, success or failure.
