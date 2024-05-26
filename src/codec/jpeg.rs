@@ -480,7 +480,7 @@ impl Depacketizer {
                 loss,
                 timestamp,
                 stream_id,
-                is_random_access_point: false,
+                is_random_access_point: true,
                 is_disposable: true,
                 data: std::mem::take(&mut self.data),
             });
