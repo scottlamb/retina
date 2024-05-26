@@ -1,5 +1,8 @@
-## unreleased
+## `v0.4.8` (2024-05-26)
 
+*   support MJPEG codec (contribution from [zanshi](https://github.com/zanshi))
+*   permit `MP2T/` protocol in media description (contribution from
+    (yujincheng08)[https://github.com/yujincheng08)]).
 *   [#102](https://github.com/scottlamb/retina/102): support Reolink cameras
     which have extraneous bytes following the SPS.
 
