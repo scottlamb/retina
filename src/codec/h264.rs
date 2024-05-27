@@ -153,7 +153,7 @@ impl Depacketizer {
                     if loss > 0 {
                         self.nals.clear();
                         self.pieces.clear();
-                        if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
+                        if access_unit.timestamp.pts == pkt.timestamp().pts {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             self.input_state = if pkt.mark() {
                                 DepacketizerInputState::PostMark {
@@ -173,7 +173,7 @@ impl Depacketizer {
                         // A suffix of a previous access unit was lost; discard it.
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
-                    } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
+                    } else if access_unit.timestamp.pts != pkt.timestamp().pts {
                         if access_unit.in_fu_a {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
@@ -192,7 +192,7 @@ impl Depacketizer {
                                 "Bogus mid-access unit timestamp change after {:?}",
                                 last_nal_hdr
                             );
-                            access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                            access_unit.timestamp.pts = pkt.timestamp().pts;
                             access_unit
                         }
                     } else {
@@ -205,7 +205,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
+                    AccessUnit::start(&pkt, loss, state_ts.pts == pkt.timestamp().pts)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
@@ -213,7 +213,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    if pkt.timestamp().timestamp == timestamp.timestamp {
+                    if pkt.timestamp().pts == timestamp.pts {
                         pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
@@ -377,7 +377,7 @@ impl Depacketizer {
                     "Bogus mid-access unit timestamp change after {:?}",
                     last_nal_hdr
                 );
-                access_unit.timestamp.timestamp = timestamp.timestamp;
+                access_unit.timestamp.pts = timestamp.pts;
                 DepacketizerInputState::PreMark(access_unit)
             }
         } else {
@@ -525,7 +525,7 @@ impl Depacketizer {
             _ => false,
         };
 
-        let mut dts = au.timestamp.timestamp;
+        let mut dts = au.timestamp.pts;
         if let Some(parameters) = &self.parameters {
             // Skip samples silently until we find one with an IDR.
             if self.dts_extractor.is_none() && is_random_access_point {
@@ -547,10 +547,12 @@ impl Depacketizer {
         }
 
         let timestamp = VideoTimestamp {
-            pts: au.timestamp.timestamp,
-            dts,
-            clock_rate: au.timestamp.clock_rate,
-            start: au.timestamp.start,
+            timestamp: Timestamp {
+                pts: au.timestamp.pts,
+                clock_rate: au.timestamp.clock_rate,
+                start: au.timestamp.start,
+            },
+            dts: Some(dts),
         };
 
         Ok(VideoFrame {
@@ -1135,12 +1137,11 @@ enum PacketizerState {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use std::num::NonZeroU32;
 
     use crate::testutil::init_logging;
-    use crate::VideoTimestamp;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
+    use crate::{Timestamp, VideoTimestamp};
 
     /*
      * This test requires
@@ -1201,7 +1202,7 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1310,12 +1311,12 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
         let ts2 = crate::Timestamp {
-            timestamp: 1,
+            pts: 1,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1384,10 +1385,12 @@ mod tests {
               \x00\x00\x00\x06\x65slice"
         );
         let want = VideoTimestamp {
-            pts: 1,
-            dts: 1,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
+            timestamp: Timestamp {
+                pts: 1,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(1),
         };
         assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
@@ -1400,12 +1403,12 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
         let ts2 = crate::Timestamp {
-            timestamp: 1,
+            pts: 1,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1432,10 +1435,12 @@ mod tests {
         };
         assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
         let want = VideoTimestamp {
-            pts: 0,
-            dts: 0,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
+            timestamp: Timestamp {
+                pts: 0,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(0),
         };
         assert_eq!(frame.timestamp, want);
         d.push(
@@ -1499,10 +1504,12 @@ mod tests {
               \x00\x00\x00\x06\x65slice"
         );
         let want = VideoTimestamp {
-            pts: 1,
-            dts: 1,
-            clock_rate: NonZeroU32::new(90_000).unwrap(),
-            start: 0,
+            timestamp: Timestamp {
+                pts: 1,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(1),
         };
         assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
@@ -1518,7 +1525,7 @@ mod tests {
             o => panic!("{o:?}"),
         }
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1626,7 +1633,7 @@ mod tests {
 
         // The stream should honor in-band parameters.
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1695,7 +1702,7 @@ mod tests {
 
         // The stream should honor in-band parameters, even with an extra byte.
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };

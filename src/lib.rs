@@ -93,8 +93,8 @@ struct ReceivedMessage {
 /// *   NPT
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Timestamp {
-    /// A timestamp which must be compared to `start`.
-    timestamp: i64,
+    /// A presentation timestamp which must be compared to `start`.
+    pts: i64,
 
     /// The codec-specified clock rate, in Hz. Must be non-zero.
     clock_rate: NonZeroU32,
@@ -108,7 +108,7 @@ impl Timestamp {
     #[inline]
     pub fn new(timestamp: i64, clock_rate: NonZeroU32, start: u32) -> Option<Self> {
         timestamp.checked_sub(i64::from(start)).map(|_| Timestamp {
-            timestamp,
+            pts: timestamp,
             clock_rate,
             start,
         })
@@ -117,7 +117,7 @@ impl Timestamp {
     /// Returns time since some arbitrary point before the stream started.
     #[inline]
     pub fn timestamp(&self) -> i64 {
-        self.timestamp
+        self.pts
     }
 
     /// Returns timestamp of the start of the stream.
@@ -135,7 +135,7 @@ impl Timestamp {
     /// Returns elapsed time since the stream start in clock rate units.
     #[inline]
     pub fn elapsed(&self) -> i64 {
-        self.timestamp - i64::from(self.start)
+        self.pts - i64::from(self.start)
     }
 
     /// Returns elapsed time since the stream start in seconds, aka "normal play
@@ -149,10 +149,10 @@ impl Timestamp {
     pub fn try_add(&self, delta: u32) -> Option<Self> {
         // Check for `timestamp` overflow only. We don't need to check for
         // `timestamp - start` underflow because delta is non-negative.
-        self.timestamp
+        self.pts
             .checked_add(i64::from(delta))
             .map(|timestamp| Timestamp {
-                timestamp,
+                pts: timestamp,
                 clock_rate: self.clock_rate,
                 start: self.start,
             })
@@ -164,8 +164,8 @@ impl Display for Timestamp {
         write!(
             f,
             "{} (mod-2^32: {}), npt {:.03}",
-            self.timestamp,
-            self.timestamp as u32,
+            self.pts,
+            self.pts as u32,
             self.elapsed_secs(),
         )
     }
@@ -215,84 +215,82 @@ impl Debug for Timestamp {
 /// *   NPT
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct VideoTimestamp {
-    /// A presentation timestamp which must be compared to `start`.
-    pts: i64,
+    timestamp: Timestamp,
 
     /// A decode timestamp.
-    dts: i64,
-
-    /// The codec-specified clock rate, in Hz. Must be non-zero.
-    clock_rate: NonZeroU32,
-
-    /// The stream's starting time, as specified in the RTSP `RTP-Info` header.
-    start: u32,
+    dts: Option<i64>,
 }
 
 impl VideoTimestamp {
     /// Creates a new timestamp unless `timestamp - start` underflows.
     #[inline]
-    pub fn new(pts: i64, dts: i64, clock_rate: NonZeroU32, start: u32) -> Option<Self> {
+    pub fn new(pts: i64, dts: Option<i64>, clock_rate: NonZeroU32, start: u32) -> Option<Self> {
         pts.checked_sub(i64::from(start)).map(|_| VideoTimestamp {
-            pts,
+            timestamp: Timestamp {
+                pts,
+                clock_rate,
+                start,
+            },
             dts,
-            clock_rate,
-            start,
         })
     }
 
     /// Returns time since some arbitrary point before the stream started.
     #[inline]
     pub fn pts(&self) -> i64 {
-        self.pts
+        self.timestamp.pts
     }
 
     #[inline]
     pub fn dts(&self) -> i64 {
-        self.dts
+        self.dts.unwrap_or(self.pts())
     }
 
     /// Returns timestamp of the start of the stream.
     #[inline]
     pub fn start(&self) -> u32 {
-        self.start
+        self.timestamp.start
     }
 
     /// Returns codec-specified clock rate, in Hz.
     #[inline]
     pub fn clock_rate(&self) -> NonZeroU32 {
-        self.clock_rate
+        self.timestamp.clock_rate
     }
 
     /// Returns elapsed presentation time since the stream start in clock rate units.
     #[inline]
     pub fn pts_elapsed(&self) -> i64 {
-        self.pts - i64::from(self.start)
+        self.timestamp.elapsed()
     }
 
     /// Returns elapsed presentation time since the stream start in seconds, aka "normal play
     /// time" (NPT).
     #[inline]
     pub fn pts_elapsed_secs(&self) -> f64 {
-        (self.pts_elapsed() as f64) / (self.clock_rate.get() as f64)
+        self.timestamp.elapsed_secs()
     }
 
     /// Returns elapsed decode time since the stream start in clock rate units.
     #[inline]
     pub fn dts_elapsed(&self) -> i64 {
-        self.dts - i64::from(self.start)
+        self.dts() - i64::from(self.timestamp.start)
     }
 
     /// Returns `self + delta` unless it would overflow.
     pub fn try_add(&self, delta: u32) -> Option<Self> {
         // Check for `timestamp` overflow only. We don't need to check for
         // `timestamp - start` underflow because delta is non-negative.
-        self.pts
+        self.timestamp
+            .pts
             .checked_add(i64::from(delta))
             .map(|timestamp| VideoTimestamp {
-                pts: timestamp,
+                timestamp: Timestamp {
+                    pts: timestamp,
+                    clock_rate: self.timestamp.clock_rate,
+                    start: self.timestamp.start,
+                },
                 dts: self.dts,
-                clock_rate: self.clock_rate,
-                start: self.start,
             })
     }
 }
@@ -302,8 +300,8 @@ impl Display for VideoTimestamp {
         write!(
             f,
             "{} (mod-2^32: {}), npt {:.03}, dts {:?}",
-            self.pts,
-            self.pts as u32,
+            self.timestamp.pts,
+            self.timestamp.pts as u32,
             self.pts_elapsed_secs(),
             self.dts,
         )
