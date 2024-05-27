@@ -31,6 +31,7 @@ rand = "0.8.3"
 rtsp-types = "0.1.0"
 sdp-types = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
+test-case = "3.3.1"
 thiserror = "1.0.25"
 time = "0.1.43"
 tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
