@@ -25,6 +25,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let session = retina::client::Session::describe(
         opts.src.url.clone(),
         retina::client::SessionOptions::default()
+            .back_channel(true)
             .creds(creds)
             .user_agent("Retina sdp example".to_owned()),
     )
