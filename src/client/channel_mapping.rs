@@ -19,6 +19,7 @@ pub struct ChannelMapping {
 
 /// Mapping of the 256 possible RTSP interleaved channels to stream indices and
 /// RTP/RTCP. Assumptions:
+///
 /// *   We only need to support 255 possible streams in a presentation. If
 ///     there are more than 128, we couldn't actually stream them all at once
 ///     anyway with one RTP and one RTCP channel per stream.
@@ -31,6 +32,7 @@ pub struct ChannelMapping {
 ///     assigns only `n` and `m`; section 12.39 the suggests full range `[n,
 ///     m]`) or when `n==m`. We'll get into trouble if an RTSP server insists on
 ///     specifying an odd `n`, but that just seems obstinate.
+///
 /// These assumptions let us keep the full mapping with little space and an
 /// efficient lookup operation.
 #[derive(Default)]
