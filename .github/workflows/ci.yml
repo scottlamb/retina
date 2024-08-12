@@ -21,7 +21,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -29,11 +29,9 @@ jobs:
           target
         key: ${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        profile: minimal
         toolchain: ${{ matrix.rust }}
-        override: true
         components: ${{ matrix.extra_components }}
     - name: Build
       run: cargo build --all-features --all-targets --workspace
@@ -44,7 +42,7 @@ jobs:
     - name: Check main workspace formatting
       if: matrix.rust == 'stable'
       run: cargo fmt --all --check
-    - name: Check fuzz worspace formatting
+    - name: Check fuzz workspace formatting
       if: matrix.rust == 'stable'
       run: cd fuzz && cargo fmt --all --check
     - name: Clippy on main workspace
@@ -59,5 +57,5 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - run: find . -type f -print0 | xargs -0 .github/workflows/check-license.py
