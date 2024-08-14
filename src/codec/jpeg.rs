@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::{codec::write_visual_sample_entry_body, rtp::ReceivedPacket, PacketContext, Timestamp};
+use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
 
 use super::{VideoFrame, VideoParameters};
 
@@ -446,12 +446,12 @@ impl Depacketizer {
                         start_ctx: ctx,
                         timestamp,
                         parameters: Some(VideoParameters {
-                            pixel_dimensions: (u32::from(width), u32::from(height)),
+                            pixel_dimensions: (width, height),
                             rfc6381_codec: "mp4v.6C".to_owned(),
                             pixel_aspect_ratio: None,
                             frame_rate: None,
                             extra_data: Bytes::new(),
-                            sample_entry: Some(make_video_sample_entry(width, height)),
+                            codec: super::VideoCodec::Jpeg,
                         }),
                     });
                 }
@@ -524,51 +524,45 @@ impl Depacketizer {
     }
 }
 
-fn make_video_sample_entry(width: u16, height: u16) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Writes the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
+///
+/// This is actually entirely static, but we construct it at runtime with the
+/// `write_mp4_box!` and `write_mpeg4_descriptor!` macros for readability.
+#[cfg(feature = "unstable-sample-entry")]
+pub(super) fn append_esds(buf: &mut Vec<u8>) {
+    write_mp4_box!(buf, *b"esds", {
+        buf.extend_from_slice(&0u32.to_be_bytes()[..]); // version
+        write_mpeg4_descriptor!(buf, 0x03 /* ES_DescrTag */, {
+            // The ESDBox contains an ES_Descriptor, defined in ISO/IEC 14496-1 section 8.3.3.
+            // ISO/IEC 14496-14 section 3.1.2 has advice on how to set its
+            // fields within the scope of a .mp4 file.
+            buf.extend_from_slice(&[
+                0, 0,    // ES_ID=0
+                0x00, // streamDependenceFlag, URL_Flag, OCRStreamFlag, streamPriority.
+            ]);
 
-    // Write an MP4VisualSampleEntry (`mp4v`), as in ISO/IEC 14496-14 section 5.6.1.
-    // It's based on VisualSampleEntry, ISO/IEC 14496-12 section 12.1.3.
-    // in turn based on SampleEntry, ISO/IEC 14496-12 section 8.5.2.2.
-    write_mp4_box!(&mut buf, b"mp4v", {
-        write_visual_sample_entry_body(&mut buf, (width, height));
-
-        // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
-        write_mp4_box!(&mut buf, b"esds", {
-            buf.extend_from_slice(&0u32.to_be_bytes()[..]); // version
-            write_mpeg4_descriptor!(&mut buf, 0x03 /* ES_DescrTag */, {
-                // The ESDBox contains an ES_Descriptor, defined in ISO/IEC 14496-1 section 8.3.3.
-                // ISO/IEC 14496-14 section 3.1.2 has advice on how to set its
-                // fields within the scope of a .mp4 file.
+            // DecoderConfigDescriptor, defined in ISO/IEC 14496-1 section 7.2.6.6.
+            write_mpeg4_descriptor!(buf, 0x04 /* DecoderConfigDescrTag */, {
                 buf.extend_from_slice(&[
-                    0, 0,    // ES_ID=0
-                    0x00, // streamDependenceFlag, URL_Flag, OCRStreamFlag, streamPriority.
+                    0x6C, // objectTypeIndication = Visual ISO/IEC 10918-1 (aka JPEG)
+                    0x11, // streamType = visual, upstream = false, reserved = 1
+                    // XXX: does any reader expect valid values here? They wouldn't be
+                    // trivial to calculate ahead of time.
+                    0x00, 0x00, 0x00, // bufferSizeDB
+                    0x00, 0x00, 0x00, 0x00, // maxBitrate
+                    0x00, 0x00, 0x00, 0x00, // avgBitrate
                 ]);
+                // No DecoderSpecificInfo.
+                // DecoderSpecificInfo, 2 of them?
+                // No profileLevelIndicatorIndexDescr.
+            });
 
-                // DecoderConfigDescriptor, defined in ISO/IEC 14496-1 section 7.2.6.6.
-                write_mpeg4_descriptor!(&mut buf, 0x04 /* DecoderConfigDescrTag */, {
-                    buf.extend_from_slice(&[
-                        0x6C, // objectTypeIndication = Visual ISO/IEC 10918-1 (aka JPEG)
-                        0x11, // streamType = visual, upstream = false, reserved = 1
-                        // XXX: does any reader expect valid values here? They wouldn't be
-                        // trivial to calculate ahead of time.
-                        0x00, 0x00, 0x00, // bufferSizeDB
-                        0x00, 0x00, 0x00, 0x00, // maxBitrate
-                        0x00, 0x00, 0x00, 0x00, // avgBitrate
-                    ]);
-                    // No DecoderSpecificInfo.
-                    // DecoderSpecificInfo, 2 of them?
-                    // No profileLevelIndicatorIndexDescr.
-                });
-
-                // SLConfigDescriptor, ISO/IEC 14496-1 section 7.3.2.3.1.
-                write_mpeg4_descriptor!(&mut buf, 0x06 /* SLConfigDescrTag */, {
-                    buf.push(2); // predefined = reserved for use in MP4 files
-                });
+            // SLConfigDescriptor, ISO/IEC 14496-1 section 7.3.2.3.1.
+            write_mpeg4_descriptor!(buf, 0x06 /* SLConfigDescrTag */, {
+                buf.push(2); // predefined = reserved for use in MP4 files
             });
         });
     });
-    buf
 }
 
 impl Default for Depacketizer {

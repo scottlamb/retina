@@ -28,7 +28,7 @@ macro_rules! write_mp4_box {
     ($buf:expr, $fourcc:expr, $b:block) => {{
         let _: &mut Vec<u8> = $buf; // type-check.
         let pos_start = $buf.len();
-        let fourcc: &[u8; 4] = $fourcc;
+        let fourcc: [u8; 4] = $fourcc;
         $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
         let r = {
             $b;
@@ -101,33 +101,6 @@ macro_rules! write_mpeg4_descriptor {
     }};
 }
 
-/// Writes the boilerplate of a ISO/IEC 14496-12 `VisualSampleEntry`.
-fn write_visual_sample_entry_body(buf: &mut Vec<u8>, pixel_dimensions: (u16, u16)) {
-    // SampleEntry, section 8.5.2.2.
-    buf.extend_from_slice(&0u32.to_be_bytes()[..]); // pre_defined + reserved
-    buf.extend_from_slice(&1u32.to_be_bytes()[..]); // data_reference_index = 1
-
-    // VisualSampleEntry, section 12.1.3.2.
-    buf.extend_from_slice(&[0; 16]);
-    buf.extend_from_slice(&pixel_dimensions.0.to_be_bytes()[..]);
-    buf.extend_from_slice(&pixel_dimensions.1.to_be_bytes()[..]);
-    buf.extend_from_slice(&[
-        0x00, 0x48, 0x00, 0x00, // horizresolution
-        0x00, 0x48, 0x00, 0x00, // vertresolution
-        0x00, 0x00, 0x00, 0x00, // reserved
-        0x00, 0x01, // frame count
-        0x00, 0x00, 0x00, 0x00, // compressorname
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x18, 0xff, 0xff, // depth + pre_defined
-    ]);
-}
-
 pub(crate) mod aac;
 pub(crate) mod g723;
 pub(crate) mod jpeg;
@@ -177,14 +150,17 @@ pub enum ParametersRef<'a> {
 /// calls to [`crate::client::Stream::parameters`] will return the new value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoParameters {
-    pixel_dimensions: (u32, u32),
+    pixel_dimensions: (u16, u16),
     rfc6381_codec: String,
     pixel_aspect_ratio: Option<(u32, u32)>,
     frame_rate: Option<(u32, u32)>,
     extra_data: Bytes,
 
+    /// The codec, for internal use in sample entry construction.
+    ///
+    /// This is more straightforward than reparsing the RFC 6381 codec string.
     #[cfg_attr(not(feature = "unstable-sample-entry"), allow(unused))]
-    sample_entry: Option<Vec<u8>>,
+    codec: VideoCodec,
 }
 
 impl VideoParameters {
@@ -195,19 +171,21 @@ impl VideoParameters {
         &self.rfc6381_codec
     }
 
-    /// An `.mp4` `VideoSampleEntry` box (as defined in ISO/IEC 14496-12), if possible.
-    ///
-    /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
-    /// may be unsupported edge cases.
+    /// Returns a builder for an `.mp4` `VideoSampleEntry` box (as defined in
+    /// ISO/IEC 14496-12).
     #[cfg(feature = "unstable-sample-entry")]
     #[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
-    pub fn sample_entry(&self) -> Option<&[u8]> {
-        self.sample_entry.as_deref()
+    pub fn sample_entry(&self) -> VideoSampleEntryBuilder {
+        VideoSampleEntryBuilder {
+            params: self,
+            aspect_ratio_override: None,
+        }
     }
 
     /// Returns the overall dimensions of the video frame in pixels, as `(width, height)`.
     pub fn pixel_dimensions(&self) -> (u32, u32) {
-        self.pixel_dimensions
+        let (width, height) = self.pixel_dimensions;
+        (width.into(), height.into())
     }
 
     /// Returns the displayed size of a pixel, if known, as a dimensionless ratio `(h_spacing, v_spacing)`.
@@ -256,6 +234,97 @@ impl std::fmt::Debug for VideoParameters {
                 &crate::hex::LimitedHex::new(&self.extra_data, 256),
             )
             .finish()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum VideoCodec {
+    H264,
+    Jpeg,
+}
+
+impl VideoCodec {
+    #[cfg(feature = "unstable-sample-entry")]
+    fn visual_sample_entry_box_type(self) -> [u8; 4] {
+        match self {
+            VideoCodec::H264 => *b"avc1",
+            VideoCodec::Jpeg => *b"mp4v",
+        }
+    }
+}
+
+#[cfg(feature = "unstable-sample-entry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
+pub struct VideoSampleEntryBuilder<'p> {
+    params: &'p VideoParameters,
+    aspect_ratio_override: Option<(u16, u16)>,
+}
+
+#[cfg(feature = "unstable-sample-entry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
+impl VideoSampleEntryBuilder<'_> {
+    /// Overrides the codec-level pixel aspect ratio via a `pasp` box.
+    #[inline]
+    pub fn with_aspect_ratio(self, aspect_ratio: (u16, u16)) -> Self {
+        Self {
+            aspect_ratio_override: Some(aspect_ratio),
+            ..self
+        }
+    }
+
+    /// Builds the `.mp4` `VisualSampleEntry` box, if possible.
+    pub fn build(self) -> Result<Vec<u8>, Error> {
+        let mut buf = Vec::new();
+        write_mp4_box!(
+            &mut buf,
+            self.params.codec.visual_sample_entry_box_type(),
+            {
+                // SampleEntry, section 8.5.2.2.
+                buf.extend_from_slice(&0u32.to_be_bytes()[..]); // pre_defined + reserved
+                buf.extend_from_slice(&1u32.to_be_bytes()[..]); // data_reference_index = 1
+
+                // VisualSampleEntry, section 12.1.3.2.
+                buf.extend_from_slice(&[0; 16]);
+                buf.extend_from_slice(&self.params.pixel_dimensions.0.to_be_bytes()[..]);
+                buf.extend_from_slice(&self.params.pixel_dimensions.1.to_be_bytes()[..]);
+                buf.extend_from_slice(&[
+                    0x00, 0x48, 0x00, 0x00, // horizresolution
+                    0x00, 0x48, 0x00, 0x00, // vertresolution
+                    0x00, 0x00, 0x00, 0x00, // reserved
+                    0x00, 0x01, // frame count
+                    0x00, 0x00, 0x00, 0x00, // compressorname
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x18, 0xff, 0xff, // depth + pre_defined
+                ]);
+
+                // Codec-specific portion.
+                match self.params.codec {
+                    VideoCodec::H264 => {
+                        write_mp4_box!(&mut buf, *b"avcC", {
+                            buf.extend_from_slice(&self.params.extra_data);
+                        });
+                    }
+                    VideoCodec::Jpeg => {
+                        jpeg::append_esds(&mut buf);
+                    }
+                }
+
+                // pasp box, if requested.
+                if let Some(aspect_ratio) = self.aspect_ratio_override {
+                    write_mp4_box!(&mut buf, *b"pasp", {
+                        buf.extend_from_slice(&u32::from(aspect_ratio.0).to_be_bytes()[..]);
+                        buf.extend_from_slice(&u32::from(aspect_ratio.1).to_be_bytes()[..]);
+                    });
+                }
+            }
+        );
+        Ok(buf)
     }
 }
 

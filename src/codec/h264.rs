@@ -12,7 +12,6 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
-    codec::write_visual_sample_entry_body,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
     Error, Timestamp,
 };
@@ -706,22 +705,6 @@ impl<'a, R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantB
     }
 }
 
-/// Writes an `avc1` / `AVCSampleEntry` as in ISO/IEC 14496-15 section 5.4.2.1.
-fn make_video_sample_entry(pixel_dimensions: (u32, u32), extra_data: &[u8]) -> Option<Vec<u8>> {
-    let pixel_dimensions = (
-        u16::try_from(pixel_dimensions.0).ok()?,
-        u16::try_from(pixel_dimensions.1).ok()?,
-    );
-    let mut buf = Vec::new();
-    write_mp4_box!(&mut buf, b"avc1", {
-        write_visual_sample_entry_body(&mut buf, pixel_dimensions);
-        write_mp4_box!(&mut buf, b"avcC", {
-            buf.extend_from_slice(extra_data);
-        });
-    });
-    Some(buf)
-}
-
 impl InternalParameters {
     /// Parses metadata from the `format-specific-params` of a SDP `fmtp` media attribute.
     fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
@@ -800,6 +783,16 @@ impl InternalParameters {
         let pixel_dimensions = sps
             .pixel_dimensions()
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
+        let e = |_| {
+            format!(
+                "SPS has invalid pixel dimensions: {}x{} is too large",
+                pixel_dimensions.0, pixel_dimensions.1
+            )
+        };
+        let pixel_dimensions = (
+            u16::try_from(pixel_dimensions.0).map_err(e)?,
+            u16::try_from(pixel_dimensions.1).map_err(e)?,
+        );
 
         // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
         // The beginning of the AVCDecoderConfiguration takes a few values from
@@ -861,7 +854,6 @@ impl InternalParameters {
         let avc_decoder_config = avc_decoder_config.freeze();
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
-        let sample_entry = make_video_sample_entry(pixel_dimensions, &avc_decoder_config);
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
@@ -869,7 +861,7 @@ impl InternalParameters {
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: avc_decoder_config,
-                sample_entry,
+                codec: super::VideoCodec::H264,
             },
             sps_nal,
             pps_nal,

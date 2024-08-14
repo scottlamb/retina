@@ -186,7 +186,7 @@ fn make_sample_entry(
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
     // It's based on AudioSampleEntry, ISO/IEC 14496-12 section 12.2.3.2,
     // in turn based on SampleEntry, ISO/IEC 14496-12 section 8.5.2.2.
-    write_mp4_box!(&mut buf, b"mp4a", {
+    write_mp4_box!(&mut buf, *b"mp4a", {
         buf.extend_from_slice(&[
             0, 0, 0, 0, // SampleEntry.reserved
             0, 0, 0, 1, // SampleEntry.reserved, SampleEntry.data_reference_index (1)
@@ -209,7 +209,7 @@ fn make_sample_entry(
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
-        write_mp4_box!(&mut buf, b"esds", {
+        write_mp4_box!(&mut buf, *b"esds", {
             buf.put_u32(0); // version
 
             write_mpeg4_descriptor!(&mut buf, 0x03 /* ES_DescrTag */, {

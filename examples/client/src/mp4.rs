@@ -382,13 +382,14 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(u32::try_from(self.video_params.len())?); // entry_count
                             for p in &self.video_params {
-                                let e = p.sample_entry().ok_or_else(|| {
+                                let e = p.sample_entry().build().map_err(|e| {
                                     anyhow!(
-                                        "unable to produce VisualSampleEntry for {} stream",
-                                        p.rfc6381_codec()
+                                        "unable to produce VisualSampleEntry for {} stream: {}",
+                                        p.rfc6381_codec(),
+                                        e,
                                     )
                                 })?;
-                                buf.extend_from_slice(e);
+                                buf.extend_from_slice(&e);
                             }
                         });
                         self.video_trak.write_common_stbl_parts(buf)?;
