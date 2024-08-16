@@ -451,7 +451,7 @@ impl Depacketizer {
                             pixel_aspect_ratio: None,
                             frame_rate: None,
                             extra_data: Bytes::new(),
-                            codec: super::VideoCodec::Jpeg,
+                            codec: super::VideoParametersCodec::Jpeg,
                         }),
                     });
                 }
@@ -528,7 +528,6 @@ impl Depacketizer {
 ///
 /// This is actually entirely static, but we construct it at runtime with the
 /// `write_mp4_box!` and `write_mpeg4_descriptor!` macros for readability.
-#[cfg(feature = "unstable-sample-entry")]
 pub(super) fn append_esds(buf: &mut Vec<u8>) {
     write_mp4_box!(buf, *b"esds", {
         buf.extend_from_slice(&0u32.to_be_bytes()[..]); // version

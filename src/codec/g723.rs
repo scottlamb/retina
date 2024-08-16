@@ -30,7 +30,7 @@ impl Depacketizer {
                 frame_length: NonZeroU32::new(240),
                 clock_rate: FIXED_CLOCK_RATE,
                 extra_data: Vec::new(),
-                sample_entry: None,
+                codec: super::AudioParametersCodec::Other,
             },
         })
     }

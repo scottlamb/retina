@@ -382,7 +382,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(u32::try_from(self.video_params.len())?); // entry_count
                             for p in &self.video_params {
-                                let e = p.sample_entry().build().map_err(|e| {
+                                let e = p.mp4_sample_entry().build().map_err(|e| {
                                     anyhow!(
                                         "unable to produce VisualSampleEntry for {} stream: {}",
                                         p.rfc6381_codec(),
@@ -473,8 +473,9 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(1); // entry_count
                             buf.extend_from_slice(
-                                parameters
-                                    .sample_entry()
+                                &parameters
+                                    .mp4_sample_entry()
+                                    .build()
                                     .expect("all added streams have sample entries"),
                             );
                         });
@@ -742,7 +743,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .find_map(|(i, s)| match s.parameters() {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
-                Some(retina::codec::ParametersRef::Audio(a)) if a.sample_entry().is_some() => {
+                Some(retina::codec::ParametersRef::Audio(a)) if a.mp4_sample_entry().build().is_ok() => {
                     log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
                     Some((i, Box::new(a.clone())))
                 }

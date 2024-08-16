@@ -139,4 +139,7 @@ pub(crate) enum ErrorInt {
 
     #[error("Timeout")]
     Timeout,
+
+    #[error("Unsupported: {0}")]
+    Unsupported(String),
 }

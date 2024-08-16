@@ -9,10 +9,12 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use std::num::NonZeroU8;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::Bytes;
 
+use crate::error::ErrorInt;
 use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
@@ -159,8 +161,7 @@ pub struct VideoParameters {
     /// The codec, for internal use in sample entry construction.
     ///
     /// This is more straightforward than reparsing the RFC 6381 codec string.
-    #[cfg_attr(not(feature = "unstable-sample-entry"), allow(unused))]
-    codec: VideoCodec,
+    codec: VideoParametersCodec,
 }
 
 impl VideoParameters {
@@ -173,9 +174,7 @@ impl VideoParameters {
 
     /// Returns a builder for an `.mp4` `VideoSampleEntry` box (as defined in
     /// ISO/IEC 14496-12).
-    #[cfg(feature = "unstable-sample-entry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
-    pub fn sample_entry(&self) -> VideoSampleEntryBuilder {
+    pub fn mp4_sample_entry(&self) -> VideoSampleEntryBuilder {
         VideoSampleEntryBuilder {
             params: self,
             aspect_ratio_override: None,
@@ -238,30 +237,25 @@ impl std::fmt::Debug for VideoParameters {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum VideoCodec {
+enum VideoParametersCodec {
     H264,
     Jpeg,
 }
 
-impl VideoCodec {
-    #[cfg(feature = "unstable-sample-entry")]
+impl VideoParametersCodec {
     fn visual_sample_entry_box_type(self) -> [u8; 4] {
         match self {
-            VideoCodec::H264 => *b"avc1",
-            VideoCodec::Jpeg => *b"mp4v",
+            VideoParametersCodec::H264 => *b"avc1",
+            VideoParametersCodec::Jpeg => *b"mp4v",
         }
     }
 }
 
-#[cfg(feature = "unstable-sample-entry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
 pub struct VideoSampleEntryBuilder<'p> {
     params: &'p VideoParameters,
     aspect_ratio_override: Option<(u16, u16)>,
 }
 
-#[cfg(feature = "unstable-sample-entry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
 impl VideoSampleEntryBuilder<'_> {
     /// Overrides the codec-level pixel aspect ratio via a `pasp` box.
     #[inline]
@@ -305,12 +299,12 @@ impl VideoSampleEntryBuilder<'_> {
 
                 // Codec-specific portion.
                 match self.params.codec {
-                    VideoCodec::H264 => {
+                    VideoParametersCodec::H264 => {
                         write_mp4_box!(&mut buf, *b"avcC", {
                             buf.extend_from_slice(&self.params.extra_data);
                         });
                     }
-                    VideoCodec::Jpeg => {
+                    VideoParametersCodec::Jpeg => {
                         jpeg::append_esds(&mut buf);
                     }
                 }
@@ -335,9 +329,7 @@ pub struct AudioParameters {
     frame_length: Option<NonZeroU32>,
     clock_rate: u32,
     extra_data: Vec<u8>,
-
-    #[cfg_attr(not(feature = "unstable-sample-entry"), allow(unused))]
-    sample_entry: Option<Vec<u8>>,
+    codec: AudioParametersCodec,
 }
 
 impl std::fmt::Debug for AudioParameters {
@@ -373,14 +365,41 @@ impl AudioParameters {
         &self.extra_data
     }
 
-    /// An `.mp4` `AudioSampleEntry` box (as defined in ISO/IEC 14496-12), if possible.
+    /// Returns a builder for an `.mp4` `AudioSampleEntry` box (as defined in ISO/IEC 14496-12).
+    pub fn mp4_sample_entry(&self) -> AudioSampleEntryBuilder {
+        AudioSampleEntryBuilder { params: self }
+    }
+}
+
+/// Holds codec-specific data needed from the `AudioParameters`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum AudioParametersCodec {
+    Aac { channels_config_id: NonZeroU8 },
+    Other,
+}
+
+pub struct AudioSampleEntryBuilder<'p> {
+    params: &'p AudioParameters,
+}
+
+impl AudioSampleEntryBuilder<'_> {
+    /// Builds the `.mp4` `AudioSampleEntry` box, if possible.
     ///
     /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
     /// may be unsupported edge cases.
-    #[cfg(feature = "unstable-sample-entry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-sample-entry")))]
-    pub fn sample_entry(&self) -> Option<&[u8]> {
-        self.sample_entry.as_deref()
+    pub fn build(self) -> Result<Vec<u8>, Error> {
+        match self.params.codec {
+            AudioParametersCodec::Aac { channels_config_id } => aac::make_sample_entry(
+                channels_config_id,
+                self.params.clock_rate,
+                &self.params.extra_data,
+            ),
+            AudioParametersCodec::Other => {
+                bail!(ErrorInt::Unsupported(
+                    "unsupported audio codec for mp4".to_owned()
+                ));
+            }
+        }
     }
 }
 
