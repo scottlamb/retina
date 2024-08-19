@@ -1,3 +1,10 @@
+## `v0.4.9` (2024-08-19)
+
+*   added helpers for building `.mp4` `VisualSampleEntry` and `AudioSampleEntry`
+    for H.264, MJPEG, and AAC.
+*   shrunk `VideoParameters` from 112 bytes to 88 bytes and `AudioParameters`
+    from 80 bytes to 64 bytes (measured on a 64-bit platform).
+
 ## `v0.4.8` (2024-05-26)
 
 *   support MJPEG codec (contribution from [zanshi](https://github.com/zanshi))
