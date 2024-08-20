@@ -204,21 +204,11 @@ impl std::fmt::Display for NtpTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let since_epoch = self.0.wrapping_sub(UNIX_EPOCH.0);
         let sec_since_epoch = (since_epoch >> 32) as u32;
-        let tm = time::at(time::Timespec {
-            sec: i64::from(sec_since_epoch),
-            nsec: 0,
-        });
-        let ms = ((since_epoch & 0xFFFF_FFFF) * 1_000) >> 32;
-        let zone_minutes = tm.tm_utcoff.abs() / 60;
-        write!(
-            f,
-            "{}.{:03}{}{:02}:{:02}",
-            tm.strftime("%FT%T").map_err(|_| std::fmt::Error)?,
-            ms,
-            if tm.tm_utcoff > 0 { '+' } else { '-' },
-            zone_minutes / 60,
-            zone_minutes % 60
-        )
+        let ns = i32::try_from(((since_epoch & 0xFFFF_FFFF) * 1_000_000_000) >> 32)
+            .expect("should be < 1_000_000_000");
+        let tm = jiff::Timestamp::new(i64::from(sec_since_epoch), ns)
+            .expect("u32 sec should be valid Timestamp");
+        std::fmt::Display::fmt(&tm, f)
     }
 }
 
@@ -233,22 +223,17 @@ impl std::fmt::Debug for NtpTimestamp {
 ///
 /// Currently this just allows formatting via `Debug` and `Display`.
 #[derive(Copy, Clone, Debug)]
-pub struct WallTime(time::Timespec);
+pub struct WallTime(jiff::Timestamp);
 
 impl WallTime {
     fn now() -> Self {
-        Self(time::get_time())
+        Self(jiff::Timestamp::now())
     }
 }
 
 impl Display for WallTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(
-            &time::at(self.0)
-                .strftime("%FT%T")
-                .map_err(|_| std::fmt::Error)?,
-            f,
-        )
+        std::fmt::Display::fmt(&self.0, f)
     }
 }
 

@@ -29,6 +29,7 @@ futures = "0.3.14"
 h264-reader = "0.7.0"
 hex = "0.4.3"
 http-auth = "0.1.2"
+jiff = "0.1.8"
 log = "0.4.8"
 memchr = "2.7.4"
 once_cell = "1.7.2"
@@ -39,7 +40,6 @@ rtsp-types = "0.1.0"
 sdp-types = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
 thiserror = "1.0.25"
-time = "0.1.43"
 tokio = { version = "1.11.0", features = ["macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7.3", features = ["codec"] }
 url = "2.2.1"

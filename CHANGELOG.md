@@ -9,6 +9,8 @@
     interoperability with additional cameras. In particular, Retina now
     understands these video parameters at `DESCRIBE` time, rather than delaying
     until the first full video frame is received.
+*   update minimum Rust to 1.70.
+*   use [`jiff`](https://crates.io/crates/jiff) for date formatting.
 
 ## `v0.4.10` (2024-08-19)
 
