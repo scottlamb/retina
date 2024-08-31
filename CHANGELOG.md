@@ -1,3 +1,8 @@
+## `v0.4.10` (2024-08-19)
+
+*   update `base64` dep to 0.22
+*   update minimum Rust version to 1.70.
+
 ## `v0.4.9` (2024-08-19)
 
 *   added helpers for building `.mp4` `VisualSampleEntry` and `AudioSampleEntry`
