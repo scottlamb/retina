@@ -814,10 +814,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-channel-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5e5f4df964fa9c1c2f8bddeb5c3611631cacd93baf810fc8bb2fb4b495c263a"
+dependencies = [
+ "futures-core-preview",
+ "futures-sink-preview",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c09fd04b7e4073ac7156a9539b57a484a8ea920f79c7c675d05d289ab6110d3"
+
+[[package]]
+name = "futures-core-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b35b6263fb1ef523c3056565fa67b1d16f0a8604ff12b11b08c25f28a734c60a"
 
 [[package]]
 name = "futures-executor"
@@ -831,10 +847,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-executor-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75236e88bd9fe88e5e8bfcd175b665d0528fe03ca4c5207fabc028c8f9d93e98"
+dependencies = [
+ "futures-core-preview",
+ "futures-util-preview",
+ "num_cpus",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc4045962a5a5e935ee2fdedaa4e08284547402885ab326734432bed5d12966b"
+
+[[package]]
+name = "futures-io-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4914ae450db1921a56c91bde97a27846287d062087d4a652efc09bb3a01ebda"
 
 [[package]]
 name = "futures-macro"
@@ -848,16 +881,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b1dce2a0267ada5c6ff75a8ba864b4e679a9e2aa44262af7a3b5516d530d76e"
+dependencies = [
+ "futures-channel-preview",
+ "futures-core-preview",
+ "futures-executor-preview",
+ "futures-io-preview",
+ "futures-sink-preview",
+ "futures-util-preview",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21163e139fa306126e6eedaf49ecdb4588f939600f0b1e770f4205ee4b7fa868"
 
 [[package]]
+name = "futures-sink-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86f148ef6b69f75bb610d4f9a2336d4fc88c4b5b67129d1a340dd0fd362efeec"
+
+[[package]]
 name = "futures-task"
 version = "0.3.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c66a976bf5909d801bbef33416c41372779507e7a6b3a5e25e4749c58f776a"
+
+[[package]]
+name = "futures-timer"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f9eb554aa23143abc64ec4d0016f038caf53bb7cbc3d91490835c54edc96550"
+dependencies = [
+ "futures-preview",
+ "pin-utils",
+]
 
 [[package]]
 name = "futures-util"
@@ -873,6 +936,21 @@ dependencies = [
  "futures-task",
  "memchr",
  "pin-project-lite",
+ "pin-utils",
+ "slab",
+]
+
+[[package]]
+name = "futures-util-preview"
+version = "0.3.0-alpha.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ce968633c17e5f97936bd2797b6e38fb56cf16a7422319f7ec2e30d3c470e8d"
+dependencies = [
+ "futures-channel-preview",
+ "futures-core-preview",
+ "futures-io-preview",
+ "futures-sink-preview",
+ "memchr",
  "pin-utils",
  "slab",
 ]
@@ -1088,6 +1166,16 @@ name = "itoa"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112c678d4050afce233f4f2852bb2eb519230b3cf12f33585275537d7e41578d"
+
+[[package]]
+name = "jittr"
+version = "0.2.0"
+source = "git+https://github.com/nemosupremo/jittr?rev=e0953a5#e0953a5f73ac07308ef54929a9db9da423e6aa01"
+dependencies = [
+ "futures",
+ "futures-timer",
+ "log",
+]
 
 [[package]]
 name = "js-sys"
@@ -1726,6 +1814,7 @@ dependencies = [
  "h264-reader",
  "hex",
  "http-auth",
+ "jittr",
  "log",
  "mylog",
  "once_cell",

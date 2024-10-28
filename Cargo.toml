@@ -29,6 +29,7 @@ futures = "0.3.14"
 h264-reader = "0.7.0"
 hex = "0.4.3"
 http-auth = "0.1.2"
+jittr = { git = "https://github.com/nemosupremo/jittr", rev = "e0953a5" }
 log = "0.4.8"
 once_cell = "1.7.2"
 pin-project = "1.0.7"
@@ -46,7 +47,12 @@ url = "2.2.1"
 [dev-dependencies]
 criterion = { version = "0.5.0", features = ["async_tokio"] }
 mylog = { git = "https://github.com/scottlamb/mylog" }
-tokio = { version = "1.5.0", features = ["io-util", "macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1.5.0", features = [
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }
 
 [profile.bench]
 debug = true

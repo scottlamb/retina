@@ -191,6 +191,32 @@ impl RawPacket {
     }
 }
 
+pub struct RawPacketCtx(pub usize, RawPacket);
+
+impl RawPacketCtx {
+    pub fn into_data(self) -> Bytes {
+        (self.1).0
+    }
+}
+
+impl jittr::Packet for RawPacketCtx {
+    fn sequence_number(&self) -> u16 {
+        self.1.sequence_number()
+    }
+}
+
+impl Clone for RawPacketCtx {
+    fn clone(&self) -> Self {
+        Self(self.0, RawPacket((self.1).0.clone()))
+    }
+}
+
+impl From<(usize, RawPacket)> for RawPacketCtx {
+    fn from(value: (usize, RawPacket)) -> Self {
+        Self(value.0, value.1)
+    }
+}
+
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct RawPacketError {

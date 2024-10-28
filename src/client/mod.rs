@@ -1173,6 +1173,9 @@ struct SessionInner {
     /// Round-robining between them rather than always starting at 0 should
     /// prevent one stream from starving the others.
     udp_next_poll_i: usize,
+
+    jitter: jittr::JitterBuffer<crate::rtp::RawPacketCtx, 16>,
+    jitter_sleep: Pin<Box<tokio::time::Sleep>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1536,6 +1539,8 @@ impl Session<Described> {
                 keepalive_timer: None,
                 flags: 0,
                 udp_next_poll_i: 0,
+                jitter: Default::default(),
+                jitter_sleep: Box::pin(tokio::time::sleep(std::time::Duration::from_nanos(1))),
             }),
             Described { sdp },
         ))
@@ -2391,23 +2396,12 @@ impl Session<Playing> {
             match r {
                 Ok(()) => {
                     let msg = Bytes::copy_from_slice(buf.filled());
-                    let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received_wall: when,
-                    });
-                    match rtp_handler.rtp(
-                        inner.options,
-                        stream_ctx,
-                        inner.presentation.tool.as_ref(),
-                        conn_ctx,
-                        &pkt_ctx,
-                        timeline,
-                        i,
-                        msg,
-                    ) {
-                        Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
-                        Ok(None) => buf.clear(),
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    }
+                    let (raw, _payload_range) = match crate::rtp::RawPacket::new(msg) {
+                        Ok(x) => x,
+                        Err(_err) => todo!("Corrupt packet"),
+                    };
+                    inner.jitter.push((i, raw).into());
+                    buf.clear();
                 }
                 Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
                     // See comment above
@@ -2578,6 +2572,65 @@ impl futures::Stream for Session<Playing> {
             if self.0.flags & (SessionFlag::UdpStreams as u8) != 0 {
                 if let Poll::Ready(result) = self.as_mut().poll_udp(cx) {
                     return Poll::Ready(result);
+                }
+            }
+
+            loop {
+                let inner = self.0.as_mut().project();
+                let packet = if inner.jitter.lossless_packets_buffered() > 0 {
+                    inner.jitter.pop().unwrap()
+                } else {
+                    if matches!(inner.jitter_sleep.as_mut().poll(cx), Poll::Ready(())) {
+                        match inner.jitter.pop_skip(true) {
+                            Some(p) => p,
+                            None => break,
+                        }
+                    } else {
+                        break;
+                    }
+                };
+                let sid = packet.0;
+                let s = &mut inner.presentation.streams[sid];
+                let (timeline, rtp_handler, stream_ctx, _udp_sockets) = match &mut s.state {
+                    StreamState::Playing {
+                        timeline,
+                        rtp_handler,
+                        ctx,
+                        udp_sockets: Some(udp_sockets),
+                        ..
+                    } => (timeline, rtp_handler, ctx, udp_sockets),
+                    _ => break,
+                };
+
+                let when = crate::WallTime::now();
+                let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
+                    received_wall: when,
+                });
+                let conn_ctx = inner
+                    .conn
+                    .as_ref()
+                    .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
+                    .inner
+                    .ctx();
+                let pkt = rtp_handler.rtp(
+                    inner.options,
+                    &stream_ctx,
+                    inner.presentation.tool.as_ref(),
+                    conn_ctx,
+                    &pkt_ctx,
+                    timeline,
+                    sid,
+                    packet.into_data(),
+                );
+
+                inner
+                    .jitter_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + std::time::Duration::from_millis(200));
+                match pkt {
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                    Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
+                    Ok(None) => continue,
                 }
             }
 
