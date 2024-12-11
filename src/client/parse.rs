@@ -392,7 +392,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
 /// or the like.
 struct MostlyAscii<'a>(&'a [u8]);
 
-impl<'a> std::fmt::Debug for MostlyAscii<'a> {
+impl std::fmt::Debug for MostlyAscii<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "\"")?;
         for &b in self.0 {

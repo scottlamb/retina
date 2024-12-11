@@ -637,7 +637,7 @@ struct TolerantBitReader<'a, R> {
     has_extra_trailing_data: &'a mut bool,
 }
 
-impl<'a, R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'a, R> {
+impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'_, R> {
     fn read_ue(&mut self, name: &'static str) -> Result<u32, h264_reader::rbsp::BitReaderError> {
         self.inner.read_ue(name)
     }

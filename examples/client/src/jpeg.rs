@@ -78,7 +78,7 @@ async fn write_jpeg(
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => {
-                        let out_path = opts.out_dir.join(&format!("{frame_count:05}.jpeg"));
+                        let out_path = opts.out_dir.join(format!("{frame_count:05}.jpeg"));
                         std::fs::write(out_path, f.data())?;
 
                         frame_count += 1;
