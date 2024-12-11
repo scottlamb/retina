@@ -586,7 +586,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
                 let m = u8::from_str_radix(m, 10)
                     .map_err(|_| format!("bad second channel number {m}"))?;
                 if n.checked_add(1) != Some(m) {
-                    format!("Expected adjacent channels; got {n}-{m}");
+                    return Err(format!("Expected adjacent channels; got {n}-{m}"));
                 }
             }
             channel_id = Some(n);
