@@ -12,7 +12,7 @@ use libfuzzer_sys::fuzz_target;
 use std::num::NonZeroU32;
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 2 {
+    if data.len() < 3 {
         return;
     }
     let conn_ctx = retina::ConnectionContext::dummy();
@@ -31,6 +31,15 @@ fuzz_target!(|data: &[u8]| {
     )
     .unwrap();
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+
+    // data[2] is the NAL header.
+    // data[3..] should not contain Annex B separators; the depacketizer will split them, and the
+    // result won't be the same as expected below.
+    let finder = memchr::memmem::Finder::new(&[0, 0, 1]);
+    if finder.find(&data[3..]).is_some() {
+        return;
+    }
+
     if p.push(timestamp, Bytes::copy_from_slice(&data[2..]))
         .is_err()
     {

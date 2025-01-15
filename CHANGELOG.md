@@ -1,6 +1,10 @@
 ## unreleased
 
 *   improve some error messages on bad H.264 `sprop-parameter-sets`
+*   interoperate with V380 cameras by interpreting Annex B sequences in contexts
+    where single NALs are otherwise expected.
+    (Fixes [#68](https://github.com/scottlamb/retina/issues/68),
+    [[#108](https://github.com/scottlamb/retina/issues/108)]).
 
 ## `v0.4.10` (2024-08-19)
 

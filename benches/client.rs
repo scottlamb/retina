@@ -77,7 +77,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
         3575, 3144, 3431, 3317, 3154, 3387, 3630, 3232, 3574, 3254, 4198, 4235, 4898, 4890, 4854,
         4854, 4863, 4652, 4227, 4101, 3867, 3870, 3716, 3074, 3253, 3267, 3192, 3995, 3904, 3781,
     ];
-    let mut dummy_frame = vec![0; 1048576];
+    let mut dummy_frame = vec![1; 1048576];
     dummy_frame[4] = h264_reader::nal::UnitType::SliceLayerWithoutPartitioningIdr.id();
     let mut p =
         retina::codec::h264::Packetizer::new(max_payload_size, 0, 24104, 96, 0x4cacc3d1).unwrap();

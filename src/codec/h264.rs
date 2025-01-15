@@ -28,6 +28,25 @@ use super::VideoFrame;
 ///
 /// Currently expects that the stream starts at an access unit boundary unless
 /// packet loss is indicated.
+///
+/// # Annex B handling
+///
+/// Some servers erroneously include Annex B separators (`00 00 01`,
+/// separating multiple H.264 NALs) in the RTP payload, rather than correctly
+/// using separate single-NAL packets or length-delimited units within a STAP-A
+/// packet. This depacketizer looks for that separator in any place a single
+/// NAL would otherwise be expected:
+///
+/// *  "Single NAL Packet Units"
+/// *  a single NAL unit in a "STAP-A" aggregation packet
+/// *  the entirety of a FU-A fragmented NAL unit. (This permissively allows
+///    the Annex B separator to be split between fragments.)
+///
+/// It breaks apart NALs at that separator and (on first encounter only) logs a
+/// warning about the protocol violation.
+///
+/// It also validates that NALs do not include the invalid sequences
+/// `00 00 00` or `00 00 02`, and that they do not end with `00`.
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     input_state: DepacketizerInputState,
@@ -39,11 +58,16 @@ pub(crate) struct Depacketizer {
 
     /// In state `PreMark`, pieces of NALs, excluding their header bytes.
     /// Kept around (empty) in other states to re-use the backing allocation.
+    /// Each piece must be non-empty.
     pieces: Vec<Bytes>,
 
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// Set the first time an Annex B separator is found in the stream.
+    /// Used to warn only on the first occurrence.
+    seen_annex_b_separator: bool,
 }
 
 #[derive(Debug)]
@@ -65,13 +89,29 @@ struct AccessUnit {
     timestamp: crate::Timestamp,
     stream_id: usize,
 
-    /// True iff currently processing a FU-A.
-    in_fu_a: bool,
+    /// FU-A fragmentation unit state, if any.
+    fu_a: Option<FuA>,
 
     /// RTP packets lost as this access unit was starting.
     loss: u16,
 
     same_ts_as_prev: bool,
+}
+
+#[derive(Debug)]
+struct FuA {
+    initial_nal_header: h264_reader::nal::NalHeader,
+    cur_nal: Option<CurFuANal>,
+}
+
+#[derive(Debug)]
+struct CurFuANal {
+    hdr: h264_reader::nal::NalHeader,
+    trailing_zeros: usize, // 0, 1, or 2
+
+    /// The bytes of data already added to `pieces`. This excludes the `hdr`
+    /// byte and `trailing_zeros`.
+    pieces_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -123,6 +163,7 @@ impl Depacketizer {
             pending: None,
             pieces: Vec::new(),
             nals: Vec::new(),
+            seen_annex_b_separator: false,
             parameters,
         })
     }
@@ -172,7 +213,7 @@ impl Depacketizer {
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
-                        if access_unit.in_fu_a {
+                        if access_unit.fu_a.is_some() {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 access_unit.timestamp,
@@ -236,21 +277,21 @@ impl Depacketizer {
         data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
-                if access_unit.in_fu_a {
+                if access_unit.fu_a.is_some() {
                     return Err(format!(
-                        "Non-fragmented NAL {nal_header:02x} while fragment in progress"
+                        "Non-fragmented NAL {nal_header:02x} while FU-A fragment in progress"
                     ));
                 }
-                let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
-                let next_piece_idx = self.add_piece(data)?;
-                self.nals.push(Nal {
-                    hdr: NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
-                    next_piece_idx,
-                    len,
-                });
+                self.add_nal_with_separators(
+                    NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
+                    data,
+                )?;
             }
             24 => {
                 // STAP-A. https://tools.ietf.org/html/rfc6184#section-5.7.1
+                if access_unit.fu_a.is_some() {
+                    return Err("STAP-A NAL while FU-A fragment in progress".into());
+                }
                 loop {
                     if data.remaining() < 3 {
                         return Err(format!(
@@ -274,23 +315,13 @@ impl Depacketizer {
                         }
                         std::cmp::Ordering::Equal => {
                             data.advance(1);
-                            let next_piece_idx = self.add_piece(data)?;
-                            self.nals.push(Nal {
-                                hdr,
-                                next_piece_idx,
-                                len: u32::from(len),
-                            });
+                            self.add_nal_with_separators(hdr, data)?;
                             break;
                         }
                         std::cmp::Ordering::Greater => {
                             let mut piece = data.split_to(usize::from(len));
                             piece.advance(1);
-                            let next_piece_idx = self.add_piece(piece)?;
-                            self.nals.push(Nal {
-                                hdr,
-                                next_piece_idx,
-                                len: u32::from(len),
-                            });
+                            self.add_nal_with_separators(hdr, piece)?;
                         }
                     }
                 }
@@ -303,6 +334,7 @@ impl Depacketizer {
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
                 if data.len() < 2 {
+                    // FU-A header takes 1 byte; need at least 2 bytes to make progress.
                     return Err(format!("FU-A len {} too short", data.len()));
                 }
                 let fu_header = data[0];
@@ -319,36 +351,52 @@ impl Depacketizer {
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
-                let u32_len = u32::try_from(data.len()).expect("RTP packet len must be < u16::MAX");
-                match (start, access_unit.in_fu_a) {
-                    (true, true) => return Err("FU-A with start bit while frag in progress".into()),
-                    (true, false) => {
-                        self.add_piece(data)?;
-                        self.nals.push(Nal {
-                            hdr: nal_header,
-                            next_piece_idx: u32::MAX, // should be overwritten later.
-                            len: 1 + u32_len,
-                        });
-                        access_unit.in_fu_a = true;
+                match (start, access_unit.fu_a.take()) {
+                    (true, Some(_)) => {
+                        return Err("FU-A with start bit while frag in progress".into())
                     }
-                    (false, true) => {
-                        let pieces = self.add_piece(data)?;
-                        let nal = self.nals.last_mut().expect("nals non-empty while in fu-a");
-                        if u8::from(nal_header) != u8::from(nal.hdr) {
+                    (true, None) => {
+                        let mut cur_nal = Some(CurFuANal {
+                            hdr: nal_header,
+                            trailing_zeros: 0,
+                            pieces_bytes: 0,
+                        });
+                        self.add_fu_a(&mut cur_nal, data)?;
+                        access_unit.fu_a = Some(FuA {
+                            initial_nal_header: nal_header,
+                            cur_nal,
+                        });
+                    }
+                    (false, Some(mut fu_a)) => {
+                        if nal_header != fu_a.initial_nal_header {
                             return Err(format!(
                                 "FU-A has inconsistent NAL type: {:?} then {:?}",
-                                nal.hdr, nal_header,
+                                fu_a.initial_nal_header, nal_header,
                             ));
                         }
-                        nal.len += u32_len;
+                        self.add_fu_a(&mut fu_a.cur_nal, data)?;
                         if end {
-                            nal.next_piece_idx = pieces;
-                            access_unit.in_fu_a = false;
+                            if let Some(cur_nal) = fu_a.cur_nal {
+                                if cur_nal.trailing_zeros > 0 {
+                                    return Err(
+                                        "the last byte of a NAL must not be equal to 0".into()
+                                    );
+                                }
+                                self.nals.push(Nal {
+                                    hdr: cur_nal.hdr,
+                                    next_piece_idx: u32::try_from(self.pieces.len())
+                                        .map_err(|_| "more than u32::MAX pieces!")?,
+                                    len: u32::try_from(cur_nal.pieces_bytes + 1)
+                                        .map_err(|_| "excessively long FU-A NAL")?,
+                                });
+                            }
                         } else if mark {
                             return Err("FU-A has MARK and no END".into());
+                        } else {
+                            access_unit.fu_a = Some(fu_a);
                         }
                     }
-                    (false, false) => {
+                    (false, None) => {
                         if loss > 0 {
                             self.pieces.clear();
                             self.nals.clear();
@@ -371,10 +419,7 @@ impl Depacketizer {
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
                 DepacketizerInputState::PostMark { timestamp, loss: 0 }
             } else {
-                log::debug!(
-                    "Bogus mid-access unit timestamp change after {:?}",
-                    last_nal_hdr
-                );
+                log::debug!("Bogus mid-access unit mark on {:?}", last_nal_hdr);
                 access_unit.timestamp.timestamp = timestamp.timestamp;
                 DepacketizerInputState::PreMark(access_unit)
             }
@@ -388,10 +433,161 @@ impl Depacketizer {
         self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
-    /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
-    fn add_piece(&mut self, piece: Bytes) -> Result<u32, String> {
-        self.pieces.push(piece);
-        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
+    fn maybe_warn_about_annex_b(&mut self) {
+        if !self.seen_annex_b_separator {
+            self.seen_annex_b_separator = true;
+            log::warn!("processing (non-RFC 6184-compliant) Annex B separators in H.264 stream");
+        }
+    }
+
+    /// Adds an unfragmented NAL which does not contain any Annex B separators.
+    fn add_nal_without_separators(&mut self, hdr: NalHeader, data: Bytes) -> Result<(), String> {
+        let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
+        if !data.is_empty() {
+            self.pieces.push(data);
+        }
+        self.nals.push(Nal {
+            hdr,
+            next_piece_idx: u32::try_from(self.pieces.len())
+                .map_err(|_| "more than u32::MAX pieces!")?,
+            len,
+        });
+        Ok(())
+    }
+
+    /// Adds an unfragmented NAL which may contain Annex B separators.
+    fn add_nal_with_separators(
+        &mut self,
+        mut hdr: NalHeader,
+        mut data: Bytes,
+    ) -> Result<(), String> {
+        let mut i = 0;
+        let mut trailing_zeros = 0; // 0, 1, or 2
+        while i < data.len() {
+            debug_assert!(trailing_zeros <= 2 && trailing_zeros <= i);
+            if trailing_zeros == 0 {
+                // fast-path; go all SIMD.
+                match memchr::memchr(0, &data[i..]) {
+                    Some(pos) => {
+                        i += pos + 1;
+                        trailing_zeros = 1;
+                    }
+                    None => {
+                        trailing_zeros = 0;
+                        break;
+                    }
+                }
+            } else if trailing_zeros == 2 && [0, 2].contains(&data[i]) {
+                return Err(format!("forbidden sequence 00 00 {:02x} in NAL", data[i]));
+            } else if trailing_zeros == 2 && data[i] == 1 {
+                self.maybe_warn_about_annex_b();
+                let piece = data.split_to(i - 2); // data now contains [0, 0, 1, ..rest].
+                self.add_nal_without_separators(hdr, piece)?;
+                if data.len() < 4 {
+                    return Ok(());
+                }
+                let hdr_byte = data[3];
+                hdr = NalHeader::new(hdr_byte)
+                    .map_err(|_| format!("bad NAL header {hdr_byte:02x}"))?;
+                data.advance(4);
+                i = 0;
+                trailing_zeros = 0;
+            } else if data[i] == 0 {
+                trailing_zeros += 1;
+                i += 1;
+            } else {
+                trailing_zeros = 0;
+                i += 1;
+            }
+        }
+        if trailing_zeros > 0 {
+            return Err("the last byte of a NAL must not be equal to 0".into());
+        }
+        self.add_nal_without_separators(hdr, data)?;
+        Ok(())
+    }
+
+    /// Adds a FU-A packet, which may contain Annex B separators.
+    fn add_fu_a(&mut self, cur_nal: &mut Option<CurFuANal>, mut data: Bytes) -> Result<(), String> {
+        'outer: loop {
+            let c = match cur_nal {
+                Some(c) => c,
+                None => {
+                    if data.is_empty() {
+                        return Ok(());
+                    }
+                    let hdr_byte = data[0];
+                    let hdr = NalHeader::new(hdr_byte)
+                        .map_err(|_| format!("bad NAL header {hdr_byte:02x}"))?;
+                    data.advance(1);
+                    cur_nal.insert(CurFuANal {
+                        hdr,
+                        trailing_zeros: 0,
+                        pieces_bytes: 0,
+                    })
+                }
+            };
+            let mut cur_pos = 0;
+            while cur_pos < data.len() {
+                if c.trailing_zeros == 0 {
+                    // fast-path; go all SIMD.
+                    match memchr::memchr(0, &data[cur_pos..]) {
+                        Some(pos) => {
+                            cur_pos += pos + 1;
+                            c.trailing_zeros = 1;
+                        }
+                        None => {
+                            c.trailing_zeros = 0;
+                            break;
+                        }
+                    }
+                } else if c.trailing_zeros == 2 && [0, 2].contains(&data[cur_pos]) {
+                    return Err(format!(
+                        "forbidden sequence 00 00 {:02x} in NAL",
+                        data[cur_pos]
+                    ));
+                } else if c.trailing_zeros == 2 && data[cur_pos] == 1 {
+                    self.maybe_warn_about_annex_b();
+                    let mut piece = data.split_to(cur_pos + 1);
+                    if piece.len() > 3 {
+                        piece.truncate(piece.len() - 3);
+                        c.pieces_bytes += piece.len();
+                        self.pieces.push(piece);
+                    }
+                    self.nals.push(Nal {
+                        hdr: c.hdr,
+                        next_piece_idx: u32::try_from(self.pieces.len())
+                            .map_err(|_| "more than u32::MAX pieces!")?,
+                        len: u32::try_from(c.pieces_bytes + 1)
+                            .map_err(|_| "excessively long FU-A NAL")?,
+                    });
+                    *cur_nal = None;
+                    continue 'outer;
+                } else if data[cur_pos] == 0 {
+                    c.trailing_zeros += 1;
+                    cur_pos += 1;
+                } else {
+                    if cur_pos < c.trailing_zeros {
+                        // The previous chunks' trailing zeros were part of the
+                        // NAL but have not yet been included. We've thrown away
+                        // the reference to those chunks, but we can insert
+                        // equivalent zero bytes here.
+                        let prev_chunk_zeros = c.trailing_zeros - cur_pos;
+                        c.pieces_bytes += prev_chunk_zeros;
+                        self.pieces
+                            .push(Bytes::from_static(&[0; 2][..prev_chunk_zeros]));
+                    }
+                    c.trailing_zeros = 0;
+                    cur_pos += 1;
+                }
+            }
+            if data.len() > c.trailing_zeros {
+                data.truncate(data.len() - c.trailing_zeros);
+                c.pieces_bytes += data.len();
+                self.pieces.push(data);
+            }
+            return Ok(());
+        }
     }
 
     /// Logs information about each access unit.
@@ -480,6 +676,7 @@ impl Depacketizer {
             data.push(nal.hdr.into());
             let mut actual_len = 1;
             for piece in nal_pieces {
+                debug_assert!(!piece.is_empty());
                 data.extend_from_slice(&piece[..]);
                 actual_len += piece.len();
             }
@@ -561,7 +758,7 @@ impl AccessUnit {
             end_ctx: *pkt.ctx(),
             timestamp: pkt.timestamp(),
             stream_id: pkt.stream_id(),
-            in_fu_a: false,
+            fu_a: None,
 
             // TODO: overflow?
             loss: pkt.loss() + additional_loss,
@@ -1715,5 +1912,214 @@ mod tests {
         };
         assert!(frame.has_new_parameters);
         assert!(d.parameters().is_some());
+    }
+
+    #[rustfmt::skip]
+    static ANNEX_B_NALS: [u8; 42] = [
+        // SPS
+        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1, 0x00, 0x00, 0x04, 0xf6,
+        0x00, 0x00, 0x63, 0x38, 0x04,
+        0x00, 0x00, 0x01,
+        // PPS
+        0x68, 0xee, 0x3c, 0xb0, 0x00, 0x00, 0x01,
+        // IDR slice
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    #[rustfmt::skip]
+    static PREFIXED_NALS: [u8; 48] = [
+        // SPS
+        0x00, 0x00, 0x00, 0x14,
+        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1,
+        0x00, 0x00, 0x04, 0xf6, 0x00, 0x00, 0x63, 0x38, 0x04,
+        // PPS
+        0x00, 0x00, 0x00, 0x04,
+        0x68, 0xee, 0x3c, 0xb0,
+        // IDR slice
+        0x00, 0x00, 0x00, 0x0c,
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    /// Tests that the depacketizer can handle Annex B separators in a "single-NAL" unit type.
+    ///
+    /// One bit of nuance here is that the Annex B separation has to happen *before* the
+    /// `can_end_au` logic, as the initial NAL unit type is one that can not end a NAL.
+    #[test]
+    fn parse_annex_b_single_nal() {
+        init_logging();
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(ANNEX_B_NALS)
+            .unwrap(),
+        )
+        .unwrap();
+        let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+            panic!();
+        };
+        assert_eq!(frame.data(), &PREFIXED_NALS);
+    }
+
+    /// Tests that the depacketizer can handle Annex B separators in a FU-A unit,
+    /// split across multiple packets.
+    #[test]
+    fn parse_annex_b_fu_a() {
+        init_logging();
+        for first_pkt_len in 2..ANNEX_B_NALS.len() - 1 {
+            for middle_pkt_len in [0, 1, 2, 3] {
+                if first_pkt_len + middle_pkt_len >= ANNEX_B_NALS.len() {
+                    continue;
+                }
+                println!(
+                    "first_pkt_len={}, middle_pkt_len={}, last_pkt_len={}",
+                    first_pkt_len,
+                    middle_pkt_len,
+                    ANNEX_B_NALS.len() - first_pkt_len - middle_pkt_len
+                );
+                let mut d = super::Depacketizer::new(
+                    90_000,
+                    Some("packetization-mode=1;profile-level-id=640033"),
+                )
+                .unwrap();
+                let timestamp = crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                };
+                let mut first_pkt = Vec::with_capacity(first_pkt_len + 1);
+                first_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                first_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b1000_0000); // start
+                first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
+                println!("  pushing first pkt");
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 0,
+                        loss: 0,
+                        mark: false,
+                        payload_type: 0,
+                    }
+                    .build(first_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(d.pull().is_none());
+                if middle_pkt_len > 0 {
+                    let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
+                    middle_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                    middle_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0000_0000); // middle
+                    middle_pkt.extend_from_slice(
+                        &ANNEX_B_NALS[first_pkt_len..first_pkt_len + middle_pkt_len],
+                    );
+                    println!("  pushing middle pkt");
+                    d.push(
+                        ReceivedPacketBuilder {
+                            ctx: crate::PacketContext::dummy(),
+                            stream_id: 0,
+                            timestamp,
+                            ssrc: 0,
+                            sequence_number: 1,
+                            loss: 0,
+                            mark: false,
+                            payload_type: 0,
+                        }
+                        .build(middle_pkt)
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(d.pull().is_none());
+                }
+                let mut last_pkt =
+                    Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len - middle_pkt_len + 2);
+                last_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                last_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0100_0000); // end
+                last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len + middle_pkt_len..]);
+                println!("  pushing last pkt");
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 2,
+                        loss: 0,
+                        mark: true,
+                        payload_type: 0,
+                    }
+                    .build(last_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                println!("  pulling");
+                let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+                    panic!();
+                };
+                assert_eq!(frame.data(), &PREFIXED_NALS);
+            }
+        }
+    }
+
+    #[test]
+    fn exit_on_inconsistent_headers_between_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A start fragment
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x81start of non-idr")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+
+        let push_result = d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x3c\x07a wild sps appeared")
+            .unwrap(),
+        );
+        assert!(push_result.is_err());
     }
 }
