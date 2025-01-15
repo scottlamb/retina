@@ -42,11 +42,13 @@ use super::VideoFrame;
 /// *  the entirety of a FU-A fragmented NAL unit. (This permissively allows
 ///    the Annex B separator to be split between fragments.)
 ///
-/// It breaks apart NALs at that separator and (on first encounter only) logs a
-/// warning about the protocol violation.
+/// It breaks apart NALs at that separator, logging a warning on first
+/// occurrence.
 ///
 /// It also validates that NALs do not include the invalid sequences
-/// `00 00 00` or `00 00 02`, and that they do not end with `00`.
+/// `00 00 00` or `00 00 02`.
+///
+/// It strips trailing zero bytes from NALs, logs a warning on first occurrence.
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     input_state: DepacketizerInputState,
@@ -68,6 +70,10 @@ pub(crate) struct Depacketizer {
     /// Set the first time an Annex B separator is found in the stream.
     /// Used to warn only on the first occurrence.
     seen_annex_b_separator: bool,
+
+    /// Set the first time a NAL unit with a trailing zero is seen.
+    /// Used to warn only on the first occurrence.
+    seen_trailing_zero: bool,
 }
 
 #[derive(Debug)]
@@ -164,6 +170,7 @@ impl Depacketizer {
             pieces: Vec::new(),
             nals: Vec::new(),
             seen_annex_b_separator: false,
+            seen_trailing_zero: false,
             parameters,
         })
     }
@@ -378,9 +385,7 @@ impl Depacketizer {
                         if end {
                             if let Some(cur_nal) = fu_a.cur_nal {
                                 if cur_nal.trailing_zeros > 0 {
-                                    return Err(
-                                        "the last byte of a NAL must not be equal to 0".into()
-                                    );
+                                    self.maybe_warn_about_trailing_zero();
                                 }
                                 self.nals.push(Nal {
                                     hdr: cur_nal.hdr,
@@ -437,6 +442,13 @@ impl Depacketizer {
         if !self.seen_annex_b_separator {
             self.seen_annex_b_separator = true;
             log::warn!("processing (non-RFC 6184-compliant) Annex B separators in H.264 stream");
+        }
+    }
+
+    fn maybe_warn_about_trailing_zero(&mut self) {
+        if !self.seen_trailing_zero {
+            self.seen_trailing_zero = true;
+            log::warn!("NAL unit with improper trailing zero byte");
         }
     }
 
@@ -501,7 +513,8 @@ impl Depacketizer {
             }
         }
         if trailing_zeros > 0 {
-            return Err("the last byte of a NAL must not be equal to 0".into());
+            self.maybe_warn_about_trailing_zero();
+            data.truncate(data.len() - trailing_zeros);
         }
         self.add_nal_without_separators(hdr, data)?;
         Ok(())
@@ -1915,7 +1928,7 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    static ANNEX_B_NALS: [u8; 42] = [
+    static ANNEX_B_NALS: [u8; 43] = [
         // SPS
         0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1, 0x00, 0x00, 0x04, 0xf6,
         0x00, 0x00, 0x63, 0x38, 0x04,
@@ -1923,7 +1936,7 @@ mod tests {
         // PPS
         0x68, 0xee, 0x3c, 0xb0, 0x00, 0x00, 0x01,
         // IDR slice
-        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e', 0x00,
     ];
 
     #[rustfmt::skip]
