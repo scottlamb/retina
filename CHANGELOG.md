@@ -1,3 +1,7 @@
+## unreleased
+
+*   improve some error messages on bad H.264 `sprop-parameter-sets`
+
 ## `v0.4.10` (2024-08-19)
 
 *   update `base64` dep to 0.22

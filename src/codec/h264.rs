@@ -725,31 +725,37 @@ impl InternalParameters {
             let nal = base64::engine::general_purpose::STANDARD
                 .decode(nal)
                 .map_err(|_| {
-                    "bad sprop-parameter-sets: NAL has invalid base64 encoding".to_string()
+                    format!("bad sprop-parameter-sets: invalid base64 encoding in NAL: {nal}")
                 })?;
-            if nal.is_empty() {
+
+            let hex = crate::hex::LimitedHex::new(&nal, 256);
+            let Some(&header) = nal.first() else {
                 return Err("bad sprop-parameter-sets: empty NAL".into());
-            }
-            let header = h264_reader::nal::NalHeader::new(nal[0])
-                .map_err(|_| format!("bad sprop-parameter-sets: bad NAL header {:0x}", nal[0]))?;
+            };
+            let header = h264_reader::nal::NalHeader::new(header)
+                .map_err(|_| format!("bad sprop-parameter-sets: bad header in NAL: {hex}"))?;
             match header.nal_unit_type() {
                 UnitType::SeqParameterSet => {
                     if sps_nal.is_some() {
-                        return Err("multiple SPSs".into());
+                        return Err("multiple SPSs are currently unsupported".into());
                     }
                     sps_nal = Some(nal);
                 }
                 UnitType::PicParameterSet => {
                     if pps_nal.is_some() {
-                        return Err("multiple PPSs".into());
+                        return Err("multiple PPSs are currently unsupported".into());
                     }
                     pps_nal = Some(nal);
                 }
-                _ => return Err("only SPS and PPS expected in parameter sets".into()),
+                _ => {
+                    return Err(format!(
+                        "bad sprop-parameter-sets: unexpected non-SPS/PPS NAL: {hex}"
+                    ));
+                }
             }
         }
-        let sps_nal = sps_nal.ok_or_else(|| "no sps".to_string())?;
-        let pps_nal = pps_nal.ok_or_else(|| "no pps".to_string())?;
+        let sps_nal = sps_nal.ok_or_else(|| "bad sprop-parameter-sets: no sps".to_string())?;
+        let pps_nal = pps_nal.ok_or_else(|| "bad sprop-parameter-sets: no pps".to_string())?;
         Self::parse_sps_and_pps(&sps_nal, &pps_nal, false)
     }
 
