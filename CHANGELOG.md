@@ -1,10 +1,14 @@
 ## unreleased
 
 *   improve some error messages on bad H.264 `sprop-parameter-sets`
-*   interoperate with V380 cameras by interpreting Annex B sequences in contexts
-    where single NALs are otherwise expected.
+*   interoperate with V380 cameras by interpreting Annex B sequences in RTP
+    payload contexts where single NALs are otherwise expected.
     (Fixes [#68](https://github.com/scottlamb/retina/issues/68),
     [[#108](https://github.com/scottlamb/retina/issues/108)]).
+*   interpret Annex B sequences in H.264 `sprop-parameter-sets` also, improving
+    interoperability with additional cameras. In particular, Retina now
+    understands these video parameters at `DESCRIBE` time, rather than delaying
+    until the first full video frame is received.
 
 ## `v0.4.10` (2024-08-19)
 

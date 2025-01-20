@@ -31,24 +31,27 @@ use super::VideoFrame;
 ///
 /// # Annex B handling
 ///
-/// Some servers erroneously include Annex B separators (`00 00 01`,
-/// separating multiple H.264 NALs) in the RTP payload, rather than correctly
-/// using separate single-NAL packets or length-delimited units within a STAP-A
-/// packet. This depacketizer looks for that separator in any place a single
-/// NAL would otherwise be expected:
+/// Some servers erroneously include Annex B byte streams where a single NAL
+/// unit is expected. This means they use Annex B "start codes" (`00 00 01`
+/// sequences, which are not allowed within a NAL) to separate NALs. This
+/// depacketizer allows Annex B byte streams in the following places
+/// where a single NAL would otherwise be expected:
 ///
 /// *  "Single NAL Packet Units"
-/// *  a single NAL unit in a "STAP-A" aggregation packet
+/// *  a single NAL unit within a "STAP-A" aggregation packet
 /// *  the entirety of a FU-A fragmented NAL unit. (This permissively allows
 ///    the Annex B separator to be split between fragments.)
 ///
-/// It breaks apart NALs at that separator, logging a warning on first
-/// occurrence.
+/// Annex B byte streams also allow additional `00` bytes before an optional
+/// after a NAL unit, referred to as `trailing_zero_8bits` respectively; this
+/// code discards those. Notably, section H.264 section 7.4.1 says
+/// "The last byte of the NAL unit shall not be equal to 0x00."
 ///
-/// It also validates that NALs do not include the invalid sequences
-/// `00 00 00` or `00 00 02`.
+/// Currently, `00 00 01` is not understand as the very start of payload; the
+/// first byte is expected to be a NAL header.
 ///
-/// It strips trailing zero bytes from NALs, logs a warning on first occurrence.
+/// Finally, it errors on the sequence `00 00 02`, which is not allowed in
+/// a single NAL or on an Annex B byte stream.
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     input_state: DepacketizerInputState,
@@ -66,14 +69,6 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
-
-    /// Set the first time an Annex B separator is found in the stream.
-    /// Used to warn only on the first occurrence.
-    seen_annex_b_separator: bool,
-
-    /// Set the first time a NAL unit with a trailing zero is seen.
-    /// Used to warn only on the first occurrence.
-    seen_trailing_zero: bool,
 }
 
 #[derive(Debug)]
@@ -143,6 +138,58 @@ enum DepacketizerInputState {
     },
 }
 
+/// Processes an Annex B stream within `data`.
+///
+/// Calls `nal_fn` on each non-empty NAL within the stream. Errors on invalid Annex B sequences.
+fn process_annex_b<F: FnMut(Bytes) -> Result<(), String>>(
+    mut data: Bytes,
+    mut nal_fn: F,
+) -> Result<(), String> {
+    let mut i = 0;
+    let mut trailing_zeros = 0;
+    while i < data.len() {
+        debug_assert!(trailing_zeros <= i);
+        if trailing_zeros == 0 {
+            // fast-path; go all SIMD.
+            match memchr::memchr(0, &data[i..]) {
+                Some(pos) => {
+                    i += pos + 1;
+                    trailing_zeros = 1;
+                }
+                None => {
+                    trailing_zeros = 0;
+                    break;
+                }
+            }
+        } else if trailing_zeros >= 2 && data[i] == 2 {
+            return Err("forbidden sequence 00 00 02 in NAL".into());
+        } else if trailing_zeros >= 2 && data[i] == 1 {
+            if i > trailing_zeros {
+                let piece = data.split_to(i - trailing_zeros);
+                nal_fn(piece)?;
+            }
+            data.advance(trailing_zeros + 1);
+            i = 0;
+            trailing_zeros = 0;
+        } else if data[i] == 0 {
+            trailing_zeros += 1;
+            i += 1;
+        } else if trailing_zeros >= 3 {
+            return Err("forbidden sequence 00 00 00 in NAL".into());
+        } else {
+            trailing_zeros = 0;
+            i += 1;
+        }
+    }
+    if trailing_zeros > 0 {
+        data.truncate(data.len() - trailing_zeros);
+    }
+    if !data.is_empty() {
+        nal_fn(data)?;
+    }
+    Ok(())
+}
+
 impl Depacketizer {
     pub(super) fn new(
         clock_rate: u32,
@@ -169,8 +216,6 @@ impl Depacketizer {
             pending: None,
             pieces: Vec::new(),
             nals: Vec::new(),
-            seen_annex_b_separator: false,
-            seen_trailing_zero: false,
             parameters,
         })
     }
@@ -227,19 +272,25 @@ impl Depacketizer {
                                 pkt.timestamp()
                             ));
                         }
-                        let last_nal_hdr = self.nals.last().unwrap().hdr;
-                        if can_end_au(last_nal_hdr.nal_unit_type()) {
-                            access_unit.end_ctx = *pkt.ctx();
-                            self.pending =
-                                Some(self.finalize_access_unit(access_unit, "ts change")?);
-                            AccessUnit::start(&pkt, 0, false)
-                        } else {
-                            log::debug!(
-                                "Bogus mid-access unit timestamp change after {:?}",
-                                last_nal_hdr
-                            );
-                            access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
-                            access_unit
+                        match self.nals.last() {
+                            Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+                                access_unit.end_ctx = *pkt.ctx();
+                                self.pending =
+                                    Some(self.finalize_access_unit(access_unit, "ts change")?);
+                                AccessUnit::start(&pkt, 0, false)
+                            }
+                            Some(n) => {
+                                log::debug!(
+                                    "Bogus mid-access unit timestamp change after {:?}",
+                                    n.hdr
+                                );
+                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                access_unit
+                            }
+                            None => {
+                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                access_unit
+                            }
                         }
                     } else {
                         access_unit
@@ -281,7 +332,6 @@ impl Depacketizer {
         if (nal_header >> 7) != 0 {
             return Err(format!("NAL header {nal_header:02x} has F bit set"));
         }
-        data.advance(1); // skip the header byte.
         match nal_header & 0b11111 {
             1..=23 => {
                 if access_unit.fu_a.is_some() {
@@ -289,13 +339,11 @@ impl Depacketizer {
                         "Non-fragmented NAL {nal_header:02x} while FU-A fragment in progress"
                     ));
                 }
-                self.add_nal_with_separators(
-                    NalHeader::new(nal_header).expect("header w/o F bit set is valid"),
-                    data,
-                )?;
+                process_annex_b(data, |nal| self.add_single_nal(nal))?;
             }
             24 => {
                 // STAP-A. https://tools.ietf.org/html/rfc6184#section-5.7.1
+                data.advance(1);
                 if access_unit.fu_a.is_some() {
                     return Err("STAP-A NAL while FU-A fragment in progress".into());
                 }
@@ -310,25 +358,22 @@ impl Depacketizer {
                     if len == 0 {
                         return Err("zero length in STAP-A".into());
                     }
-                    let hdr = NalHeader::new(data[0])
-                        .map_err(|_| format!("bad header {:02x} in STAP-A", data[0]))?;
-                    match data.remaining().cmp(&usize::from(len)) {
+                    match data.remaining().cmp(&(usize::from(len))) {
                         std::cmp::Ordering::Less => {
                             return Err(format!(
-                                "STAP-A too short: {} bytes remaining, expecting {}-byte NAL",
+                                "STAP-A too short: {} bytes remaining, expecting hdr + {}-byte NAL",
                                 data.remaining(),
                                 len
                             ))
                         }
                         std::cmp::Ordering::Equal => {
-                            data.advance(1);
-                            self.add_nal_with_separators(hdr, data)?;
+                            process_annex_b(data, |nal| self.add_single_nal(nal))?;
                             break;
                         }
                         std::cmp::Ordering::Greater => {
-                            let mut piece = data.split_to(usize::from(len));
-                            piece.advance(1);
-                            self.add_nal_with_separators(hdr, piece)?;
+                            process_annex_b(data.split_to(usize::from(len)), |nal| {
+                                self.add_single_nal(nal)
+                            })?;
                         }
                     }
                 }
@@ -340,18 +385,18 @@ impl Depacketizer {
             }
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
-                if data.len() < 2 {
-                    // FU-A header takes 1 byte; need at least 2 bytes to make progress.
+                if data.len() < 3 {
+                    // NAL + FU-A headers take 2 byte; need at least 3 bytes to make progress.
                     return Err(format!("FU-A len {} too short", data.len()));
                 }
-                let fu_header = data[0];
+                let fu_header = data[1];
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
                 let reserved = (fu_header & 0b00100000) != 0;
                 let nal_header =
                     NalHeader::new((nal_header & 0b011100000) | (fu_header & 0b00011111))
                         .expect("NalHeader is valid");
-                data.advance(1);
+                data.advance(2);
                 if (start && end) || reserved {
                     return Err(format!("Invalid FU-A header {fu_header:02x}"));
                 }
@@ -384,9 +429,6 @@ impl Depacketizer {
                         self.add_fu_a(&mut fu_a.cur_nal, data)?;
                         if end {
                             if let Some(cur_nal) = fu_a.cur_nal {
-                                if cur_nal.trailing_zeros > 0 {
-                                    self.maybe_warn_about_trailing_zero();
-                                }
                                 self.nals.push(Nal {
                                     hdr: cur_nal.hdr,
                                     next_piece_idx: u32::try_from(self.pieces.len())
@@ -418,15 +460,18 @@ impl Depacketizer {
             _ => return Err(format!("bad nal header {nal_header:02x}")),
         }
         self.input_state = if mark {
-            let last_nal_hdr = self.nals.last().unwrap().hdr;
-            if can_end_au(last_nal_hdr.nal_unit_type()) {
-                access_unit.end_ctx = ctx;
-                self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
-                DepacketizerInputState::PostMark { timestamp, loss: 0 }
-            } else {
-                log::debug!("Bogus mid-access unit mark on {:?}", last_nal_hdr);
-                access_unit.timestamp.timestamp = timestamp.timestamp;
-                DepacketizerInputState::PreMark(access_unit)
+            match self.nals.last() {
+                Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+                    access_unit.end_ctx = ctx;
+                    self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
+                    DepacketizerInputState::PostMark { timestamp, loss: 0 }
+                }
+                Some(n) => {
+                    log::debug!("Bogus mid-access unit mark on {:?}", n.hdr);
+                    access_unit.timestamp.timestamp = timestamp.timestamp;
+                    DepacketizerInputState::PreMark(access_unit)
+                }
+                None => DepacketizerInputState::PreMark(access_unit),
             }
         } else {
             DepacketizerInputState::PreMark(access_unit)
@@ -438,23 +483,11 @@ impl Depacketizer {
         self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
-    fn maybe_warn_about_annex_b(&mut self) {
-        if !self.seen_annex_b_separator {
-            self.seen_annex_b_separator = true;
-            log::warn!("processing (non-RFC 6184-compliant) Annex B separators in H.264 stream");
-        }
-    }
-
-    fn maybe_warn_about_trailing_zero(&mut self) {
-        if !self.seen_trailing_zero {
-            self.seen_trailing_zero = true;
-            log::warn!("NAL unit with improper trailing zero byte");
-        }
-    }
-
     /// Adds an unfragmented NAL which does not contain any Annex B separators.
-    fn add_nal_without_separators(&mut self, hdr: NalHeader, data: Bytes) -> Result<(), String> {
-        let len = u32::try_from(data.len()).expect("data len < u16::MAX") + 1;
+    fn add_single_nal(&mut self, mut data: Bytes) -> Result<(), String> {
+        let len = u32::try_from(data.len()).expect("data len < u16::MAX");
+        let hdr = data.get_u8();
+        let hdr = NalHeader::new(hdr).map_err(|_| format!("bad NAL header {hdr:02x}"))?;
         if !data.is_empty() {
             self.pieces.push(data);
         }
@@ -467,60 +500,14 @@ impl Depacketizer {
         Ok(())
     }
 
-    /// Adds an unfragmented NAL which may contain Annex B separators.
-    fn add_nal_with_separators(
-        &mut self,
-        mut hdr: NalHeader,
-        mut data: Bytes,
-    ) -> Result<(), String> {
-        let mut i = 0;
-        let mut trailing_zeros = 0; // 0, 1, or 2
-        while i < data.len() {
-            debug_assert!(trailing_zeros <= 2 && trailing_zeros <= i);
-            if trailing_zeros == 0 {
-                // fast-path; go all SIMD.
-                match memchr::memchr(0, &data[i..]) {
-                    Some(pos) => {
-                        i += pos + 1;
-                        trailing_zeros = 1;
-                    }
-                    None => {
-                        trailing_zeros = 0;
-                        break;
-                    }
-                }
-            } else if trailing_zeros == 2 && [0, 2].contains(&data[i]) {
-                return Err(format!("forbidden sequence 00 00 {:02x} in NAL", data[i]));
-            } else if trailing_zeros == 2 && data[i] == 1 {
-                self.maybe_warn_about_annex_b();
-                let piece = data.split_to(i - 2); // data now contains [0, 0, 1, ..rest].
-                self.add_nal_without_separators(hdr, piece)?;
-                if data.len() < 4 {
-                    return Ok(());
-                }
-                let hdr_byte = data[3];
-                hdr = NalHeader::new(hdr_byte)
-                    .map_err(|_| format!("bad NAL header {hdr_byte:02x}"))?;
-                data.advance(4);
-                i = 0;
-                trailing_zeros = 0;
-            } else if data[i] == 0 {
-                trailing_zeros += 1;
-                i += 1;
-            } else {
-                trailing_zeros = 0;
-                i += 1;
-            }
-        }
-        if trailing_zeros > 0 {
-            self.maybe_warn_about_trailing_zero();
-            data.truncate(data.len() - trailing_zeros);
-        }
-        self.add_nal_without_separators(hdr, data)?;
-        Ok(())
-    }
-
     /// Adds a FU-A packet, which may contain Annex B separators.
+    ///
+    /// This is essentially a specialized version of `process_annex_b` and
+    /// `add_single_nal` due to extra complexity of FU-A packets:
+    ///
+    /// * It is resumable, and the end-of-packet handling is done by the caller.
+    /// * The (first) NAL header is passed in by the caller after parsing from
+    ///   a couple bytes.
     fn add_fu_a(&mut self, cur_nal: &mut Option<CurFuANal>, mut data: Bytes) -> Result<(), String> {
         'outer: loop {
             let c = match cur_nal {
@@ -554,16 +541,12 @@ impl Depacketizer {
                             break;
                         }
                     }
-                } else if c.trailing_zeros == 2 && [0, 2].contains(&data[cur_pos]) {
-                    return Err(format!(
-                        "forbidden sequence 00 00 {:02x} in NAL",
-                        data[cur_pos]
-                    ));
-                } else if c.trailing_zeros == 2 && data[cur_pos] == 1 {
-                    self.maybe_warn_about_annex_b();
+                } else if c.trailing_zeros >= 2 && data[cur_pos] == 2 {
+                    return Err("forbidden sequence 00 00 02 in NAL".into());
+                } else if c.trailing_zeros >= 2 && data[cur_pos] == 1 {
                     let mut piece = data.split_to(cur_pos + 1);
-                    if piece.len() > 3 {
-                        piece.truncate(piece.len() - 3);
+                    if piece.len() > c.trailing_zeros + 1 {
+                        piece.truncate(piece.len() - c.trailing_zeros - 1);
                         c.pieces_bytes += piece.len();
                         self.pieces.push(piece);
                     }
@@ -579,12 +562,14 @@ impl Depacketizer {
                 } else if data[cur_pos] == 0 {
                     c.trailing_zeros += 1;
                     cur_pos += 1;
+                } else if c.trailing_zeros > 2 {
+                    return Err("forbidden sequence 00 00 00 in NAL".into());
                 } else {
                     if cur_pos < c.trailing_zeros {
-                        // The previous chunks' trailing zeros were part of the
-                        // NAL but have not yet been included. We've thrown away
-                        // the reference to those chunks, but we can insert
-                        // equivalent zero bytes here.
+                        // The previous chunks' (1 or 2) trailing zeros were
+                        // part of the NAL but have not yet been included. We've
+                        // thrown away the reference to those chunks, but we can
+                        // insert equivalent zero bytes here.
                         let prev_chunk_zeros = c.trailing_zeros - cur_pos;
                         c.pieces_bytes += prev_chunk_zeros;
                         self.pieces
@@ -931,16 +916,12 @@ impl InternalParameters {
 
         let mut sps_nal = None;
         let mut pps_nal = None;
-        for nal in sprop_parameter_sets.split(',') {
-            let nal = base64::engine::general_purpose::STANDARD
-                .decode(nal)
-                .map_err(|_| {
-                    format!("bad sprop-parameter-sets: invalid base64 encoding in NAL: {nal}")
-                })?;
 
+        let mut nal_fn = |nal: Bytes| -> Result<(), String> {
             let hex = crate::hex::LimitedHex::new(&nal, 256);
+
             let Some(&header) = nal.first() else {
-                return Err("bad sprop-parameter-sets: empty NAL".into());
+                return Ok(()); // shouldn't happen by `process_annex_b` guarantee but whatever.
             };
             let header = h264_reader::nal::NalHeader::new(header)
                 .map_err(|_| format!("bad sprop-parameter-sets: bad header in NAL: {hex}"))?;
@@ -963,6 +944,22 @@ impl InternalParameters {
                     ));
                 }
             }
+            Ok(())
+        };
+
+        for part in sprop_parameter_sets.split(',') {
+            // Each part is supposed to be a single NAL. But some cameras at least have an Annex B
+            // start code as a prefix or suffix. It's not *vital* to support this given that such
+            // cameras generally repeat the parameters in-band, but it's nice to
+            // get the parameters as early as possible. And we already have the `process_annex_b`
+            // logic sitting around to support cameras that use Annex B
+            // sequences within RTP payloads.
+            let part = base64::engine::general_purpose::STANDARD
+                .decode(part)
+                .map_err(|_| {
+                    format!("bad sprop-parameter-sets: invalid base64 encoding in NAL: {part}")
+                })?;
+            process_annex_b(Bytes::from(part), &mut nal_fn)?;
         }
         let sps_nal = sps_nal.ok_or_else(|| "bad sprop-parameter-sets: no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "bad sprop-parameter-sets: no pps".to_string())?;
@@ -1330,8 +1327,12 @@ enum PacketizerState {
 mod tests {
     use std::num::NonZeroU32;
 
+    use bytes::Bytes;
+
     use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
+
+    use super::process_annex_b;
 
     /*
      * This test requires
@@ -1773,12 +1774,13 @@ mod tests {
     #[test]
     fn gw_security_params() {
         init_logging();
-        super::InternalParameters::parse_format_specific_params(
+        let p = super::InternalParameters::parse_format_specific_params(
             "packetization-mode=1;\
              profile-level-id=5046302;\
              sprop-parameter-sets=Z00AHpWoLQ9puAgICBAAAAAB,aO48gAAAAAE=",
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(p.generic_parameters.rfc6381_codec, "avc1.4D001E");
     }
 
     #[test]
@@ -1928,11 +1930,11 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    static ANNEX_B_NALS: [u8; 43] = [
+    static ANNEX_B_NALS: [u8; 44] = [
         // SPS
         0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1, 0x00, 0x00, 0x04, 0xf6,
         0x00, 0x00, 0x63, 0x38, 0x04,
-        0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x01,
         // PPS
         0x68, 0xee, 0x3c, 0xb0, 0x00, 0x00, 0x01,
         // IDR slice
@@ -2134,5 +2136,60 @@ mod tests {
             .unwrap(),
         );
         assert!(push_result.is_err());
+    }
+
+    /// Tests the `process_annex_b` function in isolation.
+    #[test]
+    fn annex_b_parsing() {
+        init_logging();
+
+        // Essentially empty inputs.
+        process_annex_b(Bytes::from_static(&[]), |_| panic!()).unwrap();
+        process_annex_b(Bytes::from_static(&[0x00]), |_| panic!()).unwrap();
+        process_annex_b(Bytes::from_static(&[0x00, 0x00, 0x01]), |_| panic!()).unwrap();
+        process_annex_b(Bytes::from_static(&[0x00, 0x00, 0x00, 0x01]), |_| panic!()).unwrap();
+
+        // Single NAL unit.
+        let mut nals = vec![];
+        process_annex_b(Bytes::from_static(&[1, 2, 3, 4]), |nal| {
+            nals.push(nal);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+        nals.clear();
+        process_annex_b(Bytes::from_static(&[0, 0, 1, 1, 2, 3, 4]), |nal| {
+            nals.push(nal);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+        nals.clear();
+        process_annex_b(Bytes::from_static(&[1, 2, 3, 4, 0, 0, 1]), |nal| {
+            nals.push(nal);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+
+        // Error path.
+        assert_eq!(
+            process_annex_b(Bytes::from_static(&[1, 2, 3, 4, 0, 0, 1]), |_| {
+                Err("asdf".into())
+            }),
+            Err("asdf".into()),
+        );
+
+        // Multiple NAL units.
+        nals.clear();
+        process_annex_b(Bytes::from_static(&[0, 0, 1, 1, 0, 0, 1, 2, 3, 4]), |nal| {
+            nals.push(nal);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            nals,
+            [Bytes::from_static(&[1]), Bytes::from_static(&[2, 3, 4])]
+        );
     }
 }
