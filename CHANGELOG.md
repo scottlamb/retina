@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.11` (2025-01-22)
 
 *   improve some error messages on bad H.264 `sprop-parameter-sets`
 *   interoperate with V380 cameras by interpreting Annex B sequences in RTP
