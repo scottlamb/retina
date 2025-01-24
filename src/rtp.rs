@@ -342,7 +342,7 @@ impl ReceivedPacketBuilder {
     ) -> Result<ReceivedPacket, &'static str> {
         let (raw, payload_range) = RawPacketBuilder {
             sequence_number: self.sequence_number,
-            timestamp: self.timestamp.timestamp as u32,
+            timestamp: self.timestamp.pts as u32,
             payload_type: self.payload_type,
             ssrc: self.ssrc,
             mark: self.mark,

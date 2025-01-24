@@ -68,7 +68,7 @@ impl Depacketizer {
         }
         let mut in_progress = match std::mem::replace(&mut self.state, State::Idle) {
             State::InProgress(in_progress) => {
-                if in_progress.timestamp.timestamp != pkt.timestamp().timestamp {
+                if in_progress.timestamp.pts != pkt.timestamp().pts {
                     return Err(format!(
                         "Timestamp changed from {} to {} with message in progress",
                         &in_progress.timestamp,

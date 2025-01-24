@@ -486,11 +486,11 @@ impl Depacketizer {
                         "Got {au_headers_count}-AU packet while fragment in progress"
                     ));
                 }
-                if (pkt.timestamp().timestamp as u16) != frag.rtp_timestamp {
+                if (pkt.timestamp().pts as u16) != frag.rtp_timestamp {
                     return Err(format!(
                         "Timestamp changed from 0x{:04x} to 0x{:04x} mid-fragment",
                         frag.rtp_timestamp,
-                        pkt.timestamp().timestamp as u16
+                        pkt.timestamp().pts as u16
                     ));
                 }
                 let au_header = u16::from_be_bytes([payload[2], payload[3]]);
@@ -625,7 +625,7 @@ impl Depacketizer {
                     let mut buf = BytesMut::with_capacity(size);
                     buf.extend_from_slice(&payload[agg.data_off..]);
                     self.state = DepacketizerState::Fragmented(Fragment {
-                        rtp_timestamp: agg.pkt.timestamp().timestamp as u16,
+                        rtp_timestamp: agg.pkt.timestamp().pts as u16,
                         loss: agg.loss,
                         loss_since_mark: agg.loss_since_mark,
                         size: size as u16,
@@ -725,7 +725,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 42,
+            pts: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
@@ -921,7 +921,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 42,
+            pts: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
@@ -1025,7 +1025,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 42,
+            pts: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
@@ -1131,7 +1131,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 42,
+            pts: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
@@ -1240,7 +1240,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 42,
+            pts: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
