@@ -10,6 +10,7 @@ use h264_reader::{
     },
     rbsp::{BitRead, BitReader, BitReaderError, ByteReader},
 };
+use std::ops::{AddAssign, Mul};
 use thiserror::Error;
 
 pub(crate) struct NalUnitIter<'a> {
@@ -47,6 +48,9 @@ pub(crate) struct NalRef<'a>(&'a [u8]);
 
 #[derive(Debug, Error)]
 pub(crate) enum DtsExtractorError {
+    #[error("first call must be IDR")]
+    FirstCallNotIDR,
+
     #[error("{0}")]
     FromInt(#[from] std::num::TryFromIntError),
 
@@ -84,11 +88,16 @@ pub(crate) enum DtsExtractorError {
 // Allows to extract DTS from PTS.
 #[derive(Debug)]
 pub(crate) struct DtsExtractor {
-    prev_dts: Option<i64>,
+    initialized: Option<Initialized>,
+}
+
+#[derive(Debug)]
+struct Initialized {
+    prev_dts: i64,
     expected_poc: u32,
-    reordered_frames: isize,
-    pause_dts: isize,
-    poc_increment: isize,
+    reordered_frames: i64,
+    pause_dts: i64,
+    poc_increment: PocIncrement,
 }
 
 impl Default for DtsExtractor {
@@ -99,13 +108,7 @@ impl Default for DtsExtractor {
 
 impl DtsExtractor {
     pub fn new() -> Self {
-        Self {
-            poc_increment: 2,
-            prev_dts: None,
-            expected_poc: 0,
-            reordered_frames: 0,
-            pause_dts: 0,
-        }
+        Self { initialized: None }
     }
 
     // Extracts the DTS of a access unit. The first call must be an IDR.
@@ -116,6 +119,7 @@ impl DtsExtractor {
         au: NalUnitIter,
         pts: i64,
     ) -> Result<i64, DtsExtractorError> {
+        use DtsExtractorError::*;
         let log2_max_pic_order_cnt_lsb_minus4 = match sps.pic_order_cnt {
             PicOrderCntType::TypeZero {
                 log2_max_pic_order_cnt_lsb_minus4,
@@ -125,32 +129,46 @@ impl DtsExtractor {
                 offset_for_non_ref_pic: _,
                 offset_for_top_to_bottom_field: _,
                 offsets_for_ref_frame: _,
-            } => return Err(DtsExtractorError::PicOrderCntType1Unsupported),
+            } => return Err(PicOrderCntType1Unsupported),
             PicOrderCntType::TypeTwo => return Ok(pts),
         };
 
-        let dts = self.extract_inner(
-            is_random_access_point,
-            au,
-            pts,
-            sps.log2_max_frame_num_minus4,
-            &sps.frame_mbs_flags,
-            log2_max_pic_order_cnt_lsb_minus4,
-        )?;
-        if dts > pts {
-            return Err(DtsExtractorError::DtsGreaterThanPts(dts, pts));
-        }
-
-        if let Some(prev_dts) = self.prev_dts {
-            if dts <= prev_dts {
-                return Err(DtsExtractorError::DtsNotIncreasing(prev_dts, dts));
+        if let Some(init) = &mut self.initialized {
+            let dts = init.extract_inner(
+                is_random_access_point,
+                au,
+                pts,
+                sps.log2_max_frame_num_minus4,
+                &sps.frame_mbs_flags,
+                log2_max_pic_order_cnt_lsb_minus4,
+            )?;
+            if dts > pts {
+                return Err(DtsGreaterThanPts(dts, pts));
             }
+            if dts <= init.prev_dts {
+                return Err(DtsNotIncreasing(init.prev_dts, dts));
+            }
+            init.prev_dts = dts;
+            Ok(dts)
+        } else {
+            // First call.
+            if !is_random_access_point {
+                return Err(FirstCallNotIDR);
+            }
+            let dts = pts;
+            self.initialized = Some(Initialized {
+                prev_dts: dts,
+                poc_increment: PocIncrement::Two,
+                expected_poc: 0,
+                reordered_frames: 0,
+                pause_dts: 0,
+            });
+            Ok(dts)
         }
-
-        self.prev_dts = Some(dts);
-        Ok(dts)
     }
+}
 
+impl Initialized {
     fn extract_inner(
         &mut self,
         is_random_access_point: bool,
@@ -164,16 +182,16 @@ impl DtsExtractor {
             self.expected_poc = 0;
             self.reordered_frames = 0;
             self.pause_dts = 0;
-            self.poc_increment = 2;
+            self.poc_increment = PocIncrement::Two;
             return Ok(pts);
         }
 
-        self.expected_poc += u32::try_from(self.poc_increment)?;
+        self.expected_poc += self.poc_increment;
         self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
 
         if self.pause_dts > 0 {
             self.pause_dts -= 1;
-            return Ok(self.prev_dts.unwrap_or(0) + 1);
+            return Ok(self.prev_dts + 1);
         }
 
         let poc = find_picture_order_count(
@@ -183,16 +201,18 @@ impl DtsExtractor {
             log2_max_pic_order_cnt_lsb_minus4,
         )?;
 
-        if self.poc_increment == 2 && (poc % 2) != 0 {
-            self.poc_increment = 1;
+        let poc_is_odd = (poc % 2) != 0;
+        if matches!(self.poc_increment, PocIncrement::Two) && poc_is_odd {
+            self.poc_increment = PocIncrement::One;
             self.expected_poc /= 2;
         }
 
-        let poc_diff = isize::try_from(get_picture_order_count_diff(
+        let poc_diff = i64::from(get_picture_order_count_diff(
             poc,
             self.expected_poc,
             log2_max_pic_order_cnt_lsb_minus4,
-        )?)? + self.reordered_frames * self.poc_increment;
+        )?);
+        let poc_diff = poc_diff + self.reordered_frames * self.poc_increment;
 
         if poc_diff < 0 {
             return Err(DtsExtractorError::PocInvalid);
@@ -202,17 +222,25 @@ impl DtsExtractor {
             return Ok(pts);
         }
 
-        let reordered_frames =
-            (poc_diff - self.reordered_frames * self.poc_increment) / self.poc_increment;
+        let reordered_frames = {
+            match self.poc_increment {
+                PocIncrement::One => poc_diff - self.reordered_frames,
+                PocIncrement::Two => (poc_diff - self.reordered_frames * 2) / 2,
+            }
+        };
+
         if reordered_frames > self.reordered_frames {
             self.pause_dts = reordered_frames - self.reordered_frames - 1;
             self.reordered_frames = reordered_frames;
-            return Ok(self.prev_dts.unwrap_or(0) + 1);
+            return Ok(self.prev_dts + 1);
         }
 
-        Ok(self.prev_dts.unwrap_or(0)
-            + ((pts - self.prev_dts.unwrap_or(0)) * i64::try_from(self.poc_increment)?
-                / i64::try_from(poc_diff + self.poc_increment)?))
+        let dts_diff = pts - self.prev_dts;
+        let dts_inc = match self.poc_increment {
+            PocIncrement::One => dts_diff / (poc_diff + 1),
+            PocIncrement::Two => dts_diff * 2 / (poc_diff + 2),
+        };
+        Ok(self.prev_dts + dts_inc)
     }
 }
 
@@ -292,6 +320,32 @@ fn get_unit_type(nal: &[u8]) -> Result<UnitType, DtsExtractorError> {
     Ok(NalHeader::new(*nal.first().ok_or(NoHeader)?)
         .map_err(ParseNalHeader)?
         .nal_unit_type())
+}
+
+#[derive(Copy, Clone, Debug)]
+enum PocIncrement {
+    One,
+    Two,
+}
+
+impl AddAssign<PocIncrement> for u32 {
+    fn add_assign(&mut self, rhs: PocIncrement) {
+        match rhs {
+            PocIncrement::One => *self += 1,
+            PocIncrement::Two => *self += 2,
+        };
+    }
+}
+
+impl Mul<PocIncrement> for i64 {
+    type Output = i64;
+
+    fn mul(self, rhs: PocIncrement) -> Self::Output {
+        match rhs {
+            PocIncrement::One => self,
+            PocIncrement::Two => self * 2,
+        }
+    }
 }
 
 #[cfg(test)]
