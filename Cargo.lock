@@ -1734,7 +1734,6 @@ dependencies = [
  "log",
  "memchr",
  "mylog",
- "once_cell",
  "pin-project",
  "pretty-hex",
  "rand",
