@@ -1,7 +1,8 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video.
+//! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
+//! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
 use std::convert::TryFrom;
 use std::fmt::Write;
@@ -22,9 +23,12 @@ use super::VideoFrame;
 /// and produces unfragmented NAL units as specified in [RFC
 /// 6184](https://tools.ietf.org/html/rfc6184).
 ///
-/// This doesn't inspect the contents of the NAL units, so it doesn't depend on or
-/// verify compliance with H.264 section 7.4.1.2.3 "Order of NAL units and coded
-/// pictures and association to access units".
+/// This inspects the contents of the NAL units only minimally, and largely for
+/// logging. In particular, it doesn't completely enforce verify compliance with
+/// H.264 section 7.4.1.2.3 "Order of NAL units and coded pictures and
+/// association to access units". For compatibility with some broken cameras
+/// that change timestamps mid-AU, it does extend AUs if they end with parameter
+/// sets. See `can_end_au`.
 ///
 /// Currently expects that the stream starts at an access unit boundary unless
 /// packet loss is indicated.
@@ -324,11 +328,10 @@ impl Depacketizer {
         let loss = pkt.loss();
         let timestamp = pkt.timestamp();
         let mut data = pkt.into_payload_bytes();
-        if data.is_empty() {
-            return Err("Empty NAL".into());
-        }
         // https://tools.ietf.org/html/rfc6184#section-5.2
-        let nal_header = data[0];
+        let Some(&nal_header) = data.first() else {
+            return Err("Empty NAL".into());
+        };
         if (nal_header >> 7) != 0 {
             return Err(format!("NAL header {nal_header:02x} has F bit set"));
         }
@@ -623,7 +626,7 @@ impl Depacketizer {
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
-        let mut is_random_access_point = false;
+        let mut is_random_access_point = true;
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
@@ -655,7 +658,10 @@ impl Depacketizer {
                         new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                     }
                 }
-                UnitType::SliceLayerWithoutPartitioningIdr => is_random_access_point = true,
+                UnitType::SliceDataPartitionALayer
+                | UnitType::SliceDataPartitionBLayer
+                | UnitType::SliceDataPartitionCLayer
+                | UnitType::SliceLayerWithoutPartitioningNonIdr => is_random_access_point = false,
                 _ => {}
             }
             if nal.hdr.nal_ref_idc() != 0 {
@@ -1085,7 +1091,7 @@ impl InternalParameters {
 
 /// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..data]`.
 fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
-    if nal.is_empty() || nal[0] != u8::from(hdr) {
+    if nal.first() != Some(&u8::from(hdr)) {
         return false;
     }
     let mut nal_pos = 1;
@@ -1102,7 +1108,7 @@ fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
     nal_pos == nal.len()
 }
 
-/// Saves the given NAL to a contiguous Bytes.
+/// Saves the given NAL to a contiguous `Bytes`.
 fn to_bytes(hdr: NalHeader, len: u32, pieces: &[Bytes]) -> Bytes {
     let len = usize::try_from(len).expect("u32 fits in usize");
     let mut out = Vec::with_capacity(len);
