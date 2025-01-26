@@ -574,7 +574,7 @@ impl Default for Depacketizer {
 mod tests {
     use std::num::NonZeroU32;
 
-    use crate::testutil::init_logging;
+    use crate::testutil::{assert_eq_hex, init_logging};
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     // Raw RTP payload from a MJPEG encoded Big Buck Bunny stream
@@ -874,6 +874,6 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
-        assert_eq!(frame.data(), VALID_JPEG_IMAGE)
+        assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)
     }
 }

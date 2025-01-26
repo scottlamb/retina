@@ -1329,7 +1329,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::testutil::init_logging;
+    use crate::testutil::{assert_eq_hex, assert_eq_hexes, init_logging};
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
     use super::process_annex_b;
@@ -1383,7 +1383,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(frame.unwrap().data(), &sample.bytes);
+            assert_eq_hex!(frame.unwrap().data(), &sample.bytes);
         }
     }
      */
@@ -1485,7 +1485,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x06\x06plain\
                      \x00\x00\x00\x09\x06stap-a 1\
@@ -1569,7 +1569,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
@@ -1616,7 +1616,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x01slice");
         assert_eq!(frame.timestamp, ts1);
         d.push(
             ReceivedPacketBuilder {
@@ -1672,7 +1672,7 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
@@ -1988,7 +1988,7 @@ mod tests {
         let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
             panic!();
         };
-        assert_eq!(frame.data(), &PREFIXED_NALS);
+        assert_eq_hex!(frame.data(), &PREFIXED_NALS);
     }
 
     /// Tests that the depacketizer can handle Annex B separators in a FU-A unit,
@@ -2088,7 +2088,7 @@ mod tests {
                 let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
                     panic!();
                 };
-                assert_eq!(frame.data(), &PREFIXED_NALS);
+                assert_eq_hex!(frame.data(), &PREFIXED_NALS);
             }
         }
     }
@@ -2156,21 +2156,21 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+        assert_eq_hexes!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
         nals.clear();
         process_annex_b(Bytes::from_static(&[0, 0, 1, 1, 2, 3, 4]), |nal| {
             nals.push(nal);
             Ok(())
         })
         .unwrap();
-        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+        assert_eq_hexes!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
         nals.clear();
         process_annex_b(Bytes::from_static(&[1, 2, 3, 4, 0, 0, 1]), |nal| {
             nals.push(nal);
             Ok(())
         })
         .unwrap();
-        assert_eq!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
+        assert_eq_hexes!(nals, [Bytes::from_static(&[1, 2, 3, 4])]);
 
         // Error path.
         assert_eq!(
@@ -2187,7 +2187,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(
+        assert_eq_hexes!(
             nals,
             [Bytes::from_static(&[1]), Bytes::from_static(&[2, 3, 4])]
         );

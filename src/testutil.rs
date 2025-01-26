@@ -5,6 +5,47 @@ use std::str::FromStr;
 
 use bytes::Bytes;
 
+pub(crate) struct HexDebug(pub(crate) Vec<u8>);
+
+impl std::cmp::PartialEq for HexDebug {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl std::cmp::Eq for HexDebug {}
+
+impl std::fmt::Debug for HexDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        pretty_hex::pretty_hex_write(f, &self.0)
+    }
+}
+
+macro_rules! assert_eq_hex {
+    ($left:expr, $right:expr) => {{
+        pretty_assertions::assert_eq!(
+            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref($left))),
+            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref($right))),
+        );
+    }};
+}
+
+macro_rules! assert_eq_hexes {
+    ($left:expr, $right:expr) => {{
+        let left = $left
+            .iter()
+            .map(|x| $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(x))))
+            .collect::<Vec<_>>();
+        let right = $right
+            .iter()
+            .map(|x| $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(x))))
+            .collect::<Vec<_>>();
+        pretty_assertions::assert_eq!(left, right);
+    }};
+}
+
+pub(crate) use {assert_eq_hex, assert_eq_hexes};
+
 pub(crate) fn init_logging() {
     let h = mylog::Builder::new()
         .set_format(
