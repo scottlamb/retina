@@ -3,20 +3,19 @@
 
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video.
 
-use std::convert::TryFrom;
-use std::fmt::Write;
-
-use base64::Engine as _;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use h264_reader::nal::{NalHeader, UnitType};
-use log::{debug, log_enabled, trace};
-
-use crate::{
-    rtp::{ReceivedPacket, ReceivedPacketBuilder},
-    Error, Timestamp,
-};
+pub mod dts_extractor;
 
 use super::VideoFrame;
+use crate::{
+    codec::h264::dts_extractor::{DtsExtractor, NalUnitIter},
+    rtp::{ReceivedPacket, ReceivedPacketBuilder},
+    Error, Timestamp, VideoTimestamp,
+};
+use base64::Engine as _;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use h264_reader::nal::{sps::SeqParameterSet, NalHeader, UnitType};
+use log::{debug, log_enabled, trace};
+use std::{convert::TryFrom, fmt::Write};
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -69,6 +68,8 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    dts_extractor: Option<DtsExtractor>,
 }
 
 #[derive(Debug)]
@@ -87,7 +88,7 @@ struct Nal {
 struct AccessUnit {
     start_ctx: crate::PacketContext,
     end_ctx: crate::PacketContext,
-    timestamp: crate::Timestamp,
+    timestamp: Timestamp,
     stream_id: usize,
 
     /// FU-A fragmentation unit state, if any.
@@ -217,6 +218,7 @@ impl Depacketizer {
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
+            dts_extractor: None,
         })
     }
 
@@ -244,7 +246,7 @@ impl Depacketizer {
                     if loss > 0 {
                         self.nals.clear();
                         self.pieces.clear();
-                        if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
+                        if access_unit.timestamp.pts == pkt.timestamp().pts {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             self.input_state = if pkt.mark() {
                                 DepacketizerInputState::PostMark {
@@ -264,7 +266,7 @@ impl Depacketizer {
                         // A suffix of a previous access unit was lost; discard it.
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
-                    } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
+                    } else if access_unit.timestamp.pts != pkt.timestamp().pts {
                         if access_unit.fu_a.is_some() {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
@@ -284,11 +286,11 @@ impl Depacketizer {
                                     "Bogus mid-access unit timestamp change after {:?}",
                                     n.hdr
                                 );
-                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                access_unit.timestamp.pts = pkt.timestamp().pts;
                                 access_unit
                             }
                             None => {
-                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                access_unit.timestamp.pts = pkt.timestamp().pts;
                                 access_unit
                             }
                         }
@@ -302,7 +304,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
+                    AccessUnit::start(&pkt, loss, state_ts.pts == pkt.timestamp().pts)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
@@ -310,7 +312,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    if pkt.timestamp().timestamp == timestamp.timestamp {
+                    if pkt.timestamp().pts == timestamp.pts {
                         pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
@@ -468,7 +470,7 @@ impl Depacketizer {
                 }
                 Some(n) => {
                     log::debug!("Bogus mid-access unit mark on {:?}", n.hdr);
-                    access_unit.timestamp.timestamp = timestamp.timestamp;
+                    access_unit.timestamp.pts = timestamp.pts;
                     DepacketizerInputState::PreMark(access_unit)
                 }
                 None => DepacketizerInputState::PreMark(access_unit),
@@ -717,12 +719,43 @@ impl Depacketizer {
             }
             _ => false,
         };
+
+        let mut dts = au.timestamp.pts;
+        if let Some(parameters) = &self.parameters {
+            // Skip samples silently until we find one with an IDR.
+            if self.dts_extractor.is_none() && is_random_access_point {
+                self.dts_extractor = Some(DtsExtractor::new());
+            }
+
+            // If first sync sample has been received.
+            if let Some(dts_extractor) = &mut self.dts_extractor {
+                let pts = au.timestamp.timestamp();
+                dts = dts_extractor
+                    .extract(
+                        &parameters.sps,
+                        is_random_access_point,
+                        NalUnitIter::new(&data),
+                        pts,
+                    )
+                    .map_err(|e| e.to_string())?;
+            };
+        }
+
+        let timestamp = VideoTimestamp {
+            timestamp: Timestamp {
+                pts: au.timestamp.pts,
+                clock_rate: au.timestamp.clock_rate,
+                start: au.timestamp.start,
+            },
+            dts: Some(dts),
+        };
+
         Ok(VideoFrame {
             has_new_parameters,
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,
-            timestamp: au.timestamp,
+            timestamp,
             stream_id: au.stream_id,
             is_random_access_point,
             is_disposable,
@@ -754,7 +787,7 @@ impl AccessUnit {
         AccessUnit {
             start_ctx: *pkt.ctx(),
             end_ctx: *pkt.ctx(),
-            timestamp: pkt.timestamp(),
+            timestamp: pkt.timestamp,
             stream_id: pkt.stream_id(),
             fu_a: None,
 
@@ -812,6 +845,7 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
 #[derive(Clone, Debug)]
 struct InternalParameters {
     generic_parameters: super::VideoParameters,
+    sps: SeqParameterSet,
 
     /// The (single) SPS NAL.
     sps_nal: Bytes,
@@ -1067,6 +1101,7 @@ impl InternalParameters {
         let avc_decoder_config = avc_decoder_config.freeze();
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
+
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
@@ -1076,6 +1111,7 @@ impl InternalParameters {
                 extra_data: avc_decoder_config,
                 codec: super::VideoParametersCodec::H264,
             },
+            sps,
             sps_nal,
             pps_nal,
             seen_extra_trailing_data,
@@ -1331,6 +1367,7 @@ mod tests {
 
     use crate::testutil::init_logging;
     use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
+    use crate::{Timestamp, VideoTimestamp};
 
     use super::process_annex_b;
 
@@ -1393,7 +1430,7 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1502,12 +1539,12 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
         let ts2 = crate::Timestamp {
-            timestamp: 1,
+            pts: 1,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1575,7 +1612,15 @@ mod tests {
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
         );
-        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+        let want = VideoTimestamp {
+            timestamp: Timestamp {
+                pts: 1,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(1),
+        };
+        assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
 
     /// Test bad framing at a GOP boundary in a stream from a Reolink RLC-822A
@@ -1586,12 +1631,12 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033;sprop-parameter-sets=Z2QAM6wVFKCgL/lQ,aO48sA==")).unwrap();
         let ts1 = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
         let ts2 = crate::Timestamp {
-            timestamp: 1,
+            pts: 1,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1617,7 +1662,15 @@ mod tests {
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq!(frame.data(), b"\x00\x00\x00\x06\x01slice");
-        assert_eq!(frame.timestamp, ts1);
+        let want = VideoTimestamp {
+            timestamp: Timestamp {
+                pts: 0,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(0),
+        };
+        assert_eq!(frame.timestamp, want);
         d.push(
             ReceivedPacketBuilder {
                 // SPS with (incorrect) timestamp matching last frame.
@@ -1678,7 +1731,15 @@ mod tests {
               \x00\x00\x00\x04\x68\xee\x3c\xb0\
               \x00\x00\x00\x06\x65slice"
         );
-        assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+        let want = VideoTimestamp {
+            timestamp: Timestamp {
+                pts: 1,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            dts: Some(1),
+        };
+        assert_eq!(frame.timestamp, want); // use the timestamp from the video frame.
     }
 
     #[test]
@@ -1692,7 +1753,7 @@ mod tests {
             o => panic!("{o:?}"),
         }
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1801,7 +1862,7 @@ mod tests {
 
         // The stream should honor in-band parameters.
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1870,7 +1931,7 @@ mod tests {
 
         // The stream should honor in-band parameters, even with an extra byte.
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -1966,7 +2027,7 @@ mod tests {
             super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
                 .unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
@@ -2013,7 +2074,7 @@ mod tests {
                 )
                 .unwrap();
                 let timestamp = crate::Timestamp {
-                    timestamp: 0,
+                    pts: 0,
                     clock_rate: NonZeroU32::new(90_000).unwrap(),
                     start: 0,
                 };
@@ -2098,7 +2159,7 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };

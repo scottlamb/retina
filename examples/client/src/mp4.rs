@@ -141,7 +141,7 @@ struct TrakTracker {
 }
 
 impl TrakTracker {
-    fn add_sample(
+    fn add_audio_sample(
         &mut self,
         sample_description_index: u32,
         byte_pos: u32,
@@ -168,6 +168,43 @@ impl TrakTracker {
         self.next_pos = Some(byte_pos + size);
         if let Some(last_pts) = self.last_pts.replace(timestamp.timestamp()) {
             let duration = timestamp.timestamp().checked_sub(last_pts).unwrap();
+            self.tot_duration += u64::try_from(duration).unwrap();
+            let duration = u32::try_from(duration)?;
+            match self.durations.last_mut() {
+                Some((s, d)) if *d == duration => *s += 1,
+                _ => self.durations.push((1, duration)),
+            }
+        }
+        Ok(())
+    }
+
+    fn add_video_sample(
+        &mut self,
+        sample_description_index: u32,
+        byte_pos: u32,
+        size: u32,
+        timestamp: retina::VideoTimestamp,
+        loss: u16,
+        allow_loss: bool,
+    ) -> Result<(), Error> {
+        if self.samples > 0 && loss > 0 && !allow_loss {
+            bail!("Lost {} RTP packets mid-stream", loss);
+        }
+        self.samples += 1;
+        if self.next_pos != Some(byte_pos)
+            || self.chunks.last().map(|c| c.sample_description_index)
+                != Some(sample_description_index)
+        {
+            self.chunks.push(Chunk {
+                first_sample_number: self.samples,
+                byte_pos,
+                sample_description_index,
+            });
+        }
+        self.sizes.push(size);
+        self.next_pos = Some(byte_pos + size);
+        if let Some(last_pts) = self.last_pts.replace(timestamp.pts()) {
+            let duration = timestamp.pts().checked_sub(last_pts).unwrap();
             self.tot_duration += u64::try_from(duration).unwrap();
             let duration = u32::try_from(duration)?;
             match self.durations.last_mut() {
@@ -545,7 +582,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         };
         self.cur_video_params_sample_description_index = Some(sample_description_index);
         let size = u32::try_from(frame.data().remaining())?;
-        self.video_trak.add_sample(
+        self.video_trak.add_video_sample(
             sample_description_index,
             self.mdat_pos,
             size,
@@ -571,7 +608,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             frame.data().remaining()
         );
         let size = u32::try_from(frame.data().remaining())?;
-        self.audio_trak.add_sample(
+        self.audio_trak.add_audio_sample(
             /* sample_description_index */ 1,
             self.mdat_pos,
             size,
