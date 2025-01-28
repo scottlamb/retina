@@ -13,6 +13,7 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
+    codec::h26x::TolerantBitReader,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
     Error, Timestamp,
 };
@@ -793,7 +794,7 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
             }
             /* 9 */ UnitType::AccessUnitDelimiter => {
                 if i != 0 {
-                    let _ = write!(errs, "access unit delimiter must be first in AU; was preceded by {:?}",
+                    let _ = write!(errs, "\n* access unit delimiter must be first in AU; was preceded by {:?}",
                                 nals[i-1].hdr);
                 }
             }
@@ -826,84 +827,6 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
-}
-
-/// `h264_reader::rbsp::BitRead` impl that *notes* extra trailing data rather than failing on it.
-///
-/// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most
-/// other RTSP implementations in tolerating this.
-#[derive(Debug)]
-struct TolerantBitReader<'a, R> {
-    inner: R,
-    has_extra_trailing_data: &'a mut bool,
-}
-
-impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'_, R> {
-    fn read_ue(&mut self, name: &'static str) -> Result<u32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_ue(name)
-    }
-
-    fn read_se(&mut self, name: &'static str) -> Result<i32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_se(name)
-    }
-
-    fn read_bool(&mut self, name: &'static str) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_bool(name)
-    }
-
-    fn read_u8(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u8, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u8(bit_count, name)
-    }
-
-    fn read_u16(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u16, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u16(bit_count, name)
-    }
-
-    fn read_u32(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<u32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_u32(bit_count, name)
-    }
-
-    fn read_i32(
-        &mut self,
-        bit_count: u32,
-        name: &'static str,
-    ) -> Result<i32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_i32(bit_count, name)
-    }
-
-    fn has_more_rbsp_data(
-        &mut self,
-        name: &'static str,
-    ) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.has_more_rbsp_data(name)
-    }
-
-    fn finish_rbsp(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        match self.inner.finish_rbsp() {
-            Ok(()) => Ok(()),
-            Err(h264_reader::rbsp::BitReaderError::RemainingData) => {
-                *self.has_extra_trailing_data = true;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn finish_sei_payload(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        self.inner.finish_sei_payload()
-    }
 }
 
 impl InternalParameters {

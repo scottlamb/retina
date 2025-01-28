@@ -24,8 +24,8 @@ impl std::fmt::Debug for HexDebug {
 macro_rules! assert_eq_hex {
     ($left:expr, $right:expr) => {{
         pretty_assertions::assert_eq!(
-            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref($left))),
-            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref($right))),
+            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$left))),
+            $crate::testutil::HexDebug(Vec::from(AsRef::<[u8]>::as_ref(&$right))),
         );
     }};
 }

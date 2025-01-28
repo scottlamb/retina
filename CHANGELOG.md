@@ -1,5 +1,6 @@
 ## unreleased
 
+*   support H.265 ([#57](https://github.com/scottlamb/retina/issues/57)).
 *   fix `Connecting via TCP to known-broken RTSP server` log line on
     connection to a non-broken server.
 

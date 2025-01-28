@@ -16,6 +16,7 @@ memchr = "2.7.4"
 
 [dependencies.retina]
 path = ".."
+features = ["h265"]
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -28,6 +29,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "depacketize_h265"
+path = "fuzz_targets/depacketize_h265.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "roundtrip_h264"
 path = "fuzz_targets/roundtrip_h264.rs"
 test = false
@@ -36,5 +43,11 @@ doc = false
 [[bin]]
 name = "depacketize_jpeg"
 path = "fuzz_targets/depacketize_jpeg.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "h265_nal"
+path = "fuzz_targets/h265_nal.rs"
 test = false
 doc = false

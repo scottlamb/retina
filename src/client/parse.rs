@@ -943,14 +943,19 @@ mod tests {
         assert_eq!(p.streams[0].media(), "video");
         assert_eq!(p.streams[0].encoding_name(), "h265");
         assert_eq!(p.streams[0].rtp_payload_type, 98);
-        assert!(p.streams[0].parameters().is_none());
-        assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "pcma");
-        assert_eq!(p.streams[1].rtp_payload_type, 8);
-        match p.streams[1].parameters().unwrap() {
-            ParametersRef::Audio(_) => {}
-            _ => panic!(),
-        };
+
+        if cfg!(feature = "h265") {
+            assert!(p.streams[0].parameters().is_some());
+            assert_eq!(p.streams[1].media(), "audio");
+            assert_eq!(p.streams[1].encoding_name(), "pcma");
+            assert_eq!(p.streams[1].rtp_payload_type, 8);
+            match p.streams[1].parameters().unwrap() {
+                ParametersRef::Audio(_) => {}
+                _ => panic!(),
+            };
+        } else {
+            assert!(p.streams[0].parameters().is_none());
+        }
     }
 
     #[test]

@@ -711,8 +711,9 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let video_stream_i = if !opts.no_video {
         let s = session.streams().iter().position(|s| {
             if s.media() == "video" {
-                if s.encoding_name() == "h264" || s.encoding_name() == "jpeg" {
-                    log::info!("Using h264 video stream");
+                let encoding_name = s.encoding_name();
+                if matches!(encoding_name, "h264" | "h265" | "jpeg") {
+                    log::info!("Using {encoding_name} video stream");
                     return true;
                 }
                 log::info!(

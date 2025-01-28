@@ -33,7 +33,7 @@ Progress:
     *   [ ] synchronous with std only
 *   codec depacketization
     *   [x] video
-        * [x] H.264
+        * [x] H.264 (RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
             *   [ ] SVC
             *   [ ] periodic infra refresh
             *   [x] multiple slices per picture
@@ -41,9 +41,8 @@ Progress:
             *   [ ] interleaved mode
             *   [x] AAC output format
             *   [ ] Annex B output format ([#44](https://github.com/scottlamb/retina/issues/44))
-            *   [x] ([RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
-        * [x] MJPEG
-            *   [x] ([RFC 2435](https://datatracker.ietf.org/doc/html/rfc2435))
+        * [x] H.265 ([RFC 7798](https://tools.ietf.org/html/rfc7798))
+        * [x] MJPEG ([RFC 2435](https://datatracker.ietf.org/doc/html/rfc2435))
     *   audio
         *   [x] AAC
             *   [ ] interleaving

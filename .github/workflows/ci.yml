@@ -12,10 +12,11 @@ jobs:
       matrix:
         rust:
           - stable
-          - '1.70'
+          - '1.79'
         include:
           - rust: stable
             extra_components: rustfmt
+      fail-fast: false
     runs-on: ubuntu-20.04
     steps:
     - name: Checkout
@@ -34,11 +35,11 @@ jobs:
         toolchain: ${{ matrix.rust }}
         components: ${{ matrix.extra_components }}
     - name: Build (no features)
-      run: cargo build --all-targets --workspace
+      run: cargo build --no-default-features --all-targets --workspace
     - name: Build (all features)
       run: cargo build --all-features --all-targets --workspace
     - name: Test (no features)
-      run: cargo test --all-targets --workspace
+      run: cargo test --no-default-features --all-targets --workspace
     - name: Test (all features)
       run: cargo test --all-features --all-targets --workspace
     - name: Check fuzz tests
@@ -49,9 +50,12 @@ jobs:
     - name: Check fuzz workspace formatting
       if: matrix.rust == 'stable'
       run: cd fuzz && cargo fmt --all --check
-    - name: Clippy on main workspace
+    - name: Clippy on main workspace (no features)
       if: matrix.rust == 'stable'
-      run: cargo clippy --workspace -- -D warnings
+      run: cargo clippy --no-default-features --workspace -- -D warnings
+    - name: Clippy on main workspace (all features)
+      if: matrix.rust == 'stable'
+      run: cargo clippy --all-features --workspace -- -D warnings
     - name: Clippy on fuzz workspace
       if: matrix.rust == 'stable'
       run: cd fuzz && cargo clippy --workspace -- -D warnings
