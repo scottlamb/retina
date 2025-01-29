@@ -722,35 +722,37 @@ impl InternalParameters {
             return Err("VPS NAL is not VPS".into());
         }
 
+        let sps_hex = crate::hex::LimitedHex::new(sps_nal, 256);
         let (sps_h, sps_bits) =
-            nal::split(sps_nal).map_err(|e| format!("failed to parse SPS: {e}"))?;
+            nal::split(sps_nal).map_err(|e| format!("{e}\nwhile parsing SPS: {sps_hex}"))?;
         if sps_h.unit_type() != nal::UnitType::SpsNut {
             return Err("SPS NAL is not SPS".into());
         }
         let mut sps_has_extra_trailing_data = false;
-        let sps_hex = crate::hex::LimitedHex::new(sps_nal, 256);
         let sps_bits = TolerantBitReader {
             inner: sps_bits,
             has_extra_trailing_data: &mut sps_has_extra_trailing_data,
         };
-        let sps = nal::Sps::from_bits(sps_bits).map_err(|e| format!("failed to parse SPS: {e}"))?;
+        let sps = nal::Sps::from_bits(sps_bits)
+            .map_err(|e| format!("{e}\nwhile parsing SPS: {sps_hex}"))?;
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
             log::warn!("Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream.");
             seen_extra_trailing_data = true;
         }
 
+        let pps_hex = crate::hex::LimitedHex::new(pps_nal, 256);
         let (pps_h, pps_bits) =
-            nal::split(pps_nal).map_err(|e| format!("failed to parse PPS: {e}"))?;
+            nal::split(pps_nal).map_err(|e| format!("{e}\nwhile parsing PPS: {pps_hex}"))?;
         if pps_h.unit_type() != nal::UnitType::PpsNut {
             return Err("PPS NAL is not PPS".into());
         }
         let mut pps_has_extra_trailing_data = false;
-        let pps_hex = crate::hex::LimitedHex::new(pps_nal, 256);
         let pps_bits = TolerantBitReader {
             inner: pps_bits,
             has_extra_trailing_data: &mut pps_has_extra_trailing_data,
         };
-        let pps = nal::Pps::from_bits(pps_bits).map_err(|e| format!("failed to parse PPS: {e}"))?;
+        let pps = nal::Pps::from_bits(pps_bits)
+            .map_err(|e| format!("{e}\nwhile parsing PPS: {pps_hex}"))?;
         if pps_has_extra_trailing_data && !seen_extra_trailing_data {
             log::warn!("Ignoring trailing data in PPS {pps_hex}; will not log about trailing data again for this stream.");
             seen_extra_trailing_data = true;
