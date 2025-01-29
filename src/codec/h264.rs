@@ -396,12 +396,12 @@ impl Depacketizer {
                 let fu_header = data[1];
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
-                let reserved = (fu_header & 0b00100000) != 0;
+                let _reserved = (fu_header & 0b00100000) != 0;
                 let nal_header =
                     NalHeader::new((nal_header & 0b011100000) | (fu_header & 0b00011111))
                         .expect("NalHeader is valid");
                 data.advance(2);
-                if (start && end) || reserved {
+                if start && end {
                     return Err(format!("Invalid FU-A header {fu_header:02x}"));
                 }
                 if !end && mark {
