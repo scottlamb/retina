@@ -1,6 +1,7 @@
 ## unreleased
 
 *   fix H.265 SPS parsing flaw that affected the Tenda CP3PRO camera.
+*   fix format of RTCP packet used for firewall hole punching.
 
 ## `v0.4.12` (2025-01-28)
 

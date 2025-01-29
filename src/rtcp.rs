@@ -135,6 +135,7 @@ impl<'a> Iterator for CompoundPacketIterator<'a> {
 #[non_exhaustive]
 pub enum TypedPacketRef<'a> {
     SenderReport(SenderReportRef<'a>),
+    ReceiverReport(ReceiverReportRef<'a>),
 }
 
 /// A sender report, as defined in
@@ -192,7 +193,7 @@ impl<'a> SenderReportRef<'a> {
                 count, pkt.payload_end
             ));
         }
-        Ok(SenderReportRef(pkt))
+        Ok(Self(pkt))
     }
 
     pub fn ssrc(&self) -> u32 {
@@ -209,6 +210,67 @@ impl<'a> SenderReportRef<'a> {
 }
 
 impl<'a> std::ops::Deref for SenderReportRef<'a> {
+    type Target = PacketRef<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A receiver report, as defined in
+/// [RFC 3550 section 6.4.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.2).
+///
+/// ```text
+///         0                   1                   2                   3
+///         0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// header |V=2|P|    RC   |   PT=RR=201   |             length            |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///        |                     SSRC of packet sender                     |
+///        +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+/// report |                 SSRC_1 (SSRC of first source)                 |
+/// block  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///   1    | fraction lost |       cumulative number of packets lost       |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///        |           extended highest sequence number received           |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///        |                      interarrival jitter                      |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///        |                         last SR (LSR)                         |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///        |                   delay since last SR (DLSR)                  |
+///        +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+/// report |                 SSRC_2 (SSRC of second source)                |
+/// block  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///   2    :                               ...                             :
+///        +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+///        |                  profile-specific extensions                  |
+///        +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+///
+pub struct ReceiverReportRef<'a>(PacketRef<'a>);
+
+impl<'a> ReceiverReportRef<'a> {
+    fn validate(pkt: PacketRef<'a>) -> Result<Self, String> {
+        let count = usize::from(pkt.count());
+        const HEADER_LEN: usize = 8;
+        const REPORT_BLOCK_LEN: usize = 24;
+        let expected_len = HEADER_LEN + (count * REPORT_BLOCK_LEN);
+        if pkt.payload_end < expected_len {
+            return Err(format!(
+                "RTCP RR has invalid count={} with unpadded_byte_len={}",
+                count, pkt.payload_end
+            ));
+        }
+        Ok(Self(pkt))
+    }
+
+    pub fn ssrc(&self) -> u32 {
+        u32::from_be_bytes(self.0.buf[4..8].try_into().unwrap())
+    }
+}
+
+impl<'a> std::ops::Deref for ReceiverReportRef<'a> {
     type Target = PacketRef<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -303,6 +365,9 @@ impl<'a> PacketRef<'a> {
         match self.payload_type() {
             200 => Ok(Some(TypedPacketRef::SenderReport(
                 SenderReportRef::validate(self)?,
+            ))),
+            201 => Ok(Some(TypedPacketRef::ReceiverReport(
+                ReceiverReportRef::validate(self)?,
             ))),
             _ => Ok(None),
         }

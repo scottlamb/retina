@@ -2023,6 +2023,22 @@ fn note_stale_live555_data(
     });
 }
 
+#[rustfmt::skip]
+const HOLE_PUNCH_RTP: [u8; 12] = [
+    2 << 6,     // version=2 + p=0 + x=0 + cc=0
+    0,          // m=0 + pt=0
+    0, 0,       // sequence number=0
+    0, 0, 0, 0, // timestamp=0 0,
+    0, 0, 0, 0, // ssrc=0
+];
+#[rustfmt::skip]
+const HOLE_PUNCH_RTCP: [u8; 8] = [
+    2 << 6,     // version=2 + p=0 + rc=0
+    201,        // pt=200 (reception report)
+    0, 1,       // length=1 (in 4-byte words minus 1)
+    0, 0, 0, 0, // ssrc=0 (bogus but we don't know the ssrc reliably yet)
+];
+
 /// Sends dummy RTP and RTCP packets to punch a hole in connection-tracking
 /// firewalls.
 ///
@@ -2034,23 +2050,8 @@ fn note_stale_live555_data(
 /// Note this is insufficient for NAT traversal; the NAT firewall must be
 /// RTSP-aware to rewrite the Transport header's client_ports.
 async fn punch_firewall_hole(sockets: &UdpSockets) -> Result<(), std::io::Error> {
-    #[rustfmt::skip]
-    const DUMMY_RTP: [u8; 12] = [
-        2 << 6,     // version=2 + p=0 + x=0 + cc=0
-        0,          // m=0 + pt=0
-        0, 0,       // sequence number=0
-        0, 0, 0, 0, // timestamp=0 0,
-        0, 0, 0, 0, // ssrc=0
-    ];
-    #[rustfmt::skip]
-    const DUMMY_RTCP: [u8; 8] = [
-        2 << 6,     // version=2 + p=0 + rc=0
-        200,        // pt=200 (reception report)
-        0, 1,       // length=1 (in 4-byte words minus 1)
-        0, 0, 0, 0, // ssrc=0 (bogus but we don't know the ssrc reliably yet)
-    ];
-    sockets.rtp.send(&DUMMY_RTP[..]).await?;
-    sockets.rtcp.send(&DUMMY_RTCP[..]).await?;
+    sockets.rtp.send(&HOLE_PUNCH_RTP[..]).await?;
+    sockets.rtcp.send(&HOLE_PUNCH_RTCP[..]).await?;
     Ok(())
 }
 
@@ -3193,5 +3194,20 @@ mod tests {
         let group = SessionGroup::default();
         let stale_sessions = group.stale_sessions();
         assert_send(group.await_stale_sessions(&stale_sessions));
+    }
+
+    #[test]
+    fn validate_hole_punch_rtp() {
+        let (pkt_ref, _) = crate::rtp::RawPacket::new(Bytes::from_static(&HOLE_PUNCH_RTP)).unwrap();
+        assert_eq!(pkt_ref.payload_type(), 0);
+    }
+
+    #[test]
+    fn validate_hole_punch_rtcp() {
+        let (pkt_ref, _) = crate::rtcp::PacketRef::parse(&HOLE_PUNCH_RTCP).unwrap();
+        assert!(matches!(
+            pkt_ref.as_typed().unwrap(),
+            Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
+        ));
     }
 }
