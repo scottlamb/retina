@@ -461,7 +461,7 @@ impl Depacketizer {
             self.log_access_unit(&au, reason);
         }
         for nal in &self.nals {
-            let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.unit_type() {
                 nal::UnitType::VpsNut => {
@@ -503,13 +503,13 @@ impl Depacketizer {
                 }
                 _ => {}
             }
-            retained_len += 4usize + usize::try_from(nal.len).expect("u32 fits in usize");
+            retained_len += 4usize + crate::to_usize(nal.len);
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
         for nal in &self.nals {
-            let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
 
             data.extend_from_slice(&nal.len.to_be_bytes());
@@ -520,10 +520,7 @@ impl Depacketizer {
                 data.extend_from_slice(&piece[..]);
                 actual_len += piece.len();
             }
-            debug_assert_eq!(
-                usize::try_from(nal.len).expect("u32 fits in usize"),
-                actual_len
-            );
+            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -825,7 +822,7 @@ fn nal_matches(nal: &[u8], hdr: nal::Header, pieces: &[Bytes]) -> bool {
 
 /// Saves the given NAL to a contiguous `Bytes`.
 fn to_bytes(hdr: nal::Header, len: u32, pieces: &[Bytes]) -> Bytes {
-    let len = usize::try_from(len).expect("u32 fits in usize");
+    let len = crate::to_usize(len);
     let mut out = Vec::with_capacity(len);
     out.extend(&*hdr);
     for piece in pieces {

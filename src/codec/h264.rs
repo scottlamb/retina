@@ -636,7 +636,7 @@ impl Depacketizer {
             self.log_access_unit(&au, reason);
         }
         for nal in &self.nals {
-            let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.nal_unit_type() {
                 UnitType::SeqParameterSet => {
@@ -669,13 +669,13 @@ impl Depacketizer {
                 is_disposable = false;
             }
             // TODO: support optionally filtering non-VUI NALs.
-            retained_len += 4usize + usize::try_from(nal.len).expect("u32 fits in usize");
+            retained_len += 4usize + crate::to_usize(nal.len);
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
         for nal in &self.nals {
-            let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             data.extend_from_slice(&nal.len.to_be_bytes()[..]);
             data.push(nal.hdr.into());
@@ -685,10 +685,7 @@ impl Depacketizer {
                 data.extend_from_slice(&piece[..]);
                 actual_len += piece.len();
             }
-            debug_assert_eq!(
-                usize::try_from(nal.len).expect("u32 fits in usize"),
-                actual_len
-            );
+            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -1033,7 +1030,7 @@ fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[Bytes]) -> bool {
 
 /// Saves the given NAL to a contiguous `Bytes`.
 fn to_bytes(hdr: NalHeader, len: u32, pieces: &[Bytes]) -> Bytes {
-    let len = usize::try_from(len).expect("u32 fits in usize");
+    let len = crate::to_usize(len);
     let mut out = Vec::with_capacity(len);
     out.push(hdr.into());
     for piece in pieces {
@@ -1101,7 +1098,7 @@ impl Packetizer {
                     ));
                 }
                 let len = data.get_u32();
-                let usize_len = usize::try_from(len).expect("u32 fits in usize");
+                let usize_len = crate::to_usize(len);
                 if data.len() < usize_len || len == 0 {
                     return Err(format!(
                         "bad length of {} bytes; expected [1, {}]",
@@ -1196,7 +1193,7 @@ impl Packetizer {
                         data,
                     };
                 } else {
-                    let usize_left = usize::try_from(left).expect("u32 fits in usize");
+                    let usize_left = crate::to_usize(left);
                     payload = Vec::with_capacity(usize_left + 2);
                     let fu_indicator = (hdr.nal_ref_idc() << 5) | 28;
                     let fu_header = 0b0100_0000 | hdr.nal_unit_type().id(); // END bit set.

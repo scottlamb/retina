@@ -8,7 +8,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use rtsp_types::{Data, Message};
-use std::convert::TryFrom;
 use std::time::Instant;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::codec::Framed;
@@ -54,8 +53,7 @@ impl Connection {
 
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
         RtspMessageContext {
-            pos: self.0.codec().read_pos
-                + u64::try_from(self.0.read_buffer().remaining()).expect("usize fits in u64"),
+            pos: self.0.codec().read_pos + crate::to_u64(self.0.read_buffer().remaining()),
             received_wall: WallTime::now(),
             received: Instant::now(),
         }
@@ -266,7 +264,7 @@ impl tokio_util::codec::Decoder for Codec {
                 received: Instant::now(),
             },
         };
-        self.read_pos += u64::try_from(len).expect("usize fits in u64");
+        self.read_pos += crate::to_u64(len);
         Ok(Some(msg))
     }
 }

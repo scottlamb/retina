@@ -500,6 +500,21 @@ impl UdpPair {
     }
 }
 
+// Let's assume pointers are either 32-bit or 64-bit so we can do the following
+// infallible conversions.
+fn to_usize(v: u32) -> usize {
+    const {
+        assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
+    }
+    v as usize
+}
+fn to_u64(v: usize) -> u64 {
+    const {
+        assert!(std::mem::size_of::<usize>() <= std::mem::size_of::<u64>());
+    }
+    v as u64
+}
+
 #[cfg(test)]
 mod test {
     use std::net::Ipv4Addr;
