@@ -310,8 +310,13 @@ impl Sps {
         let log2_max_pic_order_cnt_lsb_minus4 = r.read_ue("log2_max_pic_order_cnt_lsb_minus4")?;
         let sps_sub_layer_ordering_info_present_flag =
             r.read_bool("sps_sub_layer_ordering_info_present_flag")?;
-        if sps_sub_layer_ordering_info_present_flag {
-            for _ in 0..=sps_max_sub_layers_minus1 {
+        {
+            let start = if sps_sub_layer_ordering_info_present_flag {
+                0
+            } else {
+                sps_max_sub_layers_minus1
+            };
+            for _ in start..=sps_max_sub_layers_minus1 {
                 let _sps_max_dec_pic_buffering_minus1 =
                     r.read_ue("sps_max_dec_pic_buffering_minus1")?;
                 let _sps_max_num_reorder_pics = r.read_ue("sps_max_num_reorder_pics")?;

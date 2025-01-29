@@ -1,3 +1,7 @@
+## unreleased
+
+*   fix H.265 SPS parsing flaw that affected the Tenda CP3PRO camera.
+
 ## `v0.4.12` (2025-01-28)
 
 *   support H.265 ([#57](https://github.com/scottlamb/retina/issues/57)).

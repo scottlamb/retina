@@ -947,4 +947,13 @@ mod tests {
               \x00\x00\x00\x1d\x28\x01fu start, fu middle, fu end"
         );
     }
+
+    #[test]
+    fn parse_tenda_cp3pro_format_specific_params() {
+        init_logging();
+        let p = super::InternalParameters::parse_format_specific_params(
+            "profile-space=0;profile-id=1;tier-flag=0;level-id=63;interop-constraints=900000000000;sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==;sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=;sprop-pps=RAHA8vAzJA==",
+        ).unwrap();
+        assert_eq!(p.generic_parameters.pixel_dimensions(), (640, 368));
+    }
 }
