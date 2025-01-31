@@ -16,6 +16,8 @@
 
 use h264_reader::rbsp::{BitRead, BitReaderError};
 
+use crate::to_usize;
+
 /// Whether a unit type is VCL or non-VCL, as defined in T.REC H.265 Table 7-1.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum UnitTypeClass {
@@ -213,7 +215,7 @@ impl Header {
         UnitType::try_from(self.0[0] >> 1).expect("6-bit value must be valid NAL type")
     }
 
-    /// The `nul_layer_id`, as a 6-bit value.
+    /// The `nuh_layer_id`, as a 6-bit value.
     pub fn nuh_layer_id(self) -> u8 {
         (self.0[0] & 0b1) << 5 | (self.0[1] >> 3)
     }
@@ -255,6 +257,7 @@ impl std::error::Error for Error {}
 
 // T.REC H.265 section 7.3.2.2
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Sps {
     sps_max_sub_layers_minus1: u8,
     sps_temporal_id_nesting_flag: bool,
@@ -265,6 +268,7 @@ pub struct Sps {
     conformance_window: Option<ConformanceWindow>,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
+    short_term_pic_ref_sets: Vec<ShortTermRefPicSet>,
     vui: Option<VuiParameters>,
 }
 
@@ -317,8 +321,18 @@ impl Sps {
                 sps_max_sub_layers_minus1
             };
             for _ in start..=sps_max_sub_layers_minus1 {
-                let _sps_max_dec_pic_buffering_minus1 =
+                let sps_max_dec_pic_buffering_minus1 =
                     r.read_ue("sps_max_dec_pic_buffering_minus1")?;
+                if sps_max_dec_pic_buffering_minus1 > 15 {
+                    // `MaxDpbSize` must be at most 16, except in Level 8.5
+                    // ("a suitable label for bitstreams that can exceed the
+                    // limits of all other specified levels"), which we won't
+                    // consider. H.265 section A.4.2 specifies bounds tighter
+                    // than 16 in some cases.
+                    return Err(Error(
+                        "sps_max_dec_pic_buffering_minus1 must be in [0, 15]".to_owned(),
+                    ));
+                }
                 let _sps_max_num_reorder_pics = r.read_ue("sps_max_num_reorder_pics")?;
                 let _sps_max_latency_increase_plus1 =
                     r.read_ue("sps_max_latency_increase_plus1")?;
@@ -351,8 +365,15 @@ impl Sps {
             let _pcm_loop_filter_disabled_flag = r.read_bool("pcm_loop_filter_disabled_flag")?;
         }
         let num_short_term_ref_pic_sets = r.read_ue("num_short_term_ref_pic_sets")?;
-        for i in 0..num_short_term_ref_pic_sets as usize {
-            let _short_term_ref_pic_set = ShortTermRefPicSet::from_bits(&mut r, i)?;
+        if num_short_term_ref_pic_sets > 64 {
+            return Err(Error(
+                "num_short_term_ref_pic_sets must be in [0, 64]".to_owned(),
+            ));
+        }
+        let mut short_term_pic_ref_sets = Vec::with_capacity(to_usize(num_short_term_ref_pic_sets));
+        for _ in 0..num_short_term_ref_pic_sets as usize {
+            let next = ShortTermRefPicSet::from_bits(&mut r, short_term_pic_ref_sets.last())?;
+            short_term_pic_ref_sets.push(next);
         }
         let long_term_ref_pics_present_flag = r.read_bool("long_term_ref_pics_present_flag")?;
         if long_term_ref_pics_present_flag {
@@ -432,6 +453,7 @@ impl Sps {
             conformance_window,
             bit_depth_luma_minus8,
             bit_depth_chroma_minus8,
+            short_term_pic_ref_sets,
             vui,
         })
     }
@@ -823,32 +845,205 @@ impl ScalingListData {
     }
 }
 
-/// T.REC H.265 section 7.3.7.
-#[derive(Debug)]
-pub struct ShortTermRefPicSet {}
+const MAX_SHORT_TERM_REF_PICS: usize = 16;
+
+/// Represents a `st_ref_pic_set` as in T.REC H.265 section 7.3.7: currently
+/// only the "candidate short-term RPS" variant as embedded in the SPS, not the
+/// variant embedded in the `slice_segment_header`.
+#[derive(Eq, PartialEq)]
+pub struct ShortTermRefPicSet {
+    // delta_poc[0..num_negative_pics] represents DeltaPocS0.
+    // delta_poc[num_negative_pics..num_negative_pics + num_positive_pics] represents DeltaPocS1.
+    // DeltaPOCS0 values are always negative; DeltaPOCS1 values are always positive.
+    delta_poc: [i32; MAX_SHORT_TERM_REF_PICS],
+
+    // UsedByCurrPicS0 and UsedByCurrPicS1 are not currently used/stored.
+
+    // num_negative_pics + num_positive_pics <= MAX_SHORT_TERM_REF_PICS
+    num_negative_pics: u8,
+    num_positive_pics: u8,
+}
 
 impl ShortTermRefPicSet {
-    pub fn from_bits<R: BitRead>(r: &mut R, st_rps_idx: usize) -> Result<Self, Error> {
-        // See T.REC H.265 section 7.3.7, st_ref_pic_set.
+    pub fn from_bits<R: BitRead>(
+        r: &mut R,
+        prev: Option<&ShortTermRefPicSet>,
+    ) -> Result<Self, Error> {
+        // TODO: use `let_chains` after they're stable.
+        // <https://github.com/rust-lang/rust/pull/132833>
         let inter_ref_pic_set_prediction_flag =
-            st_rps_idx != 0 && r.read_bool("inter_ref_pic_set_prediction_flag")?;
+            prev.is_some() && r.read_bool("inter_ref_pic_set_prediction_flag")?;
         if inter_ref_pic_set_prediction_flag {
-            return Err(Error(
-                "inter_ref_pic_set_prediction_flag unimplemented".to_owned(),
-            ));
+            // Note: currently this supports the `st_ref_pic_set` embedded in
+            // the `sps` only; the `slice_segment_header` variant is not
+            // supported. Thus, it's assumed that `RefRpsIdx` refers to `prev`,
+            // and there's no `delta_idx_minus1` to read.
+            let ref_rps =
+                prev.expect("`inter_ref_pic_set_prediction_flag` implies `prev.is_some()`");
+            let num_ref_rps_delta_pocs =
+                to_usize(ref_rps.num_negative_pics + ref_rps.num_positive_pics);
+            let delta_rps_sign = r.read_bool("delta_rps_sign")?;
+            let abs_delta_rps_minus1 = r.read_ue("abs_delta_rps_minus1")?;
+            if abs_delta_rps_minus1 >= 1 << 15 {
+                return Err(Error(
+                    "abs_delta_rps_minus1 must be in [0, 2^15 - 1]".to_owned(),
+                ));
+            }
+            let delta_rps = (1 - 2 * i32::from(delta_rps_sign)) * (abs_delta_rps_minus1 as i32 + 1);
+
+            // "When use_delta_flag[ j ] is not present, its value is inferred to be equal to 1."
+            let mut use_delta_flag = [true; { MAX_SHORT_TERM_REF_PICS + 1 }];
+            for f in use_delta_flag.iter_mut().take(num_ref_rps_delta_pocs + 1) {
+                let used_by_curr_pic_flag = r.read_bool("used_by_curr_pic_flag")?;
+                if !used_by_curr_pic_flag {
+                    *f = r.read_bool("use_delta_flag")?;
+                }
+            }
+
+            // See H.265 (7-61)
+            let mut delta_poc = [0; MAX_SHORT_TERM_REF_PICS];
+            let mut num_negative_pics = 0;
+            let (ref_rps_delta_poc_s0, ref_rps_delta_poc_s1) = ref_rps.delta_pocs();
+            for (j, &d) in ref_rps_delta_poc_s1.iter().enumerate().rev() {
+                let dpoc = d + delta_rps;
+                if dpoc < 0 && use_delta_flag[ref_rps.num_negative_pics as usize + j] {
+                    delta_poc[num_negative_pics] = dpoc;
+                    num_negative_pics += 1;
+                }
+            }
+            if delta_rps < 0 && use_delta_flag[num_ref_rps_delta_pocs] {
+                if num_negative_pics == MAX_SHORT_TERM_REF_PICS {
+                    return Err(Error(format!(
+                        "num_negative_pics must be less than {MAX_SHORT_TERM_REF_PICS}"
+                    )));
+                }
+                delta_poc[num_negative_pics] = delta_rps;
+                num_negative_pics += 1;
+            }
+            for (j, &d) in ref_rps_delta_poc_s0.iter().enumerate() {
+                let dpoc = d + delta_rps;
+                if dpoc < 0 && use_delta_flag[j] {
+                    if num_negative_pics == MAX_SHORT_TERM_REF_PICS {
+                        return Err(Error(format!(
+                            "num_negative_pics must be less than {MAX_SHORT_TERM_REF_PICS}"
+                        )));
+                    }
+                    delta_poc[num_negative_pics] = dpoc;
+                    num_negative_pics += 1;
+                }
+            }
+            let max_positive_pics = MAX_SHORT_TERM_REF_PICS - num_negative_pics;
+            let delta_poc_s1 = &mut delta_poc[num_negative_pics..];
+            let mut num_positive_pics = 0;
+            for (j, &d) in ref_rps_delta_poc_s0.iter().enumerate().rev() {
+                let dpoc = d + delta_rps;
+                if dpoc > 0 && use_delta_flag[j] {
+                    if num_positive_pics == max_positive_pics {
+                        return Err(Error(format!(
+                            "NumDeltaPocs must be less than or equal to {MAX_SHORT_TERM_REF_PICS}"
+                        )));
+                    }
+                    delta_poc_s1[num_positive_pics] = dpoc;
+                    num_positive_pics += 1;
+                }
+            }
+            if delta_rps > 0 && use_delta_flag[num_ref_rps_delta_pocs] {
+                if num_positive_pics == max_positive_pics {
+                    return Err(Error(format!(
+                        "NumDeltaPocs must be less than or equal to {MAX_SHORT_TERM_REF_PICS}"
+                    )));
+                }
+                delta_poc_s1[num_positive_pics] = delta_rps;
+                num_positive_pics += 1;
+            }
+            for (j, &d) in ref_rps_delta_poc_s1.iter().enumerate() {
+                let dpoc = d + delta_rps;
+                if dpoc > 0 && use_delta_flag[to_usize(ref_rps.num_negative_pics) + j] {
+                    if num_positive_pics == max_positive_pics {
+                        return Err(Error(format!(
+                            "NumDeltaPocs must be less than or equal to {MAX_SHORT_TERM_REF_PICS}"
+                        )));
+                    }
+                    delta_poc_s1[num_positive_pics] = dpoc;
+                    num_positive_pics += 1;
+                }
+            }
+            Ok(Self {
+                delta_poc,
+                num_negative_pics: num_negative_pics as u8,
+                num_positive_pics: num_positive_pics as u8,
+            })
         } else {
             let num_negative_pics = r.read_ue("num_negative_pics")?;
             let num_positive_pics = r.read_ue("num_positive_pics")?;
-            for _i in 0..num_negative_pics {
-                let _delta_poc_s0_minus1 = r.read_ue("delta_poc_s0_minus1")?;
-                let _used_by_curr_pic_s0_flag = r.read_bool("used_by_curr_pic_s0_flag")?;
+            let num_delta_pocs = num_negative_pics.saturating_add(num_positive_pics);
+            if to_usize(num_delta_pocs) > MAX_SHORT_TERM_REF_PICS {
+                return Err(Error(format!(
+                    "NumDeltaPocs must be in [0, {MAX_SHORT_TERM_REF_PICS}]"
+                )));
             }
-            for _i in 0..num_positive_pics {
-                let _delta_poc_s1_minus1 = r.read_ue("delta_poc_s1_minus1")?;
-                let _used_by_curr_pic_s1_flag = r.read_bool("used_by_curr_pic_s1_flag")?;
+            let mut delta_poc = [0; MAX_SHORT_TERM_REF_PICS];
+            let (delta_poc_s0, delta_poc_s1) = delta_poc.split_at_mut(to_usize(num_negative_pics));
+            let delta_poc_s1 = &mut delta_poc_s1[0..to_usize(num_positive_pics)];
+            let mut dpoc = 0;
+
+            let read_delta_poc = |r: &mut R, label: &'static str| -> Result<i32, Error> {
+                let v = r.read_ue(label)?;
+                if v >= 1 << 15 {
+                    return Err(Error(format!("{label} must be in [0, 2^15 - 1]")));
+                }
+                Ok(v as i32 + 1)
+            };
+
+            for d in delta_poc_s0.iter_mut() {
+                dpoc -= read_delta_poc(r, "delta_poc_s0_minus1")?; // apply H.265 (7-67) / (7-69)
+                *d = dpoc;
+                let _ = r.read_bool("used_by_curr_pic_s0_flag")?;
             }
+            dpoc = 0;
+            for d in delta_poc_s1.iter_mut() {
+                dpoc += read_delta_poc(r, "delta_poc_s1_minus1")?; // apply H.265 (7-68) / (7-70)
+                *d = dpoc;
+                let _ = r.read_bool("used_by_curr_pic_s1_flag")?;
+            }
+            Ok(Self {
+                delta_poc,
+                num_negative_pics: num_negative_pics as u8,
+                num_positive_pics: num_positive_pics as u8,
+            })
         }
-        Ok(Self {})
+    }
+
+    /// Returns `(DeltaPocS0, DeltaPocS1)`.
+    fn delta_pocs(&self) -> (&[i32], &[i32]) {
+        let (s0, s1) = self.delta_poc.split_at(to_usize(self.num_negative_pics));
+        let s1 = &s1[0..to_usize(self.num_positive_pics)];
+        (s0, s1)
+    }
+
+    #[cfg(test)]
+    fn from_delta_pocs(s0: &[i32], s1: &[i32]) -> Self {
+        debug_assert!(s0.len() + s1.len() <= MAX_SHORT_TERM_REF_PICS);
+        let mut delta_poc = [0; MAX_SHORT_TERM_REF_PICS];
+        let (delta_poc_s0, delta_poc_s1) = delta_poc.split_at_mut(s0.len());
+        let delta_poc_s1 = &mut delta_poc_s1[0..s1.len()];
+        delta_poc_s0.copy_from_slice(s0);
+        delta_poc_s1.copy_from_slice(s1);
+        Self {
+            delta_poc,
+            num_negative_pics: s0.len() as u8,
+            num_positive_pics: s1.len() as u8,
+        }
+    }
+}
+
+impl std::fmt::Debug for ShortTermRefPicSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (s0, s1) = self.delta_pocs();
+        f.debug_struct("ShortTermRefPicSet")
+            .field("delta_poc_s0", &s0)
+            .field("delta_poc_s1", &s1)
+            .finish()
     }
 }
 
@@ -1173,6 +1368,41 @@ mod tests {
         let timing = vui.timing_info().unwrap();
         assert_eq!(timing.num_units_in_tick(), 1);
         assert_eq!(timing.time_scale(), 12);
+    }
+
+    #[test]
+    fn parse_sps_with_inter_ref_pic_set_prediction_flag() {
+        init_logging();
+        let data = &b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\xba\xa0\x01\x20\x20\x05\x11\xfe\x5a\xee\x44\x88\x8b\xf2\xdc\xd4\x04\x04\x04\x02"[..];
+        let (h, bits) = split(data).unwrap();
+        assert_eq!(h.unit_type(), UnitType::SpsNut);
+        let bits = LoggingBitReader(bits);
+        let sps = Sps::from_bits(bits).unwrap();
+        assert_eq!(sps.pixel_dimensions().unwrap(), (2304, 1296));
+        assert_eq!(
+            &sps.short_term_pic_ref_sets,
+            &[
+                ShortTermRefPicSet::from_delta_pocs(&[-1], &[]),
+                ShortTermRefPicSet::from_delta_pocs(&[-1], &[]),
+                ShortTermRefPicSet::from_delta_pocs(&[], &[]),
+            ]
+        );
+    }
+
+    #[test]
+    fn excessive_short_term_ref_pics() {
+        init_logging();
+
+        // data taken from fuzz testing.
+        let data = [
+            66, 23, 0, 219, 219, 219, 219, 219, 255, 255, 255, 255, 255, 255, 219, 219, 20, 66,
+            219, 162, 219, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 219, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 219, 219, 210, 255,
+        ];
+        let (h, bits) = split(&data[..]).unwrap();
+        assert_eq!(h.unit_type(), UnitType::SpsNut);
+        let bits = LoggingBitReader(bits);
+        Sps::from_bits(bits).unwrap_err();
     }
 
     #[test]

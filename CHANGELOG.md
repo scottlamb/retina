@@ -2,6 +2,10 @@
 
 *   fix H.265 SPS parsing flaw that affected the Tenda CP3PRO camera.
 *   fix format of RTCP packet used for firewall hole punching.
+*   support H.265 SPSs which set  `st_ref_pic_set.inter_ref_pic_set_prediction_flag`,
+    including Xiaomi YI Pro 2K Home cameras running
+    <https://github.com/roleoroleo/yi-hack-Allwinner-v2> firmware.
+    Fixes [scottlamb/moonfire-nvr#333](https://github.com/scottlamb/moonfire-nvr/issues/333).
 
 ## `v0.4.12` (2025-01-28)
 

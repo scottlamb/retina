@@ -951,8 +951,34 @@ mod tests {
     fn parse_tenda_cp3pro_format_specific_params() {
         init_logging();
         let p = super::InternalParameters::parse_format_specific_params(
-            "profile-space=0;profile-id=1;tier-flag=0;level-id=63;interop-constraints=900000000000;sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==;sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=;sprop-pps=RAHA8vAzJA==",
-        ).unwrap();
+            "profile-space=0;\
+             profile-id=1;\
+             tier-flag=0;\
+             level-id=63;\
+             interop-constraints=900000000000;\
+             sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==;\
+             sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=;\
+             sprop-pps=RAHA8vAzJA==",
+        )
+        .unwrap();
         assert_eq!(p.generic_parameters.pixel_dimensions(), (640, 368));
+    }
+
+    /// Parses `format-specific-params` from <https://github.com/scottlamb/moonfire-nvr/issues/333>.
+    #[test]
+    fn parse_hacked_xiaomi_yi_pro_2k_home_format_specific_params() {
+        init_logging();
+        let p = super::InternalParameters::parse_format_specific_params(
+            "profile-space=0;\
+             profile-id=1;\
+             tier-flag=0;\
+             level-id=186;\
+             interop-constraints=000000000000;\
+             sprop-vps=QAEMAf//AWAAAAMAAAMAAAMAAAMAuqwJ;\
+             sprop-sps=QgEBAWAAAAMAAAMAAAMAAAMAuqABICAFEf5a7kSIi/Lc1AQEBAI=;\
+             sprop-pps=RAHA8oSJAzJA",
+        )
+        .unwrap();
+        assert_eq!(p.generic_parameters.pixel_dimensions(), (2304, 1296));
     }
 }
