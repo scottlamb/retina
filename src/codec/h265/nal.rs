@@ -10,9 +10,11 @@
 //! * [ITU-T H.265 "High efficiency video coding"](https://www.itu.int/rec/T-REC-H.265) is the
 //!   main H.265 specification, including all the RBSP layouts described here.
 //! * [ISO/IEC 14496-15 "Carriage of network abstraction layer (NAL) unit structured video in the ISO base media file format"](https://www.iso.org/standard/68933.html)
-//!   defines the format of the RFC 6381 codec ID.  I have been unable to
-//!   find a legal, free copy of the finalized document. However, I believe the relevant parts are
-//!   unchanged since [this working draft](https://mpeg.chiariglione.org/standards/mpeg-4/carriage-nal-unit-structured-video-iso-base-media-file-format/wd-isoiec-14496).
+//!   defines the format of the RFC 6381 codec ID. I have been unable to
+//!   find a legal, free copy of the finalized document. There is
+//!   [this working draft](https://web.archive.org/web/20240522021156/https://mpeg.chiariglione.org/standards/mpeg-4/carriage-nal-unit-structured-video-iso-base-media-file-format/wd-isoiec-14496).
+//!   and [ISO/IEC 14496-15:2013/DCOR 1](https://mpeg.chiariglione.org/standards/mpeg-4/avc-file-format/text-isoiec-14496-152013dcor-1.html)
+//!   which contains an important correction.
 
 use h264_reader::rbsp::{BitRead, BitReaderError};
 
@@ -515,9 +517,8 @@ impl Sps {
     pub fn rfc6381_codec(&self) -> String {
         let profile = self.profile();
 
-        // See ISO/IEC 14496-15, or the working draft mentioned here:
-        // <https://mpeg.chiariglione.org/standards/mpeg-4/carriage-nal-unit-structured-video-iso-base-media-file-format/wd-isoiec-14496>.
-        // Section E.3.
+        // See ISO/IEC 14496-15, or the working draft mentioned in the
+        // module-level doc comment, Section E.3.
 
         // > When the first element of a value is a code indicating a codec from
         // > the High Efficiency Video Coding specification (ISO/IEC 23008-2),
@@ -540,9 +541,19 @@ impl Sps {
         };
         let general_profile_idc = profile.general_profile_idc();
 
-        // > 2. the general_profile_compatibility_flags, encoded in hexadecimal
-        // >    (leading zeroes may be omitted);
-        let general_profile_compatibility_flags = profile.general_profile_compatibility_flags();
+        // > 2. the 32 bits of the general_profile_compatibility_flags, but in
+        //   reverse bit order, i.e. with
+        //   general_profile_compatibility_flag[ 31 ] as the most significant
+        //   bit, followed by general_profile_compatibility_flag[ 30 ], and down
+        //   to general_profile_compatibility_flag[ 0 ] as the least significant
+        //   bit, where general_profile_compatibility_flag[ i ] for i in the
+        //   range of 0 to 31, inclusive, are specified in ISO/IEC 23008-2,
+        //   encoded in hexadecimal (leading zeroes may be omitted);
+        //
+        // Note: the above is corrected text from ISO/IEC 14496-15:2013/DCOR
+        // 1. Earlier copies did not specify that the bits should be reversed!
+        let general_profile_compatibility_flags =
+            profile.general_profile_compatibility_flags().reverse_bits();
 
         // > 3. the general_tier_flag, encoded as ‘L’ (general_tier_flag==0) or
         // >    ‘H’ (general_tier_flag==1), followed by the general_level_idc,
@@ -552,7 +563,7 @@ impl Sps {
             false => "L",
         };
         let general_level_idc = self.profile_tier_level.general_level_idc;
-        let mut out = format!("hvc1.{general_profile_space}{general_profile_idc}.{general_profile_compatibility_flags:02X}.{general_tier_flag}{general_level_idc}");
+        let mut out = format!("hvc1.{general_profile_space}{general_profile_idc}.{general_profile_compatibility_flags:X}.{general_tier_flag}{general_level_idc}");
 
         // > 4. each of the 6 bytes of the constraint flags, starting from the
         //      byte containing the general_progressive_source_flag, each encoded
@@ -1354,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_sps_own() {
+    fn parse_sps() {
         init_logging();
         let data = &b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\xb0\x00\x00\x03\x00\x00\x03\x00\x5a\xa0\x05\x82\x01\xe1\x63\x6b\x92\x45\x2f\xcd\xc1\x41\x81\x41\x00\x00\x03\x00\x01\x00\x00\x03\x00\x0c\xa1"[..];
         let (h, bits) = split(data).unwrap();
@@ -1362,7 +1373,7 @@ mod tests {
         let bits = LoggingBitReader(bits);
         let sps = dbg!(Sps::from_bits(bits).unwrap());
         let rfc6381_codec = sps.rfc6381_codec();
-        assert_eq!(rfc6381_codec, "hvc1.1.60000000.L90.B0");
+        assert_eq!(rfc6381_codec, "hvc1.1.6.L90.B0");
         assert_eq!(sps.pixel_dimensions().unwrap(), (704, 480));
         let vui = sps.vui().unwrap();
         let timing = vui.timing_info().unwrap();

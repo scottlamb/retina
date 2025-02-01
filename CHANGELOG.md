@@ -6,6 +6,8 @@
     including Xiaomi YI Pro 2K Home cameras running
     <https://github.com/roleoroleo/yi-hack-Allwinner-v2> firmware.
     Fixes [scottlamb/moonfire-nvr#333](https://github.com/scottlamb/moonfire-nvr/issues/333).
+*   fix RFC 6381 codec string generation to match a significant bug fix in
+    Technical Corrigendum 1 to ISO/IEC 14496-15:2014.
 
 ## `v0.4.12` (2025-01-28)
 

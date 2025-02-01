@@ -192,16 +192,13 @@ mod tests {
         let raw_vps = &b"\x40\x01\x0c\x01\xff\xff\x01\x40\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\x99\xac\x09"[..];
         let raw_sps = &b"\x42\x01\x01\x01\x40\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\x00\x03\x00\x99\xa0\x01\x50\x20\x06\x01\xf1\x39\x6b\xb9\x1b\x06\xb9\x54\x4d\xc0\x40\x40\x41\x00\x00\x03\x00\x01\x00\x00\x03\x00\x1e\x08"[..];
         let raw_pps = &b"\x44\x01\xc0\x73\xc0\x4c\x90"[..];
-
-        // rfc6381_codec: hvc1.1.40000000.L153.00
-        // hevc_decoder_config: 01 01 40 00  00 00 00 00  00 00 00 00  99 f0 00 fc  fd f8 f8 00  00 0f 03 a0  00 01 00 18  40 01 0c 01  ff ff 01 40  00 00 03 00  00 03 00 00  03 00 00 03  00 99 ac 09  a1 00 01 00  31 42 01 01  01 40 00 00  03 00 00 03  00 00 03 00  00 03 00 99  a0 01 50 20  06 01 f1 39  6b b9 1b 06  b9 54 4d c0  40 40 41 00  00 03 00 01  00 00 03 00  1e 08 a2 00  01 00 07 44  01 c0 73 c0  4c 90
         let (pps_h, pps_bits) = nal::split(&raw_pps).unwrap();
         assert_eq!(pps_h.unit_type(), nal::UnitType::PpsNut);
         let pps = nal::Pps::from_bits(pps_bits).unwrap();
         let (sps_h, sps_bits) = nal::split(&raw_sps).unwrap();
         assert_eq!(sps_h.unit_type(), nal::UnitType::SpsNut);
         let sps = nal::Sps::from_bits(sps_bits).unwrap();
-        assert_eq!(sps.rfc6381_codec(), "hvc1.1.40000000.L153.00");
+        assert_eq!(sps.rfc6381_codec(), "hvc1.1.2.L153.00");
         let (vps_h, _vps_bits) = nal::split(&raw_vps).unwrap();
         assert_eq!(vps_h.unit_type(), nal::UnitType::VpsNut);
         let record = decoder_configuration_record(&raw_pps, &pps, &raw_sps, &sps, &raw_vps);
