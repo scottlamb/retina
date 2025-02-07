@@ -517,13 +517,11 @@ impl Depacketizer {
             let c = match cur_nal {
                 Some(c) => c,
                 None => {
-                    if data.is_empty() {
+                    let Ok(hdr_byte) = data.try_get_u8() else {
                         return Ok(());
-                    }
-                    let hdr_byte = data[0];
+                    };
                     let hdr = NalHeader::new(hdr_byte)
                         .map_err(|_| format!("bad NAL header {hdr_byte:02x}"))?;
-                    data.advance(1);
                     cur_nal.insert(CurFuANal {
                         hdr,
                         trailing_zeros: 0,

@@ -28,7 +28,7 @@ all-features = true
 [dependencies]
 base64 = "0.22.0"
 bitstream-io = "2.6"
-bytes = "1.0.1"
+bytes = "1.10"
 futures = "0.3.14"
 h264-reader = "0.8.0"
 hex = "0.4.3"
