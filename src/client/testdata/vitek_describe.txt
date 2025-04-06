@@ -1,0 +1,29 @@
+RTSP/1.0 200 OK
+Server: Server/1.0.0
+CSeq: 1
+Last-Modified: Mon Jul  8 13:51:49 2024 GMT
+Cache-Control: must-revalidate
+Date: Wed, Mar 26 2025 18:45:11 GMT
+Expires: Wed, Mar 26 2025 18:45:11 GMT
+Content-Type: application/sdp
+x-Accept-Retransmit: our-retransmit
+x-Accept-Dynamic-Rate: 1
+Content-Length: 460
+Content-Base: rtsp://192.168.1.123:554/chID=2&streamType=sub/
+
+v=0
+o=- 42329460 1 IN IP4 192.168.1.123
+s=RTSP SESSION
+u=http:///
+e=admin@
+t=0 0
+a=control:*
+a=range:npt=00.000- 
+m=video 0 RTP/AVP 98
+a=control:trackID=0
+a=rtpmap:98 H265/90000
+a=fmtp:62 profile-level-id=42e032; sprop-vps=QAEMAf//AWAAAAMAAAMAAAMAAAMAlqwJ;sprop-sps=QgEBAWAAAAMAAAMAAAMAAAMAlqALCA8f4qtO6JLuQgAAAwAIAG3dAAzf5gBA;sprop-pps=RAHAcvAbJA==; packetization-mode=1
+m=audio 0 RTP/AVP 0
+a=control:trackID=1
+a=rtpmap:0 PCMU/8000
+a=ptime:40
