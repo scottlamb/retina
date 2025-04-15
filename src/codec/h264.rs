@@ -1418,6 +1418,81 @@ mod tests {
         );
     }
 
+
+    /// Test depacketizing when reserved bit is set on FU-A header.
+    /// Longse CMSEKL800 on 
+    /// firmware KL8_1ND_BVD0L1A0T0Q0_A00038268_V2.0.10.241016_R2
+    /// has been found to set this bit - however the resulting
+    /// frame is fine.
+    #[test]
+    fn depacketize_reserved_bit_set() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, start.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\xa6fu-a start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x26fu-a middle, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 4,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x66fu-a end")
+            .unwrap(),
+        )
+        .unwrap();
+         let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert_eq_hex!(
+            frame.data(),
+            b"\x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
+        );
+    }
+
     /// Test bad framing at the start of stream from a Reolink RLC-822A
     /// Reolink RLC-822A (IPC_523128M8MP) running firmware v3.0.0.177_21012101:
     /// suppress incorrect access unit changes after the SPS and PPS.
