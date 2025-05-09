@@ -391,7 +391,7 @@ impl Sps {
         let _ = r.read_bool("sps_temporal_mvp_enabled_flag")?;
         let _ = r.read_bool("strong_intra_smoothing_enabled_flag")?;
         let vui = if r.read_bool("vui_parameters_present_flag")? {
-            Some(VuiParameters::from_bits(&mut r)?)
+            Some(VuiParameters::from_bits(&mut r, sps_max_sub_layers_minus1)?)
         } else {
             None
         };
@@ -754,10 +754,10 @@ impl Pps {
             let _num_tile_rows_minus1 = r.read_ue("num_tile_rows_minus1")?;
             let uniform_spacing_flag = r.read_bool("uniform_spacing_flag")?;
             if !uniform_spacing_flag {
-                for _i in 0..=_num_tile_columns_minus1 {
+                for _i in 0.._num_tile_columns_minus1 {
                     let _column_width_minus1 = r.read_ue("column_width_minus1")?;
                 }
-                for _i in 0..=_num_tile_rows_minus1 {
+                for _i in 0.._num_tile_rows_minus1 {
                     let _row_height_minus1 = r.read_ue("row_height_minus1")?;
                 }
             }
@@ -781,9 +781,7 @@ impl Pps {
         let pps_scaling_list_data_present_flag =
             r.read_bool("pps_scaling_list_data_present_flag")?;
         if pps_scaling_list_data_present_flag {
-            return Err(Error(
-                "pps_scaling_list_data_present unimplemented".to_owned(),
-            ));
+            let _scaling_list_data = ScalingListData::from_bits(&mut r)?;
         }
         let _lists_modification_present_flag = r.read_bool("lists_modification_present_flag")?;
         let _log2_parallel_merge_level_minus2 = r.read_ue("log2_parallel_merge_level_minus2")?;
@@ -1163,7 +1161,7 @@ pub struct VuiParameters {
 }
 
 impl VuiParameters {
-    pub fn from_bits<R: BitRead>(r: &mut R) -> Result<Self, Error> {
+    pub fn from_bits<R: BitRead>(r: &mut R, sps_max_sub_layers_minus1: u8) -> Result<Self, Error> {
         // See T.REC H.265 section E.2.1, vui_parameters.
         let aspect_ratio = AspectRatioInfo::from_bits(r)?;
         let overscan_info_present_flag = r.read_bool("overscan_info_present_flag")?;
@@ -1199,7 +1197,7 @@ impl VuiParameters {
             let _def_disp_win_bottom_offset = r.read_ue("def_disp_win_bottom_offset")?;
         }
         let timing_info = if r.read_bool("vui_timing_info_present_flag")? {
-            Some(VuiTimingInfo::from_bits(r)?)
+            Some(VuiTimingInfo::from_bits(r, sps_max_sub_layers_minus1)?)
         } else {
             None
         };
@@ -1266,7 +1264,7 @@ pub struct VuiTimingInfo {
 }
 
 impl VuiTimingInfo {
-    pub fn from_bits<R: BitRead>(r: &mut R) -> Result<Self, Error> {
+    pub fn from_bits<R: BitRead>(r: &mut R, sps_max_sub_layers_minus1: u8) -> Result<Self, Error> {
         let num_units_in_tick = r.read(32, "vui_num_units_in_tick")?;
         let time_scale = r.read(32, "vui_time_scale")?;
         if r.read_bool("vui_poc_proportional_to_timing_flag")? {
@@ -1274,9 +1272,86 @@ impl VuiTimingInfo {
         }
         let hrd_parameters_present_flag = r.read_bool("vui_hrd_parameters_present_flag")?;
         if hrd_parameters_present_flag {
-            return Err(Error(
-                "hrd_parameters_present_flag unimplemented".to_owned(),
-            ));
+            let common_inf_present = true;
+            let mut subpic_params_present = false;
+            if common_inf_present {
+                let nal_params_present = r.read_bool("nal_params_present")?;
+                let vcl_params_present = r.read_bool("vcl_params_present")?;
+
+                if nal_params_present || vcl_params_present {
+                    subpic_params_present = r.read_bool("subpic_params_present")?;
+
+                    if subpic_params_present {
+                        r.skip(8, "tick_divisor_minus2")?;
+                        r.skip(5, "du_cpb_removal_delay_increment_length_minus1")?;
+                        r.skip(1, "sub_pic_cpb_params_in_pic_timing_sei_flag")?;
+                        r.skip(5, "dpb_output_delay_du_length_minus1")?;
+                    }
+
+                    r.skip(4, "bit_rate_scale")?;
+                    r.skip(4, "cpb_size_scale")?;
+
+                    if subpic_params_present {
+                        r.skip(4, "cpb_size_du_scale")?;
+                    }
+
+                    r.skip(5, "initial_cpb_removal_delay_length_minus1")?;
+                    r.skip(5, "au_cpb_removal_delay_length_minus1")?;
+                    r.skip(5, "dpb_output_delay_length_minus1")?;
+                }
+
+                for _ in 0..=sps_max_sub_layers_minus1 {
+                    let mut low_delay = false;
+                    let mut nb_cpb = 1;
+                    let mut fixed_rate = r.read_bool("fixed_rate")?;
+
+                    if !fixed_rate {
+                        fixed_rate = r.read_bool("fixed_rate")?;
+                    }
+
+                    if fixed_rate {
+                        r.read_ue("")?;
+                    } else {
+                        low_delay = r.read_bool("low_delay")?;
+                    }
+
+                    if !low_delay {
+                        nb_cpb = r.read_ue("nb_cpb")? + 1;
+                    }
+
+                    if nal_params_present {
+                        for _ in 0..nb_cpb {
+                            let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?; // bit_rate_value_minus1
+                            let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?; // cpb_size_value_minus1
+
+                            if subpic_params_present {
+                                let _cpb_size_du_value_minus1 =
+                                    r.read_ue("cpb_size_du_value_minus1")?; // cpb_size_du_value_minus1
+                                let _bit_rate_du_value_minus1 =
+                                    r.read_ue("bit_rate_du_value_minus1")?; // bit_rate_du_value_minus1
+                            }
+
+                            let _ = r.read_bool("cbr_flag")?; // cbr_flag
+                        }
+                    }
+
+                    if vcl_params_present {
+                        for _ in 0..nb_cpb {
+                            let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?; // bit_rate_value_minus1
+                            let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?; // cpb_size_value_minus1
+
+                            if subpic_params_present {
+                                let _cpb_size_du_value_minus1 =
+                                    r.read_ue("cpb_size_du_value_minus1")?; // cpb_size_du_value_minus1
+                                let _bit_rate_du_value_minus1 =
+                                    r.read_ue("bit_rate_du_value_minus1")?; // bit_rate_du_value_minus1
+                            }
+
+                            r.skip(1, "cbr_flag")?;
+                        }
+                    }
+                }
+            }
         }
         Ok(Self {
             num_units_in_tick,
