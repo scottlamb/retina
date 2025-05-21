@@ -801,7 +801,11 @@ impl InternalParameters {
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: hevc_decoder_config.record,
-                codec: super::VideoParametersCodec::H265,
+                codec: super::VideoParametersCodec::H265 {
+                    sps: hevc_decoder_config.sps.clone(),
+                    pps: hevc_decoder_config.pps.clone(),
+                    vps: hevc_decoder_config.vps.clone(),
+                },
             },
             vps_nal: hevc_decoder_config.vps,
             sps_nal: hevc_decoder_config.sps,

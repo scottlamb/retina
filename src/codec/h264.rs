@@ -1007,7 +1007,10 @@ impl InternalParameters {
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: avc_decoder_config,
-                codec: super::VideoParametersCodec::H264,
+                codec: super::VideoParametersCodec::H264 {
+                    sps: sps_nal.clone(),
+                    pps: pps_nal.clone(),
+                },
             },
             sps_nal,
             pps_nal,
