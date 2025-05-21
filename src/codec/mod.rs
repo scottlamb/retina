@@ -219,6 +219,11 @@ impl VideoParameters {
         self.frame_rate
     }
 
+    /// Raw codec-cpecific paramers (SPS, PPS, VPS)
+    pub fn codec_params(&self) -> &VideoParametersCodec {
+        &self.codec
+    }
+
     /// The codec-specific "extra data" to feed to eg ffmpeg to decode the video frames.
     /// *   H.264: an AvcDecoderConfig.
     pub fn extra_data(&self) -> &[u8] {
@@ -241,20 +246,47 @@ impl std::fmt::Debug for VideoParameters {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum VideoParametersCodec {
-    H264,
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VideoParametersCodec {
+    H264 {
+        sps: Bytes,
+        pps: Bytes,
+    },
     #[cfg(feature = "h265")]
-    H265,
+    H265 {
+        vps: Bytes,
+        sps: Bytes,
+        pps: Bytes,
+    },
     Jpeg,
 }
 
-impl VideoParametersCodec {
-    fn visual_sample_entry_box_type(self) -> [u8; 4] {
+impl std::fmt::Debug for VideoParametersCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VideoParametersCodec::H264 => *b"avc1",
+            Self::H264 { sps, pps } => f
+                .debug_struct("H264")
+                .field("sps", &crate::hex::LimitedHex::new(sps, 256))
+                .field("pps", &crate::hex::LimitedHex::new(pps, 256))
+                .finish(),
+            Self::H265 { vps, sps, pps } => f
+                .debug_struct("H265")
+                .field("vps", &crate::hex::LimitedHex::new(vps, 256))
+                .field("sps", &crate::hex::LimitedHex::new(sps, 256))
+                .field("pps", &crate::hex::LimitedHex::new(pps, 256))
+                .finish(),
+            Self::Jpeg => write!(f, "Jpeg"),
+        }
+    }
+}
+
+impl VideoParametersCodec {
+    fn visual_sample_entry_box_type(&self) -> [u8; 4] {
+        match self {
+            VideoParametersCodec::H264 { .. } => *b"avc1",
             #[cfg(feature = "h265")]
-            VideoParametersCodec::H265 => *b"hvc1",
+            VideoParametersCodec::H265 { .. } => *b"hvc1",
             VideoParametersCodec::Jpeg => *b"mp4v",
         }
     }
@@ -308,13 +340,13 @@ impl VideoSampleEntryBuilder<'_> {
 
                 // Codec-specific portion.
                 match self.params.codec {
-                    VideoParametersCodec::H264 => {
+                    VideoParametersCodec::H264 { .. } => {
                         write_mp4_box!(&mut buf, *b"avcC", {
                             buf.extend_from_slice(&self.params.extra_data);
                         });
                     }
                     #[cfg(feature = "h265")]
-                    VideoParametersCodec::H265 => {
+                    VideoParametersCodec::H265 { .. } => {
                         write_mp4_box!(&mut buf, *b"hvcC", {
                             buf.extend_from_slice(&self.params.extra_data);
                         });
