@@ -738,6 +738,7 @@ impl Depacketizer {
                 dts = dts_extractor
                     .extract(
                         &parameters.sps,
+                        false,
                         is_random_access_point,
                         NalUnitIter::new(&data),
                         pts,

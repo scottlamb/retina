@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/gortsplib/blob/f0540b4eee760583b2d94f022674b0f3b0f8c8b0/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/4358e3135211f1ae0aa7566afd8051d4840fff04/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -115,6 +115,7 @@ impl DtsExtractor {
     pub fn extract(
         &mut self,
         sps: &SeqParameterSet,
+        sps_changed: bool,
         is_random_access_point: bool,
         au: NalUnitIter,
         pts: i64,
@@ -134,6 +135,11 @@ impl DtsExtractor {
         };
 
         if let Some(init) = &mut self.initialized {
+            if sps_changed {
+                // Reset state.
+                init.reordered_frames = 0;
+                init.poc_increment = PocIncrement::Two;
+            }
             let dts = init.extract_inner(
                 is_random_access_point,
                 au,
@@ -171,27 +177,35 @@ impl DtsExtractor {
 impl Initialized {
     fn extract_inner(
         &mut self,
-        is_random_access_point: bool,
+        idr_present: bool,
         au: NalUnitIter,
         pts: i64,
         log2_max_frame_num_minus4: u8,
         frame_mbs_flags: &FrameMbsFlags,
         log2_max_pic_order_cnt_lsb_minus4: u8,
     ) -> Result<i64, DtsExtractorError> {
-        if is_random_access_point {
+        if idr_present {
             self.expected_poc = 0;
-            self.reordered_frames = 0;
-            self.pause_dts = 0;
-            self.poc_increment = PocIncrement::Two;
-            return Ok(pts);
+        } else {
+            self.expected_poc += self.poc_increment;
+            self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
         }
-
-        self.expected_poc += self.poc_increment;
-        self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
 
         if self.pause_dts > 0 {
             self.pause_dts -= 1;
-            return Ok(self.prev_dts + 1);
+            return Ok(self.prev_dts + 100);
+        }
+
+        if idr_present {
+            if self.reordered_frames == 0 {
+                return Ok(pts);
+            }
+            let dts_diff = pts - self.prev_dts;
+            let poc_diff = self.reordered_frames * self.poc_increment;
+            return match self.poc_increment {
+                PocIncrement::One => Ok(self.prev_dts + dts_diff / (poc_diff + 1)),
+                PocIncrement::Two => Ok(self.prev_dts + dts_diff * 2 / (poc_diff + 2)),
+            };
         }
 
         let poc = find_picture_order_count(
@@ -232,15 +246,14 @@ impl Initialized {
         if reordered_frames > self.reordered_frames {
             self.pause_dts = reordered_frames - self.reordered_frames - 1;
             self.reordered_frames = reordered_frames;
-            return Ok(self.prev_dts + 1);
+            return Ok(self.prev_dts + 100);
         }
 
         let dts_diff = pts - self.prev_dts;
-        let dts_inc = match self.poc_increment {
-            PocIncrement::One => dts_diff / (poc_diff + 1),
-            PocIncrement::Two => dts_diff * 2 / (poc_diff + 2),
-        };
-        Ok(self.prev_dts + dts_inc)
+        match self.poc_increment {
+            PocIncrement::One => Ok(self.prev_dts + dts_diff / (poc_diff + 1)),
+            PocIncrement::Two => Ok(self.prev_dts + dts_diff * 2 / (poc_diff + 2)),
+        }
     }
 }
 
@@ -361,6 +374,7 @@ mod tests {
     }
 
     #[test_case(
+        // SPS.
         &[
             0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0x78,
             0x02, 0x27, 0xe5, 0x84, 0x00, 0x00, 0x03, 0x00,
@@ -378,42 +392,51 @@ mod tests {
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9a, 0x21, 0x6c, 0x45, 0xff]],
-                dts: 3336666,
-                pts: 3336666,
+                dts: 3666666,
+                pts: 3666666,
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9a, 0x42, 0x3c, 0x21, 0x93]],
-                dts: 3340000,
-                pts: 3340000,
+                dts: 4000000,
+                pts: 4000000,
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9a, 0x63, 0x49, 0xe1, 0x0f]],
-                dts: 3343333,
-                pts: 3343333,
+                dts: 4333333,
+                pts: 4333333,
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9a, 0x86, 0x49, 0xe1, 0x0f]],
-                dts: 3343334,
-                pts: 3353333,
+                dts: 4333433,
+                pts: 5333333,
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9e, 0xa5, 0x42, 0x7f, 0xf9]],
-                dts: 3343335,
-                pts: 3350000,
+                dts: 4333533,
+                pts: 5000000,
             },
             SequenceSample{
                 nalus: &[&[0x01, 0x9e, 0xc4, 0x69, 0x13, 0xff]],
-                dts: 3346666,
-                pts: 3346666,
+                dts: 4666666,
+                pts: 4666666,
             },
             SequenceSample{
                 nalus: &[&[0x41, 0x9a, 0xc8, 0x4b, 0xa8, 0x42]],
-                dts: 3349999,
-                pts: 3360000,
+                dts: 4999999,
+                pts: 6000000,
+            },
+            SequenceSample{
+                nalus: &[
+                    // IDR
+                    &[0x65, 0x88, 0x84, 0x00, 0x33, 0xff],
+                ],
+                dts: 5333332,
+                pts: 5999999,
             },
         ]; "with timing info"
     )]
     #[test_case(
+        // SPS.
         &[
             0x27, 0x64, 0x00, 0x20, 0xac, 0x52, 0x18, 0x0f,
             0x01, 0x17, 0xef, 0xff, 0x00, 0x01, 0x00, 0x01,
@@ -451,7 +474,7 @@ mod tests {
             },
             SequenceSample{
                 nalus: &[&[0x21, 0xe5, 0x19, 0x0e, 0x70, 0x01]],
-                dts: 91667,
+                dts: 91766,
                 pts: 95000,
             },
             SequenceSample{
@@ -492,6 +515,7 @@ mod tests {
         ]; "no timing info"
     )]
     #[test_case(
+        // SPS.
         &[
             0x67, 0x64, 0x00, 0x2a, 0xac, 0x2c, 0x6a, 0x81,
             0xe0, 0x08, 0x9f, 0x96, 0x6e, 0x02, 0x02, 0x02,
@@ -550,6 +574,7 @@ mod tests {
             let dts = extractor
                 .extract(
                     &sps,
+                    false,
                     is_random_access_point,
                     NalUnitIter::new(&nals),
                     sample.pts,
