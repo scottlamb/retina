@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/4358e3135211f1ae0aa7566afd8051d4840fff04/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/97783dc3923ddd3eb0ad230a0875608d8de420e6/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -258,19 +258,17 @@ impl Initialized {
 }
 
 fn get_picture_order_count_diff(
-    poc1: u32,
-    poc2: u32,
+    a: u32,
+    b: u32,
     log2_max_pic_order_cnt_lsb_minus4: u8,
 ) -> Result<i32, std::num::TryFromIntError> {
-    let cnt = log2_max_pic_order_cnt_lsb_minus4;
-    let diff = i32::try_from(poc1)? - i32::try_from(poc2)?;
-    Ok(if diff < -((1 << (cnt + 3)) - 1) {
-        diff + (1 << (cnt + 4))
-    } else if diff > ((1 << (cnt + 3)) - 1) {
-        diff - (1 << (cnt + 4))
+    let max = u32::try_from(1 << (log2_max_pic_order_cnt_lsb_minus4 + 4))?;
+    let d = a.wrapping_sub(b) & (max - 1);
+    if d > (max / 2) {
+        Ok(i32::try_from(d)? - i32::try_from(max)?)
     } else {
-        diff
-    })
+        Ok(i32::try_from(d)?)
+    }
 }
 
 // Find the Picture Order Count from a `SliceLayerWithoutPartitioningNonIdr` nalu.
