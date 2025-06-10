@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/c1ba42afce27825da824a2ab016a6f9a2865b560/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/08b1dd4a972031e030ac794f9ea08bce14fba3ad/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -57,8 +57,8 @@ pub(crate) enum DtsExtractorError {
     #[error("frame_mbs_only_flag = 0 is not supported")]
     FrameMbsNotSupported,
 
-    #[error("POC difference between frames is too big ({0})")]
-    PocDiffTooBig(i64),
+    #[error("too many reordered frames ({0})")]
+    TooManyReorderedFrames(i64),
 
     #[error("access unit doesn't contain an IDR or non-IDR NALU")]
     NoIdrOrNonIdr,
@@ -174,6 +174,8 @@ impl DtsExtractor {
     }
 }
 
+const MAX_REORDERED_FRAMES: i64 = 10;
+
 impl Initialized {
     fn extract_inner(
         &mut self,
@@ -225,51 +227,49 @@ impl Initialized {
                 self.expected_poc /= 2;
             }
 
-            let poc_diff = i64::from(get_picture_order_count_diff(
+            let mut poc_diff = i64::from(get_picture_order_count_diff(
                 poc,
                 self.expected_poc,
                 log2_max_pic_order_cnt_lsb_minus4,
             )?);
-            let poc_diff = poc_diff + self.reordered_frames * self.poc_increment;
+            if let PocIncrement::Two = self.poc_increment {
+                poc_diff /= 2;
+            };
+            let limit = -(self.reordered_frames + 1);
 
-            if poc_diff < 0 {
-                if poc_diff < -20 {
-                    return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
+            // This happens when there are B-frames immediately following an IDR frame.
+            if poc_diff < limit {
+                let increase = limit - poc_diff;
+                if (self.reordered_frames + increase) > MAX_REORDERED_FRAMES {
+                    return Err(DtsExtractorError::TooManyReorderedFrames(
+                        self.reordered_frames + increase,
+                    ));
                 }
 
-                // This happens when there are B-frames immediately following an IDR frame.
-                self.reordered_frames -= poc_diff;
-                self.pause_dts = -poc_diff;
+                self.reordered_frames += increase;
+                self.pause_dts = increase;
                 return Ok((self.prev_dts + 100, true));
             }
 
-            if poc_diff == 0 {
+            if poc_diff == limit {
                 return Ok((pts, false));
             }
 
-            if poc_diff > 20 {
-                return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
-            }
-
-            let reordered_frames = {
-                match self.poc_increment {
-                    PocIncrement::One => poc_diff - self.reordered_frames,
-                    PocIncrement::Two => poc_diff / 2 - self.reordered_frames,
+            if poc_diff > self.reordered_frames {
+                let increase = poc_diff - self.reordered_frames;
+                if (self.reordered_frames + increase) > MAX_REORDERED_FRAMES {
+                    return Err(DtsExtractorError::TooManyReorderedFrames(
+                        self.reordered_frames + increase,
+                    ));
                 }
-            };
 
-            if reordered_frames > self.reordered_frames {
-                // Reordered frames detected, add them to the count and pause DTS.
-                self.pause_dts = reordered_frames - self.reordered_frames - 1;
-                self.reordered_frames = reordered_frames;
+                self.reordered_frames += increase;
+                self.pause_dts = increase - 1;
                 return Ok((self.prev_dts + 100, false));
             }
 
             let dts_diff = pts - self.prev_dts;
-            let dts = match self.poc_increment {
-                PocIncrement::One => self.prev_dts + dts_diff / (poc_diff + 1),
-                PocIncrement::Two => self.prev_dts + dts_diff * 2 / (poc_diff + 2),
-            };
+            let dts = self.prev_dts + dts_diff / (poc_diff + self.reordered_frames + 1);
             Ok((dts, false))
         } else {
             Err(DtsExtractorError::NoIdrOrNonIdr)
