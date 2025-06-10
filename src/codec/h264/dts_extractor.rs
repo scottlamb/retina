@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/97783dc3923ddd3eb0ad230a0875608d8de420e6/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/10a54ce63a1580c5b5d8d6b7871ee087f800d374/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -200,12 +200,8 @@ impl Initialized {
             if self.reordered_frames == 0 {
                 return Ok(pts);
             }
-            let dts_diff = pts - self.prev_dts;
-            let poc_diff = self.reordered_frames * self.poc_increment;
-            return match self.poc_increment {
-                PocIncrement::One => Ok(self.prev_dts + dts_diff / (poc_diff + 1)),
-                PocIncrement::Two => Ok(self.prev_dts + dts_diff * 2 / (poc_diff + 2)),
-            };
+
+            return Ok(self.prev_dts + (pts - self.prev_dts) / (self.reordered_frames + 1));
         }
 
         let poc = find_picture_order_count(
