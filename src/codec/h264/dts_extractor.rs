@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/ca186752289a148b282fe5313b5dd9a8bdd217fd/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/c1ba42afce27825da824a2ab016a6f9a2865b560/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -57,11 +57,11 @@ pub(crate) enum DtsExtractorError {
     #[error("frame_mbs_only_flag = 0 is not supported")]
     FrameMbsNotSupported,
 
-    #[error("POC not found")]
-    PocNotFound,
-
     #[error("POC difference between frames is too big ({0})")]
     PocDiffTooBig(i64),
+
+    #[error("access unit doesn't contain an IDR or non-IDR NALU")]
+    NoIdrOrNonIdr,
 
     #[error("pic_order_cnt_type = 1 is not supported yet")]
     PicOrderCntType1Unsupported,
@@ -184,6 +184,13 @@ impl Initialized {
         frame_mbs_flags: &FrameMbsFlags,
         log2_max_pic_order_cnt_lsb_minus4: u8,
     ) -> Result<(i64, bool), DtsExtractorError> {
+        let mut non_idr = None;
+        for nalu in au {
+            if get_unit_type(nalu.0)? == UnitType::SliceLayerWithoutPartitioningNonIdr {
+                non_idr = Some(nalu)
+            }
+        }
+
         if idr_present {
             self.expected_poc = 0;
 
@@ -196,74 +203,77 @@ impl Initialized {
                 false,
             ));
         }
+        if let Some(non_idr) = non_idr {
+            self.expected_poc += u32::from(self.poc_increment);
+            self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
 
-        self.expected_poc += u32::from(self.poc_increment);
-        self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
+            if self.pause_dts > 0 {
+                self.pause_dts -= 1;
+                return Ok((self.prev_dts + 100, true));
+            }
 
-        if self.pause_dts > 0 {
-            self.pause_dts -= 1;
-            return Ok((self.prev_dts + 100, true));
-        }
+            let poc = get_picture_order_count(
+                non_idr,
+                log2_max_frame_num_minus4,
+                frame_mbs_flags,
+                log2_max_pic_order_cnt_lsb_minus4,
+            )?;
 
-        let poc = find_picture_order_count(
-            au,
-            log2_max_frame_num_minus4,
-            frame_mbs_flags,
-            log2_max_pic_order_cnt_lsb_minus4,
-        )?;
+            let poc_is_odd = (poc % 2) != 0;
+            if matches!(self.poc_increment, PocIncrement::Two) && poc_is_odd {
+                self.poc_increment = PocIncrement::One;
+                self.expected_poc /= 2;
+            }
 
-        let poc_is_odd = (poc % 2) != 0;
-        if matches!(self.poc_increment, PocIncrement::Two) && poc_is_odd {
-            self.poc_increment = PocIncrement::One;
-            self.expected_poc /= 2;
-        }
+            let poc_diff = i64::from(get_picture_order_count_diff(
+                poc,
+                self.expected_poc,
+                log2_max_pic_order_cnt_lsb_minus4,
+            )?);
+            let poc_diff = poc_diff + self.reordered_frames * self.poc_increment;
 
-        let poc_diff = i64::from(get_picture_order_count_diff(
-            poc,
-            self.expected_poc,
-            log2_max_pic_order_cnt_lsb_minus4,
-        )?);
-        let poc_diff = poc_diff + self.reordered_frames * self.poc_increment;
+            if poc_diff < 0 {
+                if poc_diff < -20 {
+                    return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
+                }
 
-        if poc_diff < 0 {
-            if poc_diff < -20 {
+                // This happens when there are B-frames immediately following an IDR frame.
+                self.reordered_frames -= poc_diff;
+                self.pause_dts = -poc_diff;
+                return Ok((self.prev_dts + 100, true));
+            }
+
+            if poc_diff == 0 {
+                return Ok((pts, false));
+            }
+
+            if poc_diff > 20 {
                 return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
             }
 
-            // This happens when there are B-frames immediately following an IDR frame.
-            self.reordered_frames -= poc_diff;
-            self.pause_dts = -poc_diff;
-            return Ok((self.prev_dts + 100, true));
-        }
+            let reordered_frames = {
+                match self.poc_increment {
+                    PocIncrement::One => poc_diff - self.reordered_frames,
+                    PocIncrement::Two => poc_diff / 2 - self.reordered_frames,
+                }
+            };
 
-        if poc_diff == 0 {
-            return Ok((pts, false));
-        }
-
-        if poc_diff > 20 {
-            return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
-        }
-
-        let reordered_frames = {
-            match self.poc_increment {
-                PocIncrement::One => poc_diff - self.reordered_frames,
-                PocIncrement::Two => poc_diff / 2 - self.reordered_frames,
+            if reordered_frames > self.reordered_frames {
+                // Reordered frames detected, add them to the count and pause DTS.
+                self.pause_dts = reordered_frames - self.reordered_frames - 1;
+                self.reordered_frames = reordered_frames;
+                return Ok((self.prev_dts + 100, false));
             }
-        };
 
-        if reordered_frames > self.reordered_frames {
-            // Reordered frames detected, add them to the count and pause DTS.
-            self.pause_dts = reordered_frames - self.reordered_frames - 1;
-            self.reordered_frames = reordered_frames;
-            return Ok((self.prev_dts + 100, false));
+            let dts_diff = pts - self.prev_dts;
+            let dts = match self.poc_increment {
+                PocIncrement::One => self.prev_dts + dts_diff / (poc_diff + 1),
+                PocIncrement::Two => self.prev_dts + dts_diff * 2 / (poc_diff + 2),
+            };
+            Ok((dts, false))
+        } else {
+            Err(DtsExtractorError::NoIdrOrNonIdr)
         }
-
-        let dts_diff = pts - self.prev_dts;
-        let dts = match self.poc_increment {
-            PocIncrement::One => self.prev_dts + dts_diff / (poc_diff + 1),
-            PocIncrement::Two => self.prev_dts + dts_diff * 2 / (poc_diff + 2),
-        };
-        Ok((dts, false))
     }
 }
 
@@ -279,27 +289,6 @@ fn get_picture_order_count_diff(
     } else {
         Ok(i32::try_from(d)?)
     }
-}
-
-// Find the Picture Order Count from a `SliceLayerWithoutPartitioningNonIdr` nalu.
-fn find_picture_order_count(
-    au: NalUnitIter,
-    log2_max_frame_num_minus4: u8,
-    frame_mbs_flags: &FrameMbsFlags,
-    log2_max_pic_order_cnt_lsb_minus4: u8,
-) -> Result<u32, DtsExtractorError> {
-    for nalu in au {
-        if get_unit_type(nalu.0)? == UnitType::SliceLayerWithoutPartitioningNonIdr {
-            let poc = get_picture_order_count(
-                nalu,
-                log2_max_frame_num_minus4,
-                frame_mbs_flags,
-                log2_max_pic_order_cnt_lsb_minus4,
-            )?;
-            return Ok(poc);
-        }
-    }
-    Err(DtsExtractorError::PocNotFound)
 }
 
 // Read the Picture Order Count in a `SliceLayerWithoutPartitioningNonIdr` nalu.
