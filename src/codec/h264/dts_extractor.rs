@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/10a54ce63a1580c5b5d8d6b7871ee087f800d374/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/ca186752289a148b282fe5313b5dd9a8bdd217fd/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -60,8 +60,8 @@ pub(crate) enum DtsExtractorError {
     #[error("POC not found")]
     PocNotFound,
 
-    #[error("invalid POC")]
-    PocInvalid,
+    #[error("POC difference between frames is too big ({0})")]
+    PocDiffTooBig(i64),
 
     #[error("pic_order_cnt_type = 1 is not supported yet")]
     PicOrderCntType1Unsupported,
@@ -111,7 +111,7 @@ impl DtsExtractor {
         Self { initialized: None }
     }
 
-    // Extracts the DTS of a access unit. The first call must be an IDR.
+    // Extracts the DTS of an access unit. The first call must be an IDR.
     pub fn extract(
         &mut self,
         sps: &SeqParameterSet,
@@ -140,7 +140,7 @@ impl DtsExtractor {
                 init.reordered_frames = 0;
                 init.poc_increment = PocIncrement::Two;
             }
-            let dts = init.extract_inner(
+            let (dts, skip_checks) = init.extract_inner(
                 is_random_access_point,
                 au,
                 pts,
@@ -148,7 +148,7 @@ impl DtsExtractor {
                 &sps.frame_mbs_flags,
                 log2_max_pic_order_cnt_lsb_minus4,
             )?;
-            if dts > pts {
+            if !skip_checks && dts > pts {
                 return Err(DtsGreaterThanPts(dts, pts));
             }
             if dts <= init.prev_dts {
@@ -183,25 +183,26 @@ impl Initialized {
         log2_max_frame_num_minus4: u8,
         frame_mbs_flags: &FrameMbsFlags,
         log2_max_pic_order_cnt_lsb_minus4: u8,
-    ) -> Result<i64, DtsExtractorError> {
+    ) -> Result<(i64, bool), DtsExtractorError> {
         if idr_present {
             self.expected_poc = 0;
-        } else {
-            self.expected_poc += self.poc_increment;
-            self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
+
+            if self.reordered_frames == 0 {
+                return Ok((pts, false));
+            }
+
+            return Ok((
+                self.prev_dts + (pts - self.prev_dts) / (self.reordered_frames + 1),
+                false,
+            ));
         }
+
+        self.expected_poc += u32::from(self.poc_increment);
+        self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
 
         if self.pause_dts > 0 {
             self.pause_dts -= 1;
-            return Ok(self.prev_dts + 100);
-        }
-
-        if idr_present {
-            if self.reordered_frames == 0 {
-                return Ok(pts);
-            }
-
-            return Ok(self.prev_dts + (pts - self.prev_dts) / (self.reordered_frames + 1));
+            return Ok((self.prev_dts + 100, true));
         }
 
         let poc = find_picture_order_count(
@@ -225,31 +226,44 @@ impl Initialized {
         let poc_diff = poc_diff + self.reordered_frames * self.poc_increment;
 
         if poc_diff < 0 {
-            return Err(DtsExtractorError::PocInvalid);
+            if poc_diff < -20 {
+                return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
+            }
+
+            // This happens when there are B-frames immediately following an IDR frame.
+            self.reordered_frames -= poc_diff;
+            self.pause_dts = -poc_diff;
+            return Ok((self.prev_dts + 100, true));
         }
 
         if poc_diff == 0 {
-            return Ok(pts);
+            return Ok((pts, false));
+        }
+
+        if poc_diff > 20 {
+            return Err(DtsExtractorError::PocDiffTooBig(poc_diff));
         }
 
         let reordered_frames = {
             match self.poc_increment {
                 PocIncrement::One => poc_diff - self.reordered_frames,
-                PocIncrement::Two => (poc_diff - self.reordered_frames * 2) / 2,
+                PocIncrement::Two => poc_diff / 2 - self.reordered_frames,
             }
         };
 
         if reordered_frames > self.reordered_frames {
+            // Reordered frames detected, add them to the count and pause DTS.
             self.pause_dts = reordered_frames - self.reordered_frames - 1;
             self.reordered_frames = reordered_frames;
-            return Ok(self.prev_dts + 100);
+            return Ok((self.prev_dts + 100, false));
         }
 
         let dts_diff = pts - self.prev_dts;
-        match self.poc_increment {
-            PocIncrement::One => Ok(self.prev_dts + dts_diff / (poc_diff + 1)),
-            PocIncrement::Two => Ok(self.prev_dts + dts_diff * 2 / (poc_diff + 2)),
-        }
+        let dts = match self.poc_increment {
+            PocIncrement::One => self.prev_dts + dts_diff / (poc_diff + 1),
+            PocIncrement::Two => self.prev_dts + dts_diff * 2 / (poc_diff + 2),
+        };
+        Ok((dts, false))
     }
 }
 
@@ -335,6 +349,15 @@ enum PocIncrement {
     Two,
 }
 
+impl From<PocIncrement> for u32 {
+    fn from(value: PocIncrement) -> Self {
+        match value {
+            PocIncrement::One => 1,
+            PocIncrement::Two => 2,
+        }
+    }
+}
+
 impl AddAssign<PocIncrement> for u32 {
     fn add_assign(&mut self, rhs: PocIncrement) {
         match rhs {
@@ -361,7 +384,7 @@ mod tests {
     use h264_reader::rbsp::BitReader;
     use test_case::test_case;
 
-    struct SequenceSample<'a> {
+    struct Sample<'a> {
         nalus: &'a [&'a [u8]],
         dts: i64,
         pts: i64,
@@ -376,50 +399,48 @@ mod tests {
             0xc6, 0x58,
         ],
         &[
-            SequenceSample{
-                nalus: &[
-                    // IDR
-                    &[0x65, 0x88, 0x84, 0x00, 0x33, 0xff],
-                ],
+            Sample{
+                // IDR
+                nalus: &[&[0x65, 0x88, 0x84, 0x00, 0x33, 0xff]],
                 dts: 3333333,
                 pts: 3333333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9a, 0x21, 0x6c, 0x45, 0xff]],
                 dts: 3666666,
                 pts: 3666666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9a, 0x42, 0x3c, 0x21, 0x93]],
                 dts: 4000000,
                 pts: 4000000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9a, 0x63, 0x49, 0xe1, 0x0f]],
                 dts: 4333333,
                 pts: 4333333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9a, 0x86, 0x49, 0xe1, 0x0f]],
                 dts: 4333433,
                 pts: 5333333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9e, 0xa5, 0x42, 0x7f, 0xf9]],
                 dts: 4333533,
                 pts: 5000000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x01, 0x9e, 0xc4, 0x69, 0x13, 0xff]],
                 dts: 4666666,
                 pts: 4666666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x41, 0x9a, 0xc8, 0x4b, 0xa8, 0x42]],
                 dts: 4999999,
                 pts: 6000000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[
                     // IDR
                     &[0x65, 0x88, 0x84, 0x00, 0x33, 0xff],
@@ -438,70 +459,68 @@ mod tests {
             0xf8, 0x08,
         ],
         &[
-            SequenceSample{
-                nalus: &[
-                    // IDR
-                    &[ 0x25, 0xb8, 0x08, 0x02, 0x1f, 0xff],
-                ],
+            Sample{
+                // IDR
+                nalus: &[&[0x25, 0xb8, 0x08, 0x02, 0x1f, 0xff]],
                 dts: 85000,
                 pts: 85000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe1, 0x05, 0xc7, 0x38, 0xbf]],
                 dts: 86666,
                 pts: 86666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe2, 0x09, 0xa1, 0xce, 0x0b]],
                 dts: 88333,
                 pts: 88333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe3, 0x0d, 0xb1, 0xce, 0x02]],
                 dts: 90000,
                 pts: 90000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe4, 0x11, 0x90, 0x73, 0x80]],
                 dts: 91666,
                 pts: 91666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe5, 0x19, 0x0e, 0x70, 0x01]],
                 dts: 91766,
                 pts: 95000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x01, 0xa9, 0x85, 0x7c, 0x93, 0xff]],
                 dts: 93333,
                 pts: 93333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe6, 0x1d, 0x0e, 0x70, 0x01]],
                 dts: 94999,
                 pts: 96666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe7, 0x21, 0x0e, 0x70, 0x01]],
                 dts: 96666,
                 pts: 98333,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe8, 0x25, 0x0e, 0x70, 0x01]],
                 dts: 98333,
                 pts: 100000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xe9, 0x29, 0x0e, 0x70, 0x01]],
                 dts: 99999,
                 pts: 101666,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x21, 0xea, 0x31, 0x0e, 0x70, 0x01]],
                 dts: 101666,
                 pts: 105000,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x01, 0xaa, 0xcb, 0x7c, 0x93, 0xff]],
                 dts: 103333,
                 pts: 103333,
@@ -517,32 +536,73 @@ mod tests {
             0x02,
         ],
         &[
-            SequenceSample{
-                nalus: &[
-                    // IDR.
-                    &[ 0x65, 0xb8, 0x00, 0x00, 0x0b, 0xc8,],
-                ],
+            Sample{
+                // IDR.
+                nalus: &[&[0x65, 0xb8, 0x00, 0x00, 0x0b, 0xc8]],
                 dts: 61,
                 pts: 61,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x61, 0xe0, 0x20, 0x00, 0x39, 0x37]],
                 dts: 101,
                 pts: 101,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x61, 0xe0, 0x40, 0x00, 0x59, 0x37]],
                 dts: 141,
                 pts: 141,
             },
-            SequenceSample{
+            Sample{
                 nalus: &[&[0x61, 0xe0, 0x60, 0x00, 0x79, 0x37]],
                 dts: 181,
                 pts: 181,
             },
         ]; "poc increment = 1"
     )]
-    fn test_dts_extractor(sps: &[u8], sequence: &[SequenceSample]) {
+    #[test_case(
+        // SPS.
+        &[
+            0x27, 0x64, 0x00, 0x2a, 0xac, 0x2d, 0x90, 0x07,
+            0x80, 0x22, 0x7e, 0x5c, 0x05, 0xa8, 0x08, 0x08,
+            0x0a, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+            0x03, 0x00, 0xf1, 0xd0, 0x80, 0x04, 0xc4, 0x80,
+            0x00, 0x09, 0x89, 0x68, 0xde, 0xf7, 0xc1, 0xda,
+            0x1c, 0x31, 0x92,
+        ],
+        &[
+            Sample{
+                // IDR.
+                nalus: &[&[0x65, 0x88, 0x80, 0x14, 0x3, 0xff, 0xde, 0x8, 0xe4, 0x74]],
+                dts: 1916000,
+                pts: 1916000,
+            },
+            Sample{
+                // b-frame.
+                nalus: &[&[0x41, 0x9e, 0x3, 0xe4, 0x3f, 0x0, 0x0, 0x3, 0x0, 0x0]],
+                dts: 1916100,
+                pts: 1883000,
+            },
+            Sample{
+                // b-frame.
+                nalus: &[&[0x1, 0x9e, 0x5, 0xd4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
+                dts: 1916200,
+                pts: 1867000,
+            },
+            Sample{
+                // p-frame.
+                nalus: &[&[0x1, 0x9e, 0x5, 0xf4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
+                dts: 1916300,
+                pts: 1899000,
+            },
+            Sample{
+                // p-frame.
+                nalus: &[&[0x1, 0x9e, 0x5, 0xf4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
+                dts: 1916400,
+                pts: 1983000,
+            },
+        ]; "B-frames after IDR (OBS 29.1.3 QuickSync on Windows)"
+    )]
+    fn test_dts_extractor(sps: &[u8], sequence: &[Sample]) {
         let sps_rbsp = h264_reader::rbsp::decode_nal(&sps).unwrap();
         let sps = SeqParameterSet::from_bits(BitReader::new(&*sps_rbsp)).unwrap();
 
