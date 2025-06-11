@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/151a3cb5eaa0949126d925a26eedba7a3f26f9c2/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/67170fc1f8bdb12710e9fa96c75a7aa1bc135b56/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -128,7 +128,7 @@ impl DtsExtractor {
             if !skip_checks && dts > pts {
                 return Err(DtsGreaterThanPts(dts, pts));
             }
-            if dts <= init.prev_dts {
+            if dts < init.prev_dts {
                 return Err(DtsNotIncreasing(init.prev_dts, dts));
             }
             init.prev_dts = dts;
