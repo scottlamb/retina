@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/328cb87fe45a2dc8f27fcbe791090f773a630ffa/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/151a3cb5eaa0949126d925a26eedba7a3f26f9c2/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -610,6 +610,26 @@ mod tests {
                 pts: 80000,
             },
         ]; "mbs_only_flag = 0"
+    )]
+    #[test_case(
+        // SPS.
+        &[0x67, 0x42, 0xc0, 0x1e, 0x8c, 0x8d, 0x40, 0x50, 0x17, 0xfc, 0xb0, 0x0f, 0x08, 0x84, 0x6a],
+        &[
+            Sample{
+                nalus: &[
+                    &[0x68, 0xce, 0x3c, 0x80,], // PPS.
+                    &[0x65, 0x88, 0x80, 0x14, 0x3, 0xff, 0xde, 0x8, 0xe4, 0x74], // IDR.
+                ],
+                dts: 0,
+                pts: 0,
+            },
+            Sample{
+                // non-IDR.
+                nalus: &[&[0x61, 0x00, 0xf0, 0xe0, 0x00, 0x40, 0x00, 0xbe, 0x47, 0x9b]],
+                dts: 40000,
+                pts: 40000,
+            },
+        ]; "Log2MaxPicOrderCntLsbMinus4 = 12"
     )]
     fn test_dts_extractor(sps: &[u8], sequence: &[Sample]) {
         let sps_rbsp = h264_reader::rbsp::decode_nal(&sps).unwrap();
