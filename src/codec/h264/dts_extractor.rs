@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/08b1dd4a972031e030ac794f9ea08bce14fba3ad/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/328cb87fe45a2dc8f27fcbe791090f773a630ffa/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -53,9 +53,6 @@ pub(crate) enum DtsExtractorError {
 
     #[error("{0}")]
     FromInt(#[from] std::num::TryFromIntError),
-
-    #[error("frame_mbs_only_flag = 0 is not supported")]
-    FrameMbsNotSupported,
 
     #[error("too many reordered frames ({0})")]
     TooManyReorderedFrames(i64),
@@ -121,33 +118,13 @@ impl DtsExtractor {
         pts: i64,
     ) -> Result<i64, DtsExtractorError> {
         use DtsExtractorError::*;
-        let log2_max_pic_order_cnt_lsb_minus4 = match sps.pic_order_cnt {
-            PicOrderCntType::TypeZero {
-                log2_max_pic_order_cnt_lsb_minus4,
-            } => log2_max_pic_order_cnt_lsb_minus4,
-            PicOrderCntType::TypeOne {
-                delta_pic_order_always_zero_flag: _,
-                offset_for_non_ref_pic: _,
-                offset_for_top_to_bottom_field: _,
-                offsets_for_ref_frame: _,
-            } => return Err(PicOrderCntType1Unsupported),
-            PicOrderCntType::TypeTwo => return Ok(pts),
-        };
-
         if let Some(init) = &mut self.initialized {
             if sps_changed {
                 // Reset state.
                 init.reordered_frames = 0;
                 init.poc_increment = PocIncrement::Two;
             }
-            let (dts, skip_checks) = init.extract_inner(
-                is_random_access_point,
-                au,
-                pts,
-                sps.log2_max_frame_num_minus4,
-                &sps.frame_mbs_flags,
-                log2_max_pic_order_cnt_lsb_minus4,
-            )?;
+            let (dts, skip_checks) = init.extract_inner(sps, is_random_access_point, au, pts)?;
             if !skip_checks && dts > pts {
                 return Err(DtsGreaterThanPts(dts, pts));
             }
@@ -179,19 +156,36 @@ const MAX_REORDERED_FRAMES: i64 = 10;
 impl Initialized {
     fn extract_inner(
         &mut self,
+        sps: &SeqParameterSet,
         idr_present: bool,
         au: NalUnitIter,
         pts: i64,
-        log2_max_frame_num_minus4: u8,
-        frame_mbs_flags: &FrameMbsFlags,
-        log2_max_pic_order_cnt_lsb_minus4: u8,
     ) -> Result<(i64, bool), DtsExtractorError> {
+        use DtsExtractorError::*;
+
         let mut non_idr = None;
         for nalu in au {
             if get_unit_type(nalu.0)? == UnitType::SliceLayerWithoutPartitioningNonIdr {
                 non_idr = Some(nalu)
             }
         }
+
+        let log2_max_pic_order_cnt_lsb_minus4 = match sps.pic_order_cnt {
+            PicOrderCntType::TypeZero {
+                log2_max_pic_order_cnt_lsb_minus4,
+            } => log2_max_pic_order_cnt_lsb_minus4,
+            PicOrderCntType::TypeOne {
+                delta_pic_order_always_zero_flag: _,
+                offset_for_non_ref_pic: _,
+                offset_for_top_to_bottom_field: _,
+                offsets_for_ref_frame: _,
+            } => return Err(PicOrderCntType1Unsupported),
+            PicOrderCntType::TypeTwo => return Ok((pts, false)),
+        };
+
+        let FrameMbsFlags::Frames = sps.frame_mbs_flags else {
+            return Ok((pts, false));
+        };
 
         if idr_present {
             self.expected_poc = 0;
@@ -216,8 +210,7 @@ impl Initialized {
 
             let poc = get_picture_order_count(
                 non_idr,
-                log2_max_frame_num_minus4,
-                frame_mbs_flags,
+                sps.log2_max_frame_num_minus4,
                 log2_max_pic_order_cnt_lsb_minus4,
             )?;
 
@@ -241,9 +234,7 @@ impl Initialized {
             if poc_diff < limit {
                 let increase = limit - poc_diff;
                 if (self.reordered_frames + increase) > MAX_REORDERED_FRAMES {
-                    return Err(DtsExtractorError::TooManyReorderedFrames(
-                        self.reordered_frames + increase,
-                    ));
+                    return Err(TooManyReorderedFrames(self.reordered_frames + increase));
                 }
 
                 self.reordered_frames += increase;
@@ -258,9 +249,7 @@ impl Initialized {
             if poc_diff > self.reordered_frames {
                 let increase = poc_diff - self.reordered_frames;
                 if (self.reordered_frames + increase) > MAX_REORDERED_FRAMES {
-                    return Err(DtsExtractorError::TooManyReorderedFrames(
-                        self.reordered_frames + increase,
-                    ));
+                    return Err(TooManyReorderedFrames(self.reordered_frames + increase));
                 }
 
                 self.reordered_frames += increase;
@@ -270,10 +259,10 @@ impl Initialized {
 
             let dts_diff = pts - self.prev_dts;
             let dts = self.prev_dts + dts_diff / (poc_diff + self.reordered_frames + 1);
-            Ok((dts, false))
-        } else {
-            Err(DtsExtractorError::NoIdrOrNonIdr)
+            return Ok((dts, false));
         }
+
+        Err(NoIdrOrNonIdr)
     }
 }
 
@@ -295,7 +284,6 @@ fn get_picture_order_count_diff(
 fn get_picture_order_count(
     nal: NalRef,
     log2_max_frame_num_minus4: u8,
-    frame_mbs_flags: &FrameMbsFlags,
     log2_max_pic_order_cnt_lsb_minus4: u8,
 ) -> Result<u32, DtsExtractorError> {
     let mut r = BitReader::new(ByteReader::new(nal.0));
@@ -307,13 +295,6 @@ fn get_picture_order_count(
         .map_err(DtsExtractorError::BitReader)?;
     r.read_u32((log2_max_frame_num_minus4 + 4).into(), "frame_num")
         .map_err(DtsExtractorError::BitReader)?;
-
-    //if !sps.FrameMbsOnlyFlag {
-    //	return 0, fmt.Errorf("frame_mbs_only_flag = 0 is not supported")
-    //}
-    let FrameMbsFlags::Frames = frame_mbs_flags else {
-        return Err(DtsExtractorError::FrameMbsNotSupported);
-    };
 
     let pic_order_cnt_lsb: u32 = r
         .read_u32(
@@ -590,6 +571,45 @@ mod tests {
                 pts: 1983000,
             },
         ]; "B-frames after IDR (OBS 29.1.3 QuickSync on Windows)"
+    )]
+    #[test_case(
+        // SPS.
+        &[
+            0x67, 0x4d, 0x40, 0x28, 0xab, 0x60, 0x3c, 0x02,
+            0x23, 0xef, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00,
+            0x10, 0x00, 0x00, 0x03, 0x03, 0x2e, 0x94, 0x00,
+            0x35, 0x64, 0x06, 0xb2, 0x85, 0x08, 0x0e, 0xe2,
+            0xc5, 0x22, 0xc0,
+        ],
+        &[
+            Sample{
+                nalus: &[
+                    &[0x68, 0xca, 0x41, 0xf2], // PPS.
+                    &[0x6, 0x0, 0x6, 0x85, 0x7e, 0x40, 0x0, 0x0, 0x10, 0x1], // SEI.
+                    &[0x65, 0x88, 0x82, 0x80, 0x1f, 0xff, 0xfb, 0xf0, 0xa2, 0x88], // IDR.
+                    &[0x6, 0x1, 0x2, 0x4, 0x24, 0x80], // SEI.
+                    &[0x41, 0x9a, 0xc, 0x1c, 0x2f, 0xe4, 0xed, 0x23, 0xb5, 0x63], // non-IDR.
+                ],
+                dts: 0,
+                pts: 0,
+            },
+            Sample{
+                nalus: &[
+                    &[0x6, 0x1, 0x2, 0x8, 0x14, 0x80], // SEI.
+                    &[0x41, 0x9a, 0x18, 0x2a, 0x1f, 0xeb, 0x2f, 0xa2, 0xb1, 0x7e], // non-IDR.
+                ],
+                dts: 40000,
+                pts: 40000,
+            },
+            Sample{
+                nalus: &[
+                    &[0x6, 0x1, 0x2, 0xc, 0x24, 0x80], // SEIMore actions.
+                    &[0x41, 0x9a, 0x1c, 0x3a, 0xf, 0xfa, 0x55, 0xc2, 0x55, 0xea], // non-IDR.
+                ],
+                dts: 80000,
+                pts: 80000,
+            },
+        ]; "mbs_only_flag = 0"
     )]
     fn test_dts_extractor(sps: &[u8], sequence: &[Sample]) {
         let sps_rbsp = h264_reader::rbsp::decode_nal(&sps).unwrap();
