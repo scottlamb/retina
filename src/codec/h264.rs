@@ -736,13 +736,7 @@ impl Depacketizer {
             if let Some(dts_extractor) = &mut self.dts_extractor {
                 let pts = au.timestamp.timestamp();
                 dts = dts_extractor
-                    .extract(
-                        &parameters.sps,
-                        false,
-                        is_random_access_point,
-                        NalUnitIter::new(&data),
-                        pts,
-                    )
+                    .extract(&parameters.sps, NalUnitIter::new(&data), pts)
                     .map_err(|e| e.to_string())?;
             };
         }
