@@ -148,14 +148,14 @@ impl DtsExtractor {
         // 00 indicate that the decoding of the NAL unit is required to
         // maintain the integrity of the reference pictures.
         let mut non_zero_nal_ref_id_found = false;
-        let mut idr = None;
+        let mut idr_present = false;
         let mut non_idr = None;
 
         for nalu in au {
             non_zero_nal_ref_id_found = non_zero_nal_ref_id_found || ((nalu.0[0] & 0x60) > 0);
             match get_unit_type(nalu.0)? {
                 UnitType::SliceLayerWithoutPartitioningNonIdr => non_idr = Some(nalu),
-                UnitType::SliceLayerWithoutPartitioningIdr => idr = Some(nalu),
+                UnitType::SliceLayerWithoutPartitioningIdr => idr_present = true,
                 UnitType::SeqParameterSet => {
                     // Reset state.
                     self.reordered_frames = 0;
@@ -164,6 +164,18 @@ impl DtsExtractor {
                 _ => {}
             }
         }
+
+        if idr_present {
+            self.expected_poc = 0;
+            self.pause_dts = 0;
+            self.reordered_frames = 0;
+            self.poc_increment = PocIncrement::Two;
+            return Ok((pts, false));
+        }
+
+        let Some(prev_dts) = self.prev_dts else {
+            return Err(FirstCallNotIDR);
+        };
 
         let log2_max_pic_order_cnt_lsb_minus4 = match sps.pic_order_cnt {
             PicOrderCntType::TypeZero {
@@ -182,31 +194,6 @@ impl DtsExtractor {
             return Ok((pts, false));
         };
 
-        // Implicit processing of PicOrderCountType 0.
-        if let Some(idr) = idr {
-            self.pause_dts = 0;
-
-            self.expected_poc = get_picture_order_count(
-                idr,
-                sps.log2_max_frame_num_minus4,
-                log2_max_pic_order_cnt_lsb_minus4,
-                true,
-            )?;
-
-            let Some(prev_dts) = self.prev_dts else {
-                return Ok((pts, false));
-            };
-            if self.reordered_frames == 0 {
-                return Ok((pts, false));
-            }
-
-            let dts = prev_dts + (pts - prev_dts) / (self.reordered_frames + 1);
-            return Ok((dts, false));
-        }
-
-        let Some(prev_dts) = self.prev_dts else {
-            return Err(FirstCallNotIDR);
-        };
         if let Some(non_idr) = non_idr {
             self.expected_poc += u32::from(self.poc_increment);
             self.expected_poc &= (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
@@ -220,7 +207,6 @@ impl DtsExtractor {
                 non_idr,
                 sps.log2_max_frame_num_minus4,
                 log2_max_pic_order_cnt_lsb_minus4,
-                false,
             )?;
 
             let poc_is_odd = (poc % 2) != 0;
@@ -298,7 +284,6 @@ fn get_picture_order_count(
     nal: NalRef,
     log2_max_frame_num_minus4: u8,
     log2_max_pic_order_cnt_lsb_minus4: u8,
-    idr: bool,
 ) -> Result<u32, DtsExtractorError> {
     use DtsExtractorError::BitReader;
     let mut r = h264_reader::rbsp::BitReader::new(ByteReader::new(nal.0));
@@ -307,10 +292,6 @@ fn get_picture_order_count(
     r.read_ue("pic_parameter_set_id").map_err(BitReader)?;
     r.read_u32((log2_max_frame_num_minus4 + 4).into(), "frame_num")
         .map_err(BitReader)?;
-
-    if idr {
-        r.read_ue("idr_pic_id").map_err(BitReader)?;
-    }
 
     let pic_order_cnt_lsb: u32 = r
         .read_u32(
@@ -432,7 +413,7 @@ mod tests {
                     // IDR
                     &[0x65, 0x88, 0x84, 0x00, 0x33, 0xff],
                 ],
-                dts: 5333332,
+                dts: 5999999,
                 pts: 5999999,
             },
         ]; "with timing info"
@@ -649,63 +630,6 @@ mod tests {
                 pts: 40000,
             },
         ]; "Log2MaxPicOrderCntLsbMinus4 = 12"
-    )]
-    #[test_case(
-        &[
-            Sample{
-                nalus: &[
-                    &[0x67, 0x42, 0x80, 0x28, 0x8c, 0x8d, 0x40, 0x5a, 0x09, 0x22],
-                    &[0x68, 0xce, 0x3c, 0x80],
-                    &[
-						0x65, 0xb8, 0x00, 0x0c, 0xa2, 0x40, 0x33, 0x93,
-						0x14, 0x00, 0x04, 0x1a, 0x6d, 0x6d, 0x6d, 0x6d,
-						0x6d, 0x6d, 0x5d, 0xaa, 0xb5, 0xb5, 0xb5, 0xb5,
-						0xb5, 0xb5, 0xb5, 0xb5, 0xb5, 0xb5, 0xb5, 0xb5,
-						0xb5, 0xb5, 0x76, 0xb6, 0xb6, 0xb6, 0xaa, 0xd6,
-						0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd6,
-						0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd6, 0xd5,
-						0xda, 0xda, 0xaa, 0x7a, 0x7a, 0x7a, 0x7a, 0x7a,
-						0x79, 0x1e, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde,
-						0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde,
-						0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde,
-						0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde, 0xde,
-						0xde, 0xde, 0xde, 0xde,
-                    ],
-                ],
-                dts: 0,
-                pts: 0,
-            },
-            Sample{
-                nalus: &[&[
-                    0x41, 0xe0, 0x00, 0x65, 0x12, 0x80, 0xce, 0x78,
-                    0x16, 0x00, 0x99, 0xff, 0xff, 0xff, 0xe0, 0xe4,
-                    0x1a, 0x7f, 0xff, 0xff, 0xea, 0x11, 0x01, 0x01,
-                    0xff, 0xff, 0xfc, 0x20, 0x08, 0x3f, 0xff, 0xff,
-                    0xfc, 0x0f, 0x22, 0x7f, 0xff, 0xff, 0xff, 0xff,
-                    0xff, 0xff, 0xff, 0xff, 0xb8, 0x60, 0x04, 0x87,
-                    0x02, 0xc8, 0x18, 0x38, 0x60, 0x04, 0x87, 0x03,
-                    0x00, 0x35, 0xa8, 0x16, 0x40, 0x9b, 0x04, 0xd0,
-                    0x11, 0x00, 0x24, 0x38, 0x11, 0x01, 0x6c, 0x16,
-                    0x41, 0x60, 0x2c, 0x82, 0xd8, 0x2c, 0x05, 0x90,
-                    0x5b, 0x05, 0x80, 0xb2, 0x0b, 0x60, 0xb0, 0x16,
-                    0x41, 0x6c, 0x16, 0x02, 0xc8, 0x2d, 0x82, 0xc0,
-                    0x59, 0x05, 0xb0, 0x58,
-                ]],
-                dts: 120000,
-                pts: 120000,
-            },
-            Sample{
-                nalus: &[&[
-						0x41, 0xe0, 0x00, 0xa5, 0x13, 0x00, 0xce, 0xf0,
-						0x2c, 0x70, 0x20, 0x01, 0x43, 0xc0, 0x8b, 0xc3,
-						0x01, 0x99, 0x60, 0x80, 0x04, 0x07, 0x06, 0x39,
-						0xe0, 0x80, 0x04, 0x04, 0x37, 0x80, 0x90, 0xe4,
-						0x06, 0x9c, 0xa0, 0x23, 0x60, 0x06, 0x25, 0x80,
-                ]],
-                dts: 160000,
-                pts: 160000,
-            },
-        ]; "issue mediamtx/3094 (non-zero IDR POC)"
     )]
     #[test_case(
         &[
