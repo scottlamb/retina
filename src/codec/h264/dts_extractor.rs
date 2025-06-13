@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/b1ff74467f785dfd0930e7101282cc5799887f45/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/051b50768b457dc33b59bc727b6148855bbbbb88/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -213,7 +213,7 @@ impl DtsExtractor {
 
             if self.pause_dts > 0 {
                 self.pause_dts -= 1;
-                return Ok((prev_dts + 100, true));
+                return Ok((prev_dts + 90, true));
             }
 
             let poc = get_picture_order_count(
@@ -248,7 +248,7 @@ impl DtsExtractor {
 
                 self.reordered_frames += increase;
                 self.pause_dts = increase;
-                return Ok((prev_dts + 100, true));
+                return Ok((prev_dts + 90, true));
             }
 
             if poc_diff == limit {
@@ -263,7 +263,7 @@ impl DtsExtractor {
 
                 self.reordered_frames += increase;
                 self.pause_dts = increase - 1;
-                return Ok((prev_dts + 100, false));
+                return Ok((prev_dts + 90, false));
             }
 
             let dts_diff = pts - prev_dts;
@@ -409,12 +409,12 @@ mod tests {
             },
             Sample{
                 nalus: &[&[0x41, 0x9a, 0x86, 0x49, 0xe1, 0x0f]],
-                dts: 4333433,
+                dts: 4333423,
                 pts: 5333333,
             },
             Sample{
                 nalus: &[&[0x41, 0x9e, 0xa5, 0x42, 0x7f, 0xf9]],
-                dts: 4333533,
+                dts: 4333513,
                 pts: 5000000,
             },
             Sample{
@@ -475,7 +475,7 @@ mod tests {
             },
             Sample{
                 nalus: &[&[0x21, 0xe5, 0x19, 0x0e, 0x70, 0x01]],
-                dts: 91766,
+                dts: 91756,
                 pts: 95000,
             },
             Sample{
@@ -569,25 +569,25 @@ mod tests {
             Sample{
                 // b-frame.
                 nalus: &[&[0x41, 0x9e, 0x3, 0xe4, 0x3f, 0x0, 0x0, 0x3, 0x0, 0x0]],
-                dts: 1916100,
+                dts: 1916090,
                 pts: 1883000,
             },
             Sample{
                 // b-frame.
                 nalus: &[&[0x1, 0x9e, 0x5, 0xd4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
-                dts: 1916200,
+                dts: 1916180,
                 pts: 1867000,
             },
             Sample{
                 // p-frame.
                 nalus: &[&[0x1, 0x9e, 0x5, 0xf4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
-                dts: 1916300,
+                dts: 1916270,
                 pts: 1899000,
             },
             Sample{
                 // p-frame.
                 nalus: &[&[0x1, 0x9e, 0x5, 0xf4, 0x7f, 0x0, 0x0, 0x3, 0x0, 0x0]],
-                dts: 1916400,
+                dts: 1916360,
                 pts: 1983000,
             },
         ]; "B-frames after IDR (OBS 29.1.3 QuickSync on Windows)"
