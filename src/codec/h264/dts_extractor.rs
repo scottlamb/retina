@@ -1,7 +1,7 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// https://github.com/bluenviron/mediacommon/blob/bdc22bee40f15999dce48fe283e4d687b2dd6bec/pkg/codecs/h264/dts_extractor.go
+// https://github.com/bluenviron/mediacommon/blob/b1ff74467f785dfd0930e7101282cc5799887f45/pkg/codecs/h264/dts_extractor.go
 
 use h264_reader::{
     nal::{
@@ -141,9 +141,18 @@ impl DtsExtractor {
     ) -> Result<(i64, bool), DtsExtractorError> {
         use DtsExtractorError::*;
 
+        // A value of 00 indicates that the content of the NAL unit is not
+        // used to reconstruct reference pictures for inter picture
+        // prediction.  Such NAL units can be discarded without risking
+        // the integrity of the reference pictures.  Values greater thanMore actions
+        // 00 indicate that the decoding of the NAL unit is required to
+        // maintain the integrity of the reference pictures.
+        let mut non_zero_nal_ref_id_found = false;
         let mut idr = None;
         let mut non_idr = None;
+
         for nalu in au {
+            non_zero_nal_ref_id_found = non_zero_nal_ref_id_found || ((nalu.0[0] & 0x60) > 0);
             match get_unit_type(nalu.0)? {
                 UnitType::SliceLayerWithoutPartitioningNonIdr => non_idr = Some(nalu),
                 UnitType::SliceLayerWithoutPartitioningIdr => idr = Some(nalu),
@@ -173,6 +182,7 @@ impl DtsExtractor {
             return Ok((pts, false));
         };
 
+        // Implicit processing of PicOrderCountType 0.
         if let Some(idr) = idr {
             self.pause_dts = 0;
 
@@ -259,6 +269,10 @@ impl DtsExtractor {
             let dts_diff = pts - prev_dts;
             let dts = prev_dts + dts_diff / (poc_diff + self.reordered_frames + 1);
             return Ok((dts, false));
+        }
+
+        if !non_zero_nal_ref_id_found {
+            return Ok((prev_dts, false));
         }
 
         Err(NoIdrOrNonIdr)
@@ -622,7 +636,7 @@ mod tests {
             Sample{
                 nalus: &[
                     &[0x67, 0x42, 0xc0, 0x1e, 0x8c, 0x8d, 0x40, 0x50, 0x17, 0xfc, 0xb0, 0x0f, 0x08, 0x84, 0x6a], // SPS.
-                    &[0x68, 0xce, 0x3c, 0x80,], // PPS.
+                    &[0x68, 0xce, 0x3c, 0x80], // PPS.
                     &[0x65, 0x88, 0x80, 0x14, 0x3, 0x00, 0x00, 0x01, 0x00, 0x00], // IDR.
                 ],
                 dts: 0,
@@ -692,6 +706,48 @@ mod tests {
                 pts: 160000,
             },
         ]; "issue mediamtx/3094 (non-zero IDR POC)"
+    )]
+    #[test_case(
+        &[
+            Sample{
+                nalus: &[
+                    // SPS.
+                    &[
+                        0x27, 0x64, 0x00, 0x2a, 0xac, 0x2d, 0x90, 0x07,
+                        0x80, 0x22, 0x7e, 0x5c, 0x05, 0xa8, 0x08, 0x08,
+                        0x0a, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00,
+                        0x03, 0x00, 0xf1, 0xd0, 0x80, 0x04, 0xc4, 0x80,
+                        0x00, 0x09, 0x89, 0x68, 0xde, 0xf7, 0xc1, 0xda,
+                        0x1c, 0x31, 0x92,
+                    ],
+                    &[0x68, 0xca, 0x41, 0xf2], // PPS.
+                    &[0x6, 0x0, 0x6, 0x85, 0x7e, 0x40, 0x0, 0x0, 0x10, 0x1], // SEI.
+                    &[0x65, 0x88, 0x82, 0x80, 0x1f, 0xff, 0xfb, 0xf0, 0xa2, 0x88], // IDR.
+                    &[0x6, 0x1, 0x2, 0x4, 0x24, 0x80], // SEI.
+                    &[0x41, 0x9a, 0xc, 0x1c, 0x2f, 0xe4, 0xed, 0x23, 0xb5, 0x63], // non-IDR.
+                ],
+                dts: 0,
+                pts: 0,
+            },
+            Sample{
+                // SEI.
+                nalus: &[&[0x6, 0x1, 0x2, 0x8, 0x14, 0x80]],
+                dts: 0,
+                pts: 0,
+            },
+            Sample{
+                // non-IDR
+                nalus: &[&[0x61, 0x00, 0xf0, 0xe0, 0x00, 0x40, 0x00, 0xbe, 0x47, 0x9b]],
+                dts: 40000,
+                pts: 40000,
+            },
+            Sample{
+                // SEI.
+                nalus: &[&[0x6, 0x1, 0x2, 0x8, 0x14, 0x80]],
+                dts: 40000,
+                pts: 80000,
+            },
+        ]; "issue mediamtx/3614 Only SEI received"
     )]
     fn test_dts_extractor(sequence: &[Sample]) {
         let sps_rbsp = h264_reader::rbsp::decode_nal(&sequence[0].nalus[0]).unwrap();
