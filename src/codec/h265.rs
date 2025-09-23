@@ -145,7 +145,7 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters
             .as_ref()
             .map(|p| super::ParametersRef::Video(&p.generic_parameters))

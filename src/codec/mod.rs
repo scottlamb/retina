@@ -179,7 +179,7 @@ impl VideoParameters {
 
     /// Returns a builder for an `.mp4` `VideoSampleEntry` box (as defined in
     /// ISO/IEC 14496-12).
-    pub fn mp4_sample_entry(&self) -> VideoSampleEntryBuilder {
+    pub fn mp4_sample_entry(&self) -> VideoSampleEntryBuilder<'_> {
         VideoSampleEntryBuilder {
             params: self,
             aspect_ratio_override: None,
@@ -381,7 +381,7 @@ impl AudioParameters {
     }
 
     /// Returns a builder for an `.mp4` `AudioSampleEntry` box (as defined in ISO/IEC 14496-12).
-    pub fn mp4_sample_entry(&self) -> AudioSampleEntryBuilder {
+    pub fn mp4_sample_entry(&self) -> AudioSampleEntryBuilder<'_> {
         AudioSampleEntryBuilder { params: self }
     }
 }
@@ -691,9 +691,7 @@ impl Depacketizer {
                 clock_rate,
                 format_specific_params,
             )?)),
-            ("image" | "video", "jpeg") => {
-                DepacketizerInner::Jpeg(Box::new(jpeg::Depacketizer::new()))
-            }
+            ("image" | "video", "jpeg") => DepacketizerInner::Jpeg(Box::default()),
             ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
@@ -757,7 +755,7 @@ impl Depacketizer {
     /// If the caller has called `push` more recently than `pull`, it's currently undefined
     /// whether the depacketizer returns parameters as of the most recently pulled or the upcoming
     /// frame.
-    pub fn parameters(&self) -> Option<ParametersRef> {
+    pub fn parameters(&self) -> Option<ParametersRef<'_>> {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),

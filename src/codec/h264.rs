@@ -225,7 +225,7 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters
             .as_ref()
             .map(|p| super::ParametersRef::Video(&p.generic_parameters))
@@ -1965,7 +1965,7 @@ mod tests {
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
                     middle_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
-                    middle_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0000_0000); // middle
+                    middle_pkt.push(ANNEX_B_NALS[0] & 0b0001_1111); // middle
                     middle_pkt.extend_from_slice(
                         &ANNEX_B_NALS[first_pkt_len..first_pkt_len + middle_pkt_len],
                     );

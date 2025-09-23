@@ -51,7 +51,7 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Message(&self.parameters))
     }
 

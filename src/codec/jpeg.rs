@@ -519,7 +519,7 @@ impl Depacketizer {
         self.pending.take().map(super::CodecItem::VideoFrame)
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters.as_ref().map(super::ParametersRef::Video)
     }
 }

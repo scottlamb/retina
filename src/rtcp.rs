@@ -43,7 +43,7 @@ impl ReceivedCompoundPacket {
     ///
     /// Returns the first packet on success so the caller doesn't need to
     /// recaculate its lengths.
-    pub(crate) fn validate(raw: &[u8]) -> Result<PacketRef, String> {
+    pub(crate) fn validate(raw: &[u8]) -> Result<PacketRef<'_>, String> {
         let (first_pkt, mut rest) = PacketRef::parse(raw)?;
         let mut pkt = first_pkt;
         loop {
@@ -97,7 +97,7 @@ impl ReceivedCompoundPacket {
 
     /// Returns an iterator through all contained packets.
     #[inline]
-    pub fn pkts(&self) -> impl Iterator<Item = PacketRef> {
+    pub fn pkts(&self) -> impl Iterator<Item = PacketRef<'_>> {
         CompoundPacketIterator(&self.raw[..])
     }
 }

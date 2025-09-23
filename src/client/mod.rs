@@ -978,7 +978,7 @@ impl Stream {
     /// When directly using [`Session`]'s packet-by-packet `futures::Stream` impl, codec
     /// depacketization logic is bypassed. The parameters returned by this function may be out of
     /// date.
-    pub fn parameters(&self) -> Option<crate::codec::ParametersRef> {
+    pub fn parameters(&self) -> Option<crate::codec::ParametersRef<'_>> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }
 
@@ -1275,7 +1275,7 @@ impl RtspConnection {
                         }
                     }
                     rtsp_types::Message::Data(d) => {
-                        if matches!(mode, ResponseMode::Teardown { .. }) {
+                        if matches!(mode, ResponseMode::Teardown) {
                             debug!("ignoring RTSP interleaved data during TEARDOWN");
                             continue;
                         } else if let (ResponseMode::Play, Some(m)) =
