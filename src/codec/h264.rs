@@ -1418,9 +1418,8 @@ mod tests {
         );
     }
 
-
     /// Test depacketizing when reserved bit is set on FU-A header.
-    /// Longse CMSEKL800 on 
+    /// Longse CMSEKL800 on
     /// firmware KL8_1ND_BVD0L1A0T0Q0_A00038268_V2.0.10.241016_R2
     /// has been found to set this bit - however the resulting
     /// frame is fine.
@@ -1483,7 +1482,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-         let frame = match d.pull() {
+        let frame = match d.pull() {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
