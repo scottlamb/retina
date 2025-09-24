@@ -1,3 +1,9 @@
+## unreleased
+
+*   fix H.265 ProfileTierLevel parsing when `sps_max_sub_layers_minus1 > 0`.
+    This caused strange error messages because the SPS bitstream was
+    mis-positioned. Thanks to [nemosupremo](https://github.com/nemosupremo)!
+
 ## `v0.4.13` (2025-01-31)
 
 *   fix H.265 SPS parsing flaw that affected the Tenda CP3PRO camera.

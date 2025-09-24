@@ -683,12 +683,12 @@ impl ProfileTierLevel {
         };
         let general_level_idc: u8 = r.read(8, "general_level_idc")?;
         if sps_max_sub_layers_minus1 > 0 {
-            let sub_layer_presence_flags: u16 = r.read(16, "sub_layer_presence_flags")?;
+            let sub_layer_present_flags: u16 = r.read_to("sub_layer_present_flags")?;
             for i in 0..sps_max_sub_layers_minus1 {
-                // TODO: check endianness here.
-                let sub_layer_profile_present_flag = sub_layer_presence_flags & (1 << (2 * i)) != 0;
+                let sub_layer_profile_present_flag =
+                    sub_layer_present_flags & (1 << (15 - 2 * i)) != 0;
                 let sub_layer_level_present_flag =
-                    sub_layer_presence_flags & (1 << (2 * i + 1)) != 0;
+                    sub_layer_present_flags & (1 << (14 - 2 * i + 1)) != 0;
                 if sub_layer_profile_present_flag {
                     r.skip(2, "sub_layer_profile_space")?;
                     r.skip(1, "sub_layer_tier_flag")?;
@@ -698,8 +698,8 @@ impl ProfileTierLevel {
                     r.skip(1, "sub_layer_interlaced_source_flag")?;
                     r.skip(1, "sub_layer_non_packed_constraint_flag")?;
                     r.skip(1, "sub_layer_frame_only_constraint_flag")?;
+                    r.skip(44, "sub_layer_reserved_and_inbld")?;
                 }
-                r.skip(44, "stuff")?;
                 if sub_layer_level_present_flag {
                     r.skip(8, "sub_layer_level_idc")?;
                 }
@@ -1398,6 +1398,23 @@ mod tests {
                 ShortTermRefPicSet::from_delta_pocs(&[], &[]),
             ]
         );
+    }
+
+    #[test]
+    fn parse_sps_max_sub_layers_minus1_nonzero() {
+        init_logging();
+        let data = &[
+            0x42, 0x01, 0x04, 0x21, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+            0x00, 0x00, 0x03, 0x00, 0x7b, 0x00, 0x00, 0xa0, 0x03, 0xc0, 0x80, 0x11, 0x07, 0xcb,
+            0xeb, 0x5a, 0xd3, 0x92, 0x89, 0xae, 0x55, 0x64, 0x00,
+        ];
+        let (h, bits) = split(data).unwrap();
+        assert_eq!(h.unit_type(), UnitType::SpsNut);
+        let bits = LoggingBitReader(bits);
+        let sps = dbg!(Sps::from_bits(bits).unwrap());
+        let rfc6381_codec = sps.rfc6381_codec();
+        assert_eq!(rfc6381_codec, "hvc1.1.6.H123.00");
+        assert_eq!(sps.pixel_dimensions().unwrap(), (1920, 1080));
     }
 
     #[test]
