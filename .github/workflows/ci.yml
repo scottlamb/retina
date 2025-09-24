@@ -15,7 +15,7 @@ jobs:
           - '1.79'
         include:
           - rust: stable
-            extra_components: rustfmt
+            extra_components: clippy, rustfmt
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
