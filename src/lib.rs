@@ -462,9 +462,7 @@ impl UdpPair {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
                         "Try {}/{}: unable to bind RTP addr {:?}",
-                        i,
-                        MAX_TRIES,
-                        rtp_addr
+                        i, MAX_TRIES, rtp_addr
                     );
                     continue;
                 }
@@ -476,9 +474,7 @@ impl UdpPair {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
                         "Try {}/{}: unable to bind RTCP addr {:?}",
-                        i,
-                        MAX_TRIES,
-                        rtcp_addr
+                        i, MAX_TRIES, rtcp_addr
                     );
                     continue;
                 }

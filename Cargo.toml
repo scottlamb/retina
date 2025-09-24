@@ -7,13 +7,13 @@ name = "retina"
 version = "0.4.13"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT/Apache-2.0"
-edition = "2021"
+edition = "2024"
 keywords = ["rtsp", "multimedia", "video", "streaming", "ip-camera"]
 categories = ["network-programming", "multimedia"]
 description = "high-level RTSP multimedia streaming library"
 repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
-rust-version = "1.79"
+rust-version = "1.85"
 
 [features]
 default = ["h265"]

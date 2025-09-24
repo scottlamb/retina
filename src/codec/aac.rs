@@ -480,7 +480,7 @@ impl Depacketizer {
             return Err("packet too short for au-headers".to_string());
         }
         match &mut self.state {
-            DepacketizerState::Fragmented(ref mut frag) => {
+            DepacketizerState::Fragmented(frag) => {
                 if au_headers_count != 1 {
                     return Err(format!(
                         "Got {au_headers_count}-AU packet while fragment in progress"

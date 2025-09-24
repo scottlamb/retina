@@ -160,7 +160,7 @@ impl SessionGroup {
     /// An identifier for this session group, for use in log messages.
     ///
     /// Currently uses the name if set, a pointer address otherwise.
-    fn debug_id(&self) -> impl Debug {
+    fn debug_id(&self) -> impl Debug + use<> {
         self.name.clone().unwrap_or_else(|| format!("{:p}", &self))
     }
 
@@ -1432,7 +1432,7 @@ impl RtspConnection {
     ) -> Result<u32, Error> {
         let cseq = self.next_cseq;
         self.next_cseq += 1;
-        if let Some(ref mut auth) = requested_auth {
+        if let Some(auth) = requested_auth {
             let creds = options
                 .creds
                 .as_ref()
@@ -1623,7 +1623,7 @@ impl Session<Described> {
                 ))
             }
         };
-        if let Some(ref s) = inner.session {
+        if let &mut Some(ref s) = inner.session {
             req = req.header(rtsp_types::headers::SESSION, s.id.to_string());
         }
         let (msg_ctx, cseq, response) = conn

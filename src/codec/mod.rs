@@ -14,11 +14,11 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::Bytes;
 
-use crate::error::ErrorInt;
-use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContext;
+use crate::error::ErrorInt;
+use crate::rtp::ReceivedPacket;
 
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
 ///
