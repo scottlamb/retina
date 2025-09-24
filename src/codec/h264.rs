@@ -13,9 +13,9 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::{
+    Error, Timestamp,
     codec::h26x::TolerantBitReader,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
-    Error, Timestamp,
 };
 
 use super::VideoFrame;
@@ -368,7 +368,7 @@ impl Depacketizer {
                                 "STAP-A too short: {} bytes remaining, expecting hdr + {}-byte NAL",
                                 data.remaining(),
                                 len
-                            ))
+                            ));
                         }
                         std::cmp::Ordering::Equal => {
                             process_annex_b(data, |nal| self.add_single_nal(nal))?;
@@ -385,7 +385,7 @@ impl Depacketizer {
             25..=27 | 29 => {
                 return Err(format!(
                     "unimplemented/unexpected interleaved mode NAL ({nal_header:02x})",
-                ))
+                ));
             }
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
@@ -409,7 +409,7 @@ impl Depacketizer {
                 }
                 match (start, access_unit.fu_a.take()) {
                     (true, Some(_)) => {
-                        return Err("FU-A with start bit while frag in progress".into())
+                        return Err("FU-A with start bit while frag in progress".into());
                     }
                     (true, None) => {
                         let mut cur_nal = Some(CurFuANal {
@@ -615,9 +615,7 @@ impl Depacketizer {
             }
             trace!(
                 "access unit (ended by {}) at ts {}; NALS are:{}",
-                reason,
-                au.timestamp,
-                nals
+                reason, au.timestamp, nals
             );
         }
     }
@@ -913,7 +911,9 @@ impl InternalParameters {
         .map_err(|e| format!("Bad SPS {sps_hex}: {e:?}"))?;
         debug!("SPS {sps_hex}: {:#?}", &sps);
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!("Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream.");
+            log::warn!(
+                "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."
+            );
             seen_extra_trailing_data = true;
         }
 
@@ -937,8 +937,8 @@ impl InternalParameters {
         let mut avc_decoder_config = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
         avc_decoder_config.put_u8(1); // configurationVersion
         avc_decoder_config.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
-                                                     // ...misc bits... . profile_compatibility
-                                                     // level_idc . AVCLevelIndication
+        // ...misc bits... . profile_compatibility
+        // level_idc . AVCLevelIndication
 
         // Hardcode lengthSizeMinusOne to 3, matching TransformSampleData's 4-byte
         // lengths.

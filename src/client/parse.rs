@@ -731,8 +731,8 @@ mod tests {
     use bytes::Bytes;
     use url::Url;
 
-    use crate::{client::StreamStateInit, codec::ParametersRef};
     use crate::{StreamContext, StreamContextInner, TcpStreamContext};
+    use crate::{client::StreamStateInit, codec::ParametersRef};
 
     use super::super::StreamState;
     use super::SessionHeader;

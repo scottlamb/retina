@@ -63,7 +63,7 @@ impl RawPacket {
                 return Err(RawPacketError {
                     reason: "too long",
                     data,
-                })
+                });
             }
         };
         if len < MIN_HEADER_LEN {
@@ -114,7 +114,7 @@ impl RawPacket {
                     return Err(RawPacketError {
                         reason: "extension extends beyond maximum packet size",
                         data,
-                    })
+                    });
                 }
             }
         } else {
@@ -146,7 +146,7 @@ impl RawPacket {
                     return Err(RawPacketError {
                         reason: "padding larger than packet",
                         data,
-                    })
+                    });
                 }
             };
             if payload_end < payload_start {

@@ -563,7 +563,9 @@ impl Sps {
             false => "L",
         };
         let general_level_idc = self.profile_tier_level.general_level_idc;
-        let mut out = format!("hvc1.{general_profile_space}{general_profile_idc}.{general_profile_compatibility_flags:X}.{general_tier_flag}{general_level_idc}");
+        let mut out = format!(
+            "hvc1.{general_profile_space}{general_profile_idc}.{general_profile_compatibility_flags:X}.{general_tier_flag}{general_level_idc}"
+        );
 
         // > 4. each of the 6 bytes of the constraint flags, starting from the
         //      byte containing the general_progressive_source_flag, each encoded

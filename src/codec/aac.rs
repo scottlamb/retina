@@ -19,10 +19,10 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::{
     convert::TryFrom,
     fmt::Debug,
-    num::{NonZeroU16, NonZeroU32, NonZeroU8},
+    num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
-use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContext};
+use crate::{ConnectionContext, Error, StreamContext, error::ErrorInt, rtp::ReceivedPacket};
 
 use super::{AudioParameters, CodecItem};
 
@@ -99,7 +99,7 @@ impl AudioSpecificConfig {
             0xb => 8_000,
             0xc => 7_350,
             v @ 0xd | v @ 0xe => {
-                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"))
+                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"));
             }
             0xf => r
                 .read::<u32>(24)
@@ -147,7 +147,7 @@ impl AudioSpecificConfig {
         let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
             (3 /* AAC SR */, true) => {
-                return Err("frame_length_flag must be false for AAC SSR".into())
+                return Err("frame_length_flag must be false for AAC SSR".into());
             }
             (23 /* ER AAC LD */, false) => NonZeroU16::new(512).expect("non-zero"),
             (23 /* ER AAC LD */, true) => NonZeroU16::new(480).expect("non-zero"),
@@ -659,7 +659,7 @@ impl Depacketizer {
                                 stream_ctx,
                                 agg,
                                 format!("aggregate timestamp {agg_timestamp} + {delta} overflows"),
-                            ))
+                            ));
                         }
                     },
                     data: Bytes::copy_from_slice(&payload[agg.data_off..agg.data_off + size]),
@@ -695,7 +695,7 @@ fn error(
 
 #[cfg(test)]
 mod tests {
-    use crate::{rtp::ReceivedPacketBuilder, PacketContext};
+    use crate::{PacketContext, rtp::ReceivedPacketBuilder};
 
     use super::*;
 
@@ -761,10 +761,11 @@ mod tests {
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Aggregate of 3 frames.
         d.push(
@@ -817,10 +818,11 @@ mod tests {
         };
         assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
         assert_eq!(&a.data[..], b"baz");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Fragment across 3 packets.
         d.push(
@@ -845,10 +847,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
         d.push(
             ReceivedPacketBuilder {
                 // fragment 2/3.
@@ -871,10 +874,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
         d.push(
             ReceivedPacketBuilder {
                 // fragment 3/3.
@@ -906,10 +910,11 @@ mod tests {
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foobarbaz");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Tests that depacketization skips/reports a frame in which its first packet was lost.
@@ -948,10 +953,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
         d.push(
             ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
@@ -973,10 +979,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Following frame reports the loss.
         d.push(
@@ -1010,10 +1017,11 @@ mod tests {
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Tests that depacketization skips/reports a frame in which an interior frame is lost.
@@ -1052,10 +1060,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
         // Fragment 2/3 is lost
         d.push(
             ReceivedPacketBuilder {
@@ -1079,10 +1088,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Following frame reports the loss.
         d.push(
@@ -1116,10 +1126,11 @@ mod tests {
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Tests that depacketization skips/reports a frame in which the interior frame is lost.
@@ -1158,10 +1169,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
         // Fragment 2/3 is lost
         d.push(
             ReceivedPacketBuilder {
@@ -1185,10 +1197,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Following frame reports the loss.
         d.push(
@@ -1222,10 +1235,11 @@ mod tests {
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Tests the distinction between `loss` and `loss_since_last_mark`.
@@ -1267,10 +1281,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(
+            d.pull(&ConnectionContext::dummy(), &StreamContext::dummy())
+                .unwrap()
+                .is_none()
+        );
 
         // Incomplete fragment with no reported loss.
         d.push(

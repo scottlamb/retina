@@ -6,7 +6,7 @@
 use std::{io::ErrorKind, net::SocketAddr, num::NonZeroU32};
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
 use retina::{
     client::{PlayOptions, SetupOptions},

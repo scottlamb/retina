@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
+use crate::{PacketContext, Timestamp, rtp::ReceivedPacket};
 
 use super::{VideoFrame, VideoParameters};
 

@@ -282,7 +282,7 @@ impl Depacketizer {
                                 "AP too short: {} bytes remaining, expecting {}-byte NAL",
                                 data.remaining(),
                                 len
-                            ))
+                            ));
                         }
                         std::cmp::Ordering::Equal => {
                             let hdr = take_hdr(&mut data)?;
@@ -437,9 +437,7 @@ impl Depacketizer {
             }
             trace!(
                 "access unit (ended by {}) at ts {}; NALS are:{}",
-                reason,
-                au.timestamp,
-                nals
+                reason, au.timestamp, nals
             );
         }
     }
@@ -733,7 +731,9 @@ impl InternalParameters {
         let sps = nal::Sps::from_bits(sps_bits)
             .map_err(|e| format!("{e}\nwhile parsing SPS: {sps_hex}"))?;
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!("Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream.");
+            log::warn!(
+                "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."
+            );
             seen_extra_trailing_data = true;
         }
 
@@ -751,7 +751,9 @@ impl InternalParameters {
         let pps = nal::Pps::from_bits(pps_bits)
             .map_err(|e| format!("{e}\nwhile parsing PPS: {pps_hex}"))?;
         if pps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!("Ignoring trailing data in PPS {pps_hex}; will not log about trailing data again for this stream.");
+            log::warn!(
+                "Ignoring trailing data in PPS {pps_hex}; will not log about trailing data again for this stream."
+            );
             seen_extra_trailing_data = true;
         }
 
@@ -837,7 +839,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use crate::{
-        codec::CodecItem, rtp::ReceivedPacketBuilder, testutil::init_logging, PacketContext,
+        PacketContext, codec::CodecItem, rtp::ReceivedPacketBuilder, testutil::init_logging,
     };
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::{num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{Error, anyhow, bail};
 use clap::Parser;
 use futures::{Future, StreamExt};
 use log::info;

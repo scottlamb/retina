@@ -1,8 +1,8 @@
 // Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{anyhow, bail, Error};
-use base64::{engine::general_purpose, Engine as _};
+use anyhow::{Error, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
@@ -12,7 +12,7 @@ use retina::{
 };
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
-    api::{interceptor_registry::register_default_interceptors, APIBuilder},
+    api::{APIBuilder, interceptor_registry::register_default_interceptors},
     ice_transport::{ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     media::Sample,
@@ -21,7 +21,7 @@ use webrtc::{
         sdp::session_description::RTCSessionDescription,
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_sample::TrackLocalStaticSample, TrackLocal},
+    track::track_local::{TrackLocal, track_local_static_sample::TrackLocalStaticSample},
 };
 
 /// Proxies from the given RTSP server to a WebRTC client.

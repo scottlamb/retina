@@ -17,7 +17,7 @@
 //! https://github.com/scottlamb/moonfire-nvr/wiki/Standards-and-specifications
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{Context, Error, anyhow, bail};
 use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use futures::{Future, StreamExt};
@@ -489,7 +489,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.extend_from_slice(b"roll"); // grouping type
                             buf.put_u32(1); // entry_count
-                                            // BMFF section 10.1: AudioRollRecoveryEntry
+                            // BMFF section 10.1: AudioRollRecoveryEntry
                             buf.put_i16(-1); // roll_distance
                         });
                         write_box!(buf, b"sbgp", {

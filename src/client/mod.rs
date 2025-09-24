@@ -15,7 +15,7 @@ use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
 use bytes::Bytes;
-use futures::{ready, Future, SinkExt, StreamExt};
+use futures::{Future, SinkExt, StreamExt, ready};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
 use rtsp_types::{Data, Method};
@@ -2113,9 +2113,7 @@ impl Session<Playing> {
                 conn_ctx: *conn.inner.ctx(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Unable to write keepalive {cseq} within {keepalive_interval:?}",
-                    ),
+                    format!("Unable to write keepalive {cseq} within {keepalive_interval:?}",),
                 ),
             }),
             KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
@@ -2366,7 +2364,7 @@ impl Session<Playing> {
                                 pkt_ctx,
                                 stream_id: i,
                                 description,
-                            }))))
+                            }))));
                         }
                     }
                 }
@@ -2383,7 +2381,7 @@ impl Session<Playing> {
                         stream_ctx: stream_ctx.to_owned(),
                         when,
                         source,
-                    }))))
+                    }))));
                 }
             }
         }
@@ -2420,7 +2418,7 @@ impl Session<Playing> {
                         stream_ctx: stream_ctx.to_owned(),
                         when,
                         source,
-                    }))))
+                    }))));
                 }
             }
         }
@@ -2560,8 +2558,10 @@ impl futures::Stream for Session<Playing> {
                         continue;
                     }
                     rtsp_types::Message::Request(request) => {
-                        warn!("Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
-                            request);
+                        warn!(
+                            "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
+                            request
+                        );
                     }
                 },
                 Poll::Ready(Some(Err(e))) => {
@@ -2644,7 +2644,7 @@ impl futures::Stream for Demuxed {
                 DemuxedState::Waiting => match ready!(Pin::new(&mut self.session).poll_next(cx)) {
                     Some(Ok(PacketItem::Rtp(p))) => (p.stream_id(), Some(p)),
                     Some(Ok(PacketItem::Rtcp(p))) => {
-                        return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))))
+                        return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))));
                     }
                     Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                     None => return Poll::Ready(None),

@@ -6,7 +6,7 @@ use rtsp_types::{Method, Request};
 use url::Url;
 
 use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
-use crate::{error::ErrorInt, Error};
+use crate::{Error, error::ErrorInt};
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRESH_CONN_INITIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);

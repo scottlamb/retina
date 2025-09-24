@@ -3,8 +3,8 @@
 
 use std::num::NonZeroU16;
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use retina::client::{rtp::InorderParser, Timeline};
+use criterion::{Criterion, criterion_group, criterion_main};
+use retina::client::{Timeline, rtp::InorderParser};
 use retina::codec::{CodecItem, Depacketizer};
 use std::convert::TryFrom;
 use std::io::Write;
