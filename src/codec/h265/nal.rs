@@ -1272,83 +1272,80 @@ impl VuiTimingInfo {
         }
         let hrd_parameters_present_flag = r.read_bool("vui_hrd_parameters_present_flag")?;
         if hrd_parameters_present_flag {
-            let common_inf_present = true;
             let mut subpic_params_present = false;
-            if common_inf_present {
-                let nal_params_present = r.read_bool("nal_params_present")?;
-                let vcl_params_present = r.read_bool("vcl_params_present")?;
+            let nal_params_present = r.read_bool("nal_params_present")?;
+            let vcl_params_present = r.read_bool("vcl_params_present")?;
 
-                if nal_params_present || vcl_params_present {
-                    subpic_params_present = r.read_bool("subpic_params_present")?;
+            if nal_params_present || vcl_params_present {
+                subpic_params_present = r.read_bool("subpic_params_present")?;
 
-                    if subpic_params_present {
-                        r.skip(8, "tick_divisor_minus2")?;
-                        r.skip(5, "du_cpb_removal_delay_increment_length_minus1")?;
-                        r.skip(1, "sub_pic_cpb_params_in_pic_timing_sei_flag")?;
-                        r.skip(5, "dpb_output_delay_du_length_minus1")?;
-                    }
-
-                    r.skip(4, "bit_rate_scale")?;
-                    r.skip(4, "cpb_size_scale")?;
-
-                    if subpic_params_present {
-                        r.skip(4, "cpb_size_du_scale")?;
-                    }
-
-                    r.skip(5, "initial_cpb_removal_delay_length_minus1")?;
-                    r.skip(5, "au_cpb_removal_delay_length_minus1")?;
-                    r.skip(5, "dpb_output_delay_length_minus1")?;
+                if subpic_params_present {
+                    r.skip(8, "tick_divisor_minus2")?;
+                    r.skip(5, "du_cpb_removal_delay_increment_length_minus1")?;
+                    r.skip(1, "sub_pic_cpb_params_in_pic_timing_sei_flag")?;
+                    r.skip(5, "dpb_output_delay_du_length_minus1")?;
                 }
 
-                for _ in 0..=sps_max_sub_layers_minus1 {
-                    let mut low_delay = false;
-                    let mut nb_cpb = 1;
-                    let mut fixed_rate = r.read_bool("fixed_rate")?;
+                r.skip(4, "bit_rate_scale")?;
+                r.skip(4, "cpb_size_scale")?;
 
-                    if !fixed_rate {
-                        fixed_rate = r.read_bool("fixed_rate")?;
-                    }
+                if subpic_params_present {
+                    r.skip(4, "cpb_size_du_scale")?;
+                }
 
-                    if fixed_rate {
-                        r.read_ue("")?;
-                    } else {
-                        low_delay = r.read_bool("low_delay")?;
-                    }
+                r.skip(5, "initial_cpb_removal_delay_length_minus1")?;
+                r.skip(5, "au_cpb_removal_delay_length_minus1")?;
+                r.skip(5, "dpb_output_delay_length_minus1")?;
+            }
 
-                    if !low_delay {
-                        nb_cpb = r.read_ue("nb_cpb")? + 1;
-                    }
+            for _ in 0..=sps_max_sub_layers_minus1 {
+                let mut low_delay = false;
+                let mut nb_cpb = 1;
+                let mut fixed_rate = r.read_bool("fixed_pic_rate_general_flag")?;
 
-                    if nal_params_present {
-                        for _ in 0..nb_cpb {
-                            let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?; // bit_rate_value_minus1
-                            let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?; // cpb_size_value_minus1
+                if !fixed_rate {
+                    fixed_rate = r.read_bool("fixed_pic_rate_within_cvs_flag")?;
+                }
 
-                            if subpic_params_present {
-                                let _cpb_size_du_value_minus1 =
-                                    r.read_ue("cpb_size_du_value_minus1")?; // cpb_size_du_value_minus1
-                                let _bit_rate_du_value_minus1 =
-                                    r.read_ue("bit_rate_du_value_minus1")?; // bit_rate_du_value_minus1
-                            }
+                if fixed_rate {
+                    r.read_ue("elemental_duration_in_tc_minus1")?;
+                } else {
+                    low_delay = r.read_bool("low_delay")?;
+                }
 
-                            let _ = r.read_bool("cbr_flag")?; // cbr_flag
+                if !low_delay {
+                    nb_cpb = r.read_ue("nb_cpb")? + 1;
+                }
+
+                if nal_params_present {
+                    for _ in 0..nb_cpb {
+                        let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?;
+                        let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?;
+
+                        if subpic_params_present {
+                            let _cpb_size_du_value_minus1 =
+                                r.read_ue("cpb_size_du_value_minus1")?;
+                            let _bit_rate_du_value_minus1 =
+                                r.read_ue("bit_rate_du_value_minus1")?;
                         }
+
+                        let _ = r.read_bool("cbr_flag")?;
                     }
+                }
 
-                    if vcl_params_present {
-                        for _ in 0..nb_cpb {
-                            let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?; // bit_rate_value_minus1
-                            let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?; // cpb_size_value_minus1
+                if vcl_params_present {
+                    for _ in 0..nb_cpb {
+                        let _bit_rate_value_minus1 = r.read_ue("bit_rate_value_minus1")?;
+                        let _cpb_size_value_minus1 = r.read_ue("cpb_size_value_minus1")?;
 
-                            if subpic_params_present {
-                                let _cpb_size_du_value_minus1 =
-                                    r.read_ue("cpb_size_du_value_minus1")?; // cpb_size_du_value_minus1
-                                let _bit_rate_du_value_minus1 =
-                                    r.read_ue("bit_rate_du_value_minus1")?; // bit_rate_du_value_minus1
-                            }
-
-                            r.skip(1, "cbr_flag")?;
+                        if subpic_params_present {
+                            let _cpb_size_du_value_minus1 =
+                                r.read_ue("cpb_size_du_value_minus1")?;
+                            let _bit_rate_du_value_minus1 =
+                                r.read_ue("bit_rate_du_value_minus1")?;
                         }
+
+                        r.skip(1, "cbr_flag")?;
                     }
                 }
             }
