@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
+use crate::{rtp::ReceivedPacket, PacketContext, Timestamp, VideoTimestamp};
 
 use super::{VideoFrame, VideoParameters};
 
@@ -466,7 +466,7 @@ impl Depacketizer {
             None => return Err("Invalid RTP/JPEG packet. Missing start packet".to_string()),
         };
 
-        if metadata.timestamp.timestamp != timestamp.timestamp {
+        if metadata.timestamp.pts != timestamp.pts {
             // This seems to happen when you connect to certain cameras.
             // We return Ok here instead of an error to not spam the log.
             return Ok(());
@@ -492,7 +492,10 @@ impl Depacketizer {
                 end_ctx: ctx,
                 has_new_parameters,
                 loss,
-                timestamp,
+                timestamp: VideoTimestamp {
+                    timestamp,
+                    dts: None,
+                },
                 stream_id,
                 is_random_access_point: true,
                 is_disposable: true,
@@ -834,7 +837,7 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };

@@ -19,6 +19,7 @@ use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContext;
+use crate::VideoTimestamp;
 
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
 ///
@@ -550,7 +551,7 @@ pub struct VideoFrame {
 
     has_new_parameters: bool,
     loss: u16,
-    timestamp: crate::Timestamp,
+    timestamp: VideoTimestamp,
     stream_id: usize,
     is_random_access_point: bool,
     is_disposable: bool,
@@ -583,7 +584,7 @@ impl VideoFrame {
 
     /// Returns this picture's timestamp in the time base associated with the stream.
     #[inline]
-    pub fn timestamp(&self) -> crate::Timestamp {
+    pub fn timestamp(&self) -> crate::VideoTimestamp {
         self.timestamp
     }
 

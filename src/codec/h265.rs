@@ -18,6 +18,7 @@ use log::{debug, log_enabled, trace};
 
 use crate::codec::h26x::TolerantBitReader;
 use crate::rtp::ReceivedPacket;
+use crate::{Timestamp, VideoTimestamp};
 
 use super::VideoFrame;
 
@@ -169,7 +170,7 @@ impl Depacketizer {
                     if loss > 0 {
                         self.nals.clear();
                         self.pieces.clear();
-                        if access_unit.timestamp.timestamp == pkt.timestamp().timestamp {
+                        if access_unit.timestamp.pts == pkt.timestamp().pts {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             self.input_state = if pkt.mark() {
                                 DepacketizerInputState::PostMark {
@@ -189,7 +190,7 @@ impl Depacketizer {
                         // A suffix of a previous access unit was lost; discard it.
                         // A prefix of the new one may have been lost; try parsing.
                         AccessUnit::start(&pkt, 0, false)
-                    } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
+                    } else if access_unit.timestamp.pts != pkt.timestamp().pts {
                         if access_unit.in_fu {
                             return Err(format!(
                                 "Timestamp changed from {} to {} in the middle of a fragmented NAL",
@@ -212,7 +213,7 @@ impl Depacketizer {
                                 "Bogus mid-access unit timestamp change after {:?}",
                                 last_nal_hdr
                             );
-                            access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                            access_unit.timestamp.pts = pkt.timestamp().pts;
                             access_unit
                         }
                     } else {
@@ -225,7 +226,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&pkt, loss, state_ts.timestamp == pkt.timestamp().timestamp)
+                    AccessUnit::start(&pkt, loss, state_ts.pts == pkt.timestamp().pts)
                 }
                 DepacketizerInputState::Loss {
                     timestamp,
@@ -233,7 +234,7 @@ impl Depacketizer {
                 } => {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
-                    if pkt.timestamp().timestamp == timestamp.timestamp {
+                    if pkt.timestamp().pts == timestamp.pts {
                         pkts += pkt.loss();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
@@ -393,7 +394,7 @@ impl Depacketizer {
                     "Bogus mid-access unit timestamp change after {:?}",
                     last_nal_hdr
                 );
-                access_unit.timestamp.timestamp = timestamp.timestamp;
+                access_unit.timestamp.pts = timestamp.pts;
                 DepacketizerInputState::PreMark(access_unit)
             }
         } else {
@@ -557,12 +558,20 @@ impl Depacketizer {
             false
         };
 
+        let timestamp = VideoTimestamp {
+            timestamp: Timestamp {
+                pts: au.timestamp.pts,
+                clock_rate: au.timestamp.clock_rate,
+                start: au.timestamp.start,
+            },
+            dts: None,
+        };
         Ok(VideoFrame {
             has_new_parameters,
             loss: au.loss,
             start_ctx: au.start_ctx,
             end_ctx: au.end_ctx,
-            timestamp: au.timestamp,
+            timestamp,
             stream_id: au.stream_id,
             is_random_access_point,
             is_disposable,
@@ -845,7 +854,7 @@ mod tests {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            pts: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };

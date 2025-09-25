@@ -71,7 +71,7 @@ impl Timeline {
                 self.max_forward_jump_secs
             ));
         }
-        self.timestamp = timestamp.timestamp;
+        self.timestamp = timestamp.pts;
         Ok(timestamp)
     }
 
@@ -117,7 +117,7 @@ impl Timeline {
         }
         Ok((
             Timestamp {
-                timestamp,
+                pts: timestamp,
                 clock_rate: self.clock_rate,
                 start,
             },
