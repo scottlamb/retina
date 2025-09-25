@@ -286,15 +286,15 @@ fn get_picture_order_count(
     log2_max_pic_order_cnt_lsb_minus4: u8,
 ) -> Result<u32, DtsExtractorError> {
     use DtsExtractorError::BitReader;
-    let mut r = h264_reader::rbsp::BitReader::new(ByteReader::new(nal.0));
+    let mut r = h264_reader::rbsp::BitReader::new(ByteReader::skipping_h264_header(nal.0));
     r.read_ue("first_mb_in_slice").map_err(BitReader)?;
     r.read_ue("slice type").map_err(BitReader)?;
     r.read_ue("pic_parameter_set_id").map_err(BitReader)?;
-    r.read_u32((log2_max_frame_num_minus4 + 4).into(), "frame_num")
+    r.read::<u32>((log2_max_frame_num_minus4 + 4).into(), "frame_num")
         .map_err(BitReader)?;
 
     let pic_order_cnt_lsb: u32 = r
-        .read_u32(
+        .read(
             (log2_max_pic_order_cnt_lsb_minus4 + 4).into(),
             "pic_order_cnt_lsb",
         )

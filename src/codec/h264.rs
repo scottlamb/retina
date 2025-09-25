@@ -630,7 +630,8 @@ impl Depacketizer {
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
-        let mut is_random_access_point = true;
+        let mut idr_present = false;
+        let mut non_idr_present = false;
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
@@ -665,7 +666,8 @@ impl Depacketizer {
                 UnitType::SliceDataPartitionALayer
                 | UnitType::SliceDataPartitionBLayer
                 | UnitType::SliceDataPartitionCLayer
-                | UnitType::SliceLayerWithoutPartitioningNonIdr => is_random_access_point = false,
+                | UnitType::SliceLayerWithoutPartitioningNonIdr => non_idr_present = true,
+                UnitType::SliceLayerWithoutPartitioningIdr => idr_present = true,
                 _ => {}
             }
             if nal.hdr.nal_ref_idc() != 0 {
@@ -675,6 +677,7 @@ impl Depacketizer {
             retained_len += 4usize + crate::to_usize(nal.len);
             piece_idx = next_piece_idx;
         }
+        let is_random_access_point = idr_present && !non_idr_present;
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
         for nal in &self.nals {
