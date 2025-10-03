@@ -93,6 +93,11 @@ This allows viewing a H.264 video stream from your browser, with the help of
 $ cargo run --package webrtc-proxy -- --help
 ```
 
+## Example ffmpeg decode tool
+
+This decodes video from an RTSP source into raw video frames in [PPM format](https://en.wikipedia.org/wiki/Netpbm)
+using the `ffmpeg-next` crate.
+
 ## Acknowledgements
 
 This builds on the whole Rust ecosystem. A couple folks have been especially

@@ -34,6 +34,8 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: ${{ matrix.extra_components }}
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkgconf
       - name: Build (no features)
         run: cargo build --no-default-features --all-targets --workspace
       - name: Build (all features)
@@ -53,7 +55,6 @@ jobs:
       - name: Clippy on main workspace (no features)
         if: matrix.rust == 'stable'
         run: cargo clippy --no-default-features --workspace -- -D warnings
-
       - name: Clippy on main workspace (all features)
         if: matrix.rust == 'stable'
         run: cargo clippy --all-features --workspace -- -D warnings
