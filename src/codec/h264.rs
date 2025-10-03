@@ -25,7 +25,7 @@ use super::VideoFrame;
 /// 6184](https://tools.ietf.org/html/rfc6184).
 ///
 /// This inspects the contents of the NAL units only minimally, and largely for
-/// logging. In particular, it doesn't completely enforce verify compliance with
+/// logging. In particular, it doesn't completely enforce/verify compliance with
 /// H.264 section 7.4.1.2.3 "Order of NAL units and coded pictures and
 /// association to access units". For compatibility with some broken cameras
 /// that change timestamps mid-AU, it does extend AUs if they end with parameter
@@ -52,7 +52,7 @@ use super::VideoFrame;
 /// code discards those. Notably, section H.264 section 7.4.1 says
 /// "The last byte of the NAL unit shall not be equal to 0x00."
 ///
-/// Currently, `00 00 01` is not understand as the very start of payload; the
+/// Currently, `00 00 01` is not understood as the very start of payload; the
 /// first byte is expected to be a NAL header.
 ///
 /// Finally, it errors on the sequence `00 00 02`, which is not allowed in
@@ -74,6 +74,10 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// True if we've seen a FU-A sequence where the NAL headers differ between
+    /// fragments.
+    seen_inconsistent_fu_a_nal_hdr: bool,
 }
 
 #[derive(Debug)]
@@ -222,6 +226,7 @@ impl Depacketizer {
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
+            seen_inconsistent_fu_a_nal_hdr: false,
         })
     }
 
@@ -424,11 +429,15 @@ impl Depacketizer {
                         });
                     }
                     (false, Some(mut fu_a)) => {
-                        if nal_header != fu_a.initial_nal_header {
-                            return Err(format!(
-                                "FU-A has inconsistent NAL type: {:?} then {:?}",
-                                fu_a.initial_nal_header, nal_header,
-                            ));
+                        if nal_header != fu_a.initial_nal_header
+                            && !self.seen_inconsistent_fu_a_nal_hdr
+                        {
+                            log::warn!(
+                                "FU-A has inconsistent NAL header: {:?} then {:?}; will not log about this again for this stream",
+                                fu_a.initial_nal_header,
+                                nal_header,
+                            );
+                            self.seen_inconsistent_fu_a_nal_hdr = true;
                         }
                         self.add_fu_a(&mut fu_a.cur_nal, data)?;
                         if end {
@@ -694,9 +703,9 @@ impl Depacketizer {
             self.parameters.as_ref(),
         ) {
             (Some(sps_nal), Some(pps_nal), old_ip) => {
-                // TODO: could map this to a RtpPacketError more accurately.
                 let seen_extra_trailing_data =
                     old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
+                // TODO: could map this to a RtpPacketError more accurately.
                 self.parameters = Some(InternalParameters::parse_sps_and_pps(
                     sps_nal,
                     pps_nal,
@@ -1416,6 +1425,7 @@ mod tests {
                      \x00\x00\x00\x09\x06stap-a 2\
                      \x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
         );
+        assert!(!d.seen_inconsistent_fu_a_nal_hdr);
     }
 
     /// Test depacketizing when reserved bit is set on FU-A header.
@@ -2092,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_on_inconsistent_headers_between_fu_a() {
+    fn allow_inconsistent_headers_between_fu_a() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("profile-level-id=TQAf;packetization-mode=1;sprop-parameter-sets=J00AH+dAKALdgKUFBQXwAAADABAAAAMCiwEAAtxoAAIlUX//AoA=,KO48gA==")).unwrap();
         let timestamp = crate::Timestamp {
@@ -2118,22 +2128,31 @@ mod tests {
         .unwrap();
         assert!(d.pull().is_none());
 
-        let push_result = d.push(
+        d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, middle.
+                // FU-A packet, end.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
                 loss: 0,
-                mark: false,
+                mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x3c\x07a wild sps appeared")
+            .build(*b"\x3c\x47a wild sps appeared")
             .unwrap(),
+        )
+        .unwrap();
+        // assert!(push_result.is_err());
+        let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+            panic!();
+        };
+        assert_eq_hex!(
+            frame.data(),
+            &b"\x00\x00\x00\x24\x21start of non-idra wild sps appeared"
         );
-        assert!(push_result.is_err());
+        assert!(d.seen_inconsistent_fu_a_nal_hdr);
     }
 
     /// Tests the `process_annex_b` function in isolation.

@@ -163,6 +163,20 @@ impl From<UnitType> for u8 {
 }
 
 /// `nal_unit_header` as in T.REC H.265 section 7.3.1.2.
+///
+/// ```text
+/// 0                   1
+/// 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |F|ttttttttttttt|lllllllll|TTTTT|
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+///
+/// F: forbidden_zero_bit, must be 0.
+/// t: unit_type, in [0, 63].
+/// l: nuh_layer_id, in [0, 63].
+/// T: nuh_temporal_id_plus1, in [1, 7].
+/// ```
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Header([u8; 2]);
 

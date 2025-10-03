@@ -3,6 +3,10 @@
 *   fix H.265 ProfileTierLevel parsing when `sps_max_sub_layers_minus1 > 0`.
     This caused strange error messages because the SPS bitstream was
     mis-positioned. Thanks to [nemosupremo](https://github.com/nemosupremo)!
+*   improve compatibility with some Tiandy cameras by warning rather than erroring
+    when H.264 FU-A and H.265 FU change NAL types within a fragmented access
+    unit. These cameras appear to never set the subsequent packets' NAL types correctly.
+    See [scottlamb/moonfire-nvr#344](https://github.com/scottlamb/moonfire-nvr/issues/344).
 
 ## `v0.4.13` (2025-01-31)
 

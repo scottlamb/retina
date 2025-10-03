@@ -50,6 +50,10 @@ pub(crate) struct Depacketizer {
     /// In state `PreMark`, an entry for each NAL.
     /// Kept around (empty) in other states to re-use the backing allocation.
     nals: Vec<Nal>,
+
+    /// True if we've seen a FU sequence where the NAL headers differ between
+    /// fragments.
+    seen_inconsistent_fu_nal_hdr: bool,
 }
 
 #[derive(Debug)]
@@ -71,7 +75,7 @@ struct AccessUnit {
     timestamp: crate::Timestamp,
     stream_id: usize,
 
-    /// True iff currently processing a FU-A.
+    /// True iff currently processing a FU.
     in_fu: bool,
 
     /// RTP packets lost as this access unit was starting.
@@ -142,6 +146,7 @@ impl Depacketizer {
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
+            seen_inconsistent_fu_nal_hdr: false,
         })
     }
 
@@ -347,11 +352,14 @@ impl Depacketizer {
                             .nals
                             .last_mut()
                             .ok_or("nals non-empty while in fu".to_string())?;
-                        if hdr != nal.hdr {
-                            return Err(format!(
-                                "FU has inconsistent NAL type: {:?} then {:?}",
-                                nal.hdr, hdr,
-                            ));
+                        // TODO
+                        if hdr != nal.hdr && !self.seen_inconsistent_fu_nal_hdr {
+                            log::warn!(
+                                "FU has inconsistent NAL header: {:?} then {:?}; will not log about this again for this stream",
+                                nal.hdr,
+                                hdr,
+                            );
+                            self.seen_inconsistent_fu_nal_hdr = true;
                         }
                         nal.len += u32_len;
                         if end {
@@ -839,7 +847,10 @@ mod tests {
     use std::num::NonZeroU32;
 
     use crate::{
-        PacketContext, codec::CodecItem, rtp::ReceivedPacketBuilder, testutil::init_logging,
+        PacketContext,
+        codec::CodecItem,
+        rtp::ReceivedPacketBuilder,
+        testutil::{assert_eq_hex, init_logging},
     };
 
     #[test]
@@ -905,7 +916,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, middle.
+                // FU packet, middle.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -922,7 +933,7 @@ mod tests {
         assert!(d.pull().is_none());
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, end.
+                // FU packet, end.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -940,13 +951,64 @@ mod tests {
             Some(CodecItem::VideoFrame(frame)) => frame,
             _ => panic!(),
         };
-        assert_eq!(
+        assert_eq_hex!(
             frame.data(),
             b"\x00\x00\x00\x07\x4e\x01plain\
               \x00\x00\x00\x0a\x4e\x01stap-a 1\
               \x00\x00\x00\x0a\x4e\x01stap-a 2\
               \x00\x00\x00\x1d\x28\x01fu start, fu middle, fu end"
         );
+        assert!(!d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    #[test]
+    fn allow_inconsistent_fu_nal_header() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, start.
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x94fu start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, end.
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x66fu end") // incorrect NAL type FdNut.
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
+        assert!(d.seen_inconsistent_fu_nal_hdr);
     }
 
     #[test]
