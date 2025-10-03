@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.14` (2025-10-03)
 
 *   fix H.265 ProfileTierLevel parsing when `sps_max_sub_layers_minus1 > 0`.
     This caused strange error messages because the SPS bitstream was
@@ -7,6 +7,10 @@
     when H.264 FU-A and H.265 FU change NAL types within a fragmented access
     unit. These cameras appear to never set the subsequent packets' NAL types correctly.
     See [scottlamb/moonfire-nvr#344](https://github.com/scottlamb/moonfire-nvr/issues/344).
+*   update dependencies: `jiff` to 0.2 and `thiserror` to 2.0
+*   add an example that uses ffmpeg to decode frames
+*   update minimum Rust version to 1.85
+*   ignore the "reserved" bit in FU-A payload, improving camera compatibility
 
 ## `v0.4.13` (2025-01-31)
 
