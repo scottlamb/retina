@@ -1336,20 +1336,6 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
 name = "jiff"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c04ef77ae73f3cf50510712722f0c4e8b46f5aaa1bf5ffad2ae213e6495e78e5"
-dependencies = [
- "jiff-tzdb-platform",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "jiff"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1f93b8b1eb69c77f24bbb0afdf66f54b632ee39af40ca21c4365a1d7347e49"
@@ -1512,9 +1498,9 @@ checksum = "96a1fe2275b68991faded2c80aa4a33dba398b77d276038b8f50701a22e55918"
 [[package]]
 name = "mylog"
 version = "0.1.0"
-source = "git+https://github.com/scottlamb/mylog#21ce1aa653aff2b030e38fb3e3e91e2cf2b38dec"
+source = "git+https://github.com/scottlamb/mylog#78a46b9c98521e32b0db04bdb5e026b11609b925"
 dependencies = [
- "jiff 0.1.29",
+ "jiff",
  "libc",
  "log",
 ]
@@ -2042,7 +2028,7 @@ dependencies = [
  "h264-reader",
  "hex",
  "http-auth",
- "jiff 0.2.15",
+ "jiff",
  "log",
  "memchr",
  "mylog",
