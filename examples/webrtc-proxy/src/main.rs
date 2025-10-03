@@ -86,7 +86,7 @@ async fn main() {
 fn read_offer() -> Result<RTCSessionDescription, Error> {
     // Avoid <https://github.com/webrtc-rs/examples/issues/16> by using rustyline
     // to take the terminal out of canonical mode.
-    let mut rl = rustyline::Editor::<()>::new();
+    let mut rl = rustyline::DefaultEditor::new()?;
     let line = rl.readline(">> ")?;
     let line = line.trim();
     let raw = general_purpose::STANDARD.decode(line)?;
@@ -148,8 +148,8 @@ async fn run() -> Result<(), Error> {
 
     // Prepare outbound state for each track of interest.
     for (i, stream) in upstream_session.streams().iter().enumerate() {
-        if stream.media() != "video" && stream.encoding_name() != "h264" {
-            // Currently we only support H.264 video.
+        if stream.media() != "video" || !["h264", "h265"].contains(&stream.encoding_name()) {
+            // Currently we only support H.264/H.265 video.
             continue;
         }
 
@@ -172,7 +172,7 @@ async fn run() -> Result<(), Error> {
         // #3 seems ideal but is not yet implemented. The current approach is #2.
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: "video/h264".to_owned(),
+                mime_type: format!("video/{}", stream.encoding_name()),
                 ..Default::default()
             },
             format!("{i}-video"),
@@ -205,6 +205,10 @@ async fn run() -> Result<(), Error> {
         upstream_session
             .setup(i, SetupOptions::default().transport(opts.transport.clone()))
             .await?;
+    }
+
+    if tracks.is_empty() {
+        bail!("no supported streams found");
     }
 
     let mut upstream_session = upstream_session
@@ -260,7 +264,7 @@ async fn run() -> Result<(), Error> {
                     Some(Ok(CodecItem::VideoFrame(f))) => {
                         if let Some(t) = tracks.get(f.stream_id()).and_then(Option::as_ref) {
                             t.write_sample(&Sample {
-                                data: convert_h264(f)?.into(),
+                                data: convert_h2645(f)?.into(),
 
                                 // TODO: webrtc-rs appears to calculate the
                                 // timestamp from this frame's duration:
@@ -307,7 +311,7 @@ async fn run() -> Result<(), Error> {
 }
 
 /// Converts from AVC representation to the Annex B representation expected by webrtc-rs.
-fn convert_h264(frame: VideoFrame) -> Result<Vec<u8>, Error> {
+fn convert_h2645(frame: VideoFrame) -> Result<Vec<u8>, Error> {
     // TODO:
     // * For each IDR frame, copy the SPS and PPS from the stream's
     //   parameters, rather than depend on it being present in the frame

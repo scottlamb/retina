@@ -13,6 +13,6 @@ retina = { path = "../../" }
 tokio = { version = "1.5.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
 url = "2.2.1"
 anyhow = "1.0.41"
-itertools = "0.10.1"
+itertools = "0.14.0"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 clap = { version = "4.1.4", features = ["derive"] }

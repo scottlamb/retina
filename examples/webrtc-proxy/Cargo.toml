@@ -9,15 +9,15 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.41"
-base64 = "0.21.0"
+base64 = "0.22.0"
 clap = { version = "4.1.4", features = ["derive"] }
 futures = "0.3.14"
 log = "0.4.8"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 retina = { path = "../../" }
-rustyline = { version = "9.1.2", default-features = false }
+rustyline = { version = "17.0.1", default-features = false }
 serde = "1.0.139"
 serde_json = "1.0.82"
 tokio = { version = "1.5.0", features = ["macros", "rt-multi-thread", "signal"] }
 url = "2.2.1"
-webrtc = "0.9.0"
+webrtc = "0.14.0"
