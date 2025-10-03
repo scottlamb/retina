@@ -40,7 +40,7 @@ impl Depacketizer {
         // Let's do it in a straightforward way.
         assert!(payload_len < usize::from(u16::MAX));
         let bits = (payload_len) as u32 * 8;
-        match (bits % self.bits_per_sample) != 0 {
+        match bits.is_multiple_of(self.bits_per_sample) {
             true => None,
             false => NonZeroU32::new(bits / self.bits_per_sample),
         }

@@ -12,7 +12,7 @@ jobs:
       matrix:
         rust:
           - stable
-          - "1.85"
+          - "1.88"
         include:
           - rust: stable
             extra_components: clippy, rustfmt

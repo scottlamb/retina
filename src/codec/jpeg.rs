@@ -500,10 +500,10 @@ impl Depacketizer {
             });
 
             let metadata = self.metadata.take();
-            if let Some(metadata) = metadata {
-                if has_new_parameters {
-                    self.parameters = metadata.parameters;
-                }
+            if let Some(metadata) = metadata
+                && has_new_parameters
+            {
+                self.parameters = metadata.parameters;
             }
         }
 

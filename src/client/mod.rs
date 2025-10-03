@@ -1773,15 +1773,16 @@ impl Session<Described> {
                 "must SETUP before PLAY".into()
             ))
         })?;
-        if let Some(ref t) = inner.presentation.tool {
-            if (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0 && t.has_live555_tcp_bug() {
-                warn!(
-                    "Connecting via TCP to known-broken RTSP server {:?}. \
+        if let Some(ref t) = inner.presentation.tool
+            && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0
+            && t.has_live555_tcp_bug()
+        {
+            warn!(
+                "Connecting via TCP to known-broken RTSP server {:?}. \
                         See <https://github.com/scottlamb/retina/issues/17>. \
                         Consider using UDP instead!",
-                    t
-                );
-            }
+                t
+            );
         }
 
         trace!("PLAY with channel mappings: {:#?}", &conn.channels);
@@ -2074,17 +2075,17 @@ impl Session<Playing> {
             .as_ref()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         for s in &mut *inner.presentation.streams {
-            if matches!(s.state, StreamState::Playing { .. }) {
-                if let Err(ref description) = s.depacketizer {
-                    bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *conn.inner.ctx(),
-                        msg_ctx: *inner.describe_ctx,
-                        method: rtsp_types::Method::Describe,
-                        cseq: *inner.describe_cseq,
-                        status: *inner.describe_status,
-                        description: description.clone(),
-                    });
-                }
+            if matches!(s.state, StreamState::Playing { .. })
+                && let Err(ref description) = s.depacketizer
+            {
+                bail!(ErrorInt::RtspResponseError {
+                    conn_ctx: *conn.inner.ctx(),
+                    msg_ctx: *inner.describe_ctx,
+                    method: rtsp_types::Method::Describe,
+                    cseq: *inner.describe_cseq,
+                    status: *inner.describe_status,
+                    description: description.clone(),
+                });
             }
         }
         Ok(Demuxed {
@@ -2576,18 +2577,18 @@ impl futures::Stream for Session<Playing> {
             }
 
             // Next try receiving data on the UDP sockets, if any.
-            if self.0.flags & (SessionFlag::UdpStreams as u8) != 0 {
-                if let Poll::Ready(result) = self.as_mut().poll_udp(cx) {
-                    return Poll::Ready(result);
-                }
+            if self.0.flags & (SessionFlag::UdpStreams as u8) != 0
+                && let Poll::Ready(result) = self.as_mut().poll_udp(cx)
+            {
+                return Poll::Ready(result);
             }
 
             // Then check if it's time for a new keepalive.
             // Note: in production keepalive_timer is always Some. Tests may disable it.
-            if let Some(t) = self.0.keepalive_timer.as_mut() {
-                if matches!(t.as_mut().poll(cx), Poll::Ready(())) {
-                    self.as_mut().handle_keepalive_timer(cx)?;
-                }
+            if let Some(t) = self.0.keepalive_timer.as_mut()
+                && matches!(t.as_mut().poll(cx), Poll::Ready(()))
+            {
+                self.as_mut().handle_keepalive_timer(cx)?;
             }
 
             // Then finish flushing the current keepalive if necessary.

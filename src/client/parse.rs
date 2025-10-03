@@ -312,10 +312,10 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                     .transpose()?;
             }
             "framerate" => {
-                if let Some(s) = a.value.as_ref() {
-                    if let Ok(f) = s.parse::<f32>() {
-                        framerate = Some(f);
-                    }
+                if let Some(s) = a.value.as_ref()
+                    && let Ok(f) = s.parse::<f32>()
+                {
+                    framerate = Some(f);
                 }
             }
             _ => (),

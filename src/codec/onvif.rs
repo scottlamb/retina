@@ -56,15 +56,15 @@ impl Depacketizer {
     }
 
     pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
-        if pkt.loss() > 0 {
-            if let State::InProgress(in_progress) = &self.state {
-                log::debug!(
-                    "Discarding {}-byte message prefix due to loss of {} RTP packets",
-                    in_progress.data.len(),
-                    pkt.loss(),
-                );
-                self.state = State::Idle;
-            }
+        if pkt.loss() > 0
+            && let State::InProgress(in_progress) = &self.state
+        {
+            log::debug!(
+                "Discarding {}-byte message prefix due to loss of {} RTP packets",
+                in_progress.data.len(),
+                pkt.loss(),
+            );
+            self.state = State::Idle;
         }
         let mut in_progress = match std::mem::replace(&mut self.state, State::Idle) {
             State::InProgress(in_progress) => {

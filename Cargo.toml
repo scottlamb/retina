@@ -13,7 +13,7 @@ categories = ["network-programming", "multimedia"]
 description = "high-level RTSP multimedia streaming library"
 repository = "https://github.com/scottlamb/retina"
 include = ["src/**/*", "benches", "Cargo.toml"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [features]
 default = ["h265"]

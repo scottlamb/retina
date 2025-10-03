@@ -450,17 +450,17 @@ impl Depacketizer {
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
-        if pkt.loss() > 0 {
-            if let DepacketizerState::Fragmented(ref mut f) = self.state {
-                log::debug!(
-                    "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                    pkt.loss(),
-                );
-                self.state = DepacketizerState::Idle {
-                    prev_loss: f.loss, // note this packet's loss will be added in later.
-                    loss_since_mark: true,
-                };
-            }
+        if pkt.loss() > 0
+            && let DepacketizerState::Fragmented(ref mut f) = self.state
+        {
+            log::debug!(
+                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
+                pkt.loss(),
+            );
+            self.state = DepacketizerState::Idle {
+                prev_loss: f.loss, // note this packet's loss will be added in later.
+                loss_since_mark: true,
+            };
         }
 
         // Read the AU headers.
