@@ -1,3 +1,10 @@
+## `v0.4.15` (2025-10-10)
+
+*   fix parsing of the `Transport` when the `ssrc` parameter precedes other
+    parameters and of SDP when the `control` attribute precedes other attributes.
+    This improves compatibility with Luckfox's `rkip` server.
+    See [#120](https://github.com/scottlamb/retina/issues/120).
+
 ## `v0.4.14` (2025-10-03)
 
 *   fix H.265 ProfileTierLevel parsing when `sps_max_sub_layers_minus1 > 0`.

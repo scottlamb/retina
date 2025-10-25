@@ -459,7 +459,6 @@ pub(crate) fn parse_describe(
                 .as_deref()
                 .map(|c| join_control(&base_url, c))
                 .transpose()?;
-            break;
         } else if a.attribute == "tool" {
             tool = a.value.as_deref().map(super::Tool::new);
         }
@@ -505,6 +504,7 @@ pub(crate) struct SessionHeader {
     pub(crate) timeout_sec: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SetupResponse {
     pub(crate) session: SessionHeader,
     pub(crate) ssrc: Option<u32>,
@@ -577,7 +577,6 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
         if let Some(v) = part.strip_prefix("ssrc=") {
             let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
             ssrc = Some(v);
-            break;
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
@@ -735,7 +734,7 @@ mod tests {
     use crate::{client::StreamStateInit, codec::ParametersRef};
 
     use super::super::StreamState;
-    use super::SessionHeader;
+    use super::*;
     use crate::testutil::{init_logging, response};
 
     fn parse_describe(
@@ -1047,6 +1046,13 @@ mod tests {
             include_bytes!("testdata/reolink_describe.txt"),
         )
         .unwrap();
+        let p2 = parse_describe(
+            "rtsp://192.168.5.206:554/h264Preview_01_main",
+            include_bytes!("testdata/reolink_describe_control_first.txt"),
+        )
+        .unwrap();
+        assert_eq!(p.control, p2.control);
+        assert_eq!(p.tool, p2.tool);
         let base = "rtsp://192.168.5.206/h264Preview_01_main/";
         assert_eq!(p.control.as_str(), base);
         assert_eq!(
@@ -1509,5 +1515,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.streams.len(), 1);
+    }
+
+    #[test]
+    fn luckfox_setup_tcp() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/luckfox_rkipc_setup_tcp.txt"));
+        let r = parse_setup(&setup_response).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: "12345678".into(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: Some(0x22345684),
+                server_port: None,
+            }
+        );
+    }
+
+    #[test]
+    fn luckfox_setup_udp() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/luckfox_rkipc_setup_udp.txt"));
+        let r = parse_setup(&setup_response).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: "12345678".into(),
+                    timeout_sec: 60,
+                },
+                channel_id: None,
+                ssrc: Some(0x22345685),
+                server_port: Some(49152),
+            }
+        );
     }
 }

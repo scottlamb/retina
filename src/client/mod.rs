@@ -807,6 +807,7 @@ pub(crate) struct Presentation {
 }
 
 /// The server's version as declared in the `DESCRIBE` response's `a:tool` SDP attribute.
+#[derive(Eq, PartialEq)]
 pub struct Tool(Box<str>);
 
 impl Tool {
