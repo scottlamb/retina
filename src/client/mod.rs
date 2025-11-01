@@ -508,7 +508,7 @@ pub struct SessionOptions {
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub enum UnassignedChannelDataPolicy {
     /// Automatic (default).
     ///
@@ -519,6 +519,7 @@ pub enum UnassignedChannelDataPolicy {
     /// *   otherwise (prior to receiving the `DESCRIBE` response, if there was
     ///     no tool attribute, or if it does not match the known pattern),
     ///     use `Ignore`.
+    #[default]
     Auto,
 
     /// Assume the data is due to the live555 stale TCP session bug described
@@ -538,12 +539,6 @@ pub enum UnassignedChannelDataPolicy {
     /// `PLAY`, they will send data anyway, on this channel. In this mode, such
     /// data messages are ignored.
     Ignore,
-}
-
-impl Default for UnassignedChannelDataPolicy {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl std::fmt::Display for UnassignedChannelDataPolicy {
