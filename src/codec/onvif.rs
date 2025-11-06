@@ -10,6 +10,8 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 
+use crate::codec::DepacketizeError;
+
 use super::{CodecItem, MessageParameters};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -115,9 +117,9 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<CodecItem> {
+    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
         match std::mem::replace(&mut self.state, State::Idle) {
-            State::Ready(message) => Some(CodecItem::MessageFrame(message)),
+            State::Ready(message) => Some(Ok(CodecItem::MessageFrame(message))),
             s => {
                 self.state = s;
                 None

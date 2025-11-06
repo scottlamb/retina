@@ -28,6 +28,7 @@ const MIN_HEADER_LEN: u16 = 12;
 ///     model](https://github.com/scottlamb/retina/issues/6).
 /// *   directly exposes the sequence number as a `u16`, rather than having an
 ///     extra type that I find awkward to work with.
+#[derive(Eq, PartialEq)]
 pub(crate) struct RawPacket(
     /// Full packet data, including headers.
     ///
@@ -233,6 +234,7 @@ impl RawPacketBuilder {
 ///
 /// This holds more information than the packet itself: also a
 /// [`PacketContext`], the stream, and extended timestamp.
+#[derive(Eq, PartialEq)]
 pub struct ReceivedPacket {
     // Currently this is constructed from crate::client::rtp, so everything here
     // is pub(crate).

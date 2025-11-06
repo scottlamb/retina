@@ -4,21 +4,23 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
 //! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
-use std::convert::TryFrom;
 use std::fmt::Write;
+use std::{collections::VecDeque, convert::TryFrom};
 
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
+use crate::Error;
+use crate::codec::DepacketizeError;
 use crate::{
-    Error, Timestamp,
+    Timestamp,
     codec::h26x::TolerantBitReader,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::VideoFrame;
+use super::{CodecItem, VideoFrame};
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -61,8 +63,8 @@ use super::VideoFrame;
 pub(crate) struct Depacketizer {
     input_state: DepacketizerInputState,
 
-    /// A complete video frame ready for pull.
-    pending: Option<VideoFrame>,
+    /// Completed items ready to be pulled.
+    pending: VecDeque<Result<VideoFrame, DepacketizeError>>,
 
     parameters: Option<InternalParameters>,
 
@@ -222,12 +224,19 @@ impl Depacketizer {
         };
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
-            pending: None,
+            pending: VecDeque::with_capacity(1),
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
         })
+    }
+
+    pub(super) fn check_invariants(&self) {
+        if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
+            assert!(self.nals.is_empty());
+            assert!(self.pieces.is_empty());
+        }
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
@@ -237,8 +246,21 @@ impl Depacketizer {
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
+        let r = self.push_inner(pkt);
+
+        // Several error paths within `push_inner` just use the `?` operator to bail out with
+        // `input_state` at `New` when they encounter a problem mid-access unit. Restore
+        // the invariant so the caller can try to recover after error.
+        if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
+            self.nals.clear();
+            self.pieces.clear();
+        }
+        r
+    }
+
+    fn push_inner(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
         // Push shouldn't be called until pull is exhausted.
-        if let Some(p) = self.pending.as_ref() {
+        if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
 
@@ -276,30 +298,40 @@ impl Depacketizer {
                         AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
                         if access_unit.fu_a.is_some() {
-                            return Err(format!(
-                                "Timestamp changed from {} to {} in the middle of a fragmented NAL",
+                            // Something went wrong: perhaps the end of the last fragmentation unit was dropped
+                            // without loss being indicated. Return error, but also process the current packet.
+                            self.pending.push_back(Err(DepacketizeError {
+                                pkt_ctx: pkt.ctx,
+                                ssrc: pkt.ssrc(),
+                                sequence_number: pkt.sequence_number(),
+                                description: format!(
+                                "timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 access_unit.timestamp,
-                                pkt.timestamp()
-                            ));
-                        }
-                        match self.nals.last() {
-                            Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
-                                access_unit.end_ctx = *pkt.ctx();
-                                self.pending =
-                                    Some(self.finalize_access_unit(access_unit, "ts change")?);
-                                AccessUnit::start(&pkt, 0, false)
-                            }
-                            Some(n) => {
-                                log::debug!(
-                                    "Bogus mid-access unit timestamp change after {:?}",
-                                    n.hdr
-                                );
-                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
-                                access_unit
-                            }
-                            None => {
-                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
-                                access_unit
+                                pkt.timestamp()),
+                            }));
+                            self.pieces.clear();
+                            self.nals.clear();
+                            AccessUnit::start(&pkt, 0, false)
+                        } else {
+                            match self.nals.last() {
+                                Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+                                    access_unit.end_ctx = *pkt.ctx();
+                                    let f = self.finalize_access_unit(access_unit, "ts change")?;
+                                    self.pending.push_back(Ok(f));
+                                    AccessUnit::start(&pkt, 0, false)
+                                }
+                                Some(n) => {
+                                    log::debug!(
+                                        "Bogus mid-access unit timestamp change after {:?}",
+                                        n.hdr
+                                    );
+                                    access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                    access_unit
+                                }
+                                None => {
+                                    access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                    access_unit
+                                }
                             }
                         }
                     } else {
@@ -476,7 +508,8 @@ impl Depacketizer {
             match self.nals.last() {
                 Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
                     access_unit.end_ctx = ctx;
-                    self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
+                    let f = self.finalize_access_unit(access_unit, "mark")?;
+                    self.pending.push_back(Ok(f));
                     DepacketizerInputState::PostMark { timestamp, loss: 0 }
                 }
                 Some(n) => {
@@ -492,8 +525,10 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::VideoFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
+        self.pending
+            .pop_front()
+            .map(|r| r.map(CodecItem::VideoFrame))
     }
 
     /// Adds an unfragmented NAL which does not contain any Annex B separators.
@@ -1265,10 +1300,11 @@ mod tests {
 
     use bytes::Bytes;
 
+    use crate::codec::CodecItem;
+    use crate::rtp::ReceivedPacketBuilder;
     use crate::testutil::{assert_eq_hex, assert_eq_hexes, init_logging};
-    use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
 
-    use super::process_annex_b;
+    use super::*;
 
     /*
      * This test requires
@@ -1349,7 +1385,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // STAP-A packet.
@@ -1366,7 +1402,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU-A packet, start.
@@ -1383,7 +1419,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU-A packet, middle.
@@ -1400,7 +1436,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU-A packet, end.
@@ -1418,7 +1454,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(
@@ -1461,7 +1497,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU-A packet, middle.
@@ -1478,7 +1514,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU-A packet, end.
@@ -1496,7 +1532,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(
@@ -1538,7 +1574,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // PPS
@@ -1555,7 +1591,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // Slice layer without partitioning IDR.
@@ -1577,7 +1613,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(
@@ -1624,7 +1660,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x01slice");
@@ -1645,7 +1681,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // PPS, again with timestamp matching last frame.
@@ -1662,7 +1698,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // Slice layer without partitioning IDR. Now correct timestamp.
@@ -1680,7 +1716,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(
@@ -1707,7 +1743,8 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(ReceivedPacketBuilder { // new SPS.
+        d.push(
+            ReceivedPacketBuilder { // new SPS.
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
             timestamp,
@@ -1717,7 +1754,7 @@ mod tests {
             mark: false,
             payload_type: 0,
         }.build(*b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10").unwrap()).unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // same PPS again.
@@ -1734,7 +1771,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // dummy slice NAL to end the AU.
@@ -1756,7 +1793,7 @@ mod tests {
         // parameters are set to between push and pull.
 
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
 
@@ -1816,7 +1853,8 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(ReceivedPacketBuilder {
+        d.push(
+            ReceivedPacketBuilder {
             // SPS
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
@@ -1829,7 +1867,7 @@ mod tests {
         }.build(
             *b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20",
         ).unwrap()).unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // PPS
@@ -1846,7 +1884,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // IDR slice
@@ -1864,7 +1902,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert!(frame.has_new_parameters);
@@ -1885,7 +1923,8 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        d.push(ReceivedPacketBuilder {
+        d.push(
+            ReceivedPacketBuilder {
             // SPS
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
@@ -1898,7 +1937,7 @@ mod tests {
         }.build(
             *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x3d\xa1\x00\x00\x04\xf6\x00\x00\x63\x38\x04\x04",
         ).unwrap()).unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // PPS
@@ -1915,7 +1954,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // IDR slice
@@ -1933,7 +1972,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert!(frame.has_new_parameters);
@@ -1996,7 +2035,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(frame.data(), &PREFIXED_NALS);
@@ -2048,7 +2087,7 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-                assert!(d.pull().is_none());
+                assert_eq!(d.pull(), None);
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
                     middle_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
@@ -2072,7 +2111,7 @@ mod tests {
                         .unwrap(),
                     )
                     .unwrap();
-                    assert!(d.pull().is_none());
+                    assert_eq!(d.pull(), None);
                 }
                 let mut last_pkt =
                     Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len - middle_pkt_len + 2);
@@ -2096,7 +2135,7 @@ mod tests {
                 )
                 .unwrap();
                 println!("  pulling");
-                let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
                     panic!();
                 };
                 assert_eq_hex!(frame.data(), &PREFIXED_NALS);
@@ -2129,7 +2168,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
 
         d.push(
             ReceivedPacketBuilder {
@@ -2148,7 +2187,7 @@ mod tests {
         )
         .unwrap();
         // assert!(push_result.is_err());
-        let CodecItem::VideoFrame(frame) = d.pull().unwrap() else {
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(
@@ -2211,5 +2250,66 @@ mod tests {
             nals,
             [Bytes::from_static(&[1]), Bytes::from_static(&[2, 3, 4])]
         );
+    }
+
+    #[test]
+    fn skip_end_of_fragment() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp0 = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, start.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: timestamp0,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x86fu-a start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        let timestamp1 = crate::Timestamp {
+            timestamp: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // plain SEI packet.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: timestamp1,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x06plain")
+            .unwrap(),
+        )
+        .unwrap();
+        match d.pull() {
+            Some(Err(e)) => assert_eq!(
+                e.description,
+                "timestamp changed from 0 (mod-2^32: 0), npt 0.000 to 1 (mod-2^32: 1), npt 0.000 in the middle of a fragmented NAL"
+            ),
+            _ => panic!(),
+        }
+        let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
+            panic!()
+        };
+        assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x06plain");
+        assert_eq!(d.pull(), None);
     }
 }

@@ -1,3 +1,9 @@
+## unreleased
+
+*   fix resuming depacketization (via `Demuxed::poll_next`) after an error. Previously this could
+    panic due to error paths not maintaining the invariants.
+    See [#122](https://github.com/scottlamb/retina/122).
+
 ## `v0.4.15` (2025-10-10)
 
 *   fix parsing of the `Transport` when the `ssrc` parameter precedes other

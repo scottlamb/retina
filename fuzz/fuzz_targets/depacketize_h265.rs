@@ -11,8 +11,6 @@ fuzz_target!(|data: &[u8]| {
         "video", "h265", 90_000, None, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
-    let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     loop {
         let (hdr, rest) = match data.split_first() {
@@ -47,14 +45,19 @@ fuzz_target!(|data: &[u8]| {
         .build(payload.iter().copied())
         .unwrap();
         // println!("pkt: {:#?}", pkt);
-        if depacketizer.push(pkt).is_err() {
+        if let Err(_e) = depacketizer.push(pkt) {
+            // println!("error: {_e}");
+            depacketizer.check_invariants();
             return;
         }
-        while let Some(item) = depacketizer.pull(&conn_ctx, &stream_ctx).transpose() {
+        depacketizer.check_invariants();
+        while let Some(item) = depacketizer.pull() {
+            depacketizer.check_invariants();
             if item.is_err() {
                 return;
             }
         }
+        depacketizer.check_invariants();
         sequence_number = sequence_number.wrapping_add(1);
     }
 });

@@ -14,9 +14,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::Bytes;
 
-use crate::ConnectionContext;
 use crate::Error;
-use crate::StreamContext;
 use crate::error::ErrorInt;
 use crate::rtp::ReceivedPacket;
 
@@ -119,7 +117,7 @@ pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CodecItem {
     VideoFrame(VideoFrame),
@@ -451,6 +449,7 @@ impl AudioSampleEntryBuilder<'_> {
 }
 
 /// An audio frame, which consists of one or more samples.
+#[derive(Eq, PartialEq)]
 pub struct AudioFrame {
     ctx: crate::PacketContext,
     stream_id: usize,
@@ -515,6 +514,7 @@ impl std::fmt::Debug for AudioFrame {
 pub struct MessageParameters(onvif::CompressionType);
 
 /// A single message, for `application` media types.
+#[derive(Eq, PartialEq)]
 pub struct MessageFrame {
     ctx: crate::PacketContext,
     timestamp: crate::Timestamp,
@@ -574,6 +574,7 @@ impl MessageFrame {
 ///
 /// Durations aren't specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
+#[derive(Eq, PartialEq)]
 pub struct VideoFrame {
     // A pair of contexts: for the start and for the end.
     // Having both can be useful to measure the total time elapsed while receiving the frame.
@@ -701,6 +702,19 @@ enum DepacketizerInner {
     Jpeg(Box<jpeg::Depacketizer>),
 }
 
+/// This is similar to `ErrorInt::RtpPacketError`, but without the connection/stream context, to avoid
+/// needing to plumb them through the depacketize stack. `Demuxed` will wrap.
+///
+/// This interface unstable and for internal use; it's exposed for direct fuzzing and benchmarking.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct DepacketizeError {
+    pub(crate) pkt_ctx: crate::PacketContext,
+    pub(crate) ssrc: u32,
+    pub(crate) sequence_number: u16,
+    pub(crate) description: String,
+}
+
 impl Depacketizer {
     pub fn new(
         media: &str,
@@ -780,6 +794,19 @@ impl Depacketizer {
         }))
     }
 
+    pub fn check_invariants(&self) {
+        match &self.0 {
+            DepacketizerInner::Aac(_) => {}
+            DepacketizerInner::G723(_) => {}
+            DepacketizerInner::H264(d) => d.check_invariants(),
+            #[cfg(feature = "h265")]
+            DepacketizerInner::H265(d) => d.check_invariants(),
+            DepacketizerInner::Onvif(_) => {}
+            DepacketizerInner::SimpleAudio(_) => {}
+            DepacketizerInner::Jpeg(_) => {}
+        }
+    }
+
     /// Returns the current codec parameters, if known.
     ///
     /// See documentation at [`crate::client::Stream::parameters`].
@@ -803,7 +830,7 @@ impl Depacketizer {
     /// Supplies a new packet to the depacketizer.
     ///
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
-    /// calls to `push`, the caller must call `pull` until `pull` returns `Ok(None)`. The later
+    /// calls to `push`, the caller must call `pull` until `pull` returns `None`. The later
     /// `push` call may panic or drop data if this expectation is violated.
     pub fn push(&mut self, input: ReceivedPacket) -> Result<(), String> {
         match &mut self.0 {
@@ -821,21 +848,17 @@ impl Depacketizer {
     /// Retrieves a completed frame from the depacketizer.
     ///
     /// Some packetization formats support aggregating multiple frames into one packet, so a single
-    /// `push` call may cause `pull` to return `Ok(Some(...))` more than once.
-    pub fn pull(
-        &mut self,
-        conn_ctx: &ConnectionContext,
-        stream_ctx: &StreamContext,
-    ) -> Result<Option<CodecItem>, Error> {
+    /// `push` call may cause `pull` to return `Some(...))` more than once.
+    pub fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
         match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.pull(conn_ctx, stream_ctx),
-            DepacketizerInner::G723(d) => Ok(d.pull()),
-            DepacketizerInner::H264(d) => Ok(d.pull()),
+            DepacketizerInner::Aac(d) => d.pull(),
+            DepacketizerInner::G723(d) => d.pull(),
+            DepacketizerInner::H264(d) => d.pull(),
             #[cfg(feature = "h265")]
-            DepacketizerInner::H265(d) => Ok(d.pull()),
-            DepacketizerInner::Onvif(d) => Ok(d.pull()),
-            DepacketizerInner::SimpleAudio(d) => Ok(d.pull()),
-            DepacketizerInner::Jpeg(d) => Ok(d.pull()),
+            DepacketizerInner::H265(d) => d.pull(),
+            DepacketizerInner::Onvif(d) => d.pull(),
+            DepacketizerInner::SimpleAudio(d) => d.pull(),
+            DepacketizerInner::Jpeg(d) => d.pull(),
         }
     }
 }

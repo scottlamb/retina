@@ -15,8 +15,6 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 3 {
         return;
     }
-    let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContext::dummy();
     let max_payload_size = u16::from_be_bytes([data[0], data[1]]);
     let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0, 0, 0) {
         Ok(p) => p,
@@ -52,14 +50,14 @@ fuzz_target!(|data: &[u8]| {
                 if d.push(pkt).is_err() {
                     return;
                 }
-                match d.pull(&conn_ctx, &stream_ctx) {
-                    Err(_) => return,
-                    Ok(Some(retina::codec::CodecItem::VideoFrame(f))) => {
+                match d.pull() {
+                    Some(Err(_)) => return,
+                    Some(Ok(retina::codec::CodecItem::VideoFrame(f))) => {
                         assert!(mark);
                         break f;
                     }
-                    Ok(Some(_)) => panic!(),
-                    Ok(None) => {
+                    Some(Ok(_)) => panic!(),
+                    None => {
                         // XXX: assert!(!mark)
                         //
                         // One would expect that a frame would be produced if the packet has mark
@@ -78,6 +76,6 @@ fuzz_target!(|data: &[u8]| {
         }
     };
     assert_eq!(&data[2..], frame.data());
-    assert!(matches!(d.pull(&conn_ctx, &stream_ctx), Ok(None)));
-    assert!(matches!(p.pull(), Ok(None)));
+    assert_eq!(d.pull(), None);
+    assert_eq!(p.pull(), Ok(None));
 });

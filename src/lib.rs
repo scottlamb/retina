@@ -222,7 +222,7 @@ impl std::fmt::Debug for NtpTimestamp {
 /// A wall time taken from the local machine's realtime clock, used in error reporting.
 ///
 /// Currently this just allows formatting via `Debug` and `Display`.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WallTime(jiff::Timestamp);
 
 impl WallTime {
@@ -275,7 +275,7 @@ impl Display for ConnectionContext {
 ///
 /// When paired with a [`ConnectionContext`], this should allow picking the
 /// message out of a packet capture.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RtspMessageContext {
     /// The starting byte position within the input stream. The bottom 32 bits
     /// can be compared to the relative TCP sequence number.
@@ -391,7 +391,7 @@ impl Display for UdpStreamContext {
 /// Should be paired with an [`ConnectionContext`] of the RTSP connection that started
 /// the session. In the interleaved data case, it's assumed the packet was received over
 /// that same connection.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PacketContext(PacketContextInner);
 
 impl PacketContext {
@@ -401,7 +401,7 @@ impl PacketContext {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PacketContextInner {
     Tcp { msg_ctx: RtspMessageContext },
     Udp { received_wall: WallTime },

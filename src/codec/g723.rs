@@ -5,6 +5,8 @@
 
 use std::num::NonZeroU32;
 
+use crate::codec::DepacketizeError;
+
 use super::AudioParameters;
 
 const FIXED_CLOCK_RATE: u32 = 8_000;
@@ -70,7 +72,9 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::AudioFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
+        self.pending
+            .take()
+            .map(|f| Ok(super::CodecItem::AudioFrame(f)))
     }
 }
