@@ -1,3 +1,10 @@
+## `v0.4.16` (unreleased)
+
+*   fix inverted logic in simple audio `frame_length()` that caused valid G.711
+    (PCMA/PCMU) audio streams to be rejected with "invalid length" errors.
+    Reported by [C-Format](https://github.com/C-Format) in
+    [#126](https://github.com/scottlamb/retina/issues/126).
+
 ## `v0.4.15` (2025-10-10)
 
 *   fix parsing of the `Transport` when the `ssrc` parameter precedes other

@@ -41,8 +41,8 @@ impl Depacketizer {
         assert!(payload_len < usize::from(u16::MAX));
         let bits = (payload_len) as u32 * 8;
         match bits.is_multiple_of(self.bits_per_sample) {
-            true => None,
-            false => NonZeroU32::new(bits / self.bits_per_sample),
+            false => None,
+            true => NonZeroU32::new(bits / self.bits_per_sample),
         }
     }
 
@@ -69,5 +69,47 @@ impl Depacketizer {
 
     pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
         self.pending.take().map(CodecItem::AudioFrame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depacketizer_8bit() -> Depacketizer {
+        Depacketizer::new(8000, 8)
+    }
+
+    fn depacketizer_16bit() -> Depacketizer {
+        Depacketizer::new(16000, 16)
+    }
+
+    #[test]
+    fn frame_length_valid_8bit() {
+        // 384 bytes of 8-bit samples = 384 samples (G.711 PCMA/PCMU)
+        let d = depacketizer_8bit();
+        assert_eq!(d.frame_length(384), Some(NonZeroU32::new(384).unwrap()));
+    }
+
+    #[test]
+    fn frame_length_invalid_8bit() {
+        // Not applicable for 8-bit: any byte count is divisible by 8 bits.
+        // But 0 bytes should return None (NonZeroU32::new(0) is None).
+        let d = depacketizer_8bit();
+        assert_eq!(d.frame_length(0), None);
+    }
+
+    #[test]
+    fn frame_length_valid_16bit() {
+        // 320 bytes = 160 16-bit samples
+        let d = depacketizer_16bit();
+        assert_eq!(d.frame_length(320), Some(NonZeroU32::new(160).unwrap()));
+    }
+
+    #[test]
+    fn frame_length_invalid_16bit() {
+        // 321 bytes is not divisible by 2 bytes per sample
+        let d = depacketizer_16bit();
+        assert_eq!(d.frame_length(321), None);
     }
 }
