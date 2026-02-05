@@ -9,6 +9,7 @@ pub mod nal;
 
 mod record;
 
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt::Write;
 
@@ -17,6 +18,7 @@ use bytes::{Buf, Bytes};
 use log::{debug, log_enabled, trace};
 
 use crate::codec::h26x::TolerantBitReader;
+use crate::codec::{CodecItem, DepacketizeError};
 use crate::rtp::ReceivedPacket;
 
 use super::VideoFrame;
@@ -38,8 +40,8 @@ use super::VideoFrame;
 pub(crate) struct Depacketizer {
     input_state: DepacketizerInputState,
 
-    /// A complete video frame ready for pull.
-    pending: Option<VideoFrame>,
+    /// Complete frame ready to pull.
+    pending: VecDeque<Result<VideoFrame, DepacketizeError>>,
 
     parameters: Option<InternalParameters>,
 
@@ -142,12 +144,19 @@ impl Depacketizer {
         };
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
-            pending: None,
+            pending: VecDeque::with_capacity(1),
             pieces: Vec::new(),
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_nal_hdr: false,
         })
+    }
+
+    pub(super) fn check_invariants(&self) {
+        if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
+            assert!(self.nals.is_empty());
+            assert!(self.pieces.is_empty());
+        }
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
@@ -157,11 +166,25 @@ impl Depacketizer {
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
+        let r = self.push_inner(pkt);
+
+        // Several error paths within `push_inner` just use the `?` operator to bail out with
+        // `input_state` at `New` when they encounter a problem mid-access unit. Restore
+        // the invariant so the caller can try to recover after error.
+        if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
+            self.nals.clear();
+            self.pieces.clear();
+        }
+        r
+    }
+
+    fn push_inner(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
         // Push shouldn't be called until pull is exhausted.
-        if let Some(p) = self.pending.as_ref() {
+        if let Some(ref p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
 
+        let mut r = Ok(());
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -196,29 +219,35 @@ impl Depacketizer {
                         AccessUnit::start(&pkt, 0, false)
                     } else if access_unit.timestamp.timestamp != pkt.timestamp().timestamp {
                         if access_unit.in_fu {
-                            return Err(format!(
-                                "Timestamp changed from {} to {} in the middle of a fragmented NAL",
+                            // Something went wrong: perhaps the end of the last fragmentation unit was dropped
+                            // without loss being indicated. Return error, but also process the current packet.
+                            r = Err(format!(
+                                "timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 access_unit.timestamp,
                                 pkt.timestamp()
                             ));
-                        }
-                        let last_nal_hdr = self
-                            .nals
-                            .last()
-                            .ok_or("nals should not be empty".to_string())?
-                            .hdr;
-                        if can_end_au(last_nal_hdr.unit_type()) {
-                            access_unit.end_ctx = *pkt.ctx();
-                            self.pending =
-                                Some(self.finalize_access_unit(access_unit, "ts change")?);
+                            self.pieces.clear();
+                            self.nals.clear();
                             AccessUnit::start(&pkt, 0, false)
                         } else {
-                            log::debug!(
-                                "Bogus mid-access unit timestamp change after {:?}",
-                                last_nal_hdr
-                            );
-                            access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
-                            access_unit
+                            let last_nal_hdr = self
+                                .nals
+                                .last()
+                                .ok_or("nals should not be empty".to_string())?
+                                .hdr;
+                            if can_end_au(last_nal_hdr.unit_type()) {
+                                access_unit.end_ctx = *pkt.ctx();
+                                let frame = self.finalize_access_unit(access_unit, "ts change")?;
+                                self.pending.push_back(Ok(frame));
+                                AccessUnit::start(&pkt, 0, false)
+                            } else {
+                                log::debug!(
+                                    "Bogus mid-access unit timestamp change after {:?}",
+                                    last_nal_hdr
+                                );
+                                access_unit.timestamp.timestamp = pkt.timestamp().timestamp;
+                                access_unit
+                            }
                         }
                     } else {
                         access_unit
@@ -394,7 +423,8 @@ impl Depacketizer {
                 .hdr;
             if can_end_au(last_nal_hdr.unit_type()) {
                 access_unit.end_ctx = ctx;
-                self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
+                let frame = self.finalize_access_unit(access_unit, "mark")?;
+                self.pending.push_back(Ok(frame));
                 DepacketizerInputState::PostMark { timestamp, loss: 0 }
             } else {
                 log::debug!(
@@ -407,11 +437,13 @@ impl Depacketizer {
         } else {
             DepacketizerInputState::PreMark(access_unit)
         };
-        Ok(())
+        r
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::VideoFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
+        self.pending
+            .pop_front()
+            .map(|r| r.map(CodecItem::VideoFrame))
     }
 
     /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
@@ -882,7 +914,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // aggregation packet.
@@ -900,7 +932,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU packet, start.
@@ -917,7 +949,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU packet, middle.
@@ -934,7 +966,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU packet, end.
@@ -952,7 +984,7 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(
@@ -990,7 +1022,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d.pull().is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // FU packet, end.
@@ -1008,11 +1040,70 @@ mod tests {
         )
         .unwrap();
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
         assert!(d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    #[test]
+    fn skip_end_of_fragment() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp0 = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, start.
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: timestamp0,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x94fu start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        let timestamp1 = crate::Timestamp {
+            timestamp: 1,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let e = d
+            .push(
+                ReceivedPacketBuilder {
+                    // plain PREFIX_SEI packet.
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp: timestamp1,
+                    ssrc: 0,
+                    sequence_number: 0,
+                    loss: 0,
+                    mark: true,
+                    payload_type: 0,
+                }
+                .build(*b"\x4e\x01plain")
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "timestamp changed from 0 (mod-2^32: 0), npt 0.000 to 1 (mod-2^32: 1), npt 0.000 in the middle of a fragmented NAL"
+        );
+        let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
+            panic!()
+        };
+        assert_eq!(f.data, *b"\x00\x00\x00\x07\x4e\x01plain");
+        assert_eq!(d.pull(), None);
     }
 
     #[test]

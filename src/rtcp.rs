@@ -20,6 +20,7 @@ use crate::PacketContext;
 /// *   All packets are RTCP version 2.
 /// *   Non-final packets have no padding.
 /// *   The packets' lengths add up to the compound packet's length.
+#[derive(Eq, PartialEq)]
 pub struct ReceivedCompoundPacket {
     pub(crate) ctx: PacketContext,
     pub(crate) stream_id: usize,

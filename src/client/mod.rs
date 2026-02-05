@@ -2691,18 +2691,28 @@ impl futures::Stream for Demuxed {
                 // can't let our callers observe that state.
             }
 
-            match depacketizer.pull(conn_ctx, stream_ctx) {
-                Ok(Some(item)) => {
+            match depacketizer.pull() {
+                Some(Ok(item)) => {
                     self.state = DemuxedState::Pulling(stream_id);
                     return Poll::Ready(Some(Ok(item)));
                 }
-                Ok(None) => {
+                None => {
                     self.state = DemuxedState::Waiting;
                     continue;
                 }
-                Err(e) => {
+                Some(Err(e)) => {
+                    let conn_ctx = *conn_ctx;
+                    let stream_ctx = *stream_ctx;
                     self.state = DemuxedState::Fused;
-                    return Poll::Ready(Some(Err(e)));
+                    return Poll::Ready(Some(Err(Error(Arc::new(ErrorInt::RtpPacketError {
+                        conn_ctx,
+                        stream_ctx,
+                        pkt_ctx: e.pkt_ctx,
+                        stream_id,
+                        ssrc: e.ssrc,
+                        sequence_number: e.sequence_number,
+                        description: e.description,
+                    })))));
                 }
             }
         }

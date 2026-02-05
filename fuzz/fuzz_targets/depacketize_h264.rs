@@ -11,8 +11,6 @@ fuzz_target!(|data: &[u8]| {
         "video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
-    let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     loop {
         let (hdr, rest) = match data.split_first() {
@@ -46,15 +44,21 @@ fuzz_target!(|data: &[u8]| {
         }
         .build(payload.iter().copied())
         .unwrap();
-        //println!("pkt: {:#?}", pkt);
-        if depacketizer.push(pkt).is_err() {
+        // println!("pkt: {pkt:#?}");
+        if let Err(_e) = depacketizer.push(pkt) {
+            // println!("e: {_e:?}");
+            depacketizer.check_invariants();
             return;
         }
-        while let Some(item) = depacketizer.pull(&conn_ctx, &stream_ctx).transpose() {
-            if item.is_err() {
+        depacketizer.check_invariants();
+        while let Some(item) = depacketizer.pull() {
+            depacketizer.check_invariants();
+            if let Err(_e) = item {
+                // println!("e: {_e:?}");
                 return;
             }
         }
+        depacketizer.check_invariants();
         sequence_number = sequence_number.wrapping_add(1);
     }
 });

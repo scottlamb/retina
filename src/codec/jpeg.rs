@@ -515,8 +515,10 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::VideoFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+        self.pending
+            .take()
+            .map(|f| Ok(super::CodecItem::VideoFrame(f)))
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
@@ -871,7 +873,7 @@ mod tests {
         .unwrap();
 
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)

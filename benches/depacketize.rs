@@ -70,11 +70,8 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();
-        while let Some(pkt) = depacketizers[stream_id]
-            .pull(&conn_ctx, &stream_ctx)
-            .unwrap()
-        {
-            f(pkt);
+        while let Some(pkt) = depacketizers[stream_id].pull() {
+            f(pkt.unwrap());
         }
     }
 }

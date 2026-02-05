@@ -4,6 +4,9 @@
     (PCMA/PCMU) audio streams to be rejected with "invalid length" errors.
     Reported by [C-Format](https://github.com/C-Format) in
     [#126](https://github.com/scottlamb/retina/issues/126).
+*   fix resuming depacketization (via `Demuxed::poll_next`) after an error. Previously this could
+    panic due to error paths not maintaining the invariants.
+    See [#122](https://github.com/scottlamb/retina/122).
 
 ## `v0.4.15` (2025-10-10)
 

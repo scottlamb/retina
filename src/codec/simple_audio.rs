@@ -67,8 +67,8 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(CodecItem::AudioFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+        self.pending.take().map(|f| Ok(CodecItem::AudioFrame(f)))
     }
 }
 
