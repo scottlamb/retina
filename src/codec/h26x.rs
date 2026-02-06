@@ -8,9 +8,9 @@
 /// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most
 /// other RTSP implementations in tolerating this.
 #[derive(Debug)]
-pub(super) struct TolerantBitReader<'a, R> {
-    pub(super) inner: R,
-    pub(super) has_extra_trailing_data: &'a mut bool,
+pub(crate) struct TolerantBitReader<'a, R> {
+    pub(crate) inner: R,
+    pub(crate) has_extra_trailing_data: &'a mut bool,
 }
 
 impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'_, R> {

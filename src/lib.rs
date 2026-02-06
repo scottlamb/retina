@@ -21,6 +21,7 @@ use std::ops::Range;
 
 mod error;
 
+pub mod dts_extractor;
 mod hex;
 pub mod rtcp;
 pub mod rtp;
