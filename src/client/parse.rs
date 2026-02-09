@@ -575,6 +575,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
     let mut server_port = None;
     for part in transport.as_str().split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
+            let v = v.trim();
             let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
             ssrc = Some(v);
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
@@ -683,6 +684,7 @@ pub(crate) fn parse_play(
                     Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
                 },
                 "ssrc" => {
+                    let value = value.trim();
                     let ssrc = u32::from_str_radix(value, 16)
                         .map_err(|_| format!("Unparseable ssrc {value}"))?;
                     state.ssrc = Some(ssrc);
@@ -1515,6 +1517,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.streams.len(), 1);
+    }
+
+    /// Some Hikvision cameras send SSRC with a leading space in the
+    /// Transport header (e.g. `ssrc= d6d6627`). Ensure we trim whitespace
+    /// before parsing.
+    #[test]
+    fn hikvision_ssrc_with_leading_space() {
+        init_logging();
+        let setup_response =
+            response(include_bytes!("testdata/hikvision_setup_ssrc_space.txt"));
+        let r = parse_setup(&setup_response).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: "708886412".into(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: Some(0x0d6d6627),
+                server_port: None,
+            }
+        );
     }
 
     #[test]
