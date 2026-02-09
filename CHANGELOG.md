@@ -1,5 +1,10 @@
 ## unreleased
 
+*   trim whitespace in SSRC values from `Transport` and `RTP-Info` headers,
+    improving compatibility with some Hikvision cameras (e.g. iDS-2CD9396-BIS
+    and DS-2CD3641G2-IZS). Thanks to
+    [@myermukhanov](https://github.com/myermukhanov) in
+    [#128](https://github.com/scottlamb/retina/pull/128).
 *   ignore trailing semicolons in `RTP-Info` header parsing, improving compatibility
     with Laureii cameras. Reported by [@ZXY595](https://github.com/ZXY595) in
     [#117](https://github.com/scottlamb/retina/issues/117).
