@@ -7,6 +7,9 @@
 *   fix resuming depacketization (via `Demuxed::poll_next`) after an error. Previously this could
     panic due to error paths not maintaining the invariants.
     See [#122](https://github.com/scottlamb/retina/122).
+*   support `pps_scaling_list_data_present`, needed by some Reolink H.265 cameras.
+    See [#112](https://github.com/scottlamb/retina/issues/112) and
+    [#116](https://github.com/scottlamb/retina/issues/116).
 
 ## `v0.4.15` (2025-10-10)
 
