@@ -66,7 +66,7 @@ Try the `mp4` example. It streams from an RTSP server to a `.mp4` file until
 you hit ctrl-C.
 
 ```shell
-$ cargo run --package client mp4 --url rtsp://ip.address.goes.here/ --username admin --password test out.mp4
+$ cargo run --package client mp4 -- --url rtsp://ip.address.goes.here/ --username admin --password test out.mp4
 ...
 ^C
 ```
