@@ -285,7 +285,7 @@ impl Depacketizer {
         let hdr = take_hdr(&mut data)?;
 
         match u8::from(hdr.unit_type()) {
-            1..=47 => {
+            0..=47 => {
                 // Single NAL Unit. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.1
                 if access_unit.in_fu {
                     return Err(format!(

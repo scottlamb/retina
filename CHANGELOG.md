@@ -1,4 +1,11 @@
-## `v0.4.16` (unreleased)
+## unreleased
+
+*   H.265: fix bug in which `TrailN`s (unit type 0) were rejected as a single NAL.
+    This was noticeable with an Intel N100 encoder + ffmpeg + MediaMTX.
+    As reported by [@anti-social](https://github.com/anti-social) in
+    [#123](https://github.com/scottlamb/retina/issues/123).
+
+## `v0.4.16`
 
 *   fix inverted logic in simple audio `frame_length()` that caused valid G.711
     (PCMA/PCMU) audio streams to be rejected with "invalid length" errors.
