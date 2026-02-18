@@ -541,7 +541,13 @@ impl Depacketizer {
                 }
                 _ => {}
             }
-            retained_len += 4usize + crate::to_usize(nal.len);
+            // Parameter NALs are conveyed via has_new_parameters/Stream::parameters, not inline.
+            if !matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            ) {
+                retained_len += 4usize + crate::to_usize(nal.len);
+            }
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
@@ -550,15 +556,20 @@ impl Depacketizer {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
 
-            data.extend_from_slice(&nal.len.to_be_bytes());
-            data.extend_from_slice(&nal.hdr[..]);
+            if !matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            ) {
+                data.extend_from_slice(&nal.len.to_be_bytes());
+                data.extend_from_slice(&nal.hdr[..]);
 
-            let mut actual_len = 2;
-            for piece in nal_pieces {
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+                let mut actual_len = 2;
+                for piece in nal_pieces {
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());

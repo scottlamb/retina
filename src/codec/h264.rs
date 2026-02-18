@@ -709,7 +709,13 @@ impl Depacketizer {
                 is_disposable = false;
             }
             // TODO: support optionally filtering non-VUI NALs.
-            retained_len += 4usize + crate::to_usize(nal.len);
+            // Parameter NALs are conveyed via has_new_parameters/Stream::parameters, not inline.
+            if !matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            ) {
+                retained_len += 4usize + crate::to_usize(nal.len);
+            }
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
@@ -717,15 +723,20 @@ impl Depacketizer {
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            data.extend_from_slice(&nal.len.to_be_bytes()[..]);
-            data.push(nal.hdr.into());
-            let mut actual_len = 1;
-            for piece in nal_pieces {
-                debug_assert!(!piece.is_empty());
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+            if !matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            ) {
+                data.extend_from_slice(&nal.len.to_be_bytes()[..]);
+                data.push(nal.hdr.into());
+                let mut actual_len = 1;
+                for piece in nal_pieces {
+                    debug_assert!(!piece.is_empty());
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -1616,12 +1627,7 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq_hex!(
-            frame.data(),
-            b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
-              \x00\x00\x00\x04\x68\xee\x3c\xb0\
-              \x00\x00\x00\x06\x65slice"
-        );
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x65slice");
         assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
     }
 
@@ -1719,12 +1725,7 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
-        assert_eq_hex!(
-            frame.data(),
-            b"\x00\x00\x00\x0C\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50\
-              \x00\x00\x00\x04\x68\xee\x3c\xb0\
-              \x00\x00\x00\x06\x65slice"
-        );
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x65slice");
         assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
     }
 
@@ -1991,15 +1992,9 @@ mod tests {
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e', 0x00,
     ];
 
+    // Expected frame data after stripping inline SPS/PPS: only the IDR slice.
     #[rustfmt::skip]
-    static PREFIXED_NALS: [u8; 48] = [
-        // SPS
-        0x00, 0x00, 0x00, 0x14,
-        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1,
-        0x00, 0x00, 0x04, 0xf6, 0x00, 0x00, 0x63, 0x38, 0x04,
-        // PPS
-        0x00, 0x00, 0x00, 0x04,
-        0x68, 0xee, 0x3c, 0xb0,
+    static PREFIXED_NALS: [u8; 16] = [
         // IDR slice
         0x00, 0x00, 0x00, 0x0c,
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',

@@ -1,3 +1,11 @@
+## unreleased
+
+*   video parameters (H.264 SPS/PPS and H.265 SPS/PPS/VPS) are now removed from
+    `VideoFrame::data` if present. This makes the representation consistent
+    across cameras: `VideoFrame::has_new_parameters` signals a parameter change,
+    and the latest parameters are in `Stream::parameters` only. It also matches
+    the advertised H.265 RFC 6381 format of `hvc1.*` (out-of-line parameters only).
+
 ## `v0.4.17` (2026-02-17)
 
 *   trim whitespace in SSRC values from `Transport` and `RTP-Info` headers,
