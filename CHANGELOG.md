@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.17` (2026-02-17)
 
 *   trim whitespace in SSRC values from `Transport` and `RTP-Info` headers,
     improving compatibility with some Hikvision cameras (e.g. iDS-2CD9396-BIS
@@ -16,7 +16,7 @@
     cameras, as reported by [@nemosupremo](https://github.com/nemosupremo) in
     [#115](https://github.com/scottlamb/retina/issues/115).
 
-## `v0.4.16`
+## `v0.4.16` (2026-02-08)
 
 *   fix inverted logic in simple audio `frame_length()` that caused valid G.711
     (PCMA/PCMU) audio streams to be rejected with "invalid length" errors.
