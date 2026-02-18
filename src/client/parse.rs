@@ -669,6 +669,9 @@ pub(crate) fn parse_play(
             super::StreamState::Playing { .. } => unreachable!(),
         };
         for part in parts {
+            if part.is_empty() {
+                continue;
+            }
             let (key, value) = part
                 .split_once('=')
                 .ok_or_else(|| "RTP-Info param has no =".to_string())?;
@@ -1515,6 +1518,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.streams.len(), 1);
+    }
+
+    /// Tests that a trailing semicolon in the `RTP-Info` header is ignored.
+    /// Reproduces <https://github.com/scottlamb/retina/issues/117>.
+    ///
+    /// The Laureii camera sends, e.g.:
+    /// `RTP-Info: url=rtsp://192.168.1.19:554/0/main/trackID=0;seq=0;rtptime=0;`
+    #[test]
+    fn rtp_info_trailing_semicolon() {
+        init_logging();
+        let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
+        let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
+        p.streams[0].state = dummy_stream_state_init(None);
+        super::parse_play(
+            &response(include_bytes!("testdata/laureii_play.txt")),
+            &mut p,
+        )
+        .unwrap();
+        match &p.streams[0].state {
+            StreamState::Init(s) => {
+                assert_eq!(s.initial_seq, Some(0));
+                assert_eq!(s.initial_rtptime, Some(0));
+            }
+            _ => panic!(),
+        };
     }
 
     #[test]

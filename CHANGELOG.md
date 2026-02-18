@@ -1,5 +1,8 @@
 ## unreleased
 
+*   ignore trailing semicolons in `RTP-Info` header parsing, improving compatibility
+    with Laureii cameras. Reported by [@ZXY595](https://github.com/ZXY595) in
+    [#117](https://github.com/scottlamb/retina/issues/117).
 *   H.265: fix bug in which `TrailN`s (unit type 0) were rejected as a single NAL.
     This was noticeable with an Intel N100 encoder + ffmpeg + MediaMTX.
     As reported by [@anti-social](https://github.com/anti-social) in
