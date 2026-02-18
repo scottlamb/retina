@@ -343,10 +343,10 @@ impl Depacketizer {
             }
             49 => {
                 // Fragmentation Unit. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.3
-                if data.len() < 2 {
+                // Empty fragments are silly but allowed.
+                let Ok(fu_header) = data.try_get_u8() else {
                     return Err(format!("FU len {} too short", data.len()));
-                }
-                let fu_header = data.get_u8();
+                };
                 let start = (fu_header & 0b10000000) != 0;
                 let end = (fu_header & 0b01000000) != 0;
                 let fu_type = nal::UnitType::try_from(fu_header & 0b00111111)
@@ -1045,6 +1045,74 @@ mod tests {
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
         assert!(d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    /// Tests that empty FU fragments (no payload bytes after the FU header) are
+    /// accepted and ignored, as some cameras send them.
+    #[test]
+    fn empty_fragment() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, start (with data).
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x94start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, middle (empty payload after FU header).
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x14")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet, end (with data).
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\x54end")
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            _ => panic!(),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0c\x28\x01start, end");
     }
 
     #[test]

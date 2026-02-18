@@ -426,8 +426,8 @@ impl Depacketizer {
             }
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
-                if data.len() < 3 {
-                    // NAL + FU-A headers take 2 byte; need at least 3 bytes to make progress.
+                if data.len() < 2 {
+                    // NAL + FU-A headers take 2 bytes. Empty fragments are silly but allowed.
                     return Err(format!("FU-A len {} too short", data.len()));
                 }
                 let fu_header = data[1];
@@ -2195,6 +2195,74 @@ mod tests {
             &b"\x00\x00\x00\x24\x21start of non-idra wild sps appeared"
         );
         assert!(d.seen_inconsistent_fu_a_nal_hdr);
+    }
+
+    /// Tests that empty FU-A fragments (no payload bytes after the 2-byte header) are
+    /// accepted and ignored, as some cameras send them.
+    #[test]
+    fn empty_fragment() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, start (with data).
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x86start, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle (empty payload after header).
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x06")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end (with data).
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x46end")
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            _ => panic!(),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x66start, end");
     }
 
     /// Tests the `process_annex_b` function in isolation.

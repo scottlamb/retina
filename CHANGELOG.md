@@ -4,6 +4,9 @@
     This was noticeable with an Intel N100 encoder + ffmpeg + MediaMTX.
     As reported by [@anti-social](https://github.com/anti-social) in
     [#123](https://github.com/scottlamb/retina/issues/123).
+*   H.264 and H.265: allow empty fragments, which are useless but sent by some
+    cameras, as reported by [@nemosupremo](https://github.com/nemosupremo) in
+    [#115](https://github.com/scottlamb/retina/issues/115).
 
 ## `v0.4.16`
 
