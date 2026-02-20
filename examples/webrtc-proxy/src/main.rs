@@ -1,11 +1,11 @@
 // Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{Error, anyhow, bail};
+use anyhow::{Error, bail};
 use base64::{Engine as _, engine::general_purpose};
 use clap::Parser;
 use futures::StreamExt;
-use log::{error, info};
+use log::{error, info, warn};
 use retina::{
     client::SetupOptions,
     codec::{CodecItem, VideoFrame},
@@ -91,6 +91,12 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
     let line = line.trim();
     let raw = general_purpose::STANDARD.decode(line)?;
     Ok(serde_json::from_slice(&raw)?)
+}
+
+#[derive(Clone)]
+struct Frame {
+    stream_id: usize,
+    annexb_data: bytes::Bytes,
 }
 
 async fn run() -> Result<(), Error> {
@@ -211,10 +217,36 @@ async fn run() -> Result<(), Error> {
         bail!("no supported streams found");
     }
 
+    // The RTSP upstream will time out if we wait too long before sending
+    // `PLAY`, and likewise will be unhappy [*] if we don't read frames quickly
+    // enough. So start now. We'll discard frames until the downstream is ready.
+    //
+    // [*] some cameras drop the TCP connection when their send buffers fill.
+    // Others truncate the current packet, which causes Retina to fail shortly
+    // afterward with "framing error".
     let mut upstream_session = upstream_session
         .play(retina::client::PlayOptions::default())
         .await?
         .demuxed()?;
+    let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
+
+    tokio::spawn(async move {
+        while let Some(item) = upstream_session.next().await {
+            match item {
+                Ok(CodecItem::VideoFrame(f)) => {
+                    let _ = upstream_frames_tx.send(Frame {
+                        stream_id: f.stream_id(),
+                        annexb_data: convert_h2645(f).unwrap().into(),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("upstream failed: {e}");
+                    break;
+                }
+            }
+        }
+    });
 
     // Set the handler for ICE connection state
     // This will notify you when the peer has connected/disconnected
@@ -226,7 +258,8 @@ async fn run() -> Result<(), Error> {
         },
     ));
     tokio::pin!(ice_conn_state_rx);
-    let (peer_conn_state_tx, peer_conn_state_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (peer_conn_state_tx, peer_conn_state_rx) =
+        tokio::sync::watch::channel(RTCPeerConnectionState::Unspecified);
     downstream_conn.on_peer_connection_state_change(Box::new(
         move |state: RTCPeerConnectionState| {
             peer_conn_state_tx.send(state).unwrap();
@@ -259,12 +292,12 @@ async fn run() -> Result<(), Error> {
 
     loop {
         tokio::select! {
-            item = upstream_session.next() => {
-                match item {
-                    Some(Ok(CodecItem::VideoFrame(f))) => {
-                        if let Some(t) = tracks.get(f.stream_id()).and_then(Option::as_ref) {
+            r = upstream_frames_rx.recv(), if matches!(*peer_conn_state_rx.borrow(), RTCPeerConnectionState::Connected) => {
+                match r {
+                    Ok(f) => {
+                        if let Some(t) = tracks.get(f.stream_id).and_then(Option::as_ref) {
                             t.write_sample(&Sample {
-                                data: convert_h2645(f)?.into(),
+                                data: f.annexb_data,
 
                                 // TODO: webrtc-rs appears to calculate the
                                 // timestamp from this frame's duration:
@@ -278,14 +311,13 @@ async fn run() -> Result<(), Error> {
                                 ..Default::default()
                             }).await?;
                         }
-                    },
-                    Some(Ok(_)) => {},
-                    Some(Err(e)) => {
-                        return Err(anyhow!(e).context("upstream failure"));
                     }
-                    None => {
-                        info!("upstream EOF");
-                        return Ok(());
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("upstream is closed");
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(frames)) => {
+                        warn!("discarded {frames} frames because the downstream was not open or was too slow");
                     }
                 }
             },
@@ -293,8 +325,9 @@ async fn run() -> Result<(), Error> {
                 let state = state.unwrap();
                 info!("ice conn state: {:?}", state);
             },
-            state = peer_conn_state_rx.recv() => {
-                let state = state.unwrap();
+            r = peer_conn_state_rx.changed() => {
+                let () = r.unwrap();
+                let state = *peer_conn_state_rx.borrow();
                 info!("peer conn state: {:?}", state);
                 if matches!(state, RTCPeerConnectionState::Failed) {
                     return Ok(());

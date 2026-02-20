@@ -4,6 +4,10 @@
     and tests. (Formerly it used `MOONFIRE_LOG`, but Retina is not part of
     Moonfire, and `RUST_LOG` is standard.) Document in `README.md`.
     As requested in [#55](https://github.com/scottlamb/retina/issues/55).
+*   restructure the `webrtc-proxy` example to avoid causing the upstream
+    RTSP server's buffer to fill while waiting for the user to copy'n'paste
+    tokens in both directions. Fixes
+    [#80](https://github.com/scottlamb/retina/issues/80).
 
 ## `v0.4.17` (2026-02-17)
 
