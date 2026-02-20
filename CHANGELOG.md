@@ -1,3 +1,10 @@
+## unreleased
+
+*   use the `RUST_LOG` environment variable to control logging in the examples
+    and tests. (Formerly it used `MOONFIRE_LOG`, but Retina is not part of
+    Moonfire, and `RUST_LOG` is standard.) Document in `README.md`.
+    As requested in [#55](https://github.com/scottlamb/retina/issues/55).
+
 ## `v0.4.17` (2026-02-17)
 
 *   trim whitespace in SSRC values from `Transport` and `RTP-Info` headers,

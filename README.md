@@ -84,6 +84,10 @@ Where CMD:
 * **onvif** - Gets realtime onvif metadata if available; exit with Ctrl+C.
 * **jpeg** - Writes depacketized JPEG images to disk; exit with CTRL+C.
 
+The client also respects the common `RUST_LOG` environment variable:
+`RUST_LOG=client=debug,retina=debug,info` will enable `debug` logging for the
+`client` and `retina` crates, leaving other Rust crates at `info` level.
+
 ## Example WebRTC proxy
 
 This allows viewing a H.264 video stream from your browser, with the help of

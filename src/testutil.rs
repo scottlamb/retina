@@ -50,12 +50,12 @@ pub(crate) fn init_logging() {
     let h = mylog::Builder::new()
         .is_test(true)
         .format(
-            ::std::env::var("MOONFIRE_FORMAT")
+            ::std::env::var("RUST_FORMAT")
                 .map_err(|_| ())
                 .and_then(|s| mylog::Format::from_str(&s))
                 .unwrap_or(mylog::Format::Google),
         )
-        .spec(::std::env::var("MOONFIRE_LOG").as_deref().unwrap_or("info"))
+        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
         .build();
     let _ = h.install();
 }
