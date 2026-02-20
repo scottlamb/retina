@@ -229,7 +229,6 @@ async fn run() -> Result<(), Error> {
         .await?
         .demuxed()?;
     let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
-
     tokio::spawn(async move {
         while let Some(item) = upstream_session.next().await {
             match item {
@@ -357,13 +356,10 @@ fn convert_h2645(frame: VideoFrame) -> Result<Vec<u8>, Error> {
 
     let mut data = frame.into_data();
     let mut i = 0;
-    while i < data.len() - 3 {
+    while let Some(prefix) = data[i..].first_chunk_mut() {
         // Replace each NAL's length with the Annex B start code b"\x00\x00\x00\x01".
-        let len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-        data[i] = 0;
-        data[i + 1] = 0;
-        data[i + 2] = 0;
-        data[i + 3] = 1;
+        let len = u32::from_be_bytes(*prefix) as usize;
+        *prefix = [0, 0, 0, 1];
         i += 4 + len;
         if i > data.len() {
             bail!("partial NAL body");
