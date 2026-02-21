@@ -1,16 +1,67 @@
 <!doctype html>
 <html>
     <head>
+        <meta charset="utf-8">
         <title>WebCodecs Demo</title>
         <script type="module" src="webcodecs.js"></script>
         <style>
+            * {
+                box-sizing: border-box;
+            }
+            html, body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                background: black;
+            }
+            #container {
+                position: relative;
+                width: 100%;
+                height: 100%;
+            }
             canvas {
-                border: 2px solid black;
+                display: block;
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+            }
+            #pip-btn {
+                display: none;
+                position: absolute;
+                bottom: 12px;
+                right: 12px;
+                padding: 6px 10px;
+                background: rgba(0, 0, 0, 0.55);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 0.4);
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            #pip-btn:hover {
+                background: rgba(0, 0, 0, 0.8);
+            }
+            #error {
+                display: none;
+                position: absolute;
+                inset: 0;
+                justify-content: center;
+                align-items: center;
+                color: #f88;
+                font-family: monospace;
+                font-size: 14px;
+                padding: 16px;
+                text-align: center;
+                white-space: pre-wrap;
             }
         </style>
     </head>
     <body>
-        <h1>WebCodecs Demo</h1>
-        <canvas id="canvas" width="648" height="480"></canvas>
+        <div id="container">
+            <canvas id="canvas"></canvas>
+            <button id="pip-btn" title="Picture-in-Picture">⧉ PiP</button>
+            <div id="error"></div>
+        </div>
     </body>
 </html>

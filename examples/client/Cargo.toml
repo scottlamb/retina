@@ -18,6 +18,9 @@ mylog = { git = "https://github.com/scottlamb/mylog" }
 clap = { version = "4.1.4", features = ["derive"] }
 tokio-tungstenite = "0.28.0"
 axum = { version = "0.8.8", features = ["ws"] }
+rcgen = "0.14.7"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false }
 tower-http = { version = "0.6.8", features = ["fs", "trace"] }
 tracing = "0.1"
 tracing-log = "0.2"

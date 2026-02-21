@@ -3,17 +3,20 @@
 
 //! Serving a stream over a WebSocket for use with the WebCodecs API.
 
+use std::{io, net::SocketAddr, sync::Arc};
+
 use anyhow::{Error, bail};
 use axum::extract::{WebSocketUpgrade, ws::Message};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
-use futures::StreamExt as _;
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use log::{debug, info};
 use retina::{
     client::SetupOptions,
     codec::{VideoFrame, VideoParameters},
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser)]
 pub struct Opts {
@@ -22,6 +25,75 @@ pub struct Opts {
 
     #[arg(long, default_value_t = (std::net::Ipv4Addr::UNSPECIFIED, 8080).into())]
     bind_addr: std::net::SocketAddr,
+
+    /// Serve HTTPS with a self-signed certificate instead of plain HTTP.
+    /// Browsers require a secure context for the WebCodecs API when not on localhost.
+    #[arg(long)]
+    tls: bool,
+}
+
+/// An axum `Listener` that wraps a `TcpListener` with TLS.
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: TlsAcceptor,
+    #[allow(clippy::type_complexity)]
+    handshaking: FuturesUnordered<
+        std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = (
+                            io::Result<tokio_rustls::server::TlsStream<TcpStream>>,
+                            SocketAddr,
+                        ),
+                    > + Send,
+            >,
+        >,
+    >,
+}
+
+impl TlsListener {
+    fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self {
+            inner,
+            acceptor,
+            handshaking: FuturesUnordered::new(),
+        }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        // Use FuturesUnordered so TLS handshakes run concurrently: accepting
+        // connection N doesn't wait for connection N-1's handshake to finish.
+        loop {
+            tokio::select! {
+                res = self.inner.accept() => {
+                    match res {
+                        Ok((stream, addr)) => {
+                            let acceptor = self.acceptor.clone();
+                            self.handshaking.push(Box::pin(async move {
+                                (acceptor.accept(stream).await, addr)
+                            }));
+                        }
+                        Err(e) => log::warn!("TCP accept error: {e}"),
+                    }
+                }
+                Some((res, addr)) = self.handshaking.next(), if !self.handshaking.is_empty() => {
+                    match res {
+                        Ok(tls_stream) => return (tls_stream, addr),
+                        Err(e) => log::warn!("TLS handshake error from {addr}: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 /// A frame ready to be broadcast to all websockets.
@@ -42,6 +114,9 @@ fn make_parameters_msg(parameters: &VideoParameters) -> axum::extract::ws::Messa
     out.put_u8(0);
     out.put_slice(parameters.rfc6381_codec().as_bytes());
     out.put_u8(0);
+    let (width, height) = parameters.pixel_dimensions();
+    out.put_u16(u16::try_from(width).unwrap_or(u16::MAX));
+    out.put_u16(u16::try_from(height).unwrap_or(u16::MAX));
     out.put_slice(parameters.extra_data());
     axum::extract::ws::Message::Binary(out.freeze())
 }
@@ -49,7 +124,7 @@ fn make_parameters_msg(parameters: &VideoParameters) -> axum::extract::ws::Messa
 fn make_frame_msg(frame: &VideoFrame) -> axum::extract::ws::Message {
     let mut out = BytesMut::new();
     out.put_u8(1);
-    out.put_i64(frame.timestamp().timestamp() * 1000 / 90); // XXX: shouldn't assume 90 kHz units.
+    out.put_i64(frame.timestamp().elapsed() * 1000 / 90); // XXX: shouldn't assume 90 kHz units.
     out.put_u8(frame.is_random_access_point().into());
     out.put_slice(frame.data());
     axum::extract::ws::Message::Binary(out.freeze())
@@ -158,19 +233,10 @@ async fn serve_websocket(
     }
 }
 
-async fn serve_clients(
-    listener: tokio::net::TcpListener,
-    frames_tx: tokio::sync::broadcast::Sender<FrameItem>,
-) -> Result<(), Error> {
+fn build_app(frames_tx: tokio::sync::broadcast::Sender<FrameItem>) -> axum::Router {
     let dir = std::path::Path::new("examples/client/src/webcodecs");
-    if !tokio::fs::try_exists(dir).await.is_ok_and(|res| res) {
-        bail!(
-            "Unable to access directory {}; can't serve static file tree",
-            dir.display()
-        );
-    }
     let serve_dir = tower_http::services::ServeDir::new(dir);
-    let app = axum::Router::new()
+    axum::Router::new()
         .route(
             "/websocket",
             axum::routing::any({
@@ -181,9 +247,39 @@ async fn serve_clients(
             }),
         )
         .fallback_service(serve_dir)
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+}
 
-    axum::serve(listener, app).await?;
+fn build_tls_acceptor() -> Result<TlsAcceptor, Error> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key)?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn serve_clients(
+    listener: TcpListener,
+    tls: bool,
+    frames_tx: tokio::sync::broadcast::Sender<FrameItem>,
+) -> Result<(), Error> {
+    let dir = std::path::Path::new("examples/client/src/webcodecs");
+    if !tokio::fs::try_exists(dir).await.is_ok_and(|res| res) {
+        bail!(
+            "Unable to access directory {}; can't serve static file tree",
+            dir.display()
+        );
+    }
+    let app = build_app(frames_tx);
+    if tls {
+        let acceptor = build_tls_acceptor()?;
+        let tls_listener = TlsListener::new(listener, acceptor);
+        axum::serve(tls_listener, app).await?;
+    } else {
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -223,7 +319,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         .demuxed()?;
 
     let listener = TcpListener::bind(&opts.bind_addr).await?;
-    info!("Listening on http://{}", listener.local_addr()?);
+    let scheme = if opts.tls { "https" } else { "http" };
+    info!("Listening on {scheme}://{}", listener.local_addr()?);
     let (frames_tx, _) = tokio::sync::broadcast::channel(64);
     let frames_tx2 = frames_tx.clone();
     let stop_signal = tokio::signal::ctrl_c();
@@ -232,7 +329,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         res = receive_frames(session, frames_tx) => {
             info!("RTSP session ending: {res:?}");
         }
-        res = serve_clients(listener, frames_tx2) => {
+        res = serve_clients(listener, opts.tls, frames_tx2) => {
             info!("Axum shutting down: {res:?}");
         }
         _ = stop_signal => {
