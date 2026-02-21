@@ -16,3 +16,9 @@ anyhow = "1.0.41"
 itertools = "0.14.0"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 clap = { version = "4.1.4", features = ["derive"] }
+tokio-tungstenite = "0.28.0"
+axum = { version = "0.8.8", features = ["ws"] }
+tower-http = { version = "0.6.8", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

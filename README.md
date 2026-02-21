@@ -80,9 +80,11 @@ $ cargo run --package client <CMD>
 Where CMD:
 
 * **info** - Gets info about available streams and exits.
+* **jpeg** - Writes depacketized JPEG images to disk; exit with CTRL+C.
 * **mp4** - Writes RTSP streams to mp4 file; exit with Ctrl+C.
 * **onvif** - Gets realtime onvif metadata if available; exit with Ctrl+C.
-* **jpeg** - Writes depacketized JPEG images to disk; exit with CTRL+C.
+* **webcodecs** - Decodes video frames using WebCodecs API; exit with Ctrl+C.
+  This is the absolute lowest-latency way to watch RTSP streams from a browser!
 
 The client also respects the common `RUST_LOG` environment variable:
 `RUST_LOG=client=debug,retina=debug,info` will enable `debug` logging for the

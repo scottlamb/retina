@@ -8,6 +8,8 @@
     RTSP server's buffer to fill while waiting for the user to copy'n'paste
     tokens in both directions. Fixes
     [#80](https://github.com/scottlamb/retina/issues/80).
+*   add a new `webcodecs` example that decodes video frames using WebCodecs API.
+    This is the absolute lowest-latency way to watch RTSP streams from a browser!
 
 ## `v0.4.17` (2026-02-17)
 

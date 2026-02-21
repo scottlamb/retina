@@ -7,11 +7,12 @@ mod info;
 mod jpeg;
 mod mp4;
 mod onvif;
+mod webcodecs;
 
 use anyhow::Error;
 use clap::Parser;
 use log::{error, info};
-use std::str::FromStr;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 #[derive(Parser)]
 struct Source {
@@ -38,29 +39,30 @@ enum Cmd {
     Onvif(onvif::Opts),
     /// Writes depacketized JPEG images to disk; use CTRL+C to stop.
     Jpeg(jpeg::Opts),
+    /// Serves a stream to a web browser via WebCodecs.
+    Webcodecs(webcodecs::Opts),
 }
 
-fn init_logging() -> mylog::Handle {
-    let h = mylog::Builder::new()
-        .format(
-            ::std::env::var("RUST_FORMAT")
-                .map_err(|_| ())
-                .and_then(|s| mylog::Format::from_str(&s))
-                .unwrap_or(mylog::Format::Google),
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .with_env_var("RUST_LOG")
+        .from_env_lossy();
+    tracing_log::LogTracer::init().unwrap();
+    let sub = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(std::io::stderr)
+                .with_thread_names(true),
         )
-        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-        .build();
-    h.clone().install().unwrap();
-    h
+        .with(filter);
+    tracing::subscriber::set_global_default(sub).unwrap();
 }
 
 #[tokio::main]
 async fn main() {
-    let mut h = init_logging();
-    if let Err(e) = {
-        let _a = h.async_scope();
-        main_inner().await
-    } {
+    init_logging();
+    if let Err(e) = { main_inner().await } {
         error!("Fatal: {}", itertools::join(e.chain(), "\ncaused by: "));
         std::process::exit(1);
     }
@@ -86,8 +88,9 @@ async fn main_inner() -> Result<(), Error> {
     let cmd = Cmd::parse();
     match cmd {
         Cmd::Info(opts) => info::run(opts).await,
+        Cmd::Jpeg(opts) => jpeg::run(opts).await,
         Cmd::Mp4(opts) => mp4::run(opts).await,
         Cmd::Onvif(opts) => onvif::run(opts).await,
-        Cmd::Jpeg(opts) => jpeg::run(opts).await,
+        Cmd::Webcodecs(opts) => webcodecs::run(opts).await,
     }
 }
