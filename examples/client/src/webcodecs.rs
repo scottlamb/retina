@@ -311,7 +311,10 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         bail!("No suitable video stream found");
     };
     session
-        .setup(video_stream_i, SetupOptions::default())
+        .setup(
+            video_stream_i,
+            SetupOptions::default().strip_inline_parameters(true),
+        )
         .await?;
     let session = session
         .play(retina::client::PlayOptions::default())

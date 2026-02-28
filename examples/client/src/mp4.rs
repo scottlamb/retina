@@ -733,7 +733,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some(i) = video_stream_i {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .strip_inline_parameters(true),
+            )
             .await?;
     }
     let audio_stream = if !opts.no_audio {
@@ -764,7 +769,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some((i, _)) = audio_stream {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .strip_inline_parameters(true),
+            )
             .await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {
