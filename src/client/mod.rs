@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::client::parse::SessionHeader;
 use crate::codec::CodecItem;
+use crate::rtp::SendingPacket;
 use crate::{
     Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
     UdpStreamContext,
@@ -505,6 +506,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    back_channel: bool,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -704,6 +706,11 @@ impl SessionOptions {
         self
     }
 
+    pub fn back_channel(mut self, back_channel: bool) -> Self {
+        self.back_channel = back_channel;
+        self
+    }
+
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
         self
@@ -862,6 +869,13 @@ impl std::ops::Deref for Tool {
     }
 }
 
+//enum sending or Receiving
+#[derive(Copy, Clone, Debug)]
+pub enum StreamDirection{
+    Receiving,
+    Sending,
+}
+
 /// Information about a stream offered within a presentation.
 ///
 /// Currently if multiple formats are offered, this only describes the first.
@@ -877,6 +891,7 @@ pub struct Stream {
     channels: Option<NonZeroU16>,
     framerate: Option<f32>,
     control: Option<Url>,
+    direction: StreamDirection
 }
 
 impl std::fmt::Debug for Stream {
@@ -889,6 +904,7 @@ impl std::fmt::Debug for Stream {
             .field("clock_rate", &self.clock_rate_hz)
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
+            .field("direction", &self.direction)
             .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
@@ -955,6 +971,10 @@ impl Stream {
     #[inline]
     pub fn control(&self) -> Option<&Url> {
         self.control.as_ref()
+    }
+
+    pub fn direction(&self) -> StreamDirection {
+        self.direction
     }
 }
 
@@ -1524,8 +1544,12 @@ impl Session<Described> {
     ) -> Result<Self, Error> {
         let mut req = rtsp_types::Request::builder(Method::Describe, rtsp_types::Version::V1_0)
             .header(rtsp_types::headers::ACCEPT, "application/sdp")
-            .request_uri(url.clone())
-            .build(Bytes::new());
+            .request_uri(url.clone());
+        if options.back_channel{
+           req= req.header(rtsp_types::headers::REQUIRE, "www.onvif.org/ver20/backchannel");
+        }
+
+        let mut req = req.build(Bytes::new());
         let mut requested_auth = None;
         let (msg_ctx, cseq, response) = conn
             .send(
@@ -2561,6 +2585,28 @@ impl PinnedDrop for SessionInner {
         ));
     }
 }
+
+impl futures::Sink<SendingPacket> for Session<Playing>{
+    type Error = futures::io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: SendingPacket) -> Result<(), Self::Error> {
+        //self.0.conn.as_mut().unwrap().inner.send(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 
 impl futures::Stream for Session<Playing> {
     type Item = Result<PacketItem, Error>;
