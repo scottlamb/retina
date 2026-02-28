@@ -106,7 +106,10 @@ async fn read_to_eof(addr: SocketAddr) {
         retina::client::Session::describe(url, retina::client::SessionOptions::default())
             .await
             .unwrap();
-    session.setup(0, SetupOptions::default()).await.unwrap();
+    session
+        .setup(0, SetupOptions::default().strip_inline_parameters(true))
+        .await
+        .unwrap();
     let session = session
         .play(PlayOptions::default())
         .await

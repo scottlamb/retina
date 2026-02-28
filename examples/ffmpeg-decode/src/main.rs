@@ -285,7 +285,9 @@ async fn run() -> Result<(), Error> {
     session
         .setup(
             video_stream_i,
-            SetupOptions::default().transport(opts.transport.clone()),
+            SetupOptions::default()
+                .transport(opts.transport.clone())
+                .strip_inline_parameters(true),
         )
         .await?;
 
