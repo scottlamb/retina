@@ -18,6 +18,8 @@ use crate::Error;
 use crate::error::ErrorInt;
 use crate::rtp::ReceivedPacket;
 
+pub(crate) use crate::codec::h26x::TolerantBitReader;
+
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
 ///
 /// See ISO/IEC 14496-12 section 4.2. This macro reserves space for the

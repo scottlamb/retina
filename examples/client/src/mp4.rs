@@ -18,16 +18,16 @@
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
 use anyhow::{Context, Error, anyhow, bail};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
     client::{SetupOptions, Transport},
-    codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters},
+    codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters, VideoParametersCodec},
+    dts_extractor::H264DtsExtractor,
 };
 
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::{convert::TryFrom, pin::Pin};
 use std::{io::SeekFrom, sync::Arc};
@@ -103,6 +103,8 @@ pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
     mdat_start: u32,
     mdat_pos: u32,
     video_params: Vec<VideoParameters>,
+    sps: Option<Bytes>,
+    dts_extractor: Option<H264DtsExtractor>,
 
     /// The most recently used 1-based index within `video_params`.
     cur_video_params_sample_description_index: Option<u32>,
@@ -111,6 +113,9 @@ pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
 
     /// The (1-indexed) video sample (frame) number of each sync sample (random access point).
     video_sync_sample_nums: Vec<u32>,
+
+    /// (sample_count, sample_offset)
+    video_composition_offsets: Vec<(u32, i32)>,
 
     video_trak: TrakTracker,
     audio_trak: TrakTracker,
@@ -134,9 +139,9 @@ struct TrakTracker {
 
     /// The durations of samples in a run-length encoding form: (number of samples, duration).
     /// This lags one sample behind calls to `add_sample` because each sample's duration
-    /// is calculated using the PTS of the following sample.
+    /// is calculated using the DTS of the following sample.
     durations: Vec<(u32, u32)>,
-    last_pts: Option<i64>,
+    last_dts: Option<i64>,
     tot_duration: u64,
 }
 
@@ -146,7 +151,7 @@ impl TrakTracker {
         sample_description_index: u32,
         byte_pos: u32,
         size: u32,
-        timestamp: retina::Timestamp,
+        timestamp: i64,
         loss: u16,
         allow_loss: bool,
     ) -> Result<(), Error> {
@@ -166,8 +171,8 @@ impl TrakTracker {
         }
         self.sizes.push(size);
         self.next_pos = Some(byte_pos + size);
-        if let Some(last_pts) = self.last_pts.replace(timestamp.timestamp()) {
-            let duration = timestamp.timestamp().checked_sub(last_pts).unwrap();
+        if let Some(last_pts) = self.last_dts.replace(timestamp) {
+            let duration = timestamp.checked_sub(last_pts).unwrap();
             self.tot_duration += u64::try_from(duration).unwrap();
             let duration = u32::try_from(duration)?;
             match self.durations.last_mut() {
@@ -179,7 +184,7 @@ impl TrakTracker {
     }
 
     fn finish(&mut self) {
-        if self.last_pts.is_some() {
+        if self.last_dts.is_some() {
             self.durations.push((1, 0));
         }
     }
@@ -259,12 +264,15 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(Mp4Writer {
             inner,
             video_params: Vec::new(),
+            sps: None,
+            dts_extractor: None,
             cur_video_params_sample_description_index: None,
             audio_params,
             allow_loss,
             video_trak: TrakTracker::default(),
             audio_trak: TrakTracker::default(),
             video_sync_sample_nums: Vec::new(),
+            video_composition_offsets: Vec::new(),
             mdat_start,
             mdat_pos: mdat_start,
         })
@@ -274,9 +282,10 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         self.video_trak.finish();
         self.audio_trak.finish();
         let mut buf = BytesMut::with_capacity(
-            1024 + self.video_trak.size_estimate()
+            1028 + self.video_trak.size_estimate()
                 + self.audio_trak.size_estimate()
-                + 4 * self.video_sync_sample_nums.len(),
+                + 4 * self.video_sync_sample_nums.len()
+                + 8 * self.video_composition_offsets.len(),
         );
         write_box!(&mut buf, b"moov", {
             write_box!(&mut buf, b"mvhd", {
@@ -398,6 +407,15 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(u32::try_from(self.video_sync_sample_nums.len())?);
                             for n in &self.video_sync_sample_nums {
                                 buf.put_u32(*n);
+                            }
+                        });
+                        // Note: FFmpeg and VLC don't seem to need this box, but web browsers do.
+                        write_box!(buf, b"ctts", {
+                            buf.put_u32(1 << 24); // version
+                            buf.put_u32(u32::try_from(self.video_composition_offsets.len())?);
+                            for (count, offset) in &self.video_composition_offsets {
+                                buf.put_u32(*count);
+                                buf.put_i32(*offset);
                             }
                         });
                     });
@@ -528,6 +546,12 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             match stream.parameters() {
                 Some(ParametersRef::Video(params)) => {
                     log::info!("new video params: {:?}", params);
+                    match params.codec_params() {
+                        VideoParametersCodec::H264 { sps, pps: _ } => {
+                            self.sps = Some(sps.clone());
+                        }
+                        _ => panic!("{:?} unsupported", params.codec_params()),
+                    };
                     let pos = self.video_params.iter().position(|p| p == params);
                     if let Some(pos) = pos {
                         u32::try_from(pos + 1)?
@@ -544,15 +568,33 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             }
         };
         self.cur_video_params_sample_description_index = Some(sample_description_index);
+        let Some(sps) = &self.sps else { return Ok(()) };
         let size = u32::try_from(frame.data().remaining())?;
+        let pts = frame.timestamp().timestamp();
+
+        if self.dts_extractor.is_none() && frame.is_random_access_point() {
+            self.dts_extractor = Some(H264DtsExtractor::new());
+        }
+        let Some(dts_extractor) = &mut self.dts_extractor else {
+            debug!("waiting for I-frame");
+            return Ok(());
+        };
+        let dts = dts_extractor.extract(sps, frame.data(), pts).unwrap();
         self.video_trak.add_sample(
             sample_description_index,
             self.mdat_pos,
             size,
-            frame.timestamp(),
+            dts,
             frame.loss(),
             self.allow_loss,
         )?;
+        let cts = i32::try_from(pts - dts).unwrap();
+        match self.video_composition_offsets.last_mut() {
+            Some((last_count, last_offset)) if *last_offset == cts => {
+                *last_count += 1;
+            }
+            _ => self.video_composition_offsets.push((1, cts)),
+        }
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
@@ -575,7 +617,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             /* sample_description_index */ 1,
             self.mdat_pos,
             size,
-            frame.timestamp(),
+            frame.timestamp().timestamp(),
             frame.loss(),
             self.allow_loss,
         )?;
@@ -650,7 +692,6 @@ async fn write_mp4(
         .play(
             retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap())
                 .unknown_rtcp_ssrc(opts.unknown_rtcp_ssrc),
         )
         .await?
