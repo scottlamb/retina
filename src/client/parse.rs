@@ -293,9 +293,12 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
                     .value
                     .as_ref()
                     .ok_or_else(|| "fmtp attribute with no value".to_string())?;
-
                 if let Some((fmtp_payload_type, v)) = v.split_once(' ') {
-                    if fmtp_payload_type == rtp_payload_type_str {
+                    let payload_type_equal = fmtp_payload_type == rtp_payload_type_str;
+                    if payload_type_equal || fmtp.is_none() {
+                        if !payload_type_equal {
+                            warn!("fmtp payload type '{}' doesn't match rtp payload type '{}'. using fmtp payload type", fmtp_payload_type, rtp_payload_type_str);
+                        }
                         fmtp = Some(v);
                     }
                 } else {
@@ -1296,6 +1299,35 @@ mod tests {
             ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
+    }
+
+    #[test]
+    fn vitek() {
+        init_logging();
+        let p = parse_describe(
+            "rtsp://192.168.1.123:554/chID=8&streamType=sub",
+            include_bytes!("testdata/vitek_describe.txt"),
+        )
+        .unwrap();
+
+        // Abridged test; similar to the other Dahua test.
+        assert_eq!(p.streams.len(), 2);
+        assert_eq!(p.streams[0].media(), "video");
+        assert_eq!(p.streams[0].encoding_name(), "h265");
+        //assert_eq!(p.streams[0].rtp_payload_type, 98);
+
+        if cfg!(feature = "h265") {
+            assert!(p.streams[0].parameters().is_some());
+            assert_eq!(p.streams[1].media(), "audio");
+            assert_eq!(p.streams[1].encoding_name(), "pcmu");
+            assert_eq!(p.streams[1].rtp_payload_type, 0);
+            match p.streams[1].parameters().unwrap() {
+                ParametersRef::Audio(_) => {}
+                _ => panic!(),
+            };
+        } else {
+            assert!(p.streams[0].parameters().is_none());
+        }
     }
 
     #[test]
