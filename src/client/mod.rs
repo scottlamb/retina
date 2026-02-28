@@ -497,7 +497,7 @@ fn keepalive_interval(session: &SessionHeader) -> std::time::Duration {
 /// Options which must be known right as a session is created.
 ///
 /// Decisions which can be deferred are in [`SetupOptions`] or [`PlayOptions`] instead.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SessionOptions {
     creds: Option<Credentials>,
     user_agent: Option<Box<str>>,
@@ -505,6 +505,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    max_redirect: u8,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -706,6 +707,11 @@ impl SessionOptions {
 
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
+        self
+    }
+
+    pub fn max_redirect(mut self, max_redirect: u8) -> Self {
+        self.max_redirect = max_redirect;
         self
     }
 }
@@ -1378,6 +1384,33 @@ impl RtspConnection {
                     }),
                 };
                 continue;
+            } else if resp.status() == rtsp_types::StatusCode::Found
+                || resp.status() == rtsp_types::StatusCode::MovedPermanently
+            {
+                let location = match resp.header(&rtsp_types::headers::LOCATION) {
+                    None => bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Redirect without Location header".into(),
+                    }),
+                    Some(h) => h,
+                };
+                let location = location.as_str();
+                let location = match location.parse() {
+                    Ok(l) => l,
+                    Err(e) => bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: format!("Can't parse Location header: {e}"),
+                    }),
+                };
+                bail!(ErrorInt::RtspRedirection(location));
             } else if !resp.status().is_success() {
                 bail!(ErrorInt::RtspResponseError {
                     conn_ctx: *self.inner.ctx(),
@@ -1513,8 +1546,23 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url).await?;
-        Self::describe_with_conn(conn, options, url).await
+        let mut url = url;
+        let mut redirect = 0u8;
+        loop {
+            let conn = RtspConnection::connect(&url).await?;
+            let result = Self::describe_with_conn(conn, options.clone(), url).await;
+            if let Err(Error(e)) = &result {
+                if let ErrorInt::RtspRedirection(ref location) = e.as_ref() {
+                    if options.max_redirect > redirect {
+                        redirect += 1;
+                        url = location.clone();
+                        continue;
+                    }
+                    bail!(ErrorInt::RtspTooManyRedirects);
+                }
+            }
+            return result;
+        }
     }
 
     async fn describe_with_conn(

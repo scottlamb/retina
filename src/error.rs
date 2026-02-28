@@ -6,6 +6,7 @@ use std::{fmt::Display, sync::Arc};
 use crate::{ConnectionContext, PacketContext, RtspMessageContext, StreamContext, WallTime};
 use bytes::Bytes;
 use thiserror::Error;
+use url::Url;
 
 /// An opaque `std::error::Error + Send + Sync + 'static` implementation.
 ///
@@ -48,6 +49,12 @@ pub(crate) enum ErrorInt {
     /// The method's caller provided an invalid argument.
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error("Redirect to: {0}")]
+    RtspRedirection(Url),
+
+    #[error("Too many redirects")]
+    RtspTooManyRedirects,
 
     /// Unparseable or unexpected RTSP message.
     #[error("RTSP framing error: {description}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
