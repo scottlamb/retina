@@ -4,7 +4,7 @@ class Decoder {
       throw new Error(
         window.isSecureContext
           ? "VideoDecoder API is not supported in this browser"
-          : "VideoDecoder API requires a secure context (HTTPS or localhost)"
+          : "VideoDecoder API requires a secure context (HTTPS or localhost)",
       );
     }
     this.decoder = new VideoDecoder({
@@ -105,7 +105,7 @@ class Decoder {
       const codedHeight = view.getUint16(2);
       const description = buf.slice(nulIndex + 5);
       console.log(
-        `[websocket] new parameters, codec=${codec} ${codedWidth}x${codedHeight}`,
+        `[websocket] new parameters, codec=${codec} coded as ${codedWidth}x${codedHeight}`,
       );
 
       const config = {

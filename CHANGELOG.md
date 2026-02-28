@@ -17,6 +17,8 @@
     major version will strip by default.
 *   expose receive timestamps (both wall clock and monotonic/instant) in packet
     contexts.
+*   expose coded as well as display pixel dimensions in `VideoParameters` to ease
+    construction of a WebCodecs `VideoDecoderConfiguration`.
 
 ## `v0.4.17` (2026-02-17)
 

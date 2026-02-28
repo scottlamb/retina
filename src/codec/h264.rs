@@ -9,11 +9,12 @@ use std::{collections::VecDeque, convert::TryFrom};
 
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use h264_reader::nal::sps::{SeqParameterSet, SpsError};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::Error;
-use crate::codec::DepacketizeError;
+use crate::codec::{AllPixelDimensions, DepacketizeError};
 use crate::{
     Timestamp,
     codec::h26x::TolerantBitReader,
@@ -983,19 +984,8 @@ impl InternalParameters {
             seen_extra_trailing_data = true;
         }
 
-        let pixel_dimensions = sps
-            .pixel_dimensions()
+        let all_pixel_dimensions = Self::all_pixel_dimensions(&sps)
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
-        let e = |_| {
-            format!(
-                "SPS has invalid pixel dimensions: {}x{} is too large",
-                pixel_dimensions.0, pixel_dimensions.1
-            )
-        };
-        let pixel_dimensions = (
-            u16::try_from(pixel_dimensions.0).map_err(e)?,
-            u16::try_from(pixel_dimensions.1).map_err(e)?,
-        );
 
         // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
         // The beginning of the AVCDecoderConfiguration takes a few values from
@@ -1060,7 +1050,7 @@ impl InternalParameters {
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
-                pixel_dimensions,
+                all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: avc_decoder_config,
@@ -1073,6 +1063,101 @@ impl InternalParameters {
             pps_nal,
             seen_extra_trailing_data,
         })
+    }
+
+    // XXX: copy'n'pasted'n'modified from `h264-reader`.
+    fn all_pixel_dimensions(sps: &SeqParameterSet) -> Result<AllPixelDimensions, SpsError> {
+        let coded_width: u16 = sps
+            .pic_width_in_mbs_minus1
+            .checked_add(1)
+            .and_then(|w| w.checked_mul(16))
+            .and_then(|w| w.try_into().ok())
+            .ok_or(SpsError::FieldValueTooLarge {
+                name: "pic_width_in_mbs_minus1",
+                value: sps.pic_width_in_mbs_minus1,
+            })?;
+        use h264_reader::nal::sps::{ChromaFormat, FrameMbsFlags};
+        let mul = match sps.frame_mbs_flags {
+            FrameMbsFlags::Fields { .. } => 2,
+            FrameMbsFlags::Frames => 1,
+        };
+        let vsub = if sps.chroma_info.chroma_format == ChromaFormat::YUV420 {
+            1
+        } else {
+            0
+        };
+        let hsub = if sps.chroma_info.chroma_format == ChromaFormat::YUV420
+            || sps.chroma_info.chroma_format == ChromaFormat::YUV422
+        {
+            1
+        } else {
+            0
+        };
+
+        let step_x = 1 << hsub;
+        let step_y = mul << vsub;
+
+        let coded_height: u16 = (sps.pic_height_in_map_units_minus1 + 1)
+            .checked_mul(mul * 16)
+            .and_then(|h| h.try_into().ok())
+            .ok_or(SpsError::FieldValueTooLarge {
+                name: "pic_height_in_map_units_minus1",
+                value: sps.pic_height_in_map_units_minus1,
+            })?;
+        let coded = (coded_width, coded_height);
+        if let Some(ref crop) = sps.frame_cropping {
+            let left_offset = crop
+                .left_offset
+                .checked_mul(step_x)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "left_offset",
+                    value: crop.left_offset,
+                })?;
+            let right_offset = crop
+                .right_offset
+                .checked_mul(step_x)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "right_offset",
+                    value: crop.right_offset,
+                })?;
+            let top_offset = crop
+                .top_offset
+                .checked_mul(step_y)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "top_offset",
+                    value: crop.top_offset,
+                })?;
+            let bottom_offset = crop
+                .bottom_offset
+                .checked_mul(step_y)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "bottom_offset",
+                    value: crop.bottom_offset,
+                })?;
+            let display_width = coded_width
+                .checked_sub(left_offset)
+                .and_then(|w| w.checked_sub(right_offset));
+            let display_height = coded_height
+                .checked_sub(top_offset)
+                .and_then(|w| w.checked_sub(bottom_offset));
+            if let (Some(display_width), Some(display_height)) = (display_width, display_height) {
+                Ok(AllPixelDimensions {
+                    display: (display_width, display_height),
+                    coded,
+                })
+            } else {
+                Err(SpsError::CroppingError(crop.clone()))
+            }
+        } else {
+            Ok(AllPixelDimensions {
+                display: coded,
+                coded,
+            })
+        }
     }
 }
 

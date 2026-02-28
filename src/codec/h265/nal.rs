@@ -18,7 +18,7 @@
 
 use h264_reader::rbsp::{BitRead, BitReaderError};
 
-use crate::to_usize;
+use crate::{codec::AllPixelDimensions, to_usize};
 
 /// Whether a unit type is VCL or non-VCL, as defined in T.REC H.265 Table 7-1.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -498,34 +498,47 @@ impl Sps {
         self.vui.as_ref()
     }
 
-    /// Returns the pixel dimensions `(width, height)`, unless the conformance
-    /// cropping window is larger than the picture.
-    pub fn pixel_dimensions(&self) -> Result<(u32, u32), String> {
-        let mut width = self.pic_width_in_luma_samples;
-        let mut height = self.pic_height_in_luma_samples;
+    /// Returns the pixel dimensions, unless the conformance cropping window is
+    /// larger than the picture.
+    pub fn all_pixel_dimensions(&self) -> Result<AllPixelDimensions, String> {
+        let coded_width: u16 = self
+            .pic_width_in_luma_samples
+            .try_into()
+            .map_err(|_| "bad pic_width_in_luma_samples")?;
+        let coded_height: u16 = self
+            .pic_height_in_luma_samples
+            .try_into()
+            .map_err(|_| "bad pic_height_in_luma_samples")?;
+        let mut display_width = coded_width;
+        let mut display_height = coded_height;
         if let Some(ref c) = self.conformance_window {
             // Subtract out the conformance window, which is specified in
             // *chroma* samples.
-            let width_shift = (self.chroma_format_idc == 1 || self.chroma_format_idc == 2) as u32;
-            let height_shift = (self.chroma_format_idc == 1) as u32;
+            let width_shift = u32::from(self.chroma_format_idc == 1 || self.chroma_format_idc == 2);
+            let height_shift = u32::from(self.chroma_format_idc == 1);
             let sub_width = c
                 .left_offset
                 .checked_add(c.right_offset)
                 .and_then(|x| x.checked_shl(width_shift))
+                .and_then(|x| x.try_into().ok())
                 .ok_or("bad conformance window")?;
             let sub_height = c
                 .top_offset
                 .checked_add(c.bottom_offset)
                 .and_then(|x| x.checked_shl(height_shift))
+                .and_then(|x| x.try_into().ok())
                 .ok_or("bad conformance window")?;
-            width = width
+            display_width = display_width
                 .checked_sub(sub_width)
                 .ok_or("bad conformance window")?;
-            height = height
+            display_height = display_height
                 .checked_sub(sub_height)
                 .ok_or("bad conformance window")?;
         }
-        Ok((width, height))
+        Ok(AllPixelDimensions {
+            display: (display_width, display_height),
+            coded: (coded_width, coded_height),
+        })
     }
 
     pub fn rfc6381_codec(&self) -> String {
@@ -1462,7 +1475,7 @@ mod tests {
         let sps = dbg!(Sps::from_bits(bits).unwrap());
         let rfc6381_codec = sps.rfc6381_codec();
         assert_eq!(rfc6381_codec, "hvc1.1.6.L90.B0");
-        assert_eq!(sps.pixel_dimensions().unwrap(), (704, 480));
+        assert_eq!(sps.all_pixel_dimensions().unwrap().display, (704, 480));
         let vui = sps.vui().unwrap();
         let timing = vui.timing_info().unwrap();
         assert_eq!(timing.num_units_in_tick(), 1);
@@ -1477,7 +1490,7 @@ mod tests {
         assert_eq!(h.unit_type(), UnitType::SpsNut);
         let bits = LoggingBitReader(bits);
         let sps = Sps::from_bits(bits).unwrap();
-        assert_eq!(sps.pixel_dimensions().unwrap(), (2304, 1296));
+        assert_eq!(sps.all_pixel_dimensions().unwrap().display, (2304, 1296));
         assert_eq!(
             &sps.short_term_pic_ref_sets,
             &[
@@ -1502,7 +1515,7 @@ mod tests {
         let sps = dbg!(Sps::from_bits(bits).unwrap());
         let rfc6381_codec = sps.rfc6381_codec();
         assert_eq!(rfc6381_codec, "hvc1.1.6.H123.00");
-        assert_eq!(sps.pixel_dimensions().unwrap(), (1920, 1080));
+        assert_eq!(sps.all_pixel_dimensions().unwrap().display, (1920, 1080));
     }
 
     #[test]
