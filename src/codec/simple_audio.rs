@@ -4,7 +4,7 @@
 //! Fixed-size audio sample codecs as defined in
 //! [RFC 3551 section 4.5](https://datatracker.ietf.org/doc/html/rfc3551#section-4.5).
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use super::{AudioParameters, CodecItem};
 
@@ -17,12 +17,13 @@ pub(crate) struct Depacketizer {
 
 impl Depacketizer {
     /// Creates a new Depacketizer.
-    pub(super) fn new(clock_rate: u32, bits_per_sample: u32) -> Self {
+    pub(super) fn new(clock_rate: u32, bits_per_sample: u32, channels: Option<NonZeroU16>) -> Self {
         Self {
             parameters: AudioParameters {
                 rfc6381_codec: None,
                 frame_length: None, // variable
                 clock_rate,
+                channels: channels.map_or(const { NonZeroU16::new(1).unwrap() }, |c| c),
                 extra_data: Vec::new(),
                 codec: super::AudioParametersCodec::Other,
             },
@@ -77,11 +78,11 @@ mod tests {
     use super::*;
 
     fn depacketizer_8bit() -> Depacketizer {
-        Depacketizer::new(8000, 8)
+        Depacketizer::new(8000, 8, None)
     }
 
     fn depacketizer_16bit() -> Depacketizer {
-        Depacketizer::new(16000, 16)
+        Depacketizer::new(16000, 16, None)
     }
 
     #[test]

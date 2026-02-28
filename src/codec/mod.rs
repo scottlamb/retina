@@ -404,6 +404,7 @@ pub struct AudioParameters {
     rfc6381_codec: Option<String>,
     frame_length: Option<NonZeroU32>,
     clock_rate: u32,
+    channels: NonZeroU16,
     extra_data: Vec<u8>,
     codec: AudioParametersCodec,
 }
@@ -433,6 +434,13 @@ impl AudioParameters {
 
     pub fn clock_rate(&self) -> u32 {
         self.clock_rate
+    }
+
+    /// Returns the number of audio channels.
+    ///
+    /// This can be passed to a [WebCodecs `AudioDecoderConfig.numberOfChannels`](https://www.w3.org/TR/webcodecs/#dom-audiodecoderconfig-numberofchannels).
+    pub fn channels(&self) -> NonZeroU16 {
+        self.channels
     }
 
     /// The codec-specific "extra data" to feed to eg ffmpeg to decode the audio.
@@ -775,24 +783,24 @@ impl Depacketizer {
                 format_specific_params,
             )?)),
             ("audio", "g726-16") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 2),
+                simple_audio::Depacketizer::new(clock_rate, 2, channels),
             )),
             ("audio", "g726-24") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 3),
+                simple_audio::Depacketizer::new(clock_rate, 3, channels),
             )),
             ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 4),
+                simple_audio::Depacketizer::new(clock_rate, 4, channels),
             )),
             ("audio", "g726-40") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 5),
+                simple_audio::Depacketizer::new(clock_rate, 5, channels),
             )),
             ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
                 DepacketizerInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
-                    clock_rate, 8,
+                    clock_rate, 8, channels,
                 )))
             }
             ("audio", "l16") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 16),
+                simple_audio::Depacketizer::new(clock_rate, 16, channels),
             )),
             // Dahua cameras when configured with G723 send packets with a
             // non-standard encoding-name "G723.1" and length 40, which doesn't

@@ -40,11 +40,11 @@ struct AudioSpecificConfig {
 /// A channel configuration as in ISO/IEC 14496-3 Table 1.19.
 #[derive(Debug)]
 struct ChannelConfig {
-    channels: u16,
+    channels: NonZeroU16,
 
     /// The "number of considered channels" as defined in ISO/IEC 13818-7 Term
     /// 3.58. Roughly, non-subwoofer channels.
-    ncc: u16,
+    ncc: NonZeroU16,
 
     /// A human-friendly name for the channel configuration.
     // The name is used in tests and in the Debug output. Suppress dead code warning.
@@ -55,13 +55,13 @@ struct ChannelConfig {
 #[rustfmt::skip]
 const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
     /* 0 */ None, // "defined in AOT related SpecificConfig"
-    /* 1 */ Some(ChannelConfig { channels: 1, ncc: 1, name: "mono" }),
-    /* 2 */ Some(ChannelConfig { channels: 2, ncc: 2, name: "stereo" }),
-    /* 3 */ Some(ChannelConfig { channels: 3, ncc: 3, name: "3.0" }),
-    /* 4 */ Some(ChannelConfig { channels: 4, ncc: 4, name: "4.0" }),
-    /* 5 */ Some(ChannelConfig { channels: 5, ncc: 5, name: "5.0" }),
-    /* 6 */ Some(ChannelConfig { channels: 6, ncc: 5, name: "5.1" }),
-    /* 7 */ Some(ChannelConfig { channels: 8, ncc: 7, name: "7.1" }),
+    /* 1 */ Some(ChannelConfig { channels: NonZeroU16::new(1).unwrap(), ncc: NonZeroU16::new(1).unwrap(), name: "mono" }),
+    /* 2 */ Some(ChannelConfig { channels: NonZeroU16::new(2).unwrap(), ncc: NonZeroU16::new(2).unwrap(), name: "stereo" }),
+    /* 3 */ Some(ChannelConfig { channels: NonZeroU16::new(3).unwrap(), ncc: NonZeroU16::new(3).unwrap(), name: "3.0" }),
+    /* 4 */ Some(ChannelConfig { channels: NonZeroU16::new(4).unwrap(), ncc: NonZeroU16::new(4).unwrap(), name: "4.0" }),
+    /* 5 */ Some(ChannelConfig { channels: NonZeroU16::new(5).unwrap(), ncc: NonZeroU16::new(5).unwrap(), name: "5.0" }),
+    /* 6 */ Some(ChannelConfig { channels: NonZeroU16::new(6).unwrap(), ncc: NonZeroU16::new(5).unwrap(), name: "5.1" }),
+    /* 7 */ Some(ChannelConfig { channels: NonZeroU16::new(8).unwrap(), ncc: NonZeroU16::new(7).unwrap(), name: "7.1" }),
 ];
 
 impl AudioSpecificConfig {
@@ -164,6 +164,7 @@ impl AudioSpecificConfig {
                 clock_rate: sampling_frequency,
                 rfc6381_codec,
                 frame_length: Some(NonZeroU32::from(frame_length)),
+                channels: channels.channels,
                 extra_data: raw.to_owned(),
                 codec: super::AudioParametersCodec::Aac { channels_config_id },
             },
@@ -196,7 +197,7 @@ pub(super) fn make_sample_entry(
             0, 0, 0, 0, // AudioSampleEntry.reserved
             0, 0, 0, 0, // AudioSampleEntry.reserved
         ]);
-        buf.put_u16(channels.channels);
+        buf.put_u16(channels.channels.get());
         buf.extend_from_slice(&[
             0x00, 0x10, // AudioSampleEntry.samplesize
             0x00, 0x00, 0x00, 0x00, // AudioSampleEntry.pre_defined, AudioSampleEntry.reserved
@@ -238,15 +239,16 @@ pub(super) fn make_sample_entry(
                     // elementary stream in byte". ISO/IEC 13818-7 section
                     // 8.2.2.1 defines the total decoder input buffer size as
                     // 6144 bits per NCC.
-                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc);
+                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc.get());
                     debug_assert!(buffer_size_bytes <= 0xFF_FFFF);
 
                     // buffer_size_bytes as a 24-bit number
                     buf.put_u8((buffer_size_bytes >> 16) as u8);
                     buf.put_u16(buffer_size_bytes as u16);
 
-                    let max_bitrate =
-                        (6144 / 1024) * u32::from(channels.ncc) * u32::from(sampling_frequency);
+                    let max_bitrate = (6144 / 1024)
+                        * u32::from(channels.ncc.get())
+                        * u32::from(sampling_frequency);
                     buf.put_u32(max_bitrate);
 
                     // avg_bitrate. ISO/IEC 14496-1 section 7.2.6.6 says "for streams with
@@ -433,7 +435,7 @@ impl Depacketizer {
         let format_specific_params = format_specific_params
             .ok_or_else(|| "AAC requires format specific params".to_string())?;
         let config = parse_format_specific_params(clock_rate, format_specific_params)?;
-        if matches!(channels, Some(c) if c.get() != config.channels.channels) {
+        if matches!(channels, Some(c) if c != config.channels.channels) {
             return Err(format!(
                 "Expected RTP channels {:?} and AAC channels {:?} to match",
                 channels, config.channels

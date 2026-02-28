@@ -3,7 +3,7 @@
 
 //! G.723.1 audio as specified in [RFC 3551 section 4.5.3](https://datatracker.ietf.org/doc/html/rfc3551#section-4.5.3).
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::codec::DepacketizeError;
 
@@ -31,6 +31,7 @@ impl Depacketizer {
                 rfc6381_codec: None,
                 frame_length: NonZeroU32::new(240),
                 clock_rate: FIXED_CLOCK_RATE,
+                channels: const { NonZeroU16::new(1).unwrap() },
                 extra_data: Vec::new(),
                 codec: super::AudioParametersCodec::Other,
             },

@@ -19,6 +19,8 @@
     contexts.
 *   expose coded as well as display pixel dimensions in `VideoParameters` to ease
     construction of a WebCodecs `VideoDecoderConfiguration`.
+*   expose number of audio channels in `AudioParameters` to ease construction of
+    a WebCodecs `AudioDecoderConfig`.
 
 ## `v0.4.17` (2026-02-17)
 
