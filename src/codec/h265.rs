@@ -56,6 +56,10 @@ pub(crate) struct Depacketizer {
     /// True if we've seen a FU sequence where the NAL headers differ between
     /// fragments.
     seen_inconsistent_fu_nal_hdr: bool,
+
+    /// If true, VPS (type 32), SPS (type 33), and PPS (type 34) NALs are stripped from the output
+    /// `VideoFrame::data`.
+    strip_inline_parameters: bool,
 }
 
 #[derive(Debug)]
@@ -149,7 +153,13 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_nal_hdr: false,
+            strip_inline_parameters: false,
         })
+    }
+
+    /// Sets whether to strip VPS, SPS, and PPS NALs from `VideoFrame::data` output.
+    pub(super) fn set_strip_inline_parameters(&mut self, strip: bool) {
+        self.strip_inline_parameters = strip;
     }
 
     pub(super) fn check_invariants(&self) {
@@ -541,7 +551,13 @@ impl Depacketizer {
                 }
                 _ => {}
             }
-            retained_len += 4usize + crate::to_usize(nal.len);
+            let is_param_set = matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            );
+            if !is_param_set || !self.strip_inline_parameters {
+                retained_len += 4usize + crate::to_usize(nal.len);
+            }
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
@@ -550,15 +566,21 @@ impl Depacketizer {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
 
-            data.extend_from_slice(&nal.len.to_be_bytes());
-            data.extend_from_slice(&nal.hdr[..]);
+            let is_param_set = matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            );
+            if !is_param_set || !self.strip_inline_parameters {
+                data.extend_from_slice(&nal.len.to_be_bytes());
+                data.extend_from_slice(&nal.hdr[..]);
 
-            let mut actual_len = 2;
-            for piece in nal_pieces {
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+                let mut actual_len = 2;
+                for piece in nal_pieces {
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -995,6 +1017,142 @@ mod tests {
               \x00\x00\x00\x1d\x28\x01fu start, fu middle, fu end"
         );
         assert!(!d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    /// Tests that inline VPS/SPS/PPS NALs are stripped when `strip_inline_parameters` is true,
+    /// and retained by default.
+    ///
+    /// The VPS/SPS/PPS bytes are sent as single-NAL RTP packets, matching the sprop parameters
+    /// used to initialize the depacketizer (so no re-parse is triggered). An IDR_W_RADL (type 19)
+    /// closes the access unit.
+    #[test]
+    fn depacketize_strip_inline_parameters() {
+        init_logging();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // These VPS/SPS/PPS bytes match the sprop parameters in the depacketize test.
+        let vps_nal = b64
+            .decode("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")
+            .unwrap();
+        let sps_nal = b64
+            .decode("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=")
+            .unwrap();
+        let pps_nal = b64.decode("RAHA8saNA7NA").unwrap();
+        // IDR_W_RADL NAL (type 19, 0x26; byte 0): \x26\x01 + data
+        let idr_nal: &[u8] = b"\x26\x01idr";
+
+        let sprop = "profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==";
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+
+        let push_pkts = |d: &mut super::Depacketizer| {
+            // VPS (mark=false: parameter sets can't end an AU).
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 0,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(vps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // SPS
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 1,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(sps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // PPS
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 2,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(pps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // IDR_W_RADL (mark=true: ends the access unit).
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 3,
+                    loss: 0,
+                    mark: true,
+                    payload_type: 0,
+                }
+                .build(idr_nal.iter().copied())
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Without stripping: VPS/SPS/PPS are included in frame data.
+        {
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            push_pkts(&mut d);
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            let expected_len = (4 + vps_nal.len())
+                + (4 + sps_nal.len())
+                + (4 + pps_nal.len())
+                + (4 + idr_nal.len());
+            assert_eq!(
+                frame.data().len(),
+                expected_len,
+                "without stripping, all NALs including VPS/SPS/PPS should be in output"
+            );
+        }
+
+        // With stripping: only the IDR NAL is in frame data.
+        {
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            d.set_strip_inline_parameters(true);
+            push_pkts(&mut d);
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&(idr_nal.len() as u32).to_be_bytes());
+            expected.extend_from_slice(idr_nal);
+            // Only IDR NAL: 4-byte length prefix + idr_nal bytes.
+            assert_eq_hex!(frame.data(), &expected);
+        }
     }
 
     #[test]

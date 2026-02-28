@@ -759,6 +759,7 @@ mod tests {
                 rtp_channel_id: 0,
             })),
             udp_sockets: None,
+            strip_inline_parameters: false,
         })
     }
 

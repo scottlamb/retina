@@ -80,6 +80,10 @@ pub(crate) struct Depacketizer {
     /// True if we've seen a FU-A sequence where the NAL headers differ between
     /// fragments.
     seen_inconsistent_fu_a_nal_hdr: bool,
+
+    /// If true, SPS (type 7) and PPS (type 8) NALs are stripped from the output
+    /// `VideoFrame::data`.
+    strip_inline_parameters: bool,
 }
 
 #[derive(Debug)]
@@ -229,7 +233,13 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
+            strip_inline_parameters: false,
         })
+    }
+
+    /// Sets whether to strip SPS and PPS NALs from `VideoFrame::data` output.
+    pub(super) fn set_strip_inline_parameters(&mut self, strip: bool) {
+        self.strip_inline_parameters = strip;
     }
 
     pub(super) fn check_invariants(&self) {
@@ -709,7 +719,13 @@ impl Depacketizer {
                 is_disposable = false;
             }
             // TODO: support optionally filtering non-VUI NALs.
-            retained_len += 4usize + crate::to_usize(nal.len);
+            let is_param_set = matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            );
+            if !is_param_set || !self.strip_inline_parameters {
+                retained_len += 4usize + crate::to_usize(nal.len);
+            }
             piece_idx = next_piece_idx;
         }
         let mut data = Vec::with_capacity(retained_len);
@@ -717,15 +733,21 @@ impl Depacketizer {
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            data.extend_from_slice(&nal.len.to_be_bytes()[..]);
-            data.push(nal.hdr.into());
-            let mut actual_len = 1;
-            for piece in nal_pieces {
-                debug_assert!(!piece.is_empty());
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+            let is_param_set = matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            );
+            if !is_param_set || !self.strip_inline_parameters {
+                data.extend_from_slice(&nal.len.to_be_bytes()[..]);
+                data.push(nal.hdr.into());
+                let mut actual_len = 1;
+                for piece in nal_pieces {
+                    debug_assert!(!piece.is_empty());
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
         debug_assert_eq!(retained_len, data.len());
@@ -1991,6 +2013,7 @@ mod tests {
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e', 0x00,
     ];
 
+    // Expected frame data with inline SPS/PPS retained (default behavior).
     #[rustfmt::skip]
     static PREFIXED_NALS: [u8; 48] = [
         // SPS
@@ -2000,6 +2023,14 @@ mod tests {
         // PPS
         0x00, 0x00, 0x00, 0x04,
         0x68, 0xee, 0x3c, 0xb0,
+        // IDR slice
+        0x00, 0x00, 0x00, 0x0c,
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    // Expected frame data with inline SPS/PPS stripped (when strip_inline_parameters is true).
+    #[rustfmt::skip]
+    static PREFIXED_NALS_STRIPPED: [u8; 16] = [
         // IDR slice
         0x00, 0x00, 0x00, 0x0c,
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
@@ -2139,6 +2170,132 @@ mod tests {
                     panic!();
                 };
                 assert_eq_hex!(frame.data(), &PREFIXED_NALS);
+            }
+        }
+    }
+
+    /// Like `parse_annex_b_single_nal` but with `strip_inline_parameters` enabled.
+    #[test]
+    fn parse_annex_b_single_nal_strip() {
+        init_logging();
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        d.set_strip_inline_parameters(true);
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(ANNEX_B_NALS)
+            .unwrap(),
+        )
+        .unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+            panic!();
+        };
+        assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
+    }
+
+    /// Like `parse_annex_b_fu_a` but with `strip_inline_parameters` enabled.
+    #[test]
+    fn parse_annex_b_fu_a_strip() {
+        init_logging();
+        for first_pkt_len in 2..ANNEX_B_NALS.len() - 1 {
+            for middle_pkt_len in [0, 1, 2, 3] {
+                if first_pkt_len + middle_pkt_len >= ANNEX_B_NALS.len() {
+                    continue;
+                }
+                let mut d = super::Depacketizer::new(
+                    90_000,
+                    Some("packetization-mode=1;profile-level-id=640033"),
+                )
+                .unwrap();
+                d.set_strip_inline_parameters(true);
+                let timestamp = crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                };
+                let mut first_pkt = Vec::with_capacity(first_pkt_len + 1);
+                first_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                first_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b1000_0000); // start
+                first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 0,
+                        loss: 0,
+                        mark: false,
+                        payload_type: 0,
+                    }
+                    .build(first_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(d.pull(), None);
+                if middle_pkt_len > 0 {
+                    let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
+                    middle_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                    middle_pkt.push(ANNEX_B_NALS[0] & 0b0001_1111); // continuation
+                    middle_pkt.extend_from_slice(
+                        &ANNEX_B_NALS[first_pkt_len..first_pkt_len + middle_pkt_len],
+                    );
+                    d.push(
+                        ReceivedPacketBuilder {
+                            ctx: crate::PacketContext::dummy(),
+                            stream_id: 0,
+                            timestamp,
+                            ssrc: 0,
+                            sequence_number: 1,
+                            loss: 0,
+                            mark: false,
+                            payload_type: 0,
+                        }
+                        .build(middle_pkt)
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(d.pull(), None);
+                }
+                let mut last_pkt =
+                    Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len - middle_pkt_len + 2);
+                last_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                last_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0100_0000); // end
+                last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len + middle_pkt_len..]);
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 2,
+                        loss: 0,
+                        mark: true,
+                        payload_type: 0,
+                    }
+                    .build(last_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                    panic!();
+                };
+                assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
             }
         }
     }

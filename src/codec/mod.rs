@@ -807,6 +807,20 @@ impl Depacketizer {
         }
     }
 
+    /// Sets whether to strip inline parameter set NALs from `VideoFrame::data` output.
+    ///
+    /// For H.264, strips SPS (type 7) and PPS (type 8) NALs.
+    /// For H.265, strips VPS (type 32), SPS (type 33), and PPS (type 34) NALs.
+    /// No-op for other codecs.
+    pub(crate) fn set_strip_inline_parameters(&mut self, strip: bool) {
+        match &mut self.0 {
+            DepacketizerInner::H264(d) => d.set_strip_inline_parameters(strip),
+            #[cfg(feature = "h265")]
+            DepacketizerInner::H265(d) => d.set_strip_inline_parameters(strip),
+            _ => {}
+        }
+    }
+
     /// Returns the current codec parameters, if known.
     ///
     /// See documentation at [`crate::client::Stream::parameters`].
