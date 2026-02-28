@@ -15,6 +15,8 @@
     This is highly recommended for the reasons in the doc comment. It is
     opt-in for now to avoid surprises on `Cargo.lock` update, but a future
     major version will strip by default.
+*   expose receive timestamps (both wall clock and monotonic/instant) in packet
+    contexts.
 
 ## `v0.4.17` (2026-02-17)
 

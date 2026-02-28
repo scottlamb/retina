@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
@@ -2369,11 +2370,13 @@ impl Session<Playing> {
 
         // Prioritize RTCP over RTP within a stream.
         while let Poll::Ready(r) = udp_sockets.rtcp.poll_recv(cx, buf) {
-            let when = crate::WallTime::now();
+            let when = Instant::now();
+            let when_wall = crate::WallTime::now();
             match r {
                 Ok(()) => {
                     let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received_wall: when,
+                        received: when,
+                        received_wall: when_wall,
                     });
                     let msg = Bytes::copy_from_slice(buf.filled());
                     match rtp_handler.rtcp(
@@ -2410,19 +2413,21 @@ impl Session<Playing> {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
                         conn_ctx: *conn_ctx,
                         stream_ctx: stream_ctx.to_owned(),
-                        when,
+                        when: when_wall,
                         source,
                     }))));
                 }
             }
         }
         while let Poll::Ready(r) = udp_sockets.rtp.poll_recv(cx, buf) {
-            let when = crate::WallTime::now();
+            let when = Instant::now();
+            let when_wall = crate::WallTime::now();
             match r {
                 Ok(()) => {
                     let msg = Bytes::copy_from_slice(buf.filled());
                     let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received_wall: when,
+                        received: when,
+                        received_wall: when_wall,
                     });
                     match rtp_handler.rtp(
                         inner.options,
@@ -2447,7 +2452,7 @@ impl Session<Playing> {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
                         conn_ctx: *conn_ctx,
                         stream_ctx: stream_ctx.to_owned(),
-                        when,
+                        when: when_wall,
                         source,
                     }))));
                 }
