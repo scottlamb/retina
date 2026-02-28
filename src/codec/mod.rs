@@ -155,7 +155,7 @@ pub enum ParametersRef<'a> {
 /// calls to [`crate::client::Stream::parameters`] will return the new value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoParameters {
-    pixel_dimensions: (u16, u16),
+    all_pixel_dimensions: AllPixelDimensions,
     rfc6381_codec: String,
     pixel_aspect_ratio: Option<(u32, u32)>,
     frame_rate: Option<(u32, u32)>,
@@ -165,6 +165,14 @@ pub struct VideoParameters {
     ///
     /// This is more straightforward than reparsing the RFC 6381 codec string.
     codec: VideoParametersCodec,
+}
+
+/// Public for fuzz testing.
+#[doc(hidden)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct AllPixelDimensions {
+    pub display: (u16, u16),
+    pub coded: (u16, u16),
 }
 
 impl VideoParameters {
@@ -184,9 +192,27 @@ impl VideoParameters {
         }
     }
 
-    /// Returns the overall dimensions of the video frame in pixels, as `(width, height)`.
+    /// Returns the *display* dimensions of the video frame in pixels, as `(width, height)`.
     pub fn pixel_dimensions(&self) -> (u32, u32) {
-        let (width, height) = self.pixel_dimensions;
+        let (width, height) = self.all_pixel_dimensions.display;
+        (width.into(), height.into())
+    }
+
+    /// Returns the *coded* dimensions of the video frame in pixels, as `(width, height)`.
+    ///
+    /// See [`pixel_dimensions`] for the more commonly needed *display* dimensions.
+    /// The coded dimensions are useful to put inside a [WebCodecs `VideoDecoderConfig`](https://www.w3.org/TR/webcodecs/#dom-videodecoderconfig-codedwidth);
+    /// Safari appears to require them.
+    ///
+    /// # What are coded dimensions?
+    ///
+    /// Video codecs aren't designed for arbitrary pixels dimensions. H.264 dimensions
+    /// for example must be specified in "macroblocks" of 16x16 pixels. So an encoder
+    /// will round say a 30x30 input video up to a coded size of 32x32, perhaps with
+    /// an extra 2 black pixels in each dimension. A decoder will crop the 32x32 video
+    /// back to a display size of 30x30.
+    pub fn coded_pixel_dimensions(&self) -> (u32, u32) {
+        let (width, height) = self.all_pixel_dimensions.coded;
         (width.into(), height.into())
     }
 
@@ -233,7 +259,8 @@ impl std::fmt::Debug for VideoParameters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VideoParameters")
             .field("rfc6381_codec", &self.rfc6381_codec)
-            .field("pixel_dimensions", &self.pixel_dimensions)
+            .field("pixel_dimensions", &self.all_pixel_dimensions.display)
+            .field("coded_pixel_dimensions", &self.all_pixel_dimensions.coded)
             .field("pixel_aspect_ratio", &self.pixel_aspect_ratio)
             .field("frame_rate", &self.frame_rate)
             .field(
@@ -318,8 +345,12 @@ impl VideoSampleEntryBuilder<'_> {
 
                 // VisualSampleEntry, section 12.1.3.2.
                 buf.extend_from_slice(&[0; 16]);
-                buf.extend_from_slice(&self.params.pixel_dimensions.0.to_be_bytes()[..]);
-                buf.extend_from_slice(&self.params.pixel_dimensions.1.to_be_bytes()[..]);
+                buf.extend_from_slice(
+                    &self.params.all_pixel_dimensions.display.0.to_be_bytes()[..],
+                );
+                buf.extend_from_slice(
+                    &self.params.all_pixel_dimensions.display.1.to_be_bytes()[..],
+                );
                 buf.extend_from_slice(&[
                     0x00, 0x48, 0x00, 0x00, // horizresolution
                     0x00, 0x48, 0x00, 0x00, // vertresolution

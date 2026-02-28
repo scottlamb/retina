@@ -821,17 +821,7 @@ impl InternalParameters {
 
         let rfc6381_codec = sps.rfc6381_codec();
 
-        let pixel_dimensions = sps.pixel_dimensions()?;
-        let e = |_| {
-            format!(
-                "SPS has invalid pixel dimensions: {}x{} is too large",
-                pixel_dimensions.0, pixel_dimensions.1
-            )
-        };
-        let pixel_dimensions = (
-            u16::try_from(pixel_dimensions.0).map_err(e)?,
-            u16::try_from(pixel_dimensions.1).map_err(e)?,
-        );
+        let all_pixel_dimensions = sps.all_pixel_dimensions()?;
         let (pixel_aspect_ratio, frame_rate);
         if let Some(v) = sps.vui() {
             pixel_aspect_ratio = v
@@ -851,7 +841,7 @@ impl InternalParameters {
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
-                pixel_dimensions,
+                all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: hevc_decoder_config.record,
