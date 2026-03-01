@@ -1240,20 +1240,7 @@ impl RtspConnection {
     }
 
     fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
-            return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
-                url.as_str()
-            ));
-        }
-        if url.username() != "" || url.password().is_some() {
-            // Url apparently doesn't even have a way to clear the credentials,
-            // so this has to be an error.
-            // TODO: that's not true; revisit this.
-            return Err("URL must not contain credentials".to_owned());
-        }
-        url.host()
-            .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
+        validate_rtsp_url(url)
     }
 
     /// Sends a request and expects an upcoming message from the peer to be its response.
@@ -2751,6 +2738,23 @@ impl futures::Stream for Demuxed {
             }
         }
     }
+}
+
+pub fn validate_rtsp_url(url: &Url) -> Result<url::Host<&str>, String> {
+    if url.scheme() != "rtsp" {
+        return Err(format!(
+            "Bad URL {}; only scheme rtsp supported",
+            url.as_str()
+        ));
+    }
+    if url.username() != "" || url.password().is_some() {
+        // Url apparently doesn't even have a way to clear the credentials,
+        // so this has to be an error.
+        // TODO: that's not true; revisit this.
+        return Err("URL must not contain credentials".to_owned());
+    }
+    url.host()
+        .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
 }
 
 #[cfg(test)]
