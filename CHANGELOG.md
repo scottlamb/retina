@@ -21,6 +21,7 @@
     construction of a WebCodecs `VideoDecoderConfiguration`.
 *   expose number of audio channels in `AudioParameters` to ease construction of
     a WebCodecs `AudioDecoderConfig`.
+*   allow producing [`VideoParameters`] from H.264 SPS and PPS NALs.
 
 ## `v0.4.17` (2026-02-17)
 

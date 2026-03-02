@@ -21,7 +21,30 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoFrame};
+use super::{CodecItem, VideoFrame, VideoParameters};
+
+/// Produce [`VideoParameters`] from SPS and PPS NAL units.
+///
+/// It's sometimes useful to "fix" a server's parameters, e.g.:
+///
+/// * adding missing pixel aspect ratio information to the SPS VUI so that
+///   anamorphic video is displayed at the correct aspect ratio.
+/// * adding missing bitstream restrictions such as `num_reorder_frames = 0`
+///   that significantly reduce decode latency.
+/// * removing garbage after the RBSP trailing bits.
+///
+/// Retina currently does not support directly making these changes itself, but
+/// callers can use e.g. [`h264_reader`](https://crates.io/crates/h264_reader)
+/// to rewrite the SPS, then use Retina's logic to repackage the parameters into
+/// a [`VideoParameters`].
+pub fn parameters_from_sps_and_pps(
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<VideoParameters, Error> {
+    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true)
+        .map(|int| int.generic_parameters)
+        .map_err(|s| wrap!(crate::error::ErrorInt::InvalidArgument(s)))
+}
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -878,7 +901,7 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
 
 #[derive(Clone, Debug)]
 struct InternalParameters {
-    generic_parameters: super::VideoParameters,
+    generic_parameters: VideoParameters,
 
     /// The (single) SPS NAL.
     sps_nal: Bytes,
@@ -1048,7 +1071,7 @@ impl InternalParameters {
         let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
         let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
         Ok(InternalParameters {
-            generic_parameters: super::VideoParameters {
+            generic_parameters: VideoParameters {
                 rfc6381_codec,
                 all_pixel_dimensions,
                 pixel_aspect_ratio,

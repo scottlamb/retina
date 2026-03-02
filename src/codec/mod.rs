@@ -106,7 +106,6 @@ pub(crate) mod g723;
 mod h26x;
 pub(crate) mod jpeg;
 
-#[doc(hidden)]
 pub mod h264;
 
 #[cfg(feature = "h265")]
