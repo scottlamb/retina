@@ -7,12 +7,12 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use rtsp_types::{Data, Message};
 use std::time::Instant;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::codec::Framed;
 use url::Host;
 
+use crate::rtsp::msg::OwnedMessage;
 use crate::{Error, ErrorInt, RtspMessageContext};
 
 use super::{ConnectionContext, ReceivedMessage, WallTime};
@@ -42,7 +42,7 @@ impl Connection {
                     peer_addr,
                     established_wall,
                 },
-                read_pos: 0,
+                parser: crate::rtsp::parse::Parser::default(),
             },
         )))
     }
@@ -53,7 +53,8 @@ impl Connection {
 
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
         RtspMessageContext {
-            pos: self.0.codec().read_pos + crate::to_u64(self.0.read_buffer().remaining()),
+            pos: self.0.codec().parser.stream_pos()
+                + crate::to_u64(self.0.read_buffer().remaining()),
             received_wall: WallTime::now(),
             received: Instant::now(),
         }
@@ -98,7 +99,7 @@ impl Stream for Connection {
     }
 }
 
-impl Sink<Message<Bytes>> for Connection {
+impl Sink<OwnedMessage> for Connection {
     type Error = ErrorInt;
 
     fn poll_ready(
@@ -112,7 +113,7 @@ impl Sink<Message<Bytes>> for Connection {
 
     fn start_send(
         mut self: std::pin::Pin<&mut Self>,
-        item: Message<Bytes>,
+        item: OwnedMessage,
     ) -> Result<(), Self::Error> {
         self.0
             .start_send_unpin(item)
@@ -141,9 +142,7 @@ impl Sink<Message<Bytes>> for Connection {
 /// Encodes and decodes RTSP messages.
 struct Codec {
     ctx: ConnectionContext,
-
-    /// Number of bytes read and processed (drained from the input buffer).
-    read_pos: u64,
+    parser: crate::rtsp::parse::Parser,
 }
 
 /// An intermediate error type that exists because [`Framed`] expects the
@@ -161,123 +160,101 @@ impl std::convert::From<std::io::Error> for CodecError {
     }
 }
 
-impl Codec {
-    fn parse_msg(&self, src: &mut BytesMut) -> Result<Option<(usize, Message<Bytes>)>, CodecError> {
-        // Skip whitespace as `rtsp-types` does. It's important to also do it here, or we might
-        // skip the our own data message encoding (next if) then hit
-        // unreachable! after rtsp-types returns Message::Data.
-        while src.starts_with(b"\r\n") {
-            src.advance(2);
-        }
-
-        if !src.is_empty() && src[0] == b'$' {
-            // Fast path for interleaved data, avoiding MessageRef -> Message<&[u8]> ->
-            // Message<Bytes> conversion. This speeds things up quite a bit in practice,
-            // avoiding a bunch of memmove calls.
-            if src.len() < 4 {
-                return Ok(None);
-            }
-            let channel_id = src[1];
-            let len = 4 + usize::from(u16::from_be_bytes([src[2], src[3]]));
-            if src.len() < len {
-                src.reserve(len - src.len());
-                return Ok(None);
-            }
-            let mut msg = src.split_to(len);
-            msg.advance(4);
-            return Ok(Some((
-                len,
-                Message::Data(Data::new(channel_id, msg.freeze())),
-            )));
-        }
-
-        let (msg, len): (Message<&[u8]>, _) = match Message::parse(src) {
-            Ok((m, l)) => (m, l),
-            Err(rtsp_types::ParseError::Error) => {
-                return Err(CodecError::ParseError {
-                    description: format!(
-                        "Invalid RTSP message; buffered:\n{:#?}",
-                        crate::hex::LimitedHex::new(&src[..], 128),
-                    ),
-                    pos: self.read_pos,
-                });
-            }
-            Err(rtsp_types::ParseError::Incomplete(_)) => return Ok(None),
-        };
-
-        // Map msg's body to a Bytes representation and advance `src`. Awkward:
-        // 1.  lifetime concerns require mapping twice: first so the message
-        //     doesn't depend on the BytesMut, which needs to be split/advanced;
-        //     then to get the proper Bytes body in place post-split.
-        // 2.  rtsp_types messages must be AsRef<[u8]>, so we can't use the
-        //     range as an intermediate body.
-        // 3.  within a match because the rtsp_types::Message enum itself
-        //     doesn't have body/replace_body/map_body methods.
-        let msg = match msg {
-            Message::Request(msg) => {
-                let body_range = crate::as_range(src, msg.body());
-                let msg = msg.replace_body(rtsp_types::Empty);
-                if let Some(r) = body_range {
-                    let mut raw_msg = src.split_to(len);
-                    raw_msg.advance(r.start);
-                    raw_msg.truncate(r.len());
-                    Message::Request(msg.replace_body(raw_msg.freeze()))
-                } else {
-                    src.advance(len);
-                    Message::Request(msg.replace_body(Bytes::new()))
-                }
-            }
-            Message::Response(msg) => {
-                let body_range = crate::as_range(src, msg.body());
-                let msg = msg.replace_body(rtsp_types::Empty);
-                if let Some(r) = body_range {
-                    let mut raw_msg = src.split_to(len);
-                    raw_msg.advance(r.start);
-                    raw_msg.truncate(r.len());
-                    Message::Response(msg.replace_body(raw_msg.freeze()))
-                } else {
-                    src.advance(len);
-                    Message::Response(msg.replace_body(Bytes::new()))
-                }
-            }
-            Message::Data(_) => unreachable!(),
-        };
-        Ok(Some((len, msg)))
-    }
-}
-
 impl tokio_util::codec::Decoder for Codec {
     type Item = ReceivedMessage;
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let (len, msg) = match self.parse_msg(src) {
-            Err(e) => return Err(e),
-            Ok(None) => return Ok(None),
-            Ok(Some((len, msg))) => (len, msg),
-        };
-        let msg = ReceivedMessage {
-            msg,
-            ctx: RtspMessageContext {
-                pos: self.read_pos,
-                received_wall: WallTime::now(),
-                received: Instant::now(),
+        use crate::rtsp::inputs::{Contiguous, Input as _};
+        use crate::rtsp::parse::FeedError;
+
+        let pos = self.parser.stream_pos();
+        let initial_len = src.len();
+
+        // Feed the parser. We extract (msg, body_len, consumed) or error
+        // info before dropping the Contiguous borrow on `src`.
+        enum FeedResult {
+            None,
+            Message {
+                msg: crate::rtsp::msg::Message,
+                body_len: usize,
+                consumed: usize,
             },
+            Incomplete {
+                needed: Option<std::num::NonZeroUsize>,
+                consumed: usize,
+            },
+            Invalid(crate::rtsp::parse::Invalid),
+        }
+
+        let feed_result = {
+            let mut input = Contiguous::new(src, true);
+            let r = self.parser.feed(&mut input);
+            let consumed = initial_len - input.len();
+            match r {
+                Ok(None) => FeedResult::None,
+                Ok(Some((msg, body_slice))) => FeedResult::Message {
+                    msg,
+                    body_len: body_slice.len(),
+                    consumed,
+                },
+                Err(FeedError::Incomplete(needed)) => FeedResult::Incomplete { needed, consumed },
+                Err(FeedError::Invalid(inv)) => FeedResult::Invalid(inv),
+            }
         };
-        self.read_pos += crate::to_u64(len);
-        Ok(Some(msg))
+
+        match feed_result {
+            FeedResult::None => Ok(None),
+            FeedResult::Message {
+                msg,
+                body_len,
+                consumed,
+            } => {
+                let body = if body_len == 0 {
+                    let _ = src.split_to(consumed);
+                    Bytes::new()
+                } else {
+                    let mut raw = src.split_to(consumed);
+                    let before_body = consumed - body_len;
+                    raw.advance(before_body);
+                    raw.truncate(body_len);
+                    raw.freeze()
+                };
+                Ok(Some(ReceivedMessage {
+                    msg,
+                    body,
+                    ctx: RtspMessageContext {
+                        pos,
+                        received_wall: WallTime::now(),
+                        received: Instant::now(),
+                    },
+                }))
+            }
+            FeedResult::Incomplete { needed, consumed } => {
+                // Advance past any bytes the parser stably consumed (e.g. headers).
+                if consumed > 0 {
+                    src.advance(consumed);
+                }
+                // Reserve space for the body if the parser knows how much is needed.
+                src.reserve(needed.map(|n| n.get()).unwrap_or(1024));
+                Ok(None)
+            }
+            FeedResult::Invalid(inv) => Err(CodecError::ParseError {
+                description: format!(
+                    "Invalid RTSP message: {inv}; buffered:\n{:#?}",
+                    crate::hex::LimitedHex::new(&src[..], 128),
+                ),
+                pos: inv.pos,
+            }),
+        }
     }
 }
 
-impl tokio_util::codec::Encoder<rtsp_types::Message<Bytes>> for Codec {
+impl tokio_util::codec::Encoder<OwnedMessage> for Codec {
     type Error = CodecError;
 
-    fn encode(
-        &mut self,
-        item: rtsp_types::Message<Bytes>,
-        mut dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        item.write(&mut (&mut dst).writer())
+    fn encode(&mut self, item: OwnedMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        item.write(&mut dst.writer())
             .expect("BufMut Writer is infallible");
         Ok(())
     }
@@ -313,7 +290,7 @@ mod tests {
     fn crlf_data() {
         let mut codec = Codec {
             ctx: ConnectionContext::dummy(),
-            read_pos: 0,
+            parser: crate::rtsp::parse::Parser::default(),
         };
         let mut buf = BytesMut::from(&b"\r\n$\x00\x00\x04asdfrest"[..]);
         codec.decode(&mut buf).unwrap();

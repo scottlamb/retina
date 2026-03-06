@@ -110,7 +110,7 @@ This builds on the whole Rust ecosystem. A couple folks have been especially
 helpful:
 
 *   Sebastian Dröge, author of
-    [`rtsp-types`](https://crates.io/crates/rtsp-types)
+    [`sdp-types`](https://crates.io/crates/sdp-types)
 *   David Holroyd, author of
     [`h264-reader`](https://crates.io/crates/h264-reader)
 

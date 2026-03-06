@@ -52,3 +52,9 @@ name = "h265_nal"
 path = "fuzz_targets/h265_nal.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "roundtrip_rtsp_message"
+path = "fuzz_targets/roundtrip_rtsp_message.rs"
+test = false
+doc = false

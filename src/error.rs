@@ -44,14 +44,16 @@ pub(crate) enum ErrorInt {
         description: String,
     },
 
-    #[display("{status} response to {} CSeq={cseq}: {description}\n\n\
-             conn: {conn_ctx}\nmsg: {msg_ctx}", <&str>::from(method))]
+    #[display(
+        "{status} response to {method} CSeq={cseq}: {description}\n\n\
+             conn: {conn_ctx}\nmsg: {msg_ctx}"
+    )]
     RtspResponseError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
-        method: rtsp_types::Method,
+        method: crate::rtsp::msg::Method,
         cseq: u32,
-        status: rtsp_types::StatusCode,
+        status: crate::rtsp::msg::StatusCode,
         description: String,
     },
 

@@ -13,7 +13,7 @@
 use bytes::Bytes;
 use log::trace;
 use rand::Rng;
-use rtsp_types::Message;
+use rtsp::msg::Message;
 use std::fmt::{Debug, Display};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
@@ -23,6 +23,7 @@ use std::time::{Instant, SystemTime};
 mod error;
 
 mod hex;
+mod mostly_ascii;
 pub mod rtcp;
 pub mod rtp;
 
@@ -48,6 +49,8 @@ macro_rules! wrap {
 pub mod client;
 pub mod codec;
 //mod error;
+#[doc(hidden)]
+pub mod rtsp;
 mod tokio;
 
 use error::ErrorInt;
@@ -56,7 +59,8 @@ use error::ErrorInt;
 #[derive(Debug)]
 struct ReceivedMessage {
     ctx: RtspMessageContext,
-    msg: Message<Bytes>,
+    msg: Message,
+    body: Bytes,
 }
 
 /// An annotated RTP timestamp.
@@ -452,27 +456,6 @@ impl Display for PacketContext {
             PacketContextInner::Dummy => write!(f, "dummy"),
         }
     }
-}
-
-/// Returns the range within `buf` that represents `subset`.
-/// If `subset` is empty, returns None; otherwise panics if `subset` is not within `buf`.
-pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usize>> {
-    if subset.is_empty() {
-        return None;
-    }
-    let subset_p = subset.as_ptr() as usize;
-    let buf_p = buf.as_ptr() as usize;
-    let off = match subset_p.checked_sub(buf_p) {
-        Some(off) => off,
-        None => panic!(
-            "{}-byte subset not within {}-byte buf",
-            subset.len(),
-            buf.len()
-        ),
-    };
-    let end = off + subset.len();
-    assert!(end <= buf.len());
-    Some(off..end)
 }
 
 /// A pair of local UDP sockets used for RTP and RTCP transmission.

@@ -145,11 +145,18 @@ pub(crate) fn init_logging() {
 }
 
 #[cfg(test)]
-pub(crate) fn response(raw: &'static [u8]) -> rtsp_types::Response<Bytes> {
-    let (msg, len) = rtsp_types::Message::parse(raw).unwrap();
-    assert_eq!(len, raw.len());
+pub(crate) fn response(raw: &'static [u8]) -> (crate::rtsp::msg::Response, Bytes) {
+    use crate::rtsp::inputs::{Contiguous, Input as _, Slice as _};
+    let mut parser = crate::rtsp::parse::Parser::default();
+    let mut input = Contiguous::new(raw, false);
+    let (msg, body_slice) = parser.feed(&mut input).unwrap().unwrap();
+    assert!(input.is_empty(), "not all bytes consumed");
     match msg {
-        rtsp_types::Message::Response(r) => r.map_body(Bytes::from_static),
+        crate::rtsp::msg::Message::Response(r) => {
+            let body_cow = body_slice.to_cow();
+            let body = Bytes::copy_from_slice(&body_cow);
+            (r, body)
+        }
         _ => panic!("unexpected message type"),
     }
 }

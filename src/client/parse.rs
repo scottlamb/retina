@@ -209,10 +209,11 @@ fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
 }
 
 /// Returns the `CSeq` from an RTSP response as a `u32`, or `None` if missing/unparseable.
-pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
+pub(crate) fn get_cseq(response: &crate::rtsp::msg::Response) -> Option<u32> {
     response
-        .header(&rtsp_types::headers::CSEQ)
-        .and_then(|cseq| u32::from_str_radix(cseq.as_str(), 10).ok())
+        .headers
+        .get("CSeq")
+        .and_then(|cseq| u32::from_str_radix(cseq, 10).ok())
 }
 
 /// Parses a [MediaDescription] to a [Stream].
@@ -384,47 +385,22 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     })
 }
 
-/// Holds something that's supposed to be mostly ASCII.
-///
-/// Some SDP values are allowed to be UTF-8-encoded ISO-10646 characters, but mostly it's
-/// supposed to be valid ASCII. This has a `Debug` impl that is fairly readable for ASCII
-/// characters and can be copy'n'pasted into Python's `codecs.decode(..., 'string_escape'`)`
-/// or the like.
-struct MostlyAscii<'a>(&'a [u8]);
-
-impl std::fmt::Debug for MostlyAscii<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "\"")?;
-        for &b in self.0 {
-            match b {
-                b'"' => write!(f, "\"")?,
-                b'\r' => write!(f, "\\r")?,
-                // Note this writes newlines in unescaped form.
-                b' ' | b'\n' | 0x20..=0x7E => write!(f, "{}", b as char)?,
-                _ => write!(f, "\\x{b:02X}")?,
-            }
-        }
-        write!(f, "\"")?;
-        Ok(())
-    }
-}
+use crate::mostly_ascii::MostlyAscii;
 
 /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
 /// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
 pub(crate) fn parse_describe(
     request_url: Url,
-    response: &rtsp_types::Response<Bytes>,
+    response: &crate::rtsp::msg::Response,
+    body: &Bytes,
 ) -> Result<Presentation, String> {
-    match response.header(&rtsp_types::headers::CONTENT_TYPE) {
-        Some(v) if v.as_str() == "application/sdp" => {}
+    match response.headers.get("Content-Type") {
+        Some(v) if &**v == "application/sdp" => {}
         Some(v) => {
-            let mut buf = vec![];
-            response.write(&mut buf).map_err(|e| e.to_string())?;
             return Err(format!(
-                "DESCRIBE response at {} has unexpected content type {}:\n{:?}",
+                "DESCRIBE response at {} has unexpected content type {}",
                 request_url.as_str(),
                 v,
-                MostlyAscii(&buf)
             ));
         }
         None => {
@@ -434,20 +410,22 @@ pub(crate) fn parse_describe(
             );
         }
     }
-    let raw_sdp = MostlyAscii(&response.body()[..]);
-    let sdp = sdp_types::Session::parse(raw_sdp.0)
+    let raw_sdp = MostlyAscii::new(&body[..]);
+    let sdp = sdp_types::Session::parse(raw_sdp.bytes)
         .map_err(|e| format!("Unable to parse SDP: {e}\n\n{raw_sdp:#?}",))?;
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
-        .header(&rtsp_types::headers::CONTENT_BASE)
-        .map(|v| (rtsp_types::headers::CONTENT_BASE, v))
+        .headers
+        .get("Content-Base")
+        .map(|v| ("Content-Base", v))
         .or_else(|| {
             response
-                .header(&rtsp_types::headers::CONTENT_LOCATION)
-                .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
+                .headers
+                .get("Content-Location")
+                .map(|v| ("Content-Location", v))
         })
-        .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {h} {v:?}: {e}")))
+        .map(|(h, v)| Url::parse(v).map_err(|e| format!("bad {h} {v:?}: {e}")))
         .unwrap_or_else(|| Ok(request_url.clone()))?;
 
     let mut control = None;
@@ -535,14 +513,16 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
 /// `session_id` is checked for assignment or reassignment.
 /// Returns an assigned interleaved channel id (implying the next channel id
 /// is also assigned) or errors.
-pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<SetupResponse, String> {
+pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<SetupResponse, String> {
     // https://datatracker.ietf.org/doc/html/rfc2326#section-12.37
     let session = response
-        .header(&rtsp_types::headers::SESSION)
+        .headers
+        .get("Session")
         .ok_or_else(|| "Missing Session header".to_string())?;
-    let session = match session.as_str().split_once(';') {
+    let session_str: &str = session;
+    let session = match session_str.split_once(';') {
         None => SessionHeader {
-            id: session.as_str().into(),
+            id: session_str.into(),
             timeout_sec: 60, // default
         },
         Some((id, timeout_str)) => {
@@ -554,7 +534,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
                     // This would make Retina send keepalives at an absurd rate; reject.
                     return Err(format!(
                         "Invalid timeout=0 in Session header {:?}",
-                        session.as_str()
+                        session_str
                     ));
                 }
                 SessionHeader {
@@ -562,18 +542,20 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
                     timeout_sec,
                 }
             } else {
-                return Err(format!("Unparseable Session header {:?}", session.as_str()));
+                return Err(format!("Unparseable Session header {:?}", session_str));
             }
         }
     };
     let transport = response
-        .header(&rtsp_types::headers::TRANSPORT)
+        .headers
+        .get("Transport")
         .ok_or_else(|| "Missing Transport header".to_string())?;
     let mut channel_id = None;
     let mut ssrc = None;
     let mut source = None;
     let mut server_port = None;
-    for part in transport.as_str().split(';') {
+    let transport_str: &str = transport;
+    for part in transport_str.split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
             let v = v.trim();
             let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
@@ -597,10 +579,7 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
             );
         } else if let Some(s) = part.strip_prefix("server_port=") {
             server_port = Some(parse_server_port(s).map_err(|()| {
-                format!(
-                    "Transport header {:?} has bad server_port",
-                    transport.as_str()
-                )
+                format!("Transport header {:?} has bad server_port", &**transport)
             })?);
         }
     }
@@ -615,15 +594,15 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
 
 /// Parses a `PLAY` response. The error should always be packed into a `RtspProtocolError`.
 pub(crate) fn parse_play(
-    response: &rtsp_types::Response<Bytes>,
+    response: &crate::rtsp::msg::Response,
     presentation: &mut Presentation,
 ) -> Result<(), String> {
     // https://tools.ietf.org/html/rfc2326#section-12.33
-    let rtp_info = match response.header(&rtsp_types::headers::RTP_INFO) {
+    let rtp_info = match response.headers.get("RTP-Info") {
         Some(rtsp_info) => rtsp_info,
         None => return Ok(()),
     };
-    for s in rtp_info.as_str().split(',') {
+    for s in rtp_info.split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
         let url = parts
@@ -707,7 +686,7 @@ pub(crate) struct OptionsResponse {
 
 /// Parses an `OPTIONS` response.
 pub(crate) fn parse_options(
-    response: &rtsp_types::Response<Bytes>,
+    response: &crate::rtsp::msg::Response,
 ) -> Result<OptionsResponse, String> {
     let mut interpreted = OptionsResponse::default();
 
@@ -715,8 +694,8 @@ pub(crate) fn parse_options(
     // HTTP/1.1 OPTIONS method: https://www.rfc-editor.org/rfc/rfc2616.html#section-9.2
     // RTSP/1.0 Public header: https://www.rfc-editor.org/rfc/rfc2326.html#section-12.28
     // HTTP/1.1 Public header: https://www.rfc-editor.org/rfc/rfc2068#section-14.35
-    if let Some(public) = response.header(&rtsp_types::headers::PUBLIC) {
-        for method in public.as_str().split(',') {
+    if let Some(public) = response.headers.get("Public") {
+        for method in public.split(',') {
             let method = method.trim();
             match method {
                 "SET_PARAMETER" => interpreted.set_parameter_supported = true,
@@ -747,7 +726,8 @@ mod tests {
         raw_response: &'static [u8],
     ) -> Result<super::Presentation, String> {
         let url = Url::parse(raw_url).unwrap();
-        super::parse_describe(url, &response(raw_response))
+        let (resp, body) = response(raw_response);
+        super::parse_describe(url, &resp, &body)
     }
 
     fn dummy_stream_state_init(ssrc: Option<u32>) -> StreamState {
@@ -775,51 +755,52 @@ mod tests {
     /// > a field parsing implementation MUST exclude such whitespace prior to
     /// > evaluating the field value.
     ///
-    /// Currently we rely on `rtsp-types` doing the stripping.
+    /// Our parser strips OWS around header values.
     #[test]
     fn longse_cseq() {
         init_logging();
-        let response = response(include_bytes!("testdata/longse_unauthorized.txt"));
+        let (response, _body) = response(include_bytes!("testdata/longse_unauthorized.txt"));
         assert_eq!(super::get_cseq(&response), Some(1));
+    }
+
+    fn sdp_response(body: &'static [u8]) -> (crate::rtsp::msg::Response, Bytes) {
+        use crate::rtsp::msg::*;
+        (
+            Response {
+                status_code: StatusCode::OK,
+                reason_phrase: "OK".into(),
+                headers: [(
+                    HeaderName::CONTENT_TYPE,
+                    HeaderValue::try_from("application/sdp").unwrap(),
+                )]
+                .into(),
+            },
+            Bytes::from_static(body),
+        )
     }
 
     #[test]
     fn anvpiz_sdp() {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
-        let response =
-            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
-                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
-                .build(Bytes::from_static(include_bytes!(
-                    "testdata/anpviz_sdp.txt"
-                )));
-        super::parse_describe(url, &response).unwrap();
+        let (response, body) = sdp_response(include_bytes!("testdata/anpviz_sdp.txt"));
+        super::parse_describe(url, &response, &body).unwrap();
     }
 
     #[test]
     fn geovision_sdp() {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
-        let response =
-            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
-                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
-                .build(Bytes::from_static(include_bytes!(
-                    "testdata/geovision_sdp.txt"
-                )));
-        super::parse_describe(url, &response).unwrap();
+        let (response, body) = sdp_response(include_bytes!("testdata/geovision_sdp.txt"));
+        super::parse_describe(url, &response, &body).unwrap();
     }
 
     #[test]
     fn ubiquiti_sdp() {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
-        let response =
-            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
-                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
-                .build(Bytes::from_static(include_bytes!(
-                    "testdata/ubiquiti_sdp.txt"
-                )));
-        let d = super::parse_describe(url, &response).unwrap();
+        let (response, body) = sdp_response(include_bytes!("testdata/ubiquiti_sdp.txt"));
+        let d = super::parse_describe(url, &response, &body).unwrap();
         assert_eq!(d.streams.len(), 3);
     }
 
@@ -831,13 +812,8 @@ mod tests {
     fn tplink_sdp() {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
-        let response =
-            rtsp_types::Response::builder(rtsp_types::Version::V1_0, rtsp_types::StatusCode::Ok)
-                .header(rtsp_types::headers::CONTENT_TYPE, "application/sdp")
-                .build(Bytes::from_static(include_bytes!(
-                    "testdata/tplink_sdp.txt"
-                )));
-        let p = super::parse_describe(url, &response).unwrap();
+        let (response, body) = sdp_response(include_bytes!("testdata/tplink_sdp.txt"));
+        let p = super::parse_describe(url, &response, &body).unwrap();
         assert_eq!(p.streams.len(), 2);
     }
 
@@ -905,7 +881,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/dahua_setup.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -918,7 +894,11 @@ mod tests {
         p.streams[0].state = dummy_stream_state_init(Some(0x30a98ee7));
 
         // PLAY.
-        super::parse_play(&response(include_bytes!("testdata/dahua_play.txt")), &mut p).unwrap();
+        super::parse_play(
+            &response(include_bytes!("testdata/dahua_play.txt")).0,
+            &mut p,
+        )
+        .unwrap();
         match &p.streams[0].state {
             StreamState::Init(s) => {
                 assert_eq!(s.initial_seq, Some(47121));
@@ -929,8 +909,8 @@ mod tests {
         // The other streams don't get filled in because they're in state Uninit.
 
         // OPTIONS.
-        let opts =
-            super::parse_options(&response(include_bytes!("testdata/dahua_options.txt"))).unwrap();
+        let opts = super::parse_options(&response(include_bytes!("testdata/dahua_options.txt")).0)
+            .unwrap();
         assert!(opts.set_parameter_supported);
     }
 
@@ -1015,7 +995,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/hikvision_setup.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1029,7 +1009,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            &response(include_bytes!("testdata/hikvision_play.txt")),
+            &response(include_bytes!("testdata/hikvision_play.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1103,7 +1083,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/reolink_setup.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1118,7 +1098,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            &response(include_bytes!("testdata/reolink_play.txt")),
+            &response(include_bytes!("testdata/reolink_play.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1187,7 +1167,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/bunny_setup.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1201,7 +1181,11 @@ mod tests {
         p.streams[1].state = dummy_stream_state_init(None);
 
         // PLAY.
-        super::parse_play(&response(include_bytes!("testdata/bunny_play.txt")), &mut p).unwrap();
+        super::parse_play(
+            &response(include_bytes!("testdata/bunny_play.txt")).0,
+            &mut p,
+        )
+        .unwrap();
         match &p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(0));
@@ -1235,7 +1219,7 @@ mod tests {
         let mut p = parse_describe(prefix, include_bytes!("testdata/bunny_describe.txt")).unwrap();
         p.streams[0].state = dummy_stream_state_init(None);
         super::parse_play(
-            &response(include_bytes!("testdata/bad_rtptime.txt")),
+            &response(include_bytes!("testdata/bad_rtptime.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1389,7 +1373,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/gw_main_setup_video.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1402,7 +1386,7 @@ mod tests {
         p.streams[0].state = dummy_stream_state_init(None);
 
         let setup_response = response(include_bytes!("testdata/gw_main_setup_audio.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1416,7 +1400,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            &response(include_bytes!("testdata/gw_main_play.txt")),
+            &response(include_bytes!("testdata/gw_main_play.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1467,7 +1451,7 @@ mod tests {
 
         // SETUP.
         let setup_response = response(include_bytes!("testdata/gw_sub_setup.txt"));
-        let setup_response = super::parse_setup(&setup_response).unwrap();
+        let setup_response = super::parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             setup_response.session,
             SessionHeader {
@@ -1481,7 +1465,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            &response(include_bytes!("testdata/gw_sub_play.txt")),
+            &response(include_bytes!("testdata/gw_sub_play.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1535,7 +1519,7 @@ mod tests {
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
         p.streams[0].state = dummy_stream_state_init(None);
         super::parse_play(
-            &response(include_bytes!("testdata/laureii_play.txt")),
+            &response(include_bytes!("testdata/laureii_play.txt")).0,
             &mut p,
         )
         .unwrap();
@@ -1555,7 +1539,7 @@ mod tests {
     fn hikvision_ssrc_with_leading_space() {
         init_logging();
         let setup_response = response(include_bytes!("testdata/hikvision_setup_ssrc_space.txt"));
-        let r = parse_setup(&setup_response).unwrap();
+        let r = parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             r,
             SetupResponse {
@@ -1575,7 +1559,7 @@ mod tests {
     fn luckfox_setup_tcp() {
         init_logging();
         let setup_response = response(include_bytes!("testdata/luckfox_rkipc_setup_tcp.txt"));
-        let r = parse_setup(&setup_response).unwrap();
+        let r = parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             r,
             SetupResponse {
@@ -1595,7 +1579,7 @@ mod tests {
     fn luckfox_setup_udp() {
         init_logging();
         let setup_response = response(include_bytes!("testdata/luckfox_rkipc_setup_udp.txt"));
-        let r = parse_setup(&setup_response).unwrap();
+        let r = parse_setup(&setup_response.0).unwrap();
         assert_eq!(
             r,
             SetupResponse {
