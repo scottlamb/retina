@@ -299,6 +299,7 @@ impl std::fmt::Debug for VideoParametersCodec {
                 .field("sps", &crate::hex::LimitedHex::new(sps, 256))
                 .field("pps", &crate::hex::LimitedHex::new(pps, 256))
                 .finish(),
+            #[cfg(feature = "h265")]
             Self::H265 { vps, sps, pps } => f
                 .debug_struct("H265")
                 .field("vps", &crate::hex::LimitedHex::new(vps, 256))

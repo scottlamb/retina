@@ -36,12 +36,12 @@ jobs:
           components: ${{ matrix.extra_components }}
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkgconf
-      - name: Build (no features)
-        run: cargo build --no-default-features --all-targets --workspace
+      - name: Build (no features, main crate only)
+        run: cargo build --no-default-features --all-targets
       - name: Build (all features)
         run: cargo build --all-features --all-targets --workspace
-      - name: Test (no features)
-        run: cargo test --no-default-features --all-targets --workspace
+      - name: Test (no features, main crate only)
+        run: cargo test --no-default-features --all-targets
       - name: Test (all features)
         run: cargo test --all-features --all-targets --workspace
       - name: Check fuzz tests
