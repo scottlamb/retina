@@ -281,7 +281,7 @@ impl SessionGroup {
 /// Policy for when to send `TEARDOWN` requests.
 ///
 /// Specify via [`SessionOptions::teardown`].
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum TeardownPolicy {
     /// Automatic.
     ///
@@ -297,26 +297,19 @@ pub enum TeardownPolicy {
     ///     to be buggy but don't advertise buggy versions. After the single attempt,
     ///     closes the TCP connection and considers the session done.
     #[default]
+    #[display("auto")]
     Auto,
 
     /// Always send `TEARDOWN` requests, regardless of transport.
     ///
     /// This tries repeatedly to tear down the session until success or expiration;
     /// [`SessionGroup`] will track it also.
+    #[display("always")]
     Always,
 
     /// Never send `TEARDOWN` or track stale sessions.
+    #[display("never")]
     Never,
-}
-
-impl std::fmt::Display for TeardownPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            TeardownPolicy::Auto => "auto",
-            TeardownPolicy::Never => "never",
-            TeardownPolicy::Always => "always",
-        })
-    }
 }
 
 impl std::str::FromStr for TeardownPolicy {
@@ -337,37 +330,30 @@ impl std::str::FromStr for TeardownPolicy {
 /// Policy for handling the `rtptime` parameter normally seen in the `RTP-Info` header.
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum InitialTimestampPolicy {
     /// Default policy: currently `Require` when playing multiple streams,
     /// `Ignore` otherwise.
     #[default]
+    #[display("default")]
     Default,
 
     /// Require the `rtptime` parameter be present and use it to set NPT. Use
     /// when accurate multi-stream NPT is important.
+    #[display("require")]
     Require,
 
     /// Ignore the `rtptime` parameter and assume the first received packet for
     /// each stream is at NPT 0. Use with cameras that are known to set
     /// `rtptime` incorrectly.
+    #[display("ignore")]
     Ignore,
 
     /// Use the `rtptime` parameter when playing multiple streams if it's
     /// specified for all of them; otherwise assume the first received packet
     /// for each stream is at NPT 0.
+    #[display("permissive")]
     Permissive,
-}
-
-impl std::fmt::Display for InitialTimestampPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            InitialTimestampPolicy::Default => "default",
-            InitialTimestampPolicy::Require => "require",
-            InitialTimestampPolicy::Ignore => "ignore",
-            InitialTimestampPolicy::Permissive => "permissive",
-        })
-    }
 }
 
 impl std::str::FromStr for InitialTimestampPolicy {
@@ -388,14 +374,16 @@ impl std::str::FromStr for InitialTimestampPolicy {
 }
 
 /// Policy for handling the `seq` parameter normally seen in the `RTP-Info` header.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum InitialSequenceNumberPolicy {
     /// Default policy: currently same as `IgnoreSuspiciousValues`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Always respect the value in the header if present.
+    #[display("respect")]
     Respect,
 
     /// Ignore `0` and `1` values, which we consider "suspicious".
@@ -406,21 +394,12 @@ pub enum InitialSequenceNumberPolicy {
     /// *   The Hikvision DS-2CD2032-I appears to always send `seq=0` on its
     ///     metadata stream.
     /// *   The Tapo C320WS appears to always send `seq=1` in all streams.
+    #[display("ignore-suspicious-values")]
     IgnoreSuspiciousValues,
 
     /// Always ignore, starting the sequence number from observed RTP packets.
+    #[display("ignore")]
     Ignore,
-}
-
-impl std::fmt::Display for InitialSequenceNumberPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            InitialSequenceNumberPolicy::Default => "default",
-            InitialSequenceNumberPolicy::Respect => "respect",
-            InitialSequenceNumberPolicy::IgnoreSuspiciousValues => "ignore-suspicious-values",
-            InitialSequenceNumberPolicy::Ignore => "ignore",
-        })
-    }
 }
 
 impl std::str::FromStr for InitialSequenceNumberPolicy {
@@ -441,32 +420,25 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
 }
 
 /// Policy for handling unknown `ssrc` value in RTCP messages.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum UnknownRtcpSsrcPolicy {
     /// Default policy: currently same as `DropPackets`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Abort the session on encountering an unknown `ssrc`.
+    #[display("abort-session")]
     AbortSession,
 
     /// Drop RTCP packets with an unknown `ssrc`.
+    #[display("drop-packets")]
     DropPackets,
 
     /// Process the packets as if they had the expected `ssrc`.
+    #[display("process-packets")]
     ProcessPackets,
-}
-
-impl std::fmt::Display for UnknownRtcpSsrcPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            UnknownRtcpSsrcPolicy::Default => "default",
-            UnknownRtcpSsrcPolicy::AbortSession => "abort-session",
-            UnknownRtcpSsrcPolicy::DropPackets => "drop-packets",
-            UnknownRtcpSsrcPolicy::ProcessPackets => "process-packets",
-        })
-    }
 }
 
 impl std::str::FromStr for UnknownRtcpSsrcPolicy {
@@ -509,7 +481,7 @@ pub struct SessionOptions {
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, derive_more::Display)]
 pub enum UnassignedChannelDataPolicy {
     /// Automatic (default).
     ///
@@ -521,6 +493,7 @@ pub enum UnassignedChannelDataPolicy {
     ///     no tool attribute, or if it does not match the known pattern),
     ///     use `Ignore`.
     #[default]
+    #[display("auto")]
     Auto,
 
     /// Assume the data is due to the live555 stale TCP session bug described
@@ -528,9 +501,11 @@ pub enum UnassignedChannelDataPolicy {
     ///
     /// This session will return error, and the `SessionGroup` will track the
     /// expiration of a stale session.
+    #[display("assume-stale-session")]
     AssumeStaleSession,
 
     /// Returns an error.
+    #[display("error")]
     Error,
 
     /// Ignores the data.
@@ -539,18 +514,8 @@ pub enum UnassignedChannelDataPolicy {
     /// to interleaved channels. If there is no `SETUP` for that stream before
     /// `PLAY`, they will send data anyway, on this channel. In this mode, such
     /// data messages are ignored.
+    #[display("ignore")]
     Ignore,
-}
-
-impl std::fmt::Display for UnassignedChannelDataPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            UnassignedChannelDataPolicy::Auto => "auto",
-            UnassignedChannelDataPolicy::AssumeStaleSession => "assume-stale-session",
-            UnassignedChannelDataPolicy::Error => "error",
-            UnassignedChannelDataPolicy::Ignore => "ignore",
-        })
-    }
 }
 
 impl std::str::FromStr for UnassignedChannelDataPolicy {
@@ -572,29 +537,22 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
 
 /// Policy for handling the session ID returned by the server in response to
 /// `SETUP` requests.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum SessionIdPolicy {
     /// Default policy: currently `RequireMatch`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Requires the server to return the same session ID for all `SETUP`
     /// requests in the session.
+    #[display("require-match")]
     RequireMatch,
 
     /// Uses the session ID returned from the first `SETUP` request and ignores
     /// any subsequent changes. Required for some broken cameras.
+    #[display("use-first")]
     UseFirst,
-}
-
-impl std::fmt::Display for SessionIdPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            SessionIdPolicy::Default => "default",
-            SessionIdPolicy::RequireMatch => "require-match",
-            SessionIdPolicy::UseFirst => "use-first",
-        })
-    }
 }
 
 impl std::str::FromStr for SessionIdPolicy {
@@ -616,10 +574,11 @@ impl std::str::FromStr for SessionIdPolicy {
 /// The RTP packet transport to request.
 ///
 /// Defaults to `Transport::Tcp`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, derive_more::Display)]
 #[non_exhaustive]
 pub enum Transport {
     /// Sends RTP packets over the RTSP TCP connection via interleaved data.
+    #[display("tcp")]
     Tcp(TcpTransportOptions),
 
     /// Sends RTP packets over UDP (experimental).
@@ -629,21 +588,13 @@ pub enum Transport {
     /// *   There's no support for sending RTCP RRs (receiver reports), so
     ///     servers won't have the correct information to measure packet loss
     ///     and pace packets appropriately.
+    #[display("udp")]
     Udp(UdpTransportOptions),
 }
 
 impl Default for Transport {
     fn default() -> Self {
         Transport::Tcp(TcpTransportOptions::default())
-    }
-}
-
-impl std::fmt::Display for Transport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            Transport::Tcp(_) => "tcp",
-            Transport::Udp(_) => "udp",
-        })
     }
 }
 

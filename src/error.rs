@@ -1,11 +1,10 @@
 // Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{fmt::Display, sync::Arc};
+use std::sync::Arc;
 
 use crate::{ConnectionContext, PacketContext, RtspMessageContext, StreamContext, WallTime};
 use bytes::Bytes;
-use thiserror::Error;
 
 /// An opaque `std::error::Error + Send + Sync + 'static` implementation.
 ///
@@ -16,8 +15,10 @@ use thiserror::Error;
 /// If you wish to inspect Retina errors programmatically, or if you need
 /// errors formatted in a different way, please file an issue on the `retina`
 /// repository.
-#[derive(Clone)]
-pub struct Error(pub(crate) Arc<ErrorInt>);
+#[derive(Clone, derive_more::Debug, derive_more::Display, derive_more::Error)]
+#[display("{_0}")]
+#[debug("{_0:?}")]
+pub struct Error(#[error(not(source))] pub(crate) Arc<ErrorInt>);
 
 impl Error {
     /// Returns the status code, if the error was generated from a response.
@@ -29,36 +30,22 @@ impl Error {
     }
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::fmt::Debug for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-impl std::error::Error for Error {}
-
-#[derive(Debug, Error)]
+#[derive(Debug, derive_more::Display, derive_more::Error)]
 pub(crate) enum ErrorInt {
     /// The method's caller provided an invalid argument.
-    #[error("Invalid argument: {0}")]
-    InvalidArgument(String),
+    #[display("Invalid argument: {_0}")]
+    InvalidArgument(#[error(not(source))] String),
 
     /// Unparseable or unexpected RTSP message.
-    #[error("RTSP framing error: {description}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
+    #[display("RTSP framing error: {description}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
     RtspFramingError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
         description: String,
     },
 
-    #[error("{status} response to {} CSeq={cseq}: {description}\n\n\
-             conn: {conn_ctx}\nmsg: {msg_ctx}", Into::<&str>::into(.method))]
+    #[display("{status} response to {} CSeq={cseq}: {description}\n\n\
+             conn: {conn_ctx}\nmsg: {msg_ctx}", <&str>::from(method))]
     RtspResponseError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
@@ -68,7 +55,7 @@ pub(crate) enum ErrorInt {
         description: String,
     },
 
-    #[error(
+    #[display(
         "Received interleaved data on unassigned channel {channel_id}: \n\
          {:?}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}",
         crate::hex::LimitedHex::new(data, 64)
@@ -80,7 +67,7 @@ pub(crate) enum ErrorInt {
         data: Bytes,
     },
 
-    #[error("{description}\n\nconn: {conn_ctx}\nstream: {stream_ctx}\npkt: {pkt_ctx}")]
+    #[display("{description}\n\nconn: {conn_ctx}\nstream: {stream_ctx}\npkt: {pkt_ctx}")]
     PacketError {
         conn_ctx: ConnectionContext,
         stream_ctx: StreamContext,
@@ -89,7 +76,7 @@ pub(crate) enum ErrorInt {
         description: String,
     },
 
-    #[error(
+    #[display(
         "{description}\n\n\
              conn: {conn_ctx}\nstream: {stream_ctx}\n\
              ssrc: {ssrc:08x}\nseq: {sequence_number}\npkt: {pkt_ctx}"
@@ -104,17 +91,18 @@ pub(crate) enum ErrorInt {
         description: String,
     },
 
-    #[error("Unable to connect to RTSP server: {0}")]
-    ConnectError(#[source] std::io::Error),
+    #[display("Unable to connect to RTSP server: {_0}")]
+    ConnectError(#[error(source)] std::io::Error),
 
-    #[error("Error reading from RTSP peer: {source}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
+    #[display("Error reading from RTSP peer: {source}\n\nconn: {conn_ctx}\nmsg: {msg_ctx}")]
     RtspReadError {
         conn_ctx: ConnectionContext,
         msg_ctx: RtspMessageContext,
+        #[error(source)]
         source: std::io::Error,
     },
 
-    #[error(
+    #[display(
         "Error receiving UDP packet: {source}\n\n\
              conn: {conn_ctx}\nstream: {stream_ctx}\nat: {when}"
     )]
@@ -122,24 +110,26 @@ pub(crate) enum ErrorInt {
         conn_ctx: ConnectionContext,
         stream_ctx: StreamContext,
         when: WallTime,
+        #[error(source)]
         source: std::io::Error,
     },
 
-    #[error("Error writing to RTSP peer: {source}\n\nconn: {conn_ctx}")]
+    #[display("Error writing to RTSP peer: {source}\n\nconn: {conn_ctx}")]
     WriteError {
         conn_ctx: ConnectionContext,
+        #[error(source)]
         source: std::io::Error,
     },
 
-    #[error("Failed precondition: {0}")]
-    FailedPrecondition(String),
+    #[display("Failed precondition: {_0}")]
+    FailedPrecondition(#[error(not(source))] String),
 
-    #[error("Internal error: {0}")]
-    Internal(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[display("Internal error: {_0}")]
+    Internal(#[error(source)] Box<dyn std::error::Error + Send + Sync>),
 
-    #[error("Timeout")]
+    #[display("Timeout")]
     Timeout,
 
-    #[error("Unsupported: {0}")]
-    Unsupported(String),
+    #[display("Unsupported: {_0}")]
+    Unsupported(#[error(not(source))] String),
 }

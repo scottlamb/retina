@@ -254,22 +254,15 @@ pub fn split(nal: &[u8]) -> Result<(Header, impl BitRead + '_), Error> {
     Ok((header, bits))
 }
 
-#[derive(Debug)]
-pub struct Error(pub(crate) String);
+#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[display("{_0}")]
+pub struct Error(#[error(not(source))] pub(crate) String);
 
 impl From<BitReaderError> for Error {
     fn from(e: BitReaderError) -> Self {
         Error(format!("{:?}", e))
     }
 }
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::error::Error for Error {}
 
 // T.REC H.265 section 7.3.2.2
 #[derive(Debug)]
