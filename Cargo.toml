@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/client", "examples/ffmpeg-decode", "examples/webrtc-proxy"]
+members = [".", "examples/client", "examples/ffmpeg-decode", "examples/webrtc-proxy", "fuzz"]
 default-members = ["."]
 
 [package]

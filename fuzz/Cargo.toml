@@ -19,10 +19,6 @@ memchr = "2.7.4"
 path = ".."
 features = ["h265"]
 
-# Prevent this from interfering with workspaces
-[workspace]
-members = ["."]
-
 [[bin]]
 name = "depacketize_h264"
 path = "fuzz_targets/depacketize_h264.rs"
