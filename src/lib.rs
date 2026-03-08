@@ -26,8 +26,9 @@ mod hex;
 pub mod rtcp;
 pub mod rtp;
 
-#[cfg(test)]
-mod testutil;
+/// This is exposed for the fuzz tests. It is not a stable interface.
+#[doc(hidden)]
+pub mod testutil;
 
 pub use error::Error;
 

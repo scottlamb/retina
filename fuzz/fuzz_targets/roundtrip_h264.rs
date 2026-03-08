@@ -1,24 +1,39 @@
 // Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Tests a roundtrip through the H.264 packetizer and depacketizer with an arbitrary
-//! input packet size and frame. Ensures the following:
+//! Tests that decode(encode(max_payload_size, frame)) == frame with
+//! an arbitrary max_payload_size. Ensures the following:
+//!
 //! *   there are no crashes.
 //! *   the round trip produces an error, nothing (see note about `can_end_au`), or identical data.
+//!
+//! This is not expected to exercise all the depacketizer paths because the packetizer will only emit
+//! a strict, normalized form, where the depacketizer is expected to accept garbage.
 
 #![no_main]
 use bytes::Bytes;
-use libfuzzer_sys::fuzz_target;
+use derive_more::Debug;
+use libfuzzer_sys::arbitrary::{self, Arbitrary};
+use libfuzzer_sys::{Corpus, fuzz_target};
+use pretty_hex::PrettyHex as _;
 use std::num::NonZeroU32;
 
-fuzz_target!(|data: &[u8]| {
-    if data.len() < 3 {
-        return;
+#[derive(Arbitrary, Debug)]
+struct Input<'i> {
+    max_payload_size: u16,
+    #[debug("{:?}", data.hex_conf(retina::testutil::NONASCII_HEX_CONFIG))]
+    data: &'i [u8],
+}
+
+fuzz_target!(|input: Input<'_>| -> Corpus {
+    // The packetizer is not written to strip Annex B sequences, for example.
+    if retina::testutil::validate_avcc_frame(input.data).is_err() {
+        return Corpus::Reject;
     }
-    let max_payload_size = u16::from_be_bytes([data[0], data[1]]);
-    let mut p = match retina::codec::h264::Packetizer::new(max_payload_size, 0, 0, 0, 0) {
+
+    let mut p = match retina::codec::h264::Packetizer::new(input.max_payload_size, 0, 0, 0, 0) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return Corpus::Reject,
     };
     let mut d = retina::codec::Depacketizer::new(
         "video",
@@ -30,28 +45,20 @@ fuzz_target!(|data: &[u8]| {
     .unwrap();
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
 
-    // data[2] is the NAL header.
-    // data[3..] should not contain Annex B separators; the depacketizer will split them, and the
-    // result won't be the same as expected below.
-    let finder = memchr::memmem::Finder::new(&[0, 0, 1]);
-    if finder.find(&data[3..]).is_some() {
-        return;
-    }
-
-    if p.push(timestamp, Bytes::copy_from_slice(&data[2..]))
+    if p.push(timestamp, Bytes::copy_from_slice(input.data))
         .is_err()
     {
-        return;
+        return Corpus::Keep;
     }
     let frame = loop {
         match p.pull() {
             Ok(Some(pkt)) => {
                 let mark = pkt.mark();
                 if d.push(pkt).is_err() {
-                    return;
+                    return Corpus::Keep;
                 }
                 match d.pull() {
-                    Some(Err(_)) => return,
+                    Some(Err(_)) => return Corpus::Keep,
                     Some(Ok(retina::codec::CodecItem::VideoFrame(f))) => {
                         assert!(mark);
                         break f;
@@ -66,16 +73,17 @@ fuzz_target!(|data: &[u8]| {
                         // `retina::codec::h264::can_end_au`. In this case, just exit.
                         if mark {
                             assert!(matches!(p.pull(), Ok(None)));
-                            return;
+                            return Corpus::Keep;
                         }
                     }
                 }
             }
             Ok(None) => panic!("packetizer ran out of packets before depacketizer produced frame"),
-            Err(_) => return,
+            Err(_) => return Corpus::Keep,
         }
     };
-    assert_eq!(&data[2..], frame.data());
+    assert_eq!(input.data, frame.data());
     assert_eq!(d.pull(), None);
     assert_eq!(p.pull(), Ok(None));
+    Corpus::Keep
 });
