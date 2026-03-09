@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Hand-rolled parser for RTSP/1.0 message heads.

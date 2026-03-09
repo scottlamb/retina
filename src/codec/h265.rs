@@ -1,4 +1,4 @@
-// Copyright (C) 2024 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [H.265](https://www.itu.int/rec/T-REC-H.265)-encoded video,

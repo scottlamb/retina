@@ -1,4 +1,4 @@
-// Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tests that decode(encode(max_payload_size, frame)) == frame with

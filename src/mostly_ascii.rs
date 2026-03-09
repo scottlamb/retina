@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Formatter for byte data that is expected to be mostly ASCII.

@@ -1,4 +1,4 @@
-// Copyright (C) 2024 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Common logic between H.264 and H.265.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+# Copyright (C) The Retina Authors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Checks that expected header lines are present.
 
@@ -23,7 +23,7 @@ FILENAME_MATCHER = re.compile(r'.*\.rs$')
 MAX_LINE_COUNT = 10
 
 EXPECTED_LINES = [
-  re.compile(r'Copyright \(C\) 20\d{2}'),
+  re.compile(r'Copyright \(C\) The Retina Authors'),
   re.compile(r'SPDX-License-Identifier: MIT OR Apache-2\.0'),
 ]
 

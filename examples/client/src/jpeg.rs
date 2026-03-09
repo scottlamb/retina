@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Proof-of-concept `.jpeg` writer.
