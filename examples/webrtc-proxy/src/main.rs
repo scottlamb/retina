@@ -6,10 +6,7 @@ use base64::{Engine as _, engine::general_purpose};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info, warn};
-use retina::{
-    client::SetupOptions,
-    codec::{CodecItem, VideoFrame},
-};
+use retina::{client::SetupOptions, codec::CodecItem};
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
     api::{APIBuilder, interceptor_registry::register_default_interceptors},
@@ -209,7 +206,12 @@ async fn run() -> Result<(), Error> {
         .filter_map(|(i, track)| track.as_ref().map(|_| i))
     {
         upstream_session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .frame_format(retina::codec::FrameFormat::SIMPLE),
+            )
             .await?;
     }
 
@@ -235,7 +237,7 @@ async fn run() -> Result<(), Error> {
                 Ok(CodecItem::VideoFrame(f)) => {
                     let _ = upstream_frames_tx.send(Frame {
                         stream_id: f.stream_id(),
-                        annexb_data: convert_h2645(f).unwrap().into(),
+                        annexb_data: f.into_data().into(),
                     });
                 }
                 Ok(_) => {}
@@ -340,33 +342,4 @@ async fn run() -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-/// Converts from AVC representation to the Annex B representation expected by webrtc-rs.
-fn convert_h2645(frame: VideoFrame) -> Result<Vec<u8>, Error> {
-    // TODO:
-    // * For each IDR frame, copy the SPS and PPS from the stream's
-    //   parameters, rather than depend on it being present in the frame
-    //   already. In-band parameters aren't guaranteed. This is awkward
-    //   with h264_reader v0.5's h264_reader::avcc::AvcDecoderRecord because it
-    //   strips off the NAL header byte from each parameter. The next major
-    //   version shouldn't do this.
-    // * Copy only the slice data. In particular, don't copy SEI, which confuses
-    //   Safari: <https://github.com/scottlamb/retina/issues/60#issuecomment-1178369955>
-
-    let mut data = frame.into_data();
-    let mut i = 0;
-    while let Some(prefix) = data[i..].first_chunk_mut() {
-        // Replace each NAL's length with the Annex B start code b"\x00\x00\x00\x01".
-        let len = u32::from_be_bytes(*prefix) as usize;
-        *prefix = [0, 0, 0, 1];
-        i += 4 + len;
-        if i > data.len() {
-            bail!("partial NAL body");
-        }
-    }
-    if i < data.len() {
-        bail!("partial NAL length");
-    }
-    Ok(data)
 }

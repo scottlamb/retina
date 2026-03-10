@@ -662,14 +662,11 @@ impl SessionOptions {
     }
 }
 
-/// Per-stream options decided for `SETUP` time, for future expansion.
-///
-/// There's nothing here yet. Likely in the future this will allow configuring
-/// the output format for H.264 (Annex B or not).
+/// Per-stream options decided at `SETUP` time.
 #[derive(Default)]
 pub struct SetupOptions {
     transport: Transport,
-    strip_inline_parameters: bool,
+    frame_format: Option<crate::codec::FrameFormat>,
 }
 
 impl SetupOptions {
@@ -680,29 +677,14 @@ impl SetupOptions {
         self
     }
 
-    /// If true, strip inline parameter set NALs from H.264 and H.265 `VideoFrame::data`.
+    /// Sets the frame format for output assembly.
     ///
-    /// Currently defaults to false. A future major version of Retina will change the default
-    /// to true for several reasons:
-    ///
-    /// * Inline parameters are otherwise supplied or not at the discretion of the server.
-    ///   Thus with some servers it is already necessary to take advantage of
-    ///   [`Stream::parameters`] and [`crate::codec::VideoFrame::has_new_parameters`]. It's
-    ///   better to normalize than to see different behavior depending on the server.
-    /// * This matches the expectations for the `hvc1.*` RFC 6381 codec string returned by
-    ///   [`crate::codec::VideoParameters::rfc6381_codec`].
-    /// * Avoiding redundant copies (slightly) reduces the encoding size.
-    /// * It's sometimes desirable to patch the parameters—for example, to add aspect ratio
-    ///   information. By removing redundant parameters, we avoid situations in which one copy
-    ///   has been patched but the other is overriding it.
-    ///
-    /// Codec behavior:
-    ///
-    /// * H.264: strips SPS (type 7) and PPS (type 8) NALs
-    /// * H.265: strips VPS (type 32), SPS (type 33), and PPS (type 34) NALs.
+    /// This controls H.26x NAL framing (length-prefixed vs Annex B) and
+    /// parameter set insertion. See [`crate::codec::FrameFormat`] for details
+    /// and preset constants like [`FrameFormat::MP4`](crate::codec::FrameFormat::MP4).
     #[inline]
-    pub fn strip_inline_parameters(mut self, strip: bool) -> Self {
-        self.strip_inline_parameters = strip;
+    pub fn frame_format(mut self, format: crate::codec::FrameFormat) -> Self {
+        self.frame_format = Some(format);
         self
     }
 }
@@ -933,6 +915,10 @@ impl Stream {
     /// Thus, it's unspecified whether a `parameters` call immediately after `Session::describe`
     /// will return `Some` or `None`.
     ///
+    /// Additionally, parameters obtained before [`Session::setup`](crate::client::Session::setup)
+    /// always use the default framing. After `setup`, parameters reflect the supplied
+    /// [`SetupOptions::frame_format`](crate::client::SetupOptions::frame_format).
+    ///
     /// # With [`Demuxed`]
     ///
     /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl, `parameters` reflects
@@ -1004,9 +990,6 @@ struct StreamStateInit {
 
     ctx: StreamContext,
     udp_sockets: Option<UdpSockets>,
-
-    /// Whether to strip inline parameter set NALs from H.264/H.265 `VideoFrame::data`.
-    strip_inline_parameters: bool,
 }
 
 /// Username and password authentication credentials.
@@ -1757,13 +1740,17 @@ impl Session<Described> {
                 udp_sockets = Some(sockets);
             }
         };
+        if let Some(format) = options.frame_format
+            && let Ok(d) = &mut stream.depacketizer
+        {
+            d.set_frame_format(format);
+        }
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
             initial_rtptime: None,
             ctx: stream_ctx,
             udp_sockets,
-            strip_inline_parameters: options.strip_inline_parameters,
         });
         Ok(())
     }
@@ -1859,11 +1846,7 @@ impl Session<Described> {
                     ssrc,
                     ctx,
                     udp_sockets,
-                    strip_inline_parameters,
                 }) => {
-                    if strip_inline_parameters && let Ok(d) = &mut s.depacketizer {
-                        d.set_strip_inline_parameters(true);
-                    }
                     let initial_rtptime = match policy.initial_timestamp {
                         InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
                             if setup_streams > 1 =>

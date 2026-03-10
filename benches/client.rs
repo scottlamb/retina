@@ -107,7 +107,10 @@ async fn read_to_eof(addr: SocketAddr) {
             .await
             .unwrap();
     session
-        .setup(0, SetupOptions::default().strip_inline_parameters(true))
+        .setup(
+            0,
+            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
+        )
         .await
         .unwrap();
     let session = session

@@ -40,8 +40,9 @@ use super::{CodecItem, VideoFrame, VideoParameters};
 pub fn parameters_from_sps_and_pps(
     sps_nal: &[u8],
     pps_nal: &[u8],
+    framing: super::h26x::Framing,
 ) -> Result<VideoParameters, Error> {
-    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true)
+    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true, framing)
         .map(|int| int.generic_parameters)
         .map_err(|s| wrap!(crate::error::ErrorInt::InvalidArgument(s)))
 }
@@ -105,9 +106,8 @@ pub(crate) struct Depacketizer {
     /// fragments.
     seen_inconsistent_fu_a_nal_hdr: bool,
 
-    /// If true, SPS (type 7) and PPS (type 8) NALs are stripped from the output
-    /// `VideoFrame::data`.
-    strip_inline_parameters: bool,
+    /// Output format controlling NAL framing and parameter set insertion.
+    frame_format: super::FrameFormat,
 }
 
 #[derive(Debug)]
@@ -257,13 +257,31 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
-            strip_inline_parameters: false,
+            frame_format: Default::default(),
         })
     }
 
-    /// Sets whether to strip SPS and PPS NALs from `VideoFrame::data` output.
-    pub(super) fn set_strip_inline_parameters(&mut self, strip: bool) {
-        self.strip_inline_parameters = strip;
+    /// Sets the frame format for output assembly.
+    ///
+    /// If existing parameters were parsed with a different framing, they are
+    /// re-parsed to produce the correct `extra_data` format.
+    pub(super) fn set_frame_format(&mut self, format: super::FrameFormat) {
+        self.frame_format = format;
+
+        // Re-parse existing parameters so extra_data matches the new framing.
+        if let Some(ref ip) = self.parameters {
+            // Re-parse is infallible here—these params were already successfully
+            // parsed once—so unwrap via expect.
+            self.parameters = Some(
+                InternalParameters::parse_sps_and_pps(
+                    &ip.sps_nal,
+                    &ip.pps_nal,
+                    ip.seen_extra_trailing_data,
+                    format.h26x_framing,
+                )
+                .expect("re-parse of previously valid SPS/PPS should not fail"),
+            );
+        }
     }
 
     pub(super) fn check_invariants(&self) {
@@ -699,6 +717,8 @@ impl Depacketizer {
     }
 
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
+        use super::{ParameterSetInsertion, h26x::Framing};
+
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
         let mut is_random_access_point = true;
@@ -742,27 +762,91 @@ impl Depacketizer {
             if nal.hdr.nal_ref_idc() != 0 {
                 is_disposable = false;
             }
-            // TODO: support optionally filtering non-VUI NALs.
-            let is_param_set = matches!(
+            // Always strip inline parameter sets; they're handled via
+            // ParameterSetInsertion and the canonical copy in self.parameters.
+            if !matches!(
                 nal.hdr.nal_unit_type(),
                 UnitType::SeqParameterSet | UnitType::PicParameterSet
-            );
-            if !is_param_set || !self.strip_inline_parameters {
+            ) {
                 retained_len += 4usize + crate::to_usize(nal.len);
             }
             piece_idx = next_piece_idx;
         }
+
+        // Update parameters before building the frame, so prepended params
+        // reflect the latest SPS/PPS.
+        let has_new_parameters = match (
+            new_sps.as_deref(),
+            new_pps.as_deref(),
+            self.parameters.as_ref(),
+        ) {
+            (Some(sps_nal), Some(pps_nal), old_ip) => {
+                let seen_extra_trailing_data =
+                    old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
+                // TODO: could map this to a RtpPacketError more accurately.
+                self.parameters = Some(InternalParameters::parse_sps_and_pps(
+                    sps_nal,
+                    pps_nal,
+                    seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
+                )?);
+                true
+            }
+            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
+                let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
+                let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
+                // TODO: as above, could map this to a RtpPacketError more accurately.
+                self.parameters = Some(InternalParameters::parse_sps_and_pps(
+                    sps_nal,
+                    pps_nal,
+                    old_ip.seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
+                )?);
+                true
+            }
+            _ => false,
+        };
+
+        // Determine whether to prepend parameter sets.
+        let prepend_params = is_random_access_point
+            && match self.frame_format.parameter_set_insertion {
+                ParameterSetInsertion::EachKeyFrame => true,
+                ParameterSetInsertion::OnChange => has_new_parameters,
+                ParameterSetInsertion::Never => false,
+            };
+        if prepend_params && let Some(ref p) = self.parameters {
+            // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
+            retained_len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+        }
+
         let mut data = Vec::with_capacity(retained_len);
+
+        // Prepend parameter sets if requested.
+        if prepend_params && let Some(ref p) = self.parameters {
+            for param_nal in [&p.sps_nal, &p.pps_nal] {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
+                data.extend_from_slice(param_nal);
+            }
+        }
+
+        // Write non-parameter-set NALs with the configured framing.
         piece_idx = 0;
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            let is_param_set = matches!(
+            if !matches!(
                 nal.hdr.nal_unit_type(),
                 UnitType::SeqParameterSet | UnitType::PicParameterSet
-            );
-            if !is_param_set || !self.strip_inline_parameters {
-                data.extend_from_slice(&nal.len.to_be_bytes()[..]);
+            ) {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => nal.len.to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
                 data.push(nal.hdr.into());
                 let mut actual_len = 1;
                 for piece in nal_pieces {
@@ -778,35 +862,6 @@ impl Depacketizer {
         self.nals.clear();
         self.pieces.clear();
 
-        let has_new_parameters = match (
-            new_sps.as_deref(),
-            new_pps.as_deref(),
-            self.parameters.as_ref(),
-        ) {
-            (Some(sps_nal), Some(pps_nal), old_ip) => {
-                let seen_extra_trailing_data =
-                    old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
-                // TODO: could map this to a RtpPacketError more accurately.
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal,
-                    pps_nal,
-                    seen_extra_trailing_data,
-                )?);
-                true
-            }
-            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
-                let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
-                let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
-                // TODO: as above, could map this to a RtpPacketError more accurately.
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal,
-                    pps_nal,
-                    old_ip.seen_extra_trailing_data,
-                )?);
-                true
-            }
-            _ => false,
-        };
         Ok(VideoFrame {
             has_new_parameters,
             loss: au.loss,
@@ -975,13 +1030,19 @@ impl InternalParameters {
         }
         let sps_nal = sps_nal.ok_or_else(|| "bad sprop-parameter-sets: no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "bad sprop-parameter-sets: no pps".to_string())?;
-        Self::parse_sps_and_pps(&sps_nal, &pps_nal, false)
+        Self::parse_sps_and_pps(
+            &sps_nal,
+            &pps_nal,
+            false,
+            super::h26x::Framing::FourByteLength,
+        )
     }
 
     fn parse_sps_and_pps(
         sps_nal: &[u8],
         pps_nal: &[u8],
         mut seen_extra_trailing_data: bool,
+        framing: super::h26x::Framing,
     ) -> Result<InternalParameters, String> {
         let sps_rbsp = h264_reader::rbsp::decode_nal(sps_nal).map_err(|_| "bad sps")?;
         if sps_rbsp.len() < 5 {
@@ -1010,41 +1071,73 @@ impl InternalParameters {
         let all_pixel_dimensions = Self::all_pixel_dimensions(&sps)
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
 
-        // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
-        // The beginning of the AVCDecoderConfiguration takes a few values from
-        // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
-        let mut avc_decoder_config = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
-        avc_decoder_config.put_u8(1); // configurationVersion
-        avc_decoder_config.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
-        // ...misc bits... . profile_compatibility
-        // level_idc . AVCLevelIndication
+        let (extra_data, sps_nal, pps_nal) = match framing {
+            super::h26x::Framing::FourByteLength => {
+                // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
+                // The beginning of the AVCDecoderConfiguration takes a few values from
+                // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
+                let mut buf = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
+                buf.put_u8(1); // configurationVersion
+                buf.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
+                // ...misc bits... . profile_compatibility
+                // level_idc . AVCLevelIndication
 
-        // Hardcode lengthSizeMinusOne to 3, matching TransformSampleData's 4-byte
-        // lengths.
-        avc_decoder_config.put_u8(0xff);
+                // Hardcode lengthSizeMinusOne to 3, matching 4-byte lengths.
+                buf.put_u8(0xff);
 
-        // Only support one SPS and PPS.
-        // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
-        // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
-        avc_decoder_config.put_u8(0xe1);
-        avc_decoder_config.extend(
-            &u16::try_from(sps_nal.len())
-                .map_err(|_| format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len()))?
-                .to_be_bytes()[..],
-        );
-        let sps_nal_start = avc_decoder_config.len();
-        avc_decoder_config.extend_from_slice(sps_nal);
-        let sps_nal_end = avc_decoder_config.len();
-        avc_decoder_config.put_u8(1); // # of PPSs.
-        avc_decoder_config.extend(
-            &u16::try_from(pps_nal.len())
-                .map_err(|_| format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len()))?
-                .to_be_bytes()[..],
-        );
-        let pps_nal_start = avc_decoder_config.len();
-        avc_decoder_config.extend_from_slice(pps_nal);
-        let pps_nal_end = avc_decoder_config.len();
-        assert_eq!(avc_decoder_config.len(), 11 + sps_nal.len() + pps_nal.len());
+                // Only support one SPS and PPS.
+                // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
+                // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
+                buf.put_u8(0xe1);
+                buf.extend(
+                    &u16::try_from(sps_nal.len())
+                        .map_err(|_| {
+                            format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len())
+                        })?
+                        .to_be_bytes()[..],
+                );
+                let sps_nal_start = buf.len();
+                buf.extend_from_slice(sps_nal);
+                let sps_nal_end = buf.len();
+                buf.put_u8(1); // # of PPSs.
+                buf.extend(
+                    &u16::try_from(pps_nal.len())
+                        .map_err(|_| {
+                            format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len())
+                        })?
+                        .to_be_bytes()[..],
+                );
+                let pps_nal_start = buf.len();
+                buf.extend_from_slice(pps_nal);
+                let pps_nal_end = buf.len();
+                assert_eq!(
+                    buf.len(),
+                    11 + (sps_nal_end - sps_nal_start) + (pps_nal_end - pps_nal_start)
+                );
+
+                let buf = buf.freeze();
+                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
+                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
+                (buf, sps_nal, pps_nal)
+            }
+            super::h26x::Framing::AnnexB => {
+                // Annex B: start code prefix + SPS + start code prefix + PPS.
+                let mut buf = BytesMut::with_capacity(8 + sps_nal.len() + pps_nal.len());
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let sps_nal_start = buf.len();
+                buf.extend_from_slice(sps_nal);
+                let sps_nal_end = buf.len();
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let pps_nal_start = buf.len();
+                buf.extend_from_slice(pps_nal);
+                let pps_nal_end = buf.len();
+
+                let buf = buf.freeze();
+                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
+                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
+                (buf, sps_nal, pps_nal)
+            }
+        };
 
         let (pixel_aspect_ratio, frame_rate);
         match sps.vui_parameters {
@@ -1067,16 +1160,13 @@ impl InternalParameters {
                 frame_rate = None;
             }
         }
-        let avc_decoder_config = avc_decoder_config.freeze();
-        let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
-        let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
         Ok(InternalParameters {
             generic_parameters: VideoParameters {
                 rfc6381_codec,
                 all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
-                extra_data: avc_decoder_config,
+                extra_data,
                 codec: super::VideoParametersCodec::H264 {
                     sps: sps_nal.clone(),
                     pps: pps_nal.clone(),
@@ -1494,6 +1584,10 @@ mod tests {
     fn depacketize() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -1606,6 +1700,10 @@ mod tests {
     fn depacketize_reserved_bit_set() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -2136,11 +2234,26 @@ mod tests {
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
     ];
 
-    // Expected frame data with inline SPS/PPS stripped (when strip_inline_parameters is true).
+    // Expected frame data with inline SPS/PPS stripped (MP4 mode).
     #[rustfmt::skip]
     static PREFIXED_NALS_STRIPPED: [u8; 16] = [
         // IDR slice
         0x00, 0x00, 0x00, 0x0c,
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    // Expected frame data in SIMPLE mode (Annex B framing, SPS/PPS prepended on key frame).
+    #[rustfmt::skip]
+    static ANNEX_B_NALS_SIMPLE: [u8; 48] = [
+        // SPS
+        0x00, 0x00, 0x00, 0x01,
+        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1,
+        0x00, 0x00, 0x04, 0xf6, 0x00, 0x00, 0x63, 0x38, 0x04,
+        // PPS
+        0x00, 0x00, 0x00, 0x01,
+        0x68, 0xee, 0x3c, 0xb0,
+        // IDR slice
+        0x00, 0x00, 0x00, 0x01,
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
     ];
 
@@ -2289,7 +2402,7 @@ mod tests {
         let mut d =
             super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
                 .unwrap();
-        d.set_strip_inline_parameters(true);
+        d.set_frame_format(crate::codec::FrameFormat::MP4);
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -2330,7 +2443,7 @@ mod tests {
                     Some("packetization-mode=1;profile-level-id=640033"),
                 )
                 .unwrap();
-                d.set_strip_inline_parameters(true);
+                d.set_frame_format(crate::codec::FrameFormat::MP4);
                 let timestamp = crate::Timestamp {
                     timestamp: 0,
                     clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -2408,6 +2521,41 @@ mod tests {
         }
     }
 
+    /// Like `parse_annex_b_single_nal` but with `FrameFormat::SIMPLE` (Annex B framing,
+    /// parameter sets prepended on each key frame).
+    #[test]
+    fn parse_annex_b_single_nal_simple() {
+        init_logging();
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(ANNEX_B_NALS)
+            .unwrap(),
+        )
+        .unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+            panic!();
+        };
+        assert_eq_hex!(frame.data(), &ANNEX_B_NALS_SIMPLE);
+    }
+
     #[test]
     fn allow_inconsistent_headers_between_fu_a() {
         init_logging();
@@ -2468,6 +2616,10 @@ mod tests {
     fn empty_fragment() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),

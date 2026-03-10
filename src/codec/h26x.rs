@@ -3,6 +3,24 @@
 
 //! Common logic between H.264 and H.265.
 
+/// Annex B start code with the `zero_byte` prefix.
+///
+/// The `zero_byte` is mandatory before parameter sets (SPS, PPS, VPS) and before the first NAL
+/// unit of each access unit (H.264 Annex B section B.1.2; H.265 has equivalent language).
+/// We use the 4-byte form everywhere for simplicity.
+pub const ANNEX_B_START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+/// How to frame H.26x NAL units in output (packet format and extra data format).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Framing {
+    /// AVCC/HCC style: NALs use 4-byte big-endian length prefix, extra data in `AvcDecoderConfigurationRecord` or `HevcDecoderConfigurationRecord`. Default.
+    #[default]
+    FourByteLength,
+
+    /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
+    AnnexB,
+}
+
 /// `h264_reader::rbsp::BitRead` impl that *notes* extra trailing data rather than failing on it.
 ///
 /// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most

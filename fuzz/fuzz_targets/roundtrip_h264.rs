@@ -31,6 +31,21 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         return Corpus::Reject;
     }
 
+    // The depacketizer always strips inline SPS/PPS NALs (they're managed
+    // via ParameterSetInsertion). Reject inputs containing them since they
+    // can't round-trip exactly.
+    {
+        let mut remaining = input.data;
+        while let Some((len_bytes, rest)) = remaining.split_first_chunk::<4>() {
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            let nal_type = rest[0] & 0x1f;
+            if nal_type == 7 || nal_type == 8 {
+                return Corpus::Reject;
+            }
+            remaining = &rest[len..];
+        }
+    }
+
     let mut p = match retina::codec::h264::Packetizer::new(input.max_payload_size, 0, 0, 0, 0) {
         Ok(p) => p,
         Err(_) => return Corpus::Reject,
@@ -43,6 +58,8 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         Some("packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4"),
     )
     .unwrap();
+    // The packetizer doesn't insert parameter sets, so the depacketizer shouldn't either.
+    d.set_frame_format(retina::codec::FrameFormat::MP4);
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
 
     if p.push(timestamp, Bytes::copy_from_slice(input.data))

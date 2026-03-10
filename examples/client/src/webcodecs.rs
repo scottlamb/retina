@@ -313,7 +313,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     session
         .setup(
             video_stream_i,
-            SetupOptions::default().strip_inline_parameters(true),
+            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
         )
         .await?;
     let session = session

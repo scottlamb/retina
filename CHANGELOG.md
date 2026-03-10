@@ -1,5 +1,12 @@
 ## unreleased
 
+*   `retina::codec::FrameFormat`: support Annex B encoding
+    ([#44](https://github.com/scottlamb/retina/issues/44)), ADTS encoding,
+    and parameter set insertion control. This makes it easier to feed
+    frames directly to a decoder or muxer without munging them. It also
+    makes Retina's behavior more camera-agnostic: previously it would include
+    inline parameters or not based on what the camera choose; now it's
+    configurable via `frame_format`.
 *   use the `RUST_LOG` environment variable to control logging in the examples
     and tests. (Formerly it used `MOONFIRE_LOG`, but Retina is not part of
     Moonfire, and `RUST_LOG` is standard.) Document in `README.md`.
@@ -10,11 +17,6 @@
     [#80](https://github.com/scottlamb/retina/issues/80).
 *   add a new `webcodecs` example that decodes video frames using WebCodecs API.
     This is the absolute lowest-latency way to watch RTSP streams from a browser!
-*   `SetupOptions::strip_inline_parameters`: stripping of inline parameter
-    set NALs (SPS/PPS for H.264, VPS/SPS/PPS for H.265) from `VideoFrame::data`.
-    This is highly recommended for the reasons in the doc comment. It is
-    opt-in for now to avoid surprises on `Cargo.lock` update, but a future
-    major version will strip by default.
 *   expose receive timestamps (both wall clock and monotonic/instant) in packet
     contexts.
 *   expose coded as well as display pixel dimensions in `VideoParameters` to ease

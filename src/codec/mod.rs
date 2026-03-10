@@ -101,9 +101,9 @@ macro_rules! write_mpeg4_descriptor {
     }};
 }
 
-pub(crate) mod aac;
+pub mod aac;
 pub(crate) mod g723;
-mod h26x;
+pub mod h26x;
 pub(crate) mod jpeg;
 
 pub mod h264;
@@ -114,6 +114,67 @@ pub mod h265;
 
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
+
+/// Configuration options controlling how depacketized frames are formatted.
+///
+/// Supplied via [`SetupOptions::frame_format`](crate::client::SetupOptions::frame_format).
+///
+/// This controls codec-specific framing (e.g. H.26x NAL unit framing, AAC
+/// framing) and parameter set insertion. Each codec picks out the knobs
+/// relevant to it and ignores the rest.
+///
+/// Preset constants are provided for common use cases:
+///
+/// * [`FrameFormat::MP4`] — suitable for writing ISO BMFF / `.mp4` files.
+/// * [`FrameFormat::SIMPLE`] — self-describing output (Annex B + inline
+///   parameter sets for H.26x, ADTS for AAC), suitable for piping to a decoder
+///   without needing to handle extra data separately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameFormat {
+    /// How to frame H.26x NAL units.
+    pub h26x_framing: h26x::Framing,
+
+    /// When to insert parameter sets (SPS/PPS/VPS) into frame data.
+    pub parameter_set_insertion: ParameterSetInsertion,
+
+    /// How to frame AAC audio.
+    pub aac_framing: aac::Framing,
+}
+
+impl FrameFormat {
+    /// Suitable for ISO BMFF / `.mp4` files: 4-byte length-prefixed NALs,
+    /// no inline parameter sets (they go in the sample entry), raw AAC.
+    pub const MP4: Self = Self {
+        h26x_framing: h26x::Framing::FourByteLength,
+        parameter_set_insertion: ParameterSetInsertion::Never,
+        aac_framing: aac::Framing::Raw,
+    };
+
+    /// Suitable for piping to a decoder without handling extra data separately:
+    /// Annex B start codes, parameter sets prepended to every key frame,
+    /// ADTS-wrapped AAC.
+    pub const SIMPLE: Self = Self {
+        h26x_framing: h26x::Framing::AnnexB,
+        parameter_set_insertion: ParameterSetInsertion::EachKeyFrame,
+        aac_framing: aac::Framing::Adts,
+    };
+}
+
+/// When to insert parameter sets (SPS/PPS for H.264; VPS/SPS/PPS for H.265)
+/// into frame data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParameterSetInsertion {
+    /// Prepend to every key frame. Default.
+    #[default]
+    EachKeyFrame,
+
+    /// Prepend only when parameters have changed since the last frame.
+    OnChange,
+
+    /// Never insert in-band; caller retrieves them out-of-band via
+    /// [`VideoParameters`].
+    Never,
+}
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug, PartialEq, Eq)]
@@ -253,7 +314,8 @@ impl VideoParameters {
     }
 
     /// The codec-specific "extra data" to feed to eg ffmpeg to decode the video frames.
-    /// *   H.264: an AvcDecoderConfig.
+    ///
+    /// For H.264 and H.265, the format depends on [`FrameFormat::h26x_framing`].
     pub fn extra_data(&self) -> &[u8] {
         &self.extra_data
     }
@@ -448,8 +510,9 @@ impl AudioParameters {
         self.channels
     }
 
-    /// The codec-specific "extra data" to feed to eg ffmpeg to decode the audio.
-    /// *   AAC: a serialized `AudioSpecificConfig`.
+    /// The codec-specific "extra data" to feed to a decoder, as specified in [`Config`].
+    ///
+    /// * For AAC, see [`FrameFormat::aac_framing`].
     pub fn extra_data(&self) -> &[u8] {
         &self.extra_data
     }
@@ -534,6 +597,8 @@ impl AudioFrame {
         self.loss
     }
 
+    /// Returns the frame data in a format that depends on the [`FrameFormat`] set via
+    /// [`crate::client::SetupOptions::frame_format`].
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.data
@@ -695,11 +760,13 @@ impl VideoFrame {
 
     /// Returns the data in a codec-specific format.
     ///
-    /// H.264 is currently the only supported video codec. A frame is encoded in AAC format with
-    /// four-byte lengths. That is, each NAL is encoded as a `u32` length in big-endian format
-    /// followed by the actual contents of the NAL (including "emulation prevention three" bytes).
-    /// In the future, a configuration parameter may allow the caller to request Annex B encoding
-    /// instead.  See [#44](https://github.com/scottlamb/retina/issues/44).
+    /// The framing depends on the [`FrameFormat`] set via
+    /// [`crate::client::SetupOptions::frame_format`]:
+    ///
+    /// * [`h26x::Framing::FourByteLength`] (default): each NAL is encoded as a
+    ///   `u32` length in big-endian format followed by the NAL contents.
+    /// * [`h26x::Framing::AnnexB`]: each NAL is preceded by a 4-byte Annex B
+    ///   start code (`00 00 00 01`).
     #[inline]
     pub fn data(&self) -> &[u8] {
         &self.data
@@ -851,16 +918,17 @@ impl Depacketizer {
         }
     }
 
-    /// Sets whether to strip inline parameter set NALs from `VideoFrame::data` output.
+    /// Sets the frame format for output assembly.
     ///
-    /// For H.264, strips SPS (type 7) and PPS (type 8) NALs.
-    /// For H.265, strips VPS (type 32), SPS (type 33), and PPS (type 34) NALs.
-    /// No-op for other codecs.
-    pub(crate) fn set_strip_inline_parameters(&mut self, strip: bool) {
+    /// Controls H.26x NAL framing (length-prefixed vs Annex B) and parameter
+    /// set insertion. No-op for codecs that don't use these settings.
+    #[doc(hidden)]
+    pub fn set_frame_format(&mut self, format: FrameFormat) {
         match &mut self.0 {
-            DepacketizerInner::H264(d) => d.set_strip_inline_parameters(strip),
+            DepacketizerInner::Aac(d) => d.set_frame_format(format),
+            DepacketizerInner::H264(d) => d.set_frame_format(format),
             #[cfg(feature = "h265")]
-            DepacketizerInner::H265(d) => d.set_strip_inline_parameters(strip),
+            DepacketizerInner::H265(d) => d.set_frame_format(format),
             _ => {}
         }
     }

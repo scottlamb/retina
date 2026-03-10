@@ -737,7 +737,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 i,
                 SetupOptions::default()
                     .transport(opts.transport.clone())
-                    .strip_inline_parameters(true),
+                    .frame_format(retina::codec::FrameFormat::MP4),
             )
             .await?;
     }
@@ -773,7 +773,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 i,
                 SetupOptions::default()
                     .transport(opts.transport.clone())
-                    .strip_inline_parameters(true),
+                    .frame_format(retina::codec::FrameFormat::MP4),
             )
             .await?;
     }
