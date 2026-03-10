@@ -4,8 +4,7 @@
 //! RTSP/1.0 message types and parser.
 //!
 //! This is a hand-rolled streaming parser designed for use with both
-//! contiguous and ring-buffer inputs. For now, only contiguous `&[u8]`
-//! input is used; ring-buffer support will come later.
+//! contiguous and ring-buffer inputs via the [`inputs::Input`] trait.
 
 pub mod msg;
 pub mod parse;

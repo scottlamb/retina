@@ -4,7 +4,7 @@
 //! Hand-rolled parser for RTSP/1.0 message heads.
 //!
 //! This parser is generic over [`Input`], supporting both contiguous
-//! `&[u8]` (via [`Contiguous`](super::inputs::Contiguous)) and discontiguous ring-buffer views.
+//! and discontiguous ring-buffer views via [`Split`](super::inputs::Split).
 
 use std::num::NonZeroUsize;
 

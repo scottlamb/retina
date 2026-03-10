@@ -54,6 +54,9 @@ pub trait Input<'i>: Copy {
     /// Returns the offset of the first byte satisfying `pred`, or `None` if none do.
     fn find_first<F: Fn(u8) -> bool>(&self, pred: F) -> Option<usize>;
 
+    /// Copies the first `N` bytes into an array. Panics if `self.len() < N`.
+    fn peek_array<const N: usize>(&self) -> [u8; N];
+
     fn to_cow(self) -> Cow<'i, [u8]>;
     fn to_cow_str(self) -> Result<Cow<'i, str>, std::str::Utf8Error> {
         match self.to_cow() {
@@ -120,6 +123,10 @@ impl<'i> Input<'i> for &'i [u8] {
     fn to_owned(self) -> Vec<u8> {
         Vec::from(self)
     }
+
+    fn peek_array<const N: usize>(&self) -> [u8; N] {
+        self[..N].try_into().unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +155,15 @@ impl<'i> Split<'i> {
         } else {
             Self { first, second }
         }
+    }
+
+    /// Returns the two underlying slices.
+    ///
+    /// Useful when raw slice access is needed (e.g. for vectored I/O or
+    /// copying into a contiguous buffer).
+    #[inline]
+    pub fn slices(&self) -> (&'i [u8], &'i [u8]) {
+        (self.first, self.second)
     }
 }
 
@@ -242,6 +258,18 @@ impl<'i> Input<'i> for Split<'i> {
         v.extend_from_slice(self.first);
         v.extend_from_slice(self.second);
         v
+    }
+
+    fn peek_array<const N: usize>(&self) -> [u8; N] {
+        let mut arr = [0u8; N];
+        if N <= self.first.len() {
+            arr.copy_from_slice(&self.first[..N]);
+        } else {
+            let (a, b) = arr.split_at_mut(self.first.len());
+            a.copy_from_slice(self.first);
+            b.copy_from_slice(&self.second[..N - self.first.len()]);
+        }
+        arr
     }
 }
 

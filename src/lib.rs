@@ -20,6 +20,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::{Instant, SystemTime};
 
+mod buf;
 mod error;
 mod hex;
 #[doc(hidden)]

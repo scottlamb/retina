@@ -2361,7 +2361,6 @@ dependencies = [
  "sdp-types",
  "smallvec",
  "tokio",
- "tokio-util",
  "url",
 ]
 
