@@ -5,6 +5,16 @@
 
 use crate::inputs::Split;
 use crate::to_u64;
+use std::sync::{Arc, Mutex};
+
+/// A reference to a byte range within a [`MarkBuf`].
+///
+/// 10 bytes of data (16 with padding).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufRange {
+    pub pos: u64,
+    pub len: u16,
+}
 
 /// A power-of-two ring buffer.
 ///
@@ -240,6 +250,295 @@ impl std::fmt::Debug for RingBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mark system
+// ---------------------------------------------------------------------------
+
+/// Shared registry of mark positions, held by [`MarkBuf`] and each live [`Mark`].
+///
+/// Uses `Arc<Mutex>` rather than `Rc<RefCell>` so that `Connection` (which
+/// contains `MarkBuf`) remains `Send`—required for background teardown tasks.
+#[derive(Debug)]
+struct MarkRegistry {
+    marks: Mutex<Vec<u64>>,
+}
+
+impl MarkRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            marks: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn add(&self, pos: u64) {
+        let mut marks = self.marks.lock().unwrap();
+        let i = marks.partition_point(|&m| m < pos);
+        marks.insert(i, pos);
+    }
+
+    fn remove(&self, pos: u64) {
+        let mut marks = self.marks.lock().unwrap();
+        if let Ok(i) = marks.binary_search(&pos) {
+            marks.remove(i);
+        } else {
+            panic!("Mark::drop: no mark at position {pos}");
+        }
+    }
+
+    fn earliest(&self) -> Option<u64> {
+        self.marks.lock().unwrap().first().copied()
+    }
+}
+
+/// An RAII handle pinning a buffer position.
+///
+/// Data from this position onward stays accessible in the [`MarkBuf`].
+/// Automatically releases when dropped, preventing mark leaks.
+pub(crate) struct Mark {
+    pos: u64,
+    registry: Arc<MarkRegistry>,
+}
+
+impl Mark {
+    /// The stream position this mark holds open.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn pos(&self) -> u64 {
+        self.pos
+    }
+}
+
+impl Drop for Mark {
+    fn drop(&mut self) {
+        self.registry.remove(self.pos);
+    }
+}
+
+impl std::fmt::Debug for Mark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mark").field("pos", &self.pos).finish()
+    }
+}
+
+/// A [`RingBuf`] wrapper with mark-based retention.
+///
+/// Marks pin stream positions so data from that point onward stays
+/// accessible. The buffer can only reclaim space behind the oldest mark.
+///
+/// Mark operations use interior mutability (`&self`) so they can be used
+/// while the depacketizer borrows the buffer. Only `spare_capacity` /
+/// `advance_end` / `advance_unparsed` require `&mut self`.
+///
+/// # Invariant: marks never sit after `unparsed`
+///
+/// Every live [`Mark`] is at a position `<= unparsed`. [`reclaim`](Self::reclaim)
+/// depends on this: it advances the ring's `start` to the earliest mark, which
+/// would discard not-yet-parsed bytes if a mark could be beyond `unparsed`.
+///
+/// Callers get this for free by parsing a packet out of the buffer (which
+/// advances `unparsed` past it) before handing it to a depacketizer that may
+/// mark it. [`add_mark_at`](Self::add_mark_at) asserts it.
+#[derive(Debug)]
+pub(crate) struct MarkBuf {
+    ring: RingBuf,
+    registry: Arc<MarkRegistry>,
+    unparsed: u64,
+}
+
+#[allow(dead_code)] // Some methods reserved for future steps.
+impl MarkBuf {
+    /// Creates a new buffer with at least `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            ring: RingBuf::new(capacity),
+            registry: MarkRegistry::new(),
+            unparsed: 0,
+        }
+    }
+
+    /// The current unparsed position (where new marks are created).
+    #[inline]
+    pub fn unparsed(&self) -> u64 {
+        self.unparsed
+    }
+
+    /// Stream position one past the last buffered byte.
+    #[inline]
+    pub fn end(&self) -> u64 {
+        self.ring.end()
+    }
+
+    /// Number of bytes between unparsed and end.
+    #[inline]
+    pub fn unparsed_len(&self) -> usize {
+        (self.ring.end() - self.unparsed) as usize
+    }
+
+    /// Returns unparsed data as a [`Split`].
+    pub fn unparsed_split(&self) -> Split<'_> {
+        let len = self.unparsed_len();
+        if len == 0 {
+            return Split::new(&[], &[]);
+        }
+        self.ring.split(self.unparsed, len)
+    }
+
+    /// Creates a new mark at the current unparsed position.
+    pub fn add_mark(&self) -> Mark {
+        self.add_mark_at(self.unparsed)
+    }
+
+    /// Creates a new mark at an arbitrary valid position.
+    ///
+    /// `pos` must be in `[start, unparsed]`: the data at `pos` must still be in
+    /// the buffer, and must already have been parsed out of it. See the
+    /// invariant documented on [`MarkBuf`]; this is the sole chokepoint for
+    /// creating marks, so asserting here enforces it for all of them.
+    pub fn add_mark_at(&self, pos: u64) -> Mark {
+        assert!(
+            pos >= self.ring.start() && pos <= self.unparsed,
+            "add_mark_at({pos}): must be within [{}, {}]",
+            self.ring.start(),
+            self.unparsed,
+        );
+        self.registry.add(pos);
+        Mark {
+            pos,
+            registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// Ring buffer capacity (always a power of two).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.ring.capacity()
+    }
+
+    /// Returns data at `[pos, pos+len)` as a [`Split`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range is outside valid buffer bounds.
+    #[inline]
+    pub fn split(&self, pos: u64, len: usize) -> Split<'_> {
+        self.ring.split(pos, len)
+    }
+
+    /// Advances the unparsed position.
+    ///
+    /// Does **not** reclaim ring buffer space; that happens lazily in
+    /// [`spare_capacity`](Self::spare_capacity). This ensures that data
+    /// between the old and new unparsed positions (e.g. message bodies)
+    /// remains accessible until the next buffer fill.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `unparsed <= new_unparsed <= end`.
+    pub fn advance_unparsed(&mut self, new_unparsed: u64) {
+        assert!(
+            self.unparsed <= new_unparsed && new_unparsed <= self.ring.end(),
+            "advance_unparsed({new_unparsed}): must be within [{}, {}]",
+            self.unparsed,
+            self.ring.end(),
+        );
+        self.unparsed = new_unparsed;
+    }
+
+    /// Returns the free space as up to two mutable slices.
+    ///
+    /// Ensures at least `reserve` bytes of free space (reclaiming behind
+    /// the oldest mark/unparsed position and growing if needed). After
+    /// writing into these slices, call [`advance_end`](Self::advance_end).
+    pub fn spare_capacity(&mut self, reserve: usize) -> (&mut [u8], &mut [u8]) {
+        self.reclaim();
+        self.ring.spare_capacity(reserve)
+    }
+
+    /// Marks `n` additional bytes at the end as valid.
+    ///
+    /// Call after writing into slices returned by [`spare_capacity`](Self::spare_capacity).
+    pub fn advance_end(&mut self, n: usize) {
+        self.ring.advance_end(n);
+    }
+
+    /// Reclaims space behind the oldest mark (or unparsed position).
+    ///
+    /// Relies on the [`MarkBuf`] invariant that no mark is beyond `unparsed`,
+    /// so `floor <= unparsed` and this never discards unparsed data.
+    fn reclaim(&mut self) {
+        let floor = self.registry.earliest().unwrap_or(self.unparsed);
+        debug_assert!(floor <= self.unparsed);
+        self.ring.advance_to(floor);
+    }
+
+    /// Appends data directly to the buffer.
+    #[cfg(test)]
+    pub fn extend(&mut self, data: &[u8]) {
+        self.reclaim();
+        self.ring.extend(data);
+    }
+}
+
+/// An RTP packet referencing payload data in a [`MarkBuf`].
+///
+/// Passed to [`Depacketizer::push`](crate::codec::Depacketizer::push),
+/// bundling packet metadata with buffer access.
+pub(crate) struct PacketRef<'a> {
+    pub meta: crate::rtp::PacketMeta,
+    buf: &'a MarkBuf,
+    payload_pos: u64,
+    payload_len: u16,
+}
+
+impl<'a> PacketRef<'a> {
+    /// Creates a `PacketRef`.
+    pub fn new(
+        meta: crate::rtp::PacketMeta,
+        buf: &'a MarkBuf,
+        payload_pos: u64,
+        payload_len: u16,
+    ) -> Self {
+        Self {
+            meta,
+            buf,
+            payload_pos,
+            payload_len,
+        }
+    }
+
+    /// Pin the payload position so the data stays accessible until the
+    /// returned [`Mark`] is dropped.
+    pub fn mark(&self) -> Mark {
+        self.buf.add_mark_at(self.payload_pos)
+    }
+
+    /// Ring-buffer position of the first payload byte.
+    #[inline]
+    pub fn payload_pos(&self) -> u64 {
+        self.payload_pos
+    }
+
+    /// Payload length in bytes.
+    #[inline]
+    pub fn payload_len(&self) -> u16 {
+        self.payload_len
+    }
+
+    /// Returns the payload data as a [`Split`].
+    #[inline]
+    pub fn payload(&self) -> Split<'_> {
+        self.buf
+            .split(self.payload_pos, usize::from(self.payload_len))
+    }
+
+    /// The underlying [`MarkBuf`], for internal helper functions that
+    /// need arbitrary buffer access (e.g. reading accumulated NAL data).
+    #[inline]
+    pub fn buf(&self) -> &MarkBuf {
+        self.buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +700,138 @@ mod tests {
             s1.len(),
             s2.len(),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mark / MarkBuf tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mark_raii() {
+        let mut buf = MarkBuf::new(16);
+        buf.extend(b"abcdefgh");
+        buf.advance_unparsed(4);
+
+        let mark = buf.add_mark(); // pins pos=4
+        assert_eq!(mark.pos(), 4);
+
+        buf.advance_unparsed(8);
+        // Mark keeps data from pos 4 accessible.
+        assert_eq!(buf.split(4, 4).slices(), (&b"efgh"[..], &b""[..]));
+
+        // Drop mark → should auto-release.
+        drop(mark);
+        // After drop, buffer can reclaim space on next extend.
+        buf.extend(b"more");
+        // Data from pos 4 might be overwritten now (buffer is free to reclaim).
+    }
+
+    #[test]
+    fn mark_multiple() {
+        let mut buf = MarkBuf::new(16);
+        buf.extend(b"0123456789");
+        buf.advance_unparsed(2);
+
+        let mark1 = buf.add_mark(); // pos=2
+        buf.advance_unparsed(5);
+        let mark2 = buf.add_mark(); // pos=5
+
+        // Both marks pin their data.
+        assert_eq!(buf.split(2, 3).slices(), (&b"234"[..], &b""[..]));
+        assert_eq!(buf.split(5, 5).slices(), (&b"56789"[..], &b""[..]));
+
+        // Dropping mark1 allows reclaim up to mark2.
+        drop(mark1);
+        buf.extend(b""); // trigger reclaim
+
+        // mark2 still works.
+        assert_eq!(buf.split(5, 5).slices(), (&b"56789"[..], &b""[..]));
+
+        drop(mark2);
+    }
+
+    #[test]
+    fn mark_release_order() {
+        let mut buf = MarkBuf::new(8);
+        buf.extend(b"abcdef");
+        buf.advance_unparsed(2);
+        let mark1 = buf.add_mark(); // pos=2
+
+        buf.advance_unparsed(4);
+        let mark2 = buf.add_mark(); // pos=4
+
+        buf.advance_unparsed(6);
+        let mark3 = buf.add_mark(); // pos=6
+
+        // Release middle mark first.
+        drop(mark2);
+        // ring start still pinned to mark1's pos=2.
+        assert_eq!(buf.split(2, 4).slices(), (&b"cdef"[..], &b""[..]));
+
+        // Release first mark.
+        drop(mark1);
+        // Now ring can advance to mark3's pos=6 on next operation.
+
+        // Release last mark.
+        drop(mark3);
+    }
+
+    #[test]
+    fn unparsed_split() {
+        let mut buf = MarkBuf::new(16);
+        buf.extend(b"hello world");
+        assert_eq!(buf.unparsed_len(), 11);
+        assert_eq!(
+            buf.unparsed_split().slices(),
+            (&b"hello world"[..], &b""[..])
+        );
+
+        buf.advance_unparsed(6);
+        assert_eq!(buf.unparsed_len(), 5);
+        assert_eq!(buf.unparsed_split().slices(), (&b"world"[..], &b""[..]));
+    }
+
+    /// Mimics the TCP read path: repeated `spare_capacity`/`advance_end`/
+    /// `advance_unparsed` while a mark pins a long-lived frame, forcing the
+    /// ring to grow with the data wrapped at a range of start positions.
+    #[test]
+    fn mark_buf_growth_like_tcp_reads() {
+        // Vary the round the mark is taken on so the realloc happens at many
+        // different `(start index, wrap parity)` combinations.
+        for mark_round in 0..40u64 {
+            const READ: usize = 4096;
+            let mut buf = MarkBuf::new(64 * 1024);
+            let mut mark = None;
+            let mut model = Vec::new();
+            let mut mark_pos = 0;
+            for round in 0..48u64 {
+                let pos = buf.end();
+                let (s1, s2) = buf.spare_capacity(READ);
+                assert!(s1.len() + s2.len() >= READ);
+                let mid = READ.min(s1.len());
+                // Fill with a position-derived pattern so misplaced bytes show.
+                for (i, b) in s1[..mid].iter_mut().enumerate() {
+                    *b = (pos + i as u64) as u8;
+                }
+                for (i, b) in s2[..READ - mid].iter_mut().enumerate() {
+                    *b = (pos + (mid + i) as u64) as u8;
+                }
+                buf.advance_end(READ);
+                buf.advance_unparsed(buf.end());
+                if round == mark_round {
+                    mark_pos = pos;
+                    mark = Some(buf.add_mark_at(pos));
+                    model.clear();
+                }
+                if round >= mark_round {
+                    model.extend((pos..pos + READ as u64).map(|p| p as u8));
+                }
+            }
+            // Everything from the mark onward must still read back intact.
+            let (s1, s2) = buf.split(mark_pos, model.len()).slices();
+            let got: Vec<u8> = s1.iter().chain(s2.iter()).copied().collect();
+            assert_eq!(got, model, "mark_round={mark_round}");
+            drop(mark);
+        }
     }
 }

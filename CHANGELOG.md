@@ -1,5 +1,21 @@
 ## unreleased
 
+*   Retina now internally reads into and depacketizes from a ring buffer,
+    finally realizing a change considered since the library's first days
+    ([#5](https://github.com/scottlamb/retina/issues/5),
+    [#6](https://github.com/scottlamb/retina/issues/6)).
+
+    This speeds up the `client/h264` benchmark from 2.1 GiB/s to 4.6 GiB/s on an
+    M2 Macbook Pro by reducing read syscalls and allocations. Real-world
+    performance improvement will vary based on a program's time spent within
+    Retina and the memory allocator in use.
+
+    The direct packet access API (`<Session<Playing> as Stream>::poll_next`) now
+    has to copy each packet into a fresh `Bytes` where it would have avoided
+    this before when the previous `tokio_util::codec::Framed` approach allocated
+    the `BytesMut` with sufficient buffer from the start. In practice, I think
+    there's little regression if any, and the higher-level
+    (`<Demuxed as Stream>::poll_next`) API is more commonly used.
 *   accept schemeless `Content-Base` header (e.g. `192.168.1.10:554/stream0/`
     instead of `rtsp://192.168.1.10:554/stream0/`) as sent by some Anjvision
     cameras. See

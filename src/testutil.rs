@@ -78,6 +78,42 @@ pub fn validate_avcc_frame(data: &[u8]) -> Result<(), InvalidAvccFrame<'_>> {
     Ok(())
 }
 
+/// Opaque wrapper around `MarkBuf` for use in benchmarks and fuzz tests.
+///
+/// Provides a simple way to push payloads to a [`crate::codec::Depacketizer`]
+/// without exposing the internal `MarkBuf` type.
+pub struct DepacketizeBuf(crate::buf::MarkBuf);
+
+impl DepacketizeBuf {
+    /// Creates a new buffer with at least `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self(crate::buf::MarkBuf::new(capacity))
+    }
+
+    /// Pushes a payload to the depacketizer via the internal ring buffer.
+    pub fn push(
+        &mut self,
+        d: &mut crate::codec::Depacketizer,
+        meta: crate::rtp::PacketMeta,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        let pos = self.0.end();
+        let len = payload.len();
+        {
+            let (s1, s2) = self.0.spare_capacity(len);
+            if len <= s1.len() {
+                s1[..len].copy_from_slice(payload);
+            } else {
+                s1.copy_from_slice(&payload[..s1.len()]);
+                s2[..len - s1.len()].copy_from_slice(&payload[s1.len()..]);
+            }
+            self.0.advance_end(len);
+        }
+        self.0.advance_unparsed(self.0.end());
+        d.push(&crate::buf::PacketRef::new(meta, &self.0, pos, len as u16))
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct HexDebug(pub(crate) Vec<u8>);
 

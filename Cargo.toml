@@ -42,7 +42,8 @@ pretty-hex = "0.4.0"
 rand = "0.8.3"
 sdp-types = "0.1.4"
 smallvec = { version = "1.6.1", features = ["union"] }
-tokio = { version = "1.11.0", features = ["macros", "net", "rt", "sync", "time"] }
+socket2 = "0.5"
+tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"] }
 url = "2.2.1"
 
 [dev-dependencies]

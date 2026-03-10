@@ -5,15 +5,14 @@
 //!
 //! In theory there could be a similar async-std-based implementation.
 
-use bytes::Bytes;
 use futures::{Sink, Stream};
 use std::time::Instant;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
-use crate::buf::RingBuf;
-use crate::inputs::Input;
+use crate::buf::MarkBuf;
+use crate::inputs::{Input as _, Split};
 use crate::rtsp::msg::OwnedMessage;
 use crate::{Error, ErrorInt, RtspMessageContext};
 
@@ -27,7 +26,7 @@ pub(crate) struct Connection {
     stream: TcpStream,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
-    read_buf: RingBuf,
+    read_buf: MarkBuf,
     /// Write buffer for outgoing messages (written then flushed).
     write_buf: Vec<u8>,
 }
@@ -54,7 +53,7 @@ impl Connection {
                 established_wall,
             },
             parser: crate::rtsp::parse::Parser::default(),
-            read_buf: RingBuf::new(DEFAULT_READ_CAPACITY),
+            read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
             write_buf: Vec::new(),
         })
     }
@@ -63,9 +62,26 @@ impl Connection {
         &self.ctx
     }
 
+    pub(crate) fn read_buf(&self) -> &MarkBuf {
+        &self.read_buf
+    }
+
+    /// Reads body data from the ring buffer as `Bytes`.
+    ///
+    /// This copies the data out. Use for cold paths (RTSP responses) or the
+    /// public `PacketItem` API. The `Demuxed` path reads directly from the
+    /// ring buffer to avoid this copy.
+    pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
+        let (s1, s2) = self.read_buf.split(body_pos, body_len as usize).slices();
+        let mut buf = Vec::with_capacity(body_len as usize);
+        buf.extend_from_slice(s1);
+        buf.extend_from_slice(s2);
+        bytes::Bytes::from(buf)
+    }
+
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
         RtspMessageContext {
-            pos: self.parser.stream_pos() + self.read_buf.len() as u64,
+            pos: self.parser.stream_pos() + self.read_buf.unparsed_len() as u64,
             received_wall: WallTime::now(),
             received: Instant::now(),
         }
@@ -80,25 +96,31 @@ impl Connection {
 /// `Ok(None)` with leftover data are promoted to errors.
 fn try_decode(
     parser: &mut crate::rtsp::parse::Parser,
-    read_buf: &mut RingBuf,
+    read_buf: &mut MarkBuf,
     eof: bool,
 ) -> Result<Option<ReceivedMessage>, CodecError> {
     use crate::rtsp::parse::FeedError;
 
     let pos = parser.stream_pos();
-    let mut input = read_buf.data_split();
+    let unparsed = read_buf.unparsed();
+    let mut input = {
+        let split = read_buf.unparsed_split();
+        let (first, second) = split.slices();
+        Split::new(first, second)
+    };
     let initial_len = input.len();
 
     match parser.feed(&mut input) {
         Ok(None) => Ok(None), // idle, no data; caller distinguishes EOF from "need more"
         Ok(Some((msg, body_slice))) => {
             let consumed = initial_len - input.len();
-            let body = Bytes::from(body_slice.to_owned());
-            let start = read_buf.start();
-            read_buf.advance_to(start + consumed as u64);
+            let body_len = body_slice.len();
+            let body_pos = unparsed + (consumed - body_len) as u64;
+            read_buf.advance_unparsed(unparsed + consumed as u64);
             Ok(Some(ReceivedMessage {
                 msg,
-                body,
+                body_pos,
+                body_len: body_len as u32,
                 ctx: RtspMessageContext {
                     pos,
                     received_wall: WallTime::now(),
@@ -111,17 +133,16 @@ fn try_decode(
             // (e.g. header lines). Advance past them.
             let consumed = initial_len - input.len();
             if consumed > 0 {
-                let start = read_buf.start();
-                read_buf.advance_to(start + consumed as u64);
+                read_buf.advance_unparsed(unparsed + consumed as u64);
             }
             Ok(None)
         }
-        Err(FeedError::Incomplete(_)) => {
+        Err(FeedError::Incomplete(inc)) => {
             // EOF with incomplete data: the message is truncated.
             Err(CodecError::ParseError {
                 description: format!(
-                    "Incomplete RTSP message at EOF; buffered:\n{:#?}",
-                    crate::hex::LimitedHex::from_split(read_buf.data_split(), 128),
+                    "Incomplete RTSP message at EOF ({inc}); buffered:\n{:#?}",
+                    crate::hex::LimitedHex::from_split(read_buf.unparsed_split(), 128),
                 ),
                 pos,
             })
@@ -129,7 +150,7 @@ fn try_decode(
         Err(FeedError::Invalid(inv)) => Err(CodecError::ParseError {
             description: format!(
                 "Invalid RTSP message: {inv}; buffered:\n{:#?}",
-                crate::hex::LimitedHex::from_split(read_buf.data_split(), 128),
+                crate::hex::LimitedHex::from_split(read_buf.unparsed_split(), 128),
             ),
             pos: inv.pos,
         }),
@@ -172,7 +193,7 @@ impl Stream for Connection {
             match this.stream.poll_read_ready(cx) {
                 std::task::Poll::Ready(Ok(())) => {}
                 std::task::Poll::Ready(Err(error)) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.len() as u64;
+                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
                     return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
                         conn_ctx: this.ctx,
                         msg_ctx: RtspMessageContext {
@@ -213,7 +234,7 @@ impl Stream for Connection {
                     continue;
                 }
                 Err(error) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.len() as u64;
+                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
                     return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
                         conn_ctx: this.ctx,
                         msg_ctx: RtspMessageContext {
@@ -232,14 +253,14 @@ impl Stream for Connection {
 fn codec_err_to_error(
     ctx: &ConnectionContext,
     parser: &crate::rtsp::parse::Parser,
-    read_buf: &RingBuf,
+    read_buf: &MarkBuf,
     e: CodecError,
 ) -> Error {
     wrap!(match e {
         CodecError::IoError(error) => ErrorInt::RtspReadError {
             conn_ctx: *ctx,
             msg_ctx: RtspMessageContext {
-                pos: parser.stream_pos() + read_buf.len() as u64,
+                pos: parser.stream_pos() + read_buf.unparsed_len() as u64,
                 received_wall: WallTime::now(),
                 received: Instant::now(),
             },
@@ -352,7 +373,7 @@ mod tests {
 
     #[test]
     fn crlf_data() {
-        let mut read_buf = RingBuf::new(64);
+        let mut read_buf = MarkBuf::new(64);
         let data = b"\r\n$\x00\x00\x04asdfrest";
         let (first, _) = read_buf.spare_capacity(data.len());
         first[..data.len()].copy_from_slice(data);
@@ -362,13 +383,16 @@ mod tests {
         let msg = try_decode(&mut parser, &mut read_buf, false)
             .unwrap()
             .unwrap();
-        assert_eq!(&msg.body[..], b"asdf");
-        assert_eq!(read_buf.len(), 4); // "rest" remains
+        // Read body from ring buffer.
+        let (s1, s2) = read_buf.split(msg.body_pos, msg.body_len as usize).slices();
+        assert_eq!(s1, b"asdf");
+        assert!(s2.is_empty());
+        assert_eq!(read_buf.unparsed_len(), 4); // "rest" remains
     }
 
     #[test]
     fn response_decode() {
-        let mut read_buf = RingBuf::new(64);
+        let mut read_buf = MarkBuf::new(64);
         let data = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n";
         let (first, _) = read_buf.spare_capacity(data.len());
         first[..data.len()].copy_from_slice(data);
@@ -379,6 +403,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(msg.msg, crate::rtsp::msg::Message::Response(_)));
-        assert!(read_buf.is_empty());
+        assert_eq!(msg.body_len, 0);
+        assert_eq!(read_buf.unparsed_len(), 0);
     }
 }

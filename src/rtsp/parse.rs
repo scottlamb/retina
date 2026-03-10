@@ -4,7 +4,7 @@
 //! Hand-rolled parser for RTSP/1.0 message heads.
 //!
 //! This parser is generic over [`Input`], supporting both contiguous
-//! and discontiguous ring-buffer views via [`Split`](super::inputs::Split).
+//! and discontiguous ring-buffer views via [`Split`](crate::inputs::Split).
 
 use std::num::NonZeroUsize;
 
@@ -49,19 +49,49 @@ impl std::fmt::Display for Invalid {
 }
 
 /// Error returned by [`Parser::feed`].
-#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[derive(Debug)]
 pub enum FeedError {
     /// Not enough data yet; call `feed` again after receiving more bytes.
-    ///
-    /// The `Option<NonZeroUsize>` holds the number of additional body bytes
-    /// needed, if known. This is `Some` when the message head has been fully
-    /// parsed and only the body remains; `None` during head parsing.
-    #[display("incomplete RTSP message")]
-    #[error(ignore)]
-    Incomplete(Option<NonZeroUsize>),
+    Incomplete(Incomplete),
     /// Malformed message; the connection should be dropped.
-    #[display("invalid RTSP message: {_0}")]
     Invalid(Invalid),
+}
+
+/// Detail carried by [`FeedError::Incomplete`].
+#[derive(Debug, Default)]
+pub struct Incomplete {
+    /// Number of additional body bytes needed, if known.
+    ///
+    /// `Some` when the message head has been fully parsed and only the body
+    /// remains; `None` during head parsing.
+    pub needed: Option<NonZeroUsize>,
+    /// ABNF production names, innermost first (same as [`Invalid::context`]).
+    pub context: Vec<&'static str>,
+}
+
+impl std::fmt::Display for Incomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("incomplete RTSP message")?;
+        if !self.context.is_empty() {
+            f.write_str(": ")?;
+            for (i, label) in self.context.iter().rev().enumerate() {
+                if i > 0 {
+                    f.write_str(" > ")?;
+                }
+                f.write_str(label)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for FeedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeedError::Incomplete(inc) => std::fmt::Display::fmt(inc, f),
+            FeedError::Invalid(inv) => write!(f, "invalid RTSP message: {inv}"),
+        }
+    }
 }
 
 impl FeedError {
@@ -69,21 +99,27 @@ impl FeedError {
         FeedError::Invalid(Invalid::default())
     }
 
-    fn map_invalid(self, f: impl FnOnce(&mut Invalid)) -> Self {
-        if let FeedError::Invalid(mut inv) = self {
-            f(&mut inv);
-            FeedError::Invalid(inv)
-        } else {
-            self
+    fn with_pos(self, pos: u64) -> Self {
+        match self {
+            FeedError::Invalid(mut inv) => {
+                inv.pos = pos;
+                FeedError::Invalid(inv)
+            }
+            other => other,
         }
     }
 
-    fn with_pos(self, pos: u64) -> Self {
-        self.map_invalid(|inv| inv.pos = pos)
-    }
-
     fn context(self, label: &'static str) -> Self {
-        self.map_invalid(|inv| inv.context.push(label))
+        match self {
+            FeedError::Invalid(mut inv) => {
+                inv.context.push(label);
+                FeedError::Invalid(inv)
+            }
+            FeedError::Incomplete(mut inc) => {
+                inc.context.push(label);
+                FeedError::Incomplete(inc)
+            }
+        }
     }
 }
 
@@ -107,7 +143,7 @@ fn invalid_err<E: std::error::Error + Send + Sync + 'static>(
 }
 
 fn incomplete() -> FeedError {
-    FeedError::Incomplete(None)
+    FeedError::Incomplete(Incomplete::default())
 }
 
 /// Builder for [`Parser`]. Obtain via [`Parser::builder`].
@@ -215,7 +251,7 @@ impl Parser {
                         }
                         Err(FeedError::Incomplete(_)) => {
                             *input = checkpoint;
-                            return Err(FeedError::Incomplete(None));
+                            return Err(incomplete());
                         }
                         Err(e) => return Err(e),
                     }
@@ -259,7 +295,7 @@ impl Parser {
                         Err(FeedError::Incomplete(_)) => {
                             *input = checkpoint;
                             self.state = ParserState::Head { msg, head_bytes };
-                            return Err(FeedError::Incomplete(None));
+                            return Err(incomplete());
                         }
                         Err(e) => {
                             self.state = ParserState::Head { msg, head_bytes };
@@ -274,7 +310,10 @@ impl Parser {
                     } else {
                         self.state = ParserState::Body(msg, body_len);
                         let needed = body_len - input.len();
-                        return Err(FeedError::Incomplete(NonZeroUsize::new(needed)));
+                        return Err(FeedError::Incomplete(Incomplete {
+                            needed: NonZeroUsize::new(needed),
+                            ..Incomplete::default()
+                        }));
                     }
                 }
             }
@@ -556,7 +595,7 @@ pub(crate) mod tests {
         take_line(input)
     }
 
-    /// Simulates two feed calls: partial first, then the remainder.
+    /// Simulates two feed calls: first chunk, then the remainder.
     fn two_feed<'a>(
         parser: &mut Parser,
         first: &'a [u8],
@@ -800,8 +839,8 @@ pub(crate) mod tests {
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {
-            FeedError::Incomplete(Some(n)) => assert_eq!(n.get(), 100),
-            other => panic!("expected Incomplete(Some(100)), got {other:?}"),
+            FeedError::Incomplete(inc) => assert_eq!(inc.needed.unwrap().get(), 100),
+            other => panic!("expected Incomplete with needed=100, got {other:?}"),
         }
     }
 
@@ -813,8 +852,8 @@ pub(crate) mod tests {
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {
-            FeedError::Incomplete(Some(n)) => assert_eq!(n.get(), 5),
-            other => panic!("expected Incomplete(Some(5)), got {other:?}"),
+            FeedError::Incomplete(inc) => assert_eq!(inc.needed.unwrap().get(), 5),
+            other => panic!("expected Incomplete with needed=5, got {other:?}"),
         }
     }
 
@@ -826,8 +865,8 @@ pub(crate) mod tests {
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {
-            FeedError::Incomplete(None) => {}
-            other => panic!("expected Incomplete(None), got {other:?}"),
+            FeedError::Incomplete(inc) => assert!(inc.needed.is_none()),
+            other => panic!("expected Incomplete with needed=None, got {other:?}"),
         }
     }
 }

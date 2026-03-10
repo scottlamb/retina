@@ -40,7 +40,8 @@ use std::{
     num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
-use crate::{Error, codec::DepacketizeError, error::ErrorInt, rtp::ReceivedPacket};
+use crate::buf::PacketRef;
+use crate::{Error, codec::DepacketizeError, error::ErrorInt, rtp::PacketMeta};
 
 use super::{AudioParameters, CodecItem};
 
@@ -388,7 +389,8 @@ pub(crate) struct Depacketizer {
 /// beginning of a fragment.
 #[derive(Debug)]
 struct Aggregate {
-    pkt: ReceivedPacket,
+    meta: PacketMeta,
+    payload: Bytes,
 
     /// RTP packets lost before the next frame in this aggregate. Includes old
     /// loss that caused a previous fragment to be too short.
@@ -537,13 +539,18 @@ impl Depacketizer {
         Some(super::ParametersRef::Audio(&self.config.parameters))
     }
 
-    pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
-        if pkt.loss() > 0
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        let meta = pkt.meta;
+        let (s1, s2) = pkt.payload().slices();
+        let mut payload = Vec::with_capacity(crate::to_usize(pkt.payload_len()));
+        payload.extend_from_slice(s1);
+        payload.extend_from_slice(s2);
+        if meta.loss > 0
             && let DepacketizerState::Fragmented(ref mut f) = self.state
         {
             log::debug!(
                 "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                pkt.loss(),
+                meta.loss,
             );
             self.state = DepacketizerState::Idle {
                 prev_loss: f.loss, // note this packet's loss will be added in later.
@@ -552,7 +559,6 @@ impl Depacketizer {
         }
 
         // Read the AU headers.
-        let payload = pkt.payload();
         if payload.len() < 2 {
             return Err("packet too short for au-header-length".to_string());
         }
@@ -574,11 +580,10 @@ impl Depacketizer {
                         "Got {au_headers_count}-AU packet while fragment in progress"
                     ));
                 }
-                if (pkt.timestamp().timestamp as u16) != frag.rtp_timestamp {
+                if (meta.timestamp.timestamp as u16) != frag.rtp_timestamp {
                     return Err(format!(
                         "Timestamp changed from 0x{:04x} to 0x{:04x} mid-fragment",
-                        frag.rtp_timestamp,
-                        pkt.timestamp().timestamp as u16
+                        frag.rtp_timestamp, meta.timestamp.timestamp as u16
                     ));
                 }
                 let au_header = u16::from_be_bytes([payload[2], payload[3]]);
@@ -589,7 +594,7 @@ impl Depacketizer {
                 let data = &payload[data_off..];
                 match (frag.buf.len() + data.len()).cmp(&size) {
                     std::cmp::Ordering::Less => {
-                        if pkt.mark() {
+                        if meta.mark {
                             if frag.loss_since_mark {
                                 self.state = DepacketizerState::Idle {
                                     prev_loss: frag.loss,
@@ -607,18 +612,18 @@ impl Depacketizer {
                         frag.buf.extend_from_slice(data);
                     }
                     std::cmp::Ordering::Equal => {
-                        if !pkt.mark() {
+                        if !meta.mark {
                             return Err(
                                 "frag not marked complete when full data present".to_string()
                             );
                         }
                         frag.buf.extend_from_slice(data);
                         self.state = DepacketizerState::Ready(super::AudioFrame {
-                            ctx: *pkt.ctx(),
+                            ctx: meta.ctx,
                             loss: frag.loss,
                             frame_length: NonZeroU32::from(self.config.frame_length),
-                            stream_id: pkt.stream_id(),
-                            timestamp: pkt.timestamp(),
+                            stream_id: meta.stream_id,
+                            timestamp: meta.timestamp,
                             data: std::mem::take(&mut frag.buf).freeze(),
                         });
                     }
@@ -633,9 +638,10 @@ impl Depacketizer {
                 if au_headers_count == 0 {
                     return Err("aggregate with no headers".to_string());
                 }
-                let loss = pkt.loss();
+                let loss = meta.loss;
                 self.state = DepacketizerState::Aggregated(Aggregate {
-                    pkt,
+                    meta,
+                    payload: Bytes::from(payload),
                     loss: *prev_loss + loss,
                     loss_since_mark: *loss_since_mark || loss > 0,
                     frame_i: 0,
@@ -675,8 +681,8 @@ impl Depacketizer {
             }
             DepacketizerState::Aggregated(mut agg) => {
                 let i = usize::from(agg.frame_i);
-                let payload = agg.pkt.payload();
-                let mark = agg.pkt.mark();
+                let payload = &agg.payload;
+                let mark = agg.meta.mark;
                 let au_header = u16::from_be_bytes([payload[2 + (i << 1)], payload[3 + (i << 1)]]);
                 let size = usize::from(au_header >> 3);
                 let index = au_header & 0b111;
@@ -686,9 +692,9 @@ impl Depacketizer {
                     // TODO: https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6
                     // says "receivers MUST support de-interleaving".
                     return Some(Err(DepacketizeError {
-                        pkt_ctx: agg.pkt.ctx,
-                        ssrc: agg.pkt.ssrc(),
-                        sequence_number: agg.pkt.sequence_number(),
+                        pkt_ctx: agg.meta.ctx,
+                        ssrc: agg.meta.ssrc,
+                        sequence_number: agg.meta.sequence_number,
                         description: "interleaving not yet supported".to_owned(),
                     }));
                 }
@@ -696,9 +702,9 @@ impl Depacketizer {
                     // start of fragment
                     if agg.frame_count != 1 {
                         return Some(Err(DepacketizeError {
-                            pkt_ctx: agg.pkt.ctx,
-                            ssrc: agg.pkt.ssrc(),
-                            sequence_number: agg.pkt.sequence_number(),
+                            pkt_ctx: agg.meta.ctx,
+                            ssrc: agg.meta.ssrc,
+                            sequence_number: agg.meta.sequence_number,
                             description: "fragmented AUs must not share packets".to_owned(),
                         }));
                     }
@@ -715,16 +721,16 @@ impl Depacketizer {
                             return None;
                         }
                         return Some(Err(DepacketizeError {
-                            pkt_ctx: agg.pkt.ctx,
-                            ssrc: agg.pkt.ssrc(),
-                            sequence_number: agg.pkt.sequence_number(),
+                            pkt_ctx: agg.meta.ctx,
+                            ssrc: agg.meta.ssrc,
+                            sequence_number: agg.meta.sequence_number,
                             description: "mark can't be set on beginning of fragment".to_owned(),
                         }));
                     }
                     let mut buf = BytesMut::with_capacity(size);
                     buf.extend_from_slice(&payload[agg.data_off..]);
                     self.state = DepacketizerState::Fragmented(Fragment {
-                        rtp_timestamp: agg.pkt.timestamp().timestamp as u16,
+                        rtp_timestamp: agg.meta.timestamp.timestamp as u16,
                         loss: agg.loss,
                         loss_since_mark: agg.loss_since_mark,
                         size: size as u16,
@@ -734,19 +740,19 @@ impl Depacketizer {
                 }
                 if !mark {
                     return Some(Err(DepacketizeError {
-                        pkt_ctx: agg.pkt.ctx,
-                        ssrc: agg.pkt.ssrc(),
-                        sequence_number: agg.pkt.sequence_number(),
+                        pkt_ctx: agg.meta.ctx,
+                        ssrc: agg.meta.ssrc,
+                        sequence_number: agg.meta.sequence_number,
                         description: "mark must be set on non-fragmented au".to_owned(),
                     }));
                 }
 
                 let delta = u32::from(agg.frame_i) * u32::from(self.config.frame_length.get());
-                let agg_timestamp = agg.pkt.timestamp();
+                let agg_timestamp = agg.meta.timestamp;
                 let frame = super::AudioFrame {
-                    ctx: *agg.pkt.ctx(),
+                    ctx: agg.meta.ctx,
                     loss: agg.loss,
-                    stream_id: agg.pkt.stream_id(),
+                    stream_id: agg.meta.stream_id,
                     frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
@@ -754,9 +760,9 @@ impl Depacketizer {
                         Some(t) => t,
                         None => {
                             return Some(Err(DepacketizeError {
-                                pkt_ctx: agg.pkt.ctx,
-                                ssrc: agg.pkt.ssrc(),
-                                sequence_number: agg.pkt.sequence_number(),
+                                pkt_ctx: agg.meta.ctx,
+                                ssrc: agg.meta.ssrc,
+                                sequence_number: agg.meta.sequence_number,
                                 description: format!(
                                     "aggregate timestamp {agg_timestamp} + {delta} overflows"
                                 ),
@@ -781,9 +787,23 @@ impl Depacketizer {
 
 #[cfg(test)]
 mod tests {
+    use crate::buf::{MarkBuf, PacketRef};
     use crate::{PacketContext, rtp::ReceivedPacketBuilder};
 
     use super::*;
+
+    /// Helper: writes payload into `buf`, then pushes to depacketizer.
+    fn push_via_buf(
+        d: &mut super::Depacketizer,
+        meta: crate::rtp::PacketMeta,
+        payload: &[u8],
+        buf: &mut MarkBuf,
+    ) -> Result<(), String> {
+        let pos = buf.end();
+        buf.extend(payload);
+        buf.advance_unparsed(buf.end());
+        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+    }
 
     #[test]
     fn parse_audio_specific_config() {
@@ -810,6 +830,7 @@ mod tests {
             None, // channels, as specified in rtpmap
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
@@ -817,8 +838,8 @@ mod tests {
         };
 
         // Single frame.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 sequence_number: 0,
@@ -835,8 +856,14 @@ mod tests {
                 0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
                 b'a', b's', b'd', b'f',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -847,8 +874,8 @@ mod tests {
         assert_eq!(d.pull(), None);
 
         // Aggregate of 3 frames.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -867,8 +894,14 @@ mod tests {
                 0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
                 b'f', b'o', b'o', b'b', b'a', b'r', b'b', b'a', b'z',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -891,8 +924,8 @@ mod tests {
         assert!(d.pull().is_none());
 
         // Fragment across 3 packets.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // fragment 1/3.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -910,12 +943,18 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'f', b'o', b'o',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // fragment 2/3.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -933,12 +972,18 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // fragment 3/3.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -956,8 +1001,14 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'z',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -976,6 +1027,7 @@ mod tests {
             None, // channels, as specified in rtpmap
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
@@ -983,8 +1035,8 @@ mod tests {
         };
 
         // Fragment
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1001,12 +1053,18 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1023,14 +1081,20 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'z',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1048,8 +1112,14 @@ mod tests {
                 0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
                 b'a', b's', b'd', b'f',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -1068,14 +1138,15 @@ mod tests {
             None, // channels, as specified in rtpmap
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
 
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // 1/3
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1093,13 +1164,19 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'f', b'o', b'o',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // 3/3 reports the loss
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1117,14 +1194,20 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'z',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1142,8 +1225,14 @@ mod tests {
                 0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
                 b'a', b's', b'd', b'f',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -1162,14 +1251,15 @@ mod tests {
             None, // channels, as specified in rtpmap
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
 
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // 1/3
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1187,13 +1277,19 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'f', b'o', b'o',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // 3/3 reports the loss
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1211,14 +1307,20 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'z',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1236,8 +1338,14 @@ mod tests {
                 0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
                 b'a', b's', b'd', b'f',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -1259,14 +1367,15 @@ mod tests {
             None, // channels, as specified in rtpmap
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
             start: 0,
         };
 
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // end of previous fragment, first parts missing.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1284,14 +1393,20 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
 
         // Incomplete fragment with no reported loss.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 // end of previous fragment, first parts missing.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
@@ -1309,8 +1424,14 @@ mod tests {
                 0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
                 b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         match d.pull() {
             Some(Err(e)) => assert!(
@@ -1332,6 +1453,7 @@ mod tests {
             None,
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
+        let mut buf = MarkBuf::new(65536);
         let get_extra_data = |d: &Depacketizer| match d.parameters().unwrap() {
             crate::codec::ParametersRef::Audio(a) => a.extra_data().to_vec(),
             _ => panic!(),
@@ -1346,8 +1468,8 @@ mod tests {
         };
 
         // Single frame.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 sequence_number: 0,
@@ -1362,8 +1484,14 @@ mod tests {
                 0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
                 b'a', b's', b'd', b'f',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -1390,8 +1518,8 @@ mod tests {
         assert_eq!(d.pull(), None);
 
         // Aggregate of 2 frames — each should get its own ADTS header.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1407,8 +1535,14 @@ mod tests {
                 0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
                 b'f', b'o', b'o', b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a1 = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,
@@ -1426,8 +1560,8 @@ mod tests {
         assert_eq!(d.pull(), None);
 
         // Fragment across 2 packets.
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1442,12 +1576,18 @@ mod tests {
                 0x00, 0x30, // AU-size=6
                 b'f', b'o', b'o',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         assert_eq!(d.pull(), None);
-        d.push(
-            ReceivedPacketBuilder {
+        {
+            let pkt = ReceivedPacketBuilder {
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1462,8 +1602,14 @@ mod tests {
                 0x00, 0x30, // AU-size=6
                 b'b', b'a', b'r',
             ])
-            .unwrap(),
-        )
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        }
         .unwrap();
         let a = match d.pull() {
             Some(Ok(CodecItem::AudioFrame(a))) => a,

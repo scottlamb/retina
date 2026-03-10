@@ -15,8 +15,8 @@ use std::num::{NonZeroU16, NonZeroU32};
 use bytes::Bytes;
 
 use crate::Error;
+use crate::buf::PacketRef;
 use crate::error::ErrorInt;
-use crate::rtp::ReceivedPacket;
 
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
 ///
@@ -958,16 +958,16 @@ impl Depacketizer {
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `None`. The later
     /// `push` call may panic or drop data if this expectation is violated.
-    pub fn push(&mut self, input: ReceivedPacket) -> Result<(), String> {
+    pub(crate) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.push(input),
-            DepacketizerInner::G723(d) => d.push(input),
-            DepacketizerInner::H264(d) => d.push(input),
+            DepacketizerInner::Aac(d) => d.push(pkt),
+            DepacketizerInner::G723(d) => d.push(pkt),
+            DepacketizerInner::H264(d) => d.push(pkt),
             #[cfg(feature = "h265")]
-            DepacketizerInner::H265(d) => d.push(input),
-            DepacketizerInner::Onvif(d) => d.push(input),
-            DepacketizerInner::SimpleAudio(d) => d.push(input),
-            DepacketizerInner::Jpeg(d) => d.push(input),
+            DepacketizerInner::H265(d) => d.push(pkt),
+            DepacketizerInner::Onvif(d) => d.push(pkt),
+            DepacketizerInner::SimpleAudio(d) => d.push(pkt),
+            DepacketizerInner::Jpeg(d) => d.push(pkt),
         }
     }
 

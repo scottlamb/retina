@@ -5,6 +5,9 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
+use bytes::Bytes;
+
+use crate::buf::PacketRef;
 use crate::codec::DepacketizeError;
 
 use super::AudioParameters;
@@ -42,8 +45,7 @@ impl Depacketizer {
         Some(super::ParametersRef::Audio(&self.parameters))
     }
 
-    fn validate(pkt: &crate::rtp::ReceivedPacket) -> bool {
-        let payload = pkt.payload();
+    fn validate(payload: &[u8]) -> bool {
         let expected_hdr_bits = match payload.len() {
             24 => 0b00,
             20 => 0b01,
@@ -54,21 +56,25 @@ impl Depacketizer {
         actual_hdr_bits == expected_hdr_bits
     }
 
-    pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         assert!(self.pending.is_none());
-        if !Self::validate(&pkt) {
+        let (s1, s2) = pkt.payload().slices();
+        let mut payload = Vec::with_capacity(crate::to_usize(pkt.payload_len()));
+        payload.extend_from_slice(s1);
+        payload.extend_from_slice(s2);
+        if !Self::validate(&payload) {
             return Err(format!(
                 "Invalid G.723 packet: {:#?}",
-                crate::hex::LimitedHex::new(pkt.payload(), 64),
+                crate::hex::LimitedHex::new(&payload, 64),
             ));
         }
         self.pending = Some(super::AudioFrame {
-            ctx: *pkt.ctx(),
-            loss: pkt.loss(),
-            stream_id: pkt.stream_id(),
-            timestamp: pkt.timestamp(),
+            ctx: pkt.meta.ctx,
+            loss: pkt.meta.loss,
+            stream_id: pkt.meta.stream_id,
+            timestamp: pkt.meta.timestamp,
             frame_length: NonZeroU32::new(240).unwrap(),
-            data: pkt.into_payload_bytes(),
+            data: Bytes::from(payload),
         });
         Ok(())
     }

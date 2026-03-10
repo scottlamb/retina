@@ -5,9 +5,8 @@
 //!
 //! Two [`Input`] implementations are provided:
 //!
-//! * [`&[u8]`] — used for contiguous buffers like `BytesMut`.
-//! * [`Split`] — wraps two `&[u8]` halves, for discontiguous ring-buffer
-//!   views. Reserved for future use.
+//! * `&[u8]` — contiguous byte slice.
+//! * [`Split`] — two `&[u8]` halves, for discontiguous ring-buffer views.
 
 use std::borrow::Cow;
 
@@ -32,7 +31,7 @@ pub trait Input<'i>: Copy {
     /// Skips `n` bytes. Panics if `n > self.len()`.
     fn advance(&mut self, n: usize);
 
-    /// Consumes and returns the next `n` bytes as a slice. Panics if `n > self.len()`.
+    /// Consumes and returns the next `n` bytes. Panics if `n > self.len()`.
     fn next_slice(&mut self, n: usize) -> Self;
 
     /// Returns byte at index `i`. Panics if `i >= self.len()`.
@@ -57,7 +56,10 @@ pub trait Input<'i>: Copy {
     /// Copies the first `N` bytes into an array. Panics if `self.len() < N`.
     fn peek_array<const N: usize>(&self) -> [u8; N];
 
+    /// Converts to a `Cow<[u8]>`, borrowing if contiguous.
     fn to_cow(self) -> Cow<'i, [u8]>;
+
+    /// Converts to a `Cow<str>`, borrowing if contiguous and valid UTF-8.
     fn to_cow_str(self) -> Result<Cow<'i, str>, std::str::Utf8Error> {
         match self.to_cow() {
             Cow::Borrowed(b) => std::str::from_utf8(b).map(Cow::Borrowed),
@@ -70,7 +72,7 @@ pub trait Input<'i>: Copy {
 }
 
 // ---------------------------------------------------------------------------
-// single &[u8] input
+// &[u8] — contiguous byte slice
 // ---------------------------------------------------------------------------
 
 impl<'i> Input<'i> for &'i [u8] {
@@ -86,7 +88,7 @@ impl<'i> Input<'i> for &'i [u8] {
         *self = &self[n..];
     }
 
-    fn next_slice(&mut self, n: usize) -> Self {
+    fn next_slice(&mut self, n: usize) -> &'i [u8] {
         let (ret, rest) = self.split_at(n);
         *self = rest;
         ret
@@ -116,16 +118,16 @@ impl<'i> Input<'i> for &'i [u8] {
         self.iter().position(|&b| pred(b))
     }
 
+    fn peek_array<const N: usize>(&self) -> [u8; N] {
+        self[..N].try_into().unwrap()
+    }
+
     fn to_cow(self) -> Cow<'i, [u8]> {
         Cow::Borrowed(self)
     }
 
     fn to_owned(self) -> Vec<u8> {
         Vec::from(self)
-    }
-
-    fn peek_array<const N: usize>(&self) -> [u8; N] {
-        self[..N].try_into().unwrap()
     }
 }
 
@@ -246,19 +248,6 @@ impl<'i> Input<'i> for Split<'i> {
                 .map(|i| i + self.first.len())
         })
     }
-    fn to_cow(self) -> Cow<'i, [u8]> {
-        if self.second.is_empty() {
-            Cow::Borrowed(self.first)
-        } else {
-            Cow::Owned(self.to_owned())
-        }
-    }
-    fn to_owned(self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(self.first.len() + self.second.len());
-        v.extend_from_slice(self.first);
-        v.extend_from_slice(self.second);
-        v
-    }
 
     fn peek_array<const N: usize>(&self) -> [u8; N] {
         let mut arr = [0u8; N];
@@ -270,6 +259,24 @@ impl<'i> Input<'i> for Split<'i> {
             b.copy_from_slice(&self.second[..N - self.first.len()]);
         }
         arr
+    }
+
+    fn to_cow(self) -> Cow<'i, [u8]> {
+        if self.second.is_empty() {
+            Cow::Borrowed(self.first)
+        } else {
+            let mut v = Vec::with_capacity(self.first.len() + self.second.len());
+            v.extend_from_slice(self.first);
+            v.extend_from_slice(self.second);
+            Cow::Owned(v)
+        }
+    }
+
+    fn to_owned(self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.first.len() + self.second.len());
+        v.extend_from_slice(self.first);
+        v.extend_from_slice(self.second);
+        v
     }
 }
 
@@ -291,7 +298,7 @@ mod tests {
 
     #[test]
     fn contiguous_take_line() {
-        let data = &b"foo\r\nbar"[..];
+        let data: &[u8] = b"foo\r\nbar";
         check_take_line(data);
     }
 
@@ -306,7 +313,7 @@ mod tests {
 
     #[test]
     fn contiguous_find_bytes() {
-        let input = &b"hello:world"[..];
+        let input: &[u8] = b"hello:world";
         assert_eq!(input.find_byte(b':'), Some(5));
         assert_eq!(input.find_bytes2(b':', b'x'), Some(5));
         assert_eq!(input.find_bytes3(b'x', b'y', b':'), Some(5));
@@ -325,7 +332,7 @@ mod tests {
 
     #[test]
     fn contiguous_advance_and_next_slice() {
-        let mut input = &b"abcdef"[..];
+        let mut input: &[u8] = b"abcdef";
         input.advance(2);
         assert_eq!(input.len(), 4);
         let s = input.next_slice(3);
@@ -354,7 +361,7 @@ mod tests {
 
     #[test]
     fn contiguous_starts_with_lit() {
-        let input = &b"RTSP/1.0 200 OK"[..];
+        let input: &[u8] = b"RTSP/1.0 200 OK";
         assert!(input.starts_with_lit(b"RTSP/"));
         assert!(!input.starts_with_lit(b"HTTP/"));
     }
@@ -367,16 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_slice_to_cow_str() {
-        let mut input = &b"hello"[..];
-        let s: &[u8] = input.next_slice(5);
-        // Since it's &[u8], we need to call Slice::to_cow_str.
+    fn contiguous_to_cow_str() {
+        let mut input: &[u8] = b"hello";
+        let s = input.next_slice(5);
         let cow_str = s.to_cow_str().unwrap();
         assert_eq!(&*cow_str, "hello");
     }
 
     #[test]
-    fn split_slice_to_cow_str() {
+    fn split_to_cow_str() {
         let mut input = Split::new(b"hel", b"lo");
         let s = input.next_slice(5);
         let cow_str = s.to_cow_str().unwrap();

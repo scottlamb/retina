@@ -15,9 +15,10 @@ use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
+use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
 use bytes::Bytes;
-use futures::{Future, SinkExt, StreamExt, ready};
+use futures::{Future, SinkExt, Stream as _, StreamExt, ready};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
 use tokio::net::UdpSocket;
@@ -895,6 +896,7 @@ impl Stream {
 struct UdpSockets {
     rtp: UdpSocket,
     rtcp: UdpSocket,
+    read_buf: crate::buf::MarkBuf,
 }
 
 /// Placeholder `Debug` impl to allow `UdpSockets` to be a field within a `#[derive(Debug)]` struct.
@@ -1221,7 +1223,8 @@ impl RtspConnection {
                     msg::Message::Response(r) => {
                         if let Some(response_cseq) = parse::get_cseq(&r) {
                             if response_cseq == cseq {
-                                break (r, msg.body, msg_ctx);
+                                let body = self.inner.body_bytes(msg.body_pos, msg.body_len);
+                                break (r, body, msg_ctx);
                             }
                             if matches!(mode, ResponseMode::Teardown) {
                                 debug!("ignoring unrelated response during TEARDOWN");
@@ -1246,13 +1249,8 @@ impl RtspConnection {
                             );
                             continue;
                         }
-                        self.handle_unassigned_data(
-                            msg_ctx,
-                            options,
-                            tool,
-                            d.channel_id,
-                            msg.body,
-                        )?;
+                        let body = self.inner.body_bytes(msg.body_pos, msg.body_len);
+                        self.handle_unassigned_data(msg_ctx, options, tool, d.channel_id, body)?;
                         continue;
                     }
                     msg::Message::Request(r) => format!("{:?} request", r.method),
@@ -1600,6 +1598,7 @@ impl Session<Described> {
                     UdpSockets {
                         rtp: pair.rtp_socket,
                         rtcp: pair.rtcp_socket,
+                        read_buf: crate::buf::MarkBuf::new(65536),
                     },
                 ))
             }
@@ -2251,21 +2250,26 @@ impl Session<Playing> {
         })
     }
 
+    /// Maps an interleaved TCP data message to a [`StreamItem`].
+    ///
+    /// Handles unassigned channels (returning `Ok(None)`); validation is
+    /// deferred to [`Session::validate_item`].
     fn handle_data(
         mut self: Pin<&mut Self>,
         msg_ctx: &RtspMessageContext,
         channel_id: u8,
-        body: Bytes,
-    ) -> Result<Option<PacketItem>, Error> {
+        body_pos: u64,
+        body_len: u16,
+    ) -> Result<Option<StreamItem>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
             .conn
             .as_mut()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Tcp { msg_ctx: *msg_ctx });
         let m = match conn.channels.lookup(channel_id) {
             Some(m) => m,
             None => {
+                let body = conn.inner.body_bytes(body_pos, u32::from(body_len));
                 conn.handle_unassigned_data(
                     *msg_ctx,
                     inner.options,
@@ -2276,49 +2280,101 @@ impl Session<Playing> {
                 return Ok(None);
             }
         };
-        let stream = &mut inner.presentation.streams[m.stream_i];
-        let (timeline, rtp_handler, stream_ctx) = match &mut stream.state {
-            StreamState::Playing {
-                timeline,
-                rtp_handler,
-                ctx,
-                ..
-            } => (timeline, rtp_handler, ctx),
-            _ => unreachable!(
-                "Session<Playing>'s {}->{:?} not in Playing state",
-                channel_id, m
-            ),
-        };
-        match m.channel_type {
-            ChannelType::Rtp => Ok(rtp_handler.rtp(
-                inner.options,
-                stream_ctx,
-                inner.presentation.tool.as_ref(),
-                conn.inner.ctx(),
-                &pkt_ctx,
-                timeline,
-                m.stream_i,
-                body,
-            )?),
-            ChannelType::Rtcp => {
-                match rtp_handler.rtcp(
-                    inner.options,
-                    stream_ctx,
-                    inner.presentation.tool.as_ref(),
-                    conn.inner.ctx(),
-                    &pkt_ctx,
-                    timeline,
-                    m.stream_i,
-                    body,
-                ) {
-                    Ok(p) => Ok(p),
-                    Err(description) => Err(wrap!(ErrorInt::PacketError {
-                        conn_ctx: *conn.inner.ctx(),
-                        stream_ctx: stream.ctx().unwrap().to_owned(),
-                        pkt_ctx,
-                        stream_id: m.stream_i,
-                        description,
-                    })),
+        Ok(Some(StreamItem {
+            pkt_ctx: crate::PacketContext(crate::PacketContextInner::Tcp { msg_ctx: *msg_ctx }),
+            stream_i: m.stream_i,
+            channel_type: m.channel_type,
+            body_pos,
+            body_len,
+        }))
+    }
+
+    /// Polls a UDP socket, reading into `read_buf`'s spare capacity via
+    /// vectored I/O (`socket2::SockRef::recv_vectored`). Handles spurious
+    /// readiness, `ConnectionRefused` (from firewall hole-punching), and
+    /// wraps I/O errors.
+    ///
+    /// On success, returns the byte count. The caller must call `advance_end`
+    /// or the data will be overwritten on next call.
+    ///
+    /// Reads at most [`u16::MAX`] bytes, above any real datagram (65,507 for
+    /// IPv4, 65,527 for IPv6), so the length fits in a `u16`. Note the vectored
+    /// slices scatter a *single* datagram across the ring's wrap point;
+    /// `recvmsg` on a datagram socket never coalesces queued packets.
+    ///
+    /// TODO: drain several packets per syscall via `recvmmsg` and/or `UDP_GRO`.
+    /// That needs the caller to return a batch and the ring to hold more than
+    /// one packet at a time; each datagram's length is still `u16`-bounded.
+    fn poll_udp_recv(
+        socket: &UdpSocket,
+        cx: &mut std::task::Context,
+        read_buf: &mut crate::buf::MarkBuf,
+        conn_ctx: &crate::ConnectionContext,
+        stream_ctx: &crate::StreamContext,
+    ) -> Poll<Result<u16, Error>> {
+        const MAX_DATAGRAM: usize = u16::MAX as usize;
+        // `spare_capacity` returns *all* the free space, which may exceed the
+        // requested reserve; clamp so `recv_vectored` can't exceed a `u16`.
+        let (s1, s2) = read_buf.spare_capacity(MAX_DATAGRAM);
+        let s1_len = s1.len().min(MAX_DATAGRAM);
+        let s2_len = s2.len().min(MAX_DATAGRAM - s1_len);
+        let s1 = &mut s1[..s1_len];
+        let s2 = &mut s2[..s2_len];
+        loop {
+            ready!(socket.poll_recv_ready(cx)).map_err(|source| {
+                wrap!(ErrorInt::UdpRecvError {
+                    conn_ctx: *conn_ctx,
+                    stream_ctx: stream_ctx.to_owned(),
+                    when: crate::WallTime::now(),
+                    source,
+                })
+            })?;
+            // SAFETY: MaybeUninit<u8> has the same layout as u8, and
+            // initialized memory is valid MaybeUninit.
+            let s1_mu = unsafe {
+                std::slice::from_raw_parts_mut(s1.as_mut_ptr().cast::<MaybeUninit<u8>>(), s1.len())
+            };
+            let s2_mu = unsafe {
+                std::slice::from_raw_parts_mut(s2.as_mut_ptr().cast::<MaybeUninit<u8>>(), s2.len())
+            };
+            let mut bufs = [
+                socket2::MaybeUninitSlice::new(s1_mu),
+                socket2::MaybeUninitSlice::new(s2_mu),
+            ];
+            // Must go through `try_io` rather than issuing the syscall
+            // directly: on `WouldBlock` it clears tokio's cached readiness, so
+            // the next `poll_recv_ready` actually waits. Calling
+            // `SockRef::recv_vectored` here instead leaves the readiness set,
+            // and this task then burns CPU re-polling indefinitely (tokio's
+            // cooperative budget makes it yield after ~128 futile syscalls,
+            // whereupon the stale readiness wakes it right back up).
+            let r = socket.try_io(tokio::io::Interest::READABLE, || {
+                socket2::SockRef::from(socket).recv_vectored(&mut bufs)
+            });
+            match r {
+                Ok((n, _flags)) => {
+                    debug_assert!(n <= MAX_DATAGRAM);
+                    return Poll::Ready(Ok(n as u16));
+                }
+                Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                    // Spurious readiness. Loop back to poll_recv_ready
+                    // to wait for actual readiness.
+                    continue;
+                }
+                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
+                    // The packets sent by `punch_firewall_hole` can elicit a
+                    // 'destination unreachable' ICMP response from the server,
+                    // which gets turned into a 'connection refused' error.
+                    debug!("Ignoring UDP connection refused error");
+                    continue;
+                }
+                Err(source) => {
+                    return Poll::Ready(Err(wrap!(ErrorInt::UdpRecvError {
+                        conn_ctx: *conn_ctx,
+                        stream_ctx: stream_ctx.to_owned(),
+                        when: crate::WallTime::now(),
+                        source,
+                    })));
                 }
             }
         }
@@ -2326,26 +2382,25 @@ impl Session<Playing> {
 
     /// Polls a single UDP stream, `inner.presentation.streams[i]`.
     ///
-    /// Assumes `buf` is cleared and large enough for any UDP packet.
+    /// Reads from RTCP then RTP sockets into the per-stream ring buffer.
+    /// Returns a raw [`StreamItem`]; validation is deferred to
+    /// [`Session::validate_item`].
+    ///
     /// Only returns `Poll::Pending` after both RTCP and RTP sockets have
     /// returned `Poll::Pending`.
     fn poll_udp_stream(
         &mut self,
         cx: &mut std::task::Context,
-        buf: &mut tokio::io::ReadBuf,
         i: usize,
-    ) -> Poll<Option<Result<PacketItem, Error>>> {
-        debug_assert!(buf.filled().is_empty());
+    ) -> Poll<Option<Result<StreamItem, Error>>> {
         let inner = self.0.as_mut().project();
         let s = &mut inner.presentation.streams[i];
-        let (timeline, rtp_handler, stream_ctx, udp_sockets) = match &mut s.state {
+        let (stream_ctx, udp_sockets) = match &mut s.state {
             StreamState::Playing {
-                timeline,
-                rtp_handler,
                 ctx,
                 udp_sockets: Some(udp_sockets),
                 ..
-            } => (timeline, rtp_handler, ctx, udp_sockets),
+            } => (ctx, udp_sockets),
             _ => return Poll::Pending,
         };
         let conn_ctx = inner
@@ -2356,110 +2411,38 @@ impl Session<Playing> {
             .ctx();
 
         // Prioritize RTCP over RTP within a stream.
-        while let Poll::Ready(r) = udp_sockets.rtcp.poll_recv(cx, buf) {
-            let when = Instant::now();
-            let when_wall = crate::WallTime::now();
-            match r {
-                Ok(()) => {
-                    let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received: when,
-                        received_wall: when_wall,
-                    });
-                    let msg = Bytes::copy_from_slice(buf.filled());
-                    match rtp_handler.rtcp(
-                        inner.options,
-                        stream_ctx,
-                        inner.presentation.tool.as_ref(),
-                        conn_ctx,
-                        &pkt_ctx,
-                        timeline,
-                        i,
-                        msg,
-                    ) {
-                        Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
-                        Ok(None) => buf.clear(),
-                        Err(description) => {
-                            return Poll::Ready(Some(Err(wrap!(ErrorInt::PacketError {
-                                conn_ctx: *conn_ctx,
-                                stream_ctx: stream_ctx.to_owned(),
-                                pkt_ctx,
-                                stream_id: i,
-                                description,
-                            }))));
-                        }
-                    }
+        for channel_type in [ChannelType::Rtcp, ChannelType::Rtp] {
+            let socket = match channel_type {
+                ChannelType::Rtcp => &udp_sockets.rtcp,
+                ChannelType::Rtp => &udp_sockets.rtp,
+            };
+            let body_pos = udp_sockets.read_buf.end();
+            match Self::poll_udp_recv(socket, cx, &mut udp_sockets.read_buf, conn_ctx, stream_ctx) {
+                Poll::Ready(Ok(n)) => {
+                    udp_sockets.read_buf.advance_end(usize::from(n));
+                    udp_sockets
+                        .read_buf
+                        .advance_unparsed(udp_sockets.read_buf.end());
+                    return Poll::Ready(Some(Ok(StreamItem {
+                        pkt_ctx: crate::PacketContext(crate::PacketContextInner::Udp {
+                            received: Instant::now(),
+                            received_wall: crate::WallTime::now(),
+                        }),
+                        stream_i: i,
+                        channel_type,
+                        body_pos,
+                        body_len: n,
+                    })));
                 }
-                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    // The packets sent by `punch_firewall_hole` can elicit a
-                    // 'destination unreachable' ICMP response from the server,
-                    // which gets turned into a 'connection refused' error. This
-                    // is not actually a problem so just ignore it.
-                    debug!("Ignoring UDP connection refused error");
-                }
-                Err(source) => {
-                    return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                        conn_ctx: *conn_ctx,
-                        stream_ctx: stream_ctx.to_owned(),
-                        when: when_wall,
-                        source,
-                    }))));
-                }
-            }
-        }
-        while let Poll::Ready(r) = udp_sockets.rtp.poll_recv(cx, buf) {
-            let when = Instant::now();
-            let when_wall = crate::WallTime::now();
-            match r {
-                Ok(()) => {
-                    let msg = Bytes::copy_from_slice(buf.filled());
-                    let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received: when,
-                        received_wall: when_wall,
-                    });
-                    match rtp_handler.rtp(
-                        inner.options,
-                        stream_ctx,
-                        inner.presentation.tool.as_ref(),
-                        conn_ctx,
-                        &pkt_ctx,
-                        timeline,
-                        i,
-                        msg,
-                    ) {
-                        Ok(Some(p)) => return Poll::Ready(Some(Ok(p))),
-                        Ok(None) => buf.clear(),
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    }
-                }
-                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    // See comment above
-                    debug!("Ignoring UDP connection refused error");
-                }
-                Err(source) => {
-                    return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
-                        conn_ctx: *conn_ctx,
-                        stream_ctx: stream_ctx.to_owned(),
-                        when: when_wall,
-                        source,
-                    }))));
-                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => {}
             }
         }
         Poll::Pending
     }
 
     /// Polls all UDP streams, round-robining between them to avoid starvation.
-    fn poll_udp(&mut self, cx: &mut std::task::Context) -> Poll<Option<Result<PacketItem, Error>>> {
-        // For now, create a buffer on the stack large enough for any UDP packet, then
-        // copy into a fresh allocation if it's actually used.
-        // TODO: a ring buffer would be better: see
-        // <https://github.com/scottlamb/retina/issues/6>.
-
-        // SAFETY: this exactly matches an example in the documentation:
-        // <https://doc.rust-lang.org/nightly/core/mem/union.MaybeUninit.html#initializing-an-array-element-by-element>.
-        let mut buf: [MaybeUninit<u8>; 65_536] = unsafe { MaybeUninit::uninit().assume_init() };
-        let mut buf = tokio::io::ReadBuf::uninit(&mut buf);
-
+    fn poll_udp(&mut self, cx: &mut std::task::Context) -> Poll<Option<Result<StreamItem, Error>>> {
         // Assume 0 <= inner.udp_next_poll_i < inner.presentation.streams.len().
         // play() would have failed if there were no (setup) streams.
         let starting_i = *self.0.as_mut().project().udp_next_poll_i;
@@ -2471,7 +2454,7 @@ impl Session<Playing> {
                 *inner.udp_next_poll_i = 0;
             }
 
-            if let Poll::Ready(r) = self.poll_udp_stream(cx, &mut buf, i) {
+            if let Poll::Ready(r) = self.poll_udp_stream(cx, i) {
                 return Poll::Ready(r);
             }
 
@@ -2480,6 +2463,186 @@ impl Session<Playing> {
             }
         }
         Poll::Pending
+    }
+
+    /// Validates a raw [`StreamItem`], returning a [`ValidatedItem`].
+    ///
+    /// This is the single processing point for both TCP and UDP paths:
+    /// RTP header validation, `rtp_handler.rtp()`, and `rtp_handler.rtcp()`
+    /// all happen here.
+    fn validate_item(
+        mut self: Pin<&mut Self>,
+        item: StreamItem,
+    ) -> Result<Option<ValidatedItem>, Error> {
+        let inner = self.0.as_mut().project();
+        let conn = inner
+            .conn
+            .as_ref()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+        let stream = &mut inner.presentation.streams[item.stream_i];
+        let StreamState::Playing {
+            timeline,
+            rtp_handler,
+            ctx: stream_ctx,
+            udp_sockets,
+            ..
+        } = &mut stream.state
+        else {
+            unreachable!("stream {} not in Playing state", item.stream_i);
+        };
+        match item.channel_type {
+            ChannelType::Rtp => {
+                let body_len = usize::from(item.body_len);
+                let split = match udp_sockets {
+                    Some(s) => s.read_buf.split(item.body_pos, body_len),
+                    None => conn.inner.read_buf().split(item.body_pos, body_len),
+                };
+                let (header, payload_range) =
+                    crate::rtp::PacketHeader::validate(split).map_err(|reason| {
+                        wrap!(ErrorInt::PacketError {
+                            conn_ctx: *conn.inner.ctx(),
+                            stream_ctx: stream_ctx.to_owned(),
+                            pkt_ctx: item.pkt_ctx,
+                            stream_id: item.stream_i,
+                            description: rtp_handler.validate_error(reason, split),
+                        })
+                    })?;
+                let Some(meta) = rtp_handler.rtp(
+                    inner.options,
+                    stream_ctx,
+                    inner.presentation.tool.as_ref(),
+                    conn.inner.ctx(),
+                    &item.pkt_ctx,
+                    timeline,
+                    item.stream_i,
+                    &header,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
+                    meta,
+                    body_pos: item.body_pos,
+                    body_len: item.body_len,
+                    payload_range,
+                })))
+            }
+            ChannelType::Rtcp => {
+                let body = match udp_sockets {
+                    Some(s) => Bytes::from(
+                        s.read_buf
+                            .split(item.body_pos, usize::from(item.body_len))
+                            .to_owned(),
+                    ),
+                    None => conn
+                        .inner
+                        .body_bytes(item.body_pos, u32::from(item.body_len)),
+                };
+                match rtp_handler.rtcp(
+                    inner.options,
+                    stream_ctx,
+                    inner.presentation.tool.as_ref(),
+                    conn.inner.ctx(),
+                    &item.pkt_ctx,
+                    timeline,
+                    item.stream_i,
+                    body,
+                ) {
+                    Ok(p) => Ok(p.map(ValidatedItem::Rtcp)),
+                    Err(description) => Err(wrap!(ErrorInt::PacketError {
+                        conn_ctx: *conn.inner.ctx(),
+                        stream_ctx: stream_ctx.to_owned(),
+                        pkt_ctx: item.pkt_ctx,
+                        stream_id: item.stream_i,
+                        description,
+                    })),
+                }
+            }
+        }
+    }
+
+    /// Polls for the next validated item (RTP or RTCP) from either the RTSP
+    /// connection or UDP sockets, handling keepalives along the way.
+    fn poll_stream_item(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<ValidatedItem, Error>>> {
+        loop {
+            // First try receiving data on the RTSP connection. Let this starve
+            // sending keepalives; if we can't keep up, the server should
+            // probably drop us.
+            match Pin::new(&mut self.0.conn.as_mut().unwrap().inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(msg))) => match msg.msg {
+                    msg::Message::Data(d) => {
+                        if let Some(item) = self.as_mut().handle_data(
+                            &msg.ctx,
+                            d.channel_id,
+                            msg.body_pos,
+                            d.body_len,
+                        )? {
+                            match self.as_mut().validate_item(item)? {
+                                Some(v) => return Poll::Ready(Some(Ok(v))),
+                                None => continue,
+                            }
+                        }
+                        continue;
+                    }
+                    msg::Message::Response(response) => {
+                        if let Err(e) = self.as_mut().handle_response(&msg.ctx, response) {
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        continue;
+                    }
+                    msg::Message::Request(request) => {
+                        warn!(
+                            "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
+                            request
+                        );
+                    }
+                },
+                Poll::Ready(Some(Err(e))) => {
+                    debug!("RTSP connection error: {:?}", e);
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    debug!("Server closed RTSP connection");
+                    return Poll::Ready(None);
+                }
+                std::task::Poll::Pending => {}
+            }
+
+            // Next try receiving data on the UDP sockets, if any.
+            if self.0.flags & (SessionFlag::UdpStreams as u8) != 0
+                && let Poll::Ready(Some(result)) = self.as_mut().poll_udp(cx)
+            {
+                match self.as_mut().validate_item(result?)? {
+                    Some(v) => return Poll::Ready(Some(Ok(v))),
+                    None => continue,
+                }
+            }
+
+            // Then check if it's time for a new keepalive.
+            // Note: in production keepalive_timer is always Some. Tests may disable it.
+            if let Some(t) = self.0.keepalive_timer.as_mut()
+                && matches!(t.as_mut().poll(cx), Poll::Ready(()))
+            {
+                self.as_mut().handle_keepalive_timer(cx)?;
+            }
+
+            // Then finish flushing the current keepalive if necessary.
+            if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
+                match self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
+                    Poll::Pending => {}
+                }
+            }
+
+            // Nothing to do. The poll calls above have already registered cx as necessary.
+            return Poll::Pending;
+        }
     }
 }
 
@@ -2561,72 +2724,74 @@ impl futures::Stream for Session<Playing> {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        loop {
-            // First try receiving data on the RTSP connection. Let this starve
-            // sending keepalives; if we can't keep up, the server should
-            // probably drop us.
-            match Pin::new(&mut self.0.conn.as_mut().unwrap().inner).poll_next(cx) {
-                Poll::Ready(Some(Ok(msg))) => match msg.msg {
-                    msg::Message::Data(d) => {
-                        match self.as_mut().handle_data(&msg.ctx, d.channel_id, msg.body) {
-                            Err(e) => return Poll::Ready(Some(Err(e))),
-                            Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
-                            Ok(None) => continue,
-                        };
+        let item = ready!(self.as_mut().poll_stream_item(cx));
+        Poll::Ready(match item {
+            Some(Ok(ValidatedItem::Rtcp(pkt))) => Some(Ok(pkt)),
+            Some(Ok(ValidatedItem::Rtp(rtp))) => {
+                let stream = &mut self.0.presentation.streams[rtp.meta.stream_id];
+                let data = match &mut stream.state {
+                    StreamState::Playing {
+                        udp_sockets: Some(udp_sockets),
+                        ..
+                    } => Bytes::from(
+                        udp_sockets
+                            .read_buf
+                            .split(rtp.body_pos, usize::from(rtp.body_len))
+                            .to_owned(),
+                    ),
+                    _ => {
+                        let conn = self.0.conn.as_ref().unwrap();
+                        conn.inner.body_bytes(rtp.body_pos, u32::from(rtp.body_len))
                     }
-                    msg::Message::Response(response) => {
-                        if let Err(e) = self.as_mut().handle_response(&msg.ctx, response) {
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        continue;
-                    }
-                    msg::Message::Request(request) => {
-                        warn!(
-                            "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
-                            request
-                        );
-                    }
-                },
-                Poll::Ready(Some(Err(e))) => {
-                    debug!("RTSP connection error: {:?}", e);
-                    return Poll::Ready(Some(Err(e)));
-                }
-                Poll::Ready(None) => {
-                    debug!("Server closed RTSP connection");
-                    return Poll::Ready(None);
-                }
-                std::task::Poll::Pending => {}
+                };
+                Some(Ok(rtp.into_received_packet(data)))
             }
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        })
+    }
+}
 
-            // Next try receiving data on the UDP sockets, if any.
-            if self.0.flags & (SessionFlag::UdpStreams as u8) != 0
-                && let Poll::Ready(result) = self.as_mut().poll_udp(cx)
-            {
-                return Poll::Ready(result);
-            }
+/// Raw received packet before validation.
+///
+/// Both TCP and UDP paths produce this minimal descriptor; validation
+/// happens in [`Session::validate_item`].
+struct StreamItem {
+    pkt_ctx: crate::PacketContext,
+    stream_i: usize,
+    channel_type: ChannelType,
+    body_pos: u64,
+    body_len: u16,
+}
 
-            // Then check if it's time for a new keepalive.
-            // Note: in production keepalive_timer is always Some. Tests may disable it.
-            if let Some(t) = self.0.keepalive_timer.as_mut()
-                && matches!(t.as_mut().poll(cx), Poll::Ready(()))
-            {
-                self.as_mut().handle_keepalive_timer(cx)?;
-            }
+/// Validated stream data (RTP or RTCP), ready for consumption.
+///
+/// Callers convert to their specific item type (`PacketItem` or `CodecItem`).
+enum ValidatedItem {
+    Rtcp(PacketItem),
+    Rtp(ValidatedRtp),
+}
 
-            // Then finish flushing the current keepalive if necessary.
-            if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
-                match self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
-                    Poll::Pending => {}
-                }
-            }
+/// Metadata for a validated RTP packet whose body is in a ring buffer.
+struct ValidatedRtp {
+    meta: crate::rtp::PacketMeta,
+    body_pos: u64,
+    body_len: u16,
+    payload_range: std::ops::Range<u16>,
+}
 
-            // Nothing to do. The poll calls above have already registered cx as necessary.
-            return Poll::Pending;
-        }
+impl ValidatedRtp {
+    /// Converts to a [`PacketItem::Rtp`] for the non-Demuxed path, given the
+    /// body already copied from the ring buffer as `Bytes`.
+    fn into_received_packet(self, data: Bytes) -> PacketItem {
+        PacketItem::Rtp(crate::rtp::ReceivedPacket {
+            ctx: self.meta.ctx,
+            stream_id: self.meta.stream_id,
+            timestamp: self.meta.timestamp,
+            data,
+            payload_range: self.payload_range,
+            loss: self.meta.loss,
+        })
     }
 }
 
@@ -2663,16 +2828,59 @@ impl futures::Stream for Demuxed {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         loop {
-            let (stream_id, pkt) = match self.state {
-                DemuxedState::Waiting => match ready!(Pin::new(&mut self.session).poll_next(cx)) {
-                    Some(Ok(PacketItem::Rtp(p))) => (p.stream_id(), Some(p)),
-                    Some(Ok(PacketItem::Rtcp(p))) => {
-                        return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))));
+            let stream_id = match self.state {
+                DemuxedState::Waiting => {
+                    match ready!(Pin::new(&mut self.session).poll_stream_item(cx)) {
+                        Some(Ok(ValidatedItem::Rtp(rtp))) => {
+                            let stream_id = rtp.meta.stream_id;
+                            let inner = &mut *self.session.0;
+                            let stream = &mut inner.presentation.streams[stream_id];
+                            let payload_pos = rtp.body_pos + u64::from(rtp.payload_range.start);
+                            let payload_len = rtp.payload_range.end - rtp.payload_range.start;
+                            let depacketizer = match &mut stream.depacketizer {
+                                Ok(d) => d,
+                                Err(_) => unreachable!("depacketizer was Ok"),
+                            };
+                            let buf = match &stream.state {
+                                StreamState::Playing {
+                                    udp_sockets: Some(udp_sockets),
+                                    ..
+                                } => &udp_sockets.read_buf,
+                                _ => inner.conn.as_ref().unwrap().inner.read_buf(),
+                            };
+                            depacketizer
+                                .push(&crate::buf::PacketRef::new(
+                                    rtp.meta,
+                                    buf,
+                                    payload_pos,
+                                    payload_len,
+                                ))
+                                .map_err(|description| {
+                                    let conn_ctx = *inner.conn.as_ref().unwrap().inner.ctx();
+                                    wrap!(ErrorInt::RtpPacketError {
+                                        conn_ctx,
+                                        stream_ctx: stream.ctx().unwrap().to_owned(),
+                                        pkt_ctx: rtp.meta.ctx,
+                                        stream_id,
+                                        ssrc: rtp.meta.ssrc,
+                                        sequence_number: rtp.meta.sequence_number,
+                                        description,
+                                    })
+                                })?;
+                            stream_id
+                        }
+                        Some(Ok(ValidatedItem::Rtcp(pkt))) => {
+                            let p = match pkt {
+                                PacketItem::Rtcp(r) => r,
+                                _ => unreachable!(),
+                            };
+                            return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))));
+                        }
+                        Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        None => return Poll::Ready(None),
                     }
-                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                    None => return Poll::Ready(None),
-                },
-                DemuxedState::Pulling(stream_id) => (stream_id, None),
+                }
+                DemuxedState::Pulling(stream_id) => stream_id,
                 DemuxedState::Fused => return Poll::Ready(None),
             };
             let inner = self.session.0.as_mut().project();
@@ -2691,32 +2899,14 @@ impl futures::Stream for Demuxed {
                 .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
                 .inner
                 .ctx();
-            if let Some(p) = pkt {
-                let pkt_ctx = *p.ctx();
-                let stream_id = p.stream_id();
-                let ssrc = p.ssrc();
-                let sequence_number = p.sequence_number();
-                depacketizer.push(p).map_err(|description| {
-                    wrap!(ErrorInt::RtpPacketError {
-                        conn_ctx: *conn_ctx,
-                        stream_ctx: stream_ctx.to_owned(),
-                        pkt_ctx,
-                        stream_id,
-                        ssrc,
-                        sequence_number,
-                        description,
-                    })
-                })?;
 
-                // Note we're committed now to calling `pull` and returning
-                // `Ready` if it has a frame. This is because the
-                // `Stream::parameters` contract guarantees that changes in
-                // upcoming frames are *not* reflected. It's implemented by a
-                // call to `Depacketizer::pull`, which doesn't make a like
-                // guarantee about the state between `push` and `pull`. So we
-                // can't let our callers observe that state.
-            }
-
+            // Note we're committed now to calling `pull` and returning
+            // `Ready` if it has a frame. This is because the
+            // `Stream::parameters` contract guarantees that changes in
+            // upcoming frames are *not* reflected. It's implemented by a
+            // call to `Depacketizer::pull`, which doesn't make a like
+            // guarantee about the state between `push` and `pull`. So we
+            // can't let our callers observe that state.
             match depacketizer.pull() {
                 Some(Ok(item)) => {
                     self.state = DemuxedState::Pulling(stream_id);
@@ -2759,6 +2949,128 @@ mod tests {
         let client = tokio::net::TcpStream::connect(addr);
         let server = listener.accept();
         (client.await.unwrap(), server.await.unwrap().0)
+    }
+
+    /// UDP equivalent of [`socketpair`]: two mutually connected localhost
+    /// sockets, as `setup` establishes for a UDP stream.
+    async fn udp_socketpair() -> (UdpSocket, UdpSocket) {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        (a, b)
+    }
+
+    /// Polls [`Session::poll_udp_recv`] once, returning its `Poll`.
+    async fn poll_udp_recv_once(
+        socket: &UdpSocket,
+        read_buf: &mut crate::buf::MarkBuf,
+    ) -> Poll<Result<u16, Error>> {
+        let conn_ctx = crate::ConnectionContext::dummy();
+        let stream_ctx = crate::StreamContext::dummy();
+        std::future::poll_fn(|cx| {
+            Poll::Ready(Session::<Playing>::poll_udp_recv(
+                socket,
+                cx,
+                read_buf,
+                &conn_ctx,
+                &stream_ctx,
+            ))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn udp_recv_pending_when_idle() {
+        let (a, _b) = udp_socketpair().await;
+        let mut read_buf = crate::buf::MarkBuf::new(128 * 1024);
+        assert!(poll_udp_recv_once(&a, &mut read_buf).await.is_pending());
+    }
+
+    #[tokio::test]
+    async fn udp_recv_datagram() {
+        let (a, b) = udp_socketpair().await;
+        let mut read_buf = crate::buf::MarkBuf::new(128 * 1024);
+        b.send(b"hello world").await.unwrap();
+        a.readable().await.unwrap();
+
+        let pos = read_buf.end();
+        let Poll::Ready(Ok(n)) = poll_udp_recv_once(&a, &mut read_buf).await else {
+            panic!("expected a datagram");
+        };
+        assert_eq!(n, 11);
+        read_buf.advance_end(usize::from(n));
+        assert_eq!(read_buf.split(pos, 11).to_owned(), b"hello world");
+    }
+
+    /// A datagram landing on the ring's wrap point must be scattered correctly
+    /// across both halves of the vectored read.
+    #[tokio::test]
+    async fn udp_recv_scatters_across_ring_wrap() {
+        let (a, b) = udp_socketpair().await;
+
+        // Position `end` 10 bytes short of the ring's end, and consume
+        // everything, so the free space wraps and its first half is 10 bytes.
+        let mut read_buf = crate::buf::MarkBuf::new(128 * 1024);
+        let head = read_buf.capacity() - 10;
+        read_buf.extend(&vec![0u8; head]);
+        read_buf.advance_unparsed(read_buf.end());
+
+        let datagram: Vec<u8> = (0..100u8).collect();
+        b.send(&datagram).await.unwrap();
+        a.readable().await.unwrap();
+
+        let pos = read_buf.end();
+        let Poll::Ready(Ok(n)) = poll_udp_recv_once(&a, &mut read_buf).await else {
+            panic!("expected a datagram");
+        };
+        assert_eq!(n, 100);
+        read_buf.advance_end(usize::from(n));
+
+        let split = read_buf.split(pos, 100);
+        let (s1, s2) = split.slices();
+        assert_eq!((s1.len(), s2.len()), (10, 90), "should have wrapped");
+        assert_eq!(split.to_owned(), datagram);
+    }
+
+    /// Regression test: tokio caches readiness, and only its own `try_*` /
+    /// `try_io` helpers clear it. Issuing the `recvmsg` directly after
+    /// `poll_recv_ready` leaves stale readiness set, so the task is woken again
+    /// as soon as it yields and re-polls forever, burning CPU without making
+    /// progress. (It doesn't hang outright: tokio's cooperative budget forces a
+    /// yield after ~128 futile syscalls, then the stale readiness wakes it
+    /// straight back up.)
+    ///
+    /// Asserts the socket is polled once and then stays asleep.
+    #[tokio::test]
+    async fn udp_recv_stale_readiness_does_not_spin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (a, b) = udp_socketpair().await;
+        b.send(b"hello").await.unwrap();
+        a.readable().await.unwrap(); // tokio caches READABLE
+
+        // Consume the datagram behind tokio's back, so the socket is no longer
+        // readable but tokio still believes it is.
+        let mut scratch = [MaybeUninit::<u8>::uninit(); 64];
+        let n = socket2::SockRef::from(&a).recv(&mut scratch[..]).unwrap();
+        assert_eq!(n, 5);
+
+        let mut read_buf = crate::buf::MarkBuf::new(128 * 1024);
+        let conn_ctx = crate::ConnectionContext::dummy();
+        let stream_ctx = crate::StreamContext::dummy();
+        let polls = AtomicUsize::new(0);
+        let fut = std::future::poll_fn(|cx| {
+            polls.fetch_add(1, Ordering::Relaxed);
+            Session::<Playing>::poll_udp_recv(&a, cx, &mut read_buf, &conn_ctx, &stream_ctx)
+        });
+        let r = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+        assert!(r.is_err(), "expected no datagram; got {:?}", r.map(drop));
+        let polls = polls.load(Ordering::Relaxed);
+        assert!(
+            polls < 10,
+            "polled {polls} times in 200ms: spinning on stale readiness",
+        );
     }
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
@@ -3234,13 +3546,13 @@ mod tests {
 
     #[test]
     fn validate_hole_punch_rtp() {
-        let (pkt_ref, _) = crate::rtp::RawPacket::new(Bytes::from_static(&HOLE_PUNCH_RTP)).unwrap();
-        assert_eq!(pkt_ref.payload_type(), 0);
+        let (header, _) = crate::rtp::PacketHeader::validate(&HOLE_PUNCH_RTP[..]).unwrap();
+        assert_eq!(header.payload_type(), 0);
     }
 
     #[test]
     fn validate_hole_punch_rtcp() {
-        let (pkt_ref, _) = crate::rtcp::PacketRef::parse(&HOLE_PUNCH_RTCP).unwrap();
+        let (pkt_ref, _) = crate::rtcp::PacketRef::parse(&HOLE_PUNCH_RTCP[..]).unwrap();
         assert!(matches!(
             pkt_ref.as_typed().unwrap(),
             Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))

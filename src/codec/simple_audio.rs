@@ -6,6 +6,10 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
+use bytes::Bytes;
+
+use crate::buf::PacketRef;
+
 use super::{AudioParameters, CodecItem};
 
 #[derive(Debug)]
@@ -47,23 +51,26 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         assert!(self.pending.is_none());
-        let payload = pkt.payload();
-        let frame_length = self.frame_length(payload.len()).ok_or_else(|| {
+        let payload_len = pkt.payload_len();
+        let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
             format!(
                 "invalid length {} for payload of {}-bit audio samples",
-                payload.len(),
-                self.bits_per_sample
+                payload_len, self.bits_per_sample
             )
         })?;
+        let (s1, s2) = pkt.payload().slices();
+        let mut payload = Vec::with_capacity(payload_len as usize);
+        payload.extend_from_slice(s1);
+        payload.extend_from_slice(s2);
         self.pending = Some(super::AudioFrame {
-            loss: pkt.loss(),
-            ctx: *pkt.ctx(),
-            stream_id: pkt.stream_id(),
-            timestamp: pkt.timestamp(),
+            loss: pkt.meta.loss,
+            ctx: pkt.meta.ctx,
+            stream_id: pkt.meta.stream_id,
+            timestamp: pkt.meta.timestamp,
             frame_length,
-            data: pkt.into_payload_bytes(),
+            data: Bytes::from(payload),
         });
         Ok(())
     }

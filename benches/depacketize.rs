@@ -9,6 +9,16 @@ use retina::codec::{CodecItem, Depacketizer};
 use std::convert::TryFrom;
 use std::io::Write;
 
+/// Helper to push a payload to a depacketizer via a `DepacketizeBuf`.
+fn push_payload(
+    depacketizer: &mut Depacketizer,
+    meta: retina::rtp::PacketMeta,
+    payload: &[u8],
+    buf: &mut retina::testutil::DepacketizeBuf,
+) {
+    buf.push(depacketizer, meta, payload).unwrap();
+}
+
 // This holds just the RTSP data portions of a session from this public endpoint.
 // https://www.wowza.com/html/mobile.html
 // Big Buck Bunny is (c) copyright 2008, Blender Foundation, licensed via
@@ -39,6 +49,10 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
         Depacketizer::new("audio", "mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap(),
         Depacketizer::new("video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap(),
     ];
+    let mut bufs = [
+        retina::testutil::DepacketizeBuf::new(65536),
+        retina::testutil::DepacketizeBuf::new(65536),
+    ];
     let conn_ctx = retina::ConnectionContext::dummy();
     let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
@@ -56,7 +70,8 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             1 | 3 => continue, // RTCP
             _ => unreachable!(),
         };
-        let pkt = match rtps[stream_id].rtp(
+        let (header, payload_range) = retina::rtp::PacketHeader::validate(&data[..]).unwrap();
+        let meta = match rtps[stream_id].rtp(
             &retina::client::SessionOptions::default(),
             &stream_ctx,
             None,
@@ -64,12 +79,18 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             &pkt_ctx,
             &mut timelines[stream_id],
             stream_id,
-            data,
+            &header,
         ) {
-            Ok(Some(retina::client::PacketItem::Rtp(rtp))) => rtp,
+            Ok(Some(meta)) => meta,
             _ => unreachable!(),
         };
-        depacketizers[stream_id].push(pkt).unwrap();
+        let payload = &data[usize::from(payload_range.start)..usize::from(payload_range.end)];
+        push_payload(
+            &mut depacketizers[stream_id],
+            meta,
+            payload,
+            &mut bufs[stream_id],
+        );
         while let Some(pkt) = depacketizers[stream_id].pull() {
             f(pkt.unwrap());
         }

@@ -61,6 +61,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
     // The packetizer doesn't insert parameter sets, so the depacketizer shouldn't either.
     d.set_frame_format(retina::codec::FrameFormat::MP4);
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+    let mut buf = retina::testutil::DepacketizeBuf::new(65536);
 
     if p.push(timestamp, Bytes::copy_from_slice(input.data))
         .is_err()
@@ -71,7 +72,9 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         match p.pull() {
             Ok(Some(pkt)) => {
                 let mark = pkt.mark();
-                if d.push(pkt).is_err() {
+                let meta = retina::rtp::PacketMeta::from_received(&pkt);
+                let payload = pkt.payload();
+                if buf.push(&mut d, meta, payload).is_err() {
                     return Corpus::Keep;
                 }
                 match d.pull() {

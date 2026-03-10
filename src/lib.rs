@@ -10,7 +10,6 @@
 // I prefer to use from_str_radix(..., 10) to explicitly note the base.
 #![allow(clippy::from_str_radix_10)]
 
-use bytes::Bytes;
 use log::trace;
 use rand::Rng;
 use rtsp::msg::Message;
@@ -20,7 +19,9 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::{Instant, SystemTime};
 
-mod buf;
+/// Exposed for benchmarks and fuzz tests; not a stable API.
+#[doc(hidden)]
+pub mod buf;
 mod error;
 mod hex;
 #[doc(hidden)]
@@ -62,7 +63,8 @@ use error::ErrorInt;
 struct ReceivedMessage {
     ctx: RtspMessageContext,
     msg: Message,
-    body: Bytes,
+    body_pos: u64,
+    body_len: u32,
 }
 
 /// An annotated RTP timestamp.

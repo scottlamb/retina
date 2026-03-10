@@ -8,7 +8,7 @@ use log::{debug, warn};
 
 use crate::client::PacketItem;
 use crate::rtcp::ReceivedCompoundPacket;
-use crate::rtp::{RawPacket, ReceivedPacket};
+use crate::rtp::{PacketHeader, PacketMeta};
 use crate::{
     ConnectionContext, Error, ErrorInt, PacketContext, PacketContextInner, StreamContext,
     StreamContextInner,
@@ -123,8 +123,12 @@ impl InorderParser {
         }
     }
 
+    /// Validates an RTP header and checks SSRC/sequence/timestamp ordering.
+    ///
+    /// Returns `Ok(Some((timestamp, loss)))` on success, `Ok(None)` if the
+    /// packet should be skipped (e.g. pt=50 or out-of-order UDP).
     #[allow(clippy::too_many_arguments)]
-    pub fn rtp(
+    pub(crate) fn rtp_validate(
         &mut self,
         session_options: &SessionOptions,
         stream_ctx: &StreamContext,
@@ -133,36 +137,16 @@ impl InorderParser {
         pkt_ctx: &PacketContext,
         timeline: &mut Timeline,
         stream_id: usize,
-        data: Bytes,
-    ) -> Result<Option<PacketItem>, Error> {
-        let (raw, payload_range) = RawPacket::new(data).map_err(|e| {
-            wrap!(ErrorInt::PacketError {
-                conn_ctx: *conn_ctx,
-                stream_ctx: stream_ctx.to_owned(),
-                pkt_ctx: *pkt_ctx,
-                stream_id,
-                description: format!(
-                    "corrupt RTP header while expecting seq={:?}: {:?}\n{:#?}",
-                    &self.seq,
-                    e.reason,
-                    crate::hex::LimitedHex::new(&e.data[..], 64),
-                ),
-            })
-        })?;
-
-        // Skip pt=50 packets, sent by at least Geovision cameras. I'm not sure
-        // what purpose these serve, but they have the same sequence number as
-        // the packet immediately before. In TCP streams, this can cause an
-        // "Out-of-order packet or large loss" error. In UDP streams, if these
-        // are delivered out of order, they will cause the more important other
-        // packet with the same sequence number to be skipped.
-        if raw.payload_type() == 50 {
+        header: &PacketHeader,
+    ) -> Result<Option<(crate::Timestamp, u16)>, Error> {
+        // Skip pt=50 packets, sent by at least Geovision cameras.
+        if header.payload_type() == 50 {
             debug!("skipping pkt with invalid payload type 50");
             return Ok(None);
         }
 
-        let sequence_number = raw.sequence_number();
-        let ssrc = raw.ssrc();
+        let sequence_number = header.sequence_number();
+        let ssrc = header.ssrc();
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
@@ -209,7 +193,7 @@ impl InorderParser {
                 return Ok(None);
             }
         }
-        let timestamp = match timeline.advance_to(raw.timestamp()) {
+        let timestamp = match timeline.advance_to(header.timestamp()) {
             Ok(ts) => ts,
             Err(description) => bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -229,14 +213,60 @@ impl InorderParser {
             next: sequence_number.wrapping_add(1),
         });
         self.seen_rtp_packets += 1;
-        Ok(Some(PacketItem::Rtp(ReceivedPacket {
+        Ok(Some((timestamp, loss)))
+    }
+
+    /// Formats an error description for a failed [`PacketHeader::validate`].
+    pub(crate) fn validate_error(
+        &self,
+        reason: &'static str,
+        pkt: crate::inputs::Split<'_>,
+    ) -> String {
+        format!(
+            "corrupt RTP header while expecting seq={:?}: {:?}\n{:#?}",
+            self.seq,
+            reason,
+            crate::hex::LimitedHex::from_split(pkt, 64),
+        )
+    }
+
+    /// Processes a pre-validated RTP header, returning packet metadata.
+    ///
+    /// The caller is responsible for calling [`PacketHeader::validate`] first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rtp(
+        &mut self,
+        session_options: &SessionOptions,
+        stream_ctx: &StreamContext,
+        tool: Option<&super::Tool>,
+        conn_ctx: &ConnectionContext,
+        pkt_ctx: &PacketContext,
+        timeline: &mut Timeline,
+        stream_id: usize,
+        header: &PacketHeader,
+    ) -> Result<Option<PacketMeta>, Error> {
+        let Some((timestamp, loss)) = self.rtp_validate(
+            session_options,
+            stream_ctx,
+            tool,
+            conn_ctx,
+            pkt_ctx,
+            timeline,
+            stream_id,
+            header,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PacketMeta {
             ctx: *pkt_ctx,
             stream_id,
             timestamp,
-            raw,
-            payload_range,
+            sequence_number: header.sequence_number(),
+            ssrc: header.ssrc(),
+            mark: header.mark(),
             loss,
-        })))
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -330,15 +360,8 @@ mod tests {
         let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
-        let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
-            sequence_number: 0x1234,
-            timestamp: 141000,
-            payload_type: 105,
-            ssrc: 0xd25614e,
-            mark: true,
-        }
-        .build(*b"foo")
-        .unwrap();
+        let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 105, 0xd25614e, true, *b"foo").unwrap();
+        let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &SessionOptions::default(),
             &stream_ctx,
@@ -347,22 +370,15 @@ mod tests {
             &PacketContext::dummy(),
             &mut timeline,
             0,
-            pkt.0,
+            &header,
         ) {
-            Ok(Some(PacketItem::Rtp(_))) => {}
+            Ok(Some(_)) => {}
             o => panic!("unexpected packet 1 result: {o:#?}"),
         }
 
         // Mystery pt=50 packet with same sequence number.
-        let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
-            sequence_number: 0x1234,
-            timestamp: 141000,
-            payload_type: 50,
-            ssrc: 0xd25614e,
-            mark: true,
-        }
-        .build(*b"bar")
-        .unwrap();
+        let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 50, 0xd25614e, true, *b"bar").unwrap();
+        let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &SessionOptions::default(),
             &stream_ctx,
@@ -371,7 +387,7 @@ mod tests {
             &PacketContext::dummy(),
             &mut timeline,
             0,
-            pkt.0,
+            &header,
         ) {
             Ok(None) => {}
             o => panic!("unexpected packet 2 result: {o:#?}"),
@@ -389,15 +405,8 @@ mod tests {
             peer_rtp_port: 0,
         }));
         let session_options = SessionOptions::default();
-        let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
-            sequence_number: 2,
-            timestamp: 2,
-            payload_type: 96,
-            ssrc: 0xd25614e,
-            mark: true,
-        }
-        .build(*b"pkt 2")
-        .unwrap();
+        let pkt = crate::rtp::build_raw_rtp(2, 2, 96, 0xd25614e, true, *b"pkt 2").unwrap();
+        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
             &stream_ctx,
@@ -406,23 +415,16 @@ mod tests {
             &PacketContext::dummy(),
             &mut timeline,
             0,
-            pkt.0,
+            &header,
         ) {
-            Ok(Some(PacketItem::Rtp(p))) => {
-                assert_eq!(p.timestamp().elapsed(), 0);
+            Ok(Some(meta)) => {
+                assert_eq!(meta.timestamp.elapsed(), 0);
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
 
-        let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
-            sequence_number: 1,
-            timestamp: 1,
-            payload_type: 96,
-            ssrc: 0xd25614e,
-            mark: true,
-        }
-        .build(*b"pkt 1")
-        .unwrap();
+        let pkt = crate::rtp::build_raw_rtp(1, 1, 96, 0xd25614e, true, *b"pkt 1").unwrap();
+        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
             &stream_ctx,
@@ -431,21 +433,14 @@ mod tests {
             &PacketContext::dummy(),
             &mut timeline,
             0,
-            pkt.0,
+            &header,
         ) {
             Ok(None) => {}
             o => panic!("unexpected packet 1 result: {o:#?}"),
         }
 
-        let (pkt, _payload_range) = crate::rtp::RawPacketBuilder {
-            sequence_number: 3,
-            timestamp: 3,
-            payload_type: 96,
-            ssrc: 0xd25614e,
-            mark: true,
-        }
-        .build(*b"pkt 3")
-        .unwrap();
+        let pkt = crate::rtp::build_raw_rtp(3, 3, 96, 0xd25614e, true, *b"pkt 3").unwrap();
+        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
             &stream_ctx,
@@ -454,11 +449,11 @@ mod tests {
             &PacketContext::dummy(),
             &mut timeline,
             0,
-            pkt.0,
+            &header,
         ) {
-            Ok(Some(PacketItem::Rtp(p))) => {
+            Ok(Some(meta)) => {
                 // The missing timestamp shouldn't have adjusted time.
-                assert_eq!(p.timestamp().elapsed(), 1);
+                assert_eq!(meta.timestamp.elapsed(), 1);
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }

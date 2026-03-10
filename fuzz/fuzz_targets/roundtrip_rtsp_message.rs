@@ -8,7 +8,7 @@ use retina::inputs::{Input, Split};
 use retina::rtsp::{msg::Message, parse::Parser};
 
 /// Parse with the given input, round-trip, and compare.
-fn check<'i, I: Input<'i>>(data: &[u8], mut input: I, initial_len: usize) {
+fn check<'i, I: Input<'i> + std::fmt::Debug>(data: &[u8], mut input: I, initial_len: usize) {
     let Ok(Some((head, body_slice))) = Parser::default().feed(&mut input) else {
         return;
     };
@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
 
     let initial_len = data.len();
 
-    // Test with contiguous input.
+    // Test with contiguous &[u8] input.
     check(data, data, initial_len);
 
     // Test with Split input at every possible split point.
