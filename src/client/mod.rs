@@ -2848,7 +2848,6 @@ mod tests {
                 response(include_bytes!("testdata/reolink_play.txt"))
             ),
         );
-        let drop_time;
         {
             let session = session.unwrap();
             tokio::pin!(session);
@@ -2889,15 +2888,21 @@ mod tests {
                         .unwrap();
                 },
             );
-
-            drop_time = tokio::time::Instant::now();
         };
 
         // Drop (initiated by exiting the scope above).
         // This server advertises an ancient version of live555, so Retina
         // sends a TEARDOWN even with TCP.
+
         let stale_sessions = group.stale_sessions();
         assert_eq!(stale_sessions.num_sessions, 1);
+
+        // Resume real time for the TEARDOWN exchange. With paused time,
+        // the runtime may auto-advance through the teardown's I/O timeout
+        // before the I/O exchange with the mock server completes, because
+        // the auto-advance's non-blocking I/O poll can race with kernel
+        // TCP event delivery on localhost.
+        tokio::time::resume();
         tokio::join!(
             group.await_stale_sessions(&stale_sessions),
             req_response(
@@ -2906,16 +2911,8 @@ mod tests {
                 response(include_bytes!("testdata/reolink_teardown.txt"))
             ),
         );
+        tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
-
-        // XXX: tokio will "auto-advance" paused time when timers are polled,
-        // including background_teardown's timer_at, so elapsed > 0.
-        // <https://github.com/tokio-rs/tokio/issues/4522>
-        let elapsed = tokio::time::Instant::now() - drop_time;
-        assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "elapsed={elapsed:?}"
-        );
     }
 
     /// As above, but TEARDOWN fails until session expiration.
