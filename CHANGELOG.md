@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.18` (2026-03-10)
 
 *   `retina::codec::FrameFormat`: support Annex B encoding
     ([#44](https://github.com/scottlamb/retina/issues/44)), ADTS encoding,
@@ -23,7 +23,7 @@
     construction of a WebCodecs `VideoDecoderConfiguration`.
 *   expose number of audio channels in `AudioParameters` to ease construction of
     a WebCodecs `AudioDecoderConfig`.
-*   allow producing [`VideoParameters`] from H.264 SPS and PPS NALs.
+*   allow producing `VideoParameters` from H.264 SPS and PPS NALs.
 
 ## `v0.4.17` (2026-02-17)
 
