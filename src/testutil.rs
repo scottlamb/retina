@@ -146,7 +146,7 @@ pub(crate) fn init_logging() {
 
 #[cfg(test)]
 pub(crate) fn response(raw: &'static [u8]) -> (crate::rtsp::msg::Response, Bytes) {
-    use crate::rtsp::inputs::{Contiguous, Input as _, Slice as _};
+    use crate::inputs::{Contiguous, Input as _, Slice as _};
     let mut parser = crate::rtsp::parse::Parser::default();
     let mut input = Contiguous::new(raw, false);
     let (msg, body_slice) = parser.feed(&mut input).unwrap().unwrap();

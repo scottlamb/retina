@@ -1,7 +1,7 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Input abstractions for the RTSP parser.
+//! Input abstractions for parsing.
 //!
 //! Two [`Input`] implementations are provided:
 //!

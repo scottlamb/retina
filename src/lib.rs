@@ -21,8 +21,9 @@ use std::ops::Range;
 use std::time::{Instant, SystemTime};
 
 mod error;
-
 mod hex;
+#[doc(hidden)]
+pub mod inputs;
 mod mostly_ascii;
 pub mod rtcp;
 pub mod rtp;

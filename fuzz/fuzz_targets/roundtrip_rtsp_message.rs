@@ -4,14 +4,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use retina::rtsp::{
-    inputs::{Contiguous, Slice as _, Split},
-    msg::Message,
-    parse::Parser,
-};
+use retina::inputs::{Contiguous, Input, Slice as _, Split};
+use retina::rtsp::{msg::Message, parse::Parser};
 
 /// Parse with the given input, round-trip, and compare.
-fn check<'i, I: retina::rtsp::inputs::Input<'i>>(data: &[u8], mut input: I, initial_len: usize)
+fn check<'i, I: Input<'i>>(data: &[u8], mut input: I, initial_len: usize)
 where
     I::Slice: std::fmt::Debug,
 {

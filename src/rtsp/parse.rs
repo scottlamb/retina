@@ -10,11 +10,11 @@ use std::num::NonZeroUsize;
 
 use url::Url;
 
-use super::{
-    inputs::{Input, Slice as _},
-    msg::{Data, HeaderName, HeaderValue, Headers, Message, Method, Request, Response, StatusCode},
-    table::is_tchar,
+use super::msg::{
+    Data, HeaderName, HeaderValue, Headers, Message, Method, Request, Response, StatusCode,
 };
+use super::table::is_tchar;
+use crate::inputs::{Input, Slice as _};
 
 /// Error detail carried by [`FeedError::Invalid`].
 #[derive(Debug, Default, derive_more::Error)]
@@ -563,7 +563,7 @@ fn eat_byte<'i, I: Input<'i>>(input: &mut I, b: u8) -> Result<(), FeedError> {
 pub(crate) mod tests {
     use url::Url;
 
-    use crate::rtsp::inputs::Split;
+    use crate::inputs::Split;
     use crate::rtsp::msg::{HeaderName, Message, Method, Request};
 
     use super::*;
