@@ -878,16 +878,19 @@ impl Depacketizer {
 
 /// Returns true if we allow the given NAL unit type to end an access unit.
 ///
-/// We specifically prohibit this for the SPS and PPS. Reolink cameras sometimes
+/// We specifically prohibit this for the SPS, PPS, and SEI. Some cameras
 /// incorrectly set the RTP marker bit and/or change the timestamp after these.
 fn can_end_au(nal_unit_type: UnitType) -> bool {
-    // H.264 section 7.4.1.2.3 Order of NAL units and coded pictures and
-    // association to access units says "Sequence parameter set NAL units or
-    // picture parameter set NAL units may be present in an access unit, but
-    // cannot follow the last VCL NAL unit of the primary coded picture within
-    // the access unit, as this condition would specify the start of a new
-    // access unit."
-    nal_unit_type != UnitType::SeqParameterSet && nal_unit_type != UnitType::PicParameterSet
+    // H.264 section 7.4.1.2.3 specifies that SPS, PPS, and SEI NAL units
+    // must precede the primary coded picture within an access unit. If any of
+    // these appear after the last VCL NAL unit, they signal the start of a
+    // new access unit rather than ending the current one. An access unit
+    // containing only these non-VCL NAL types (with no VCL NAL) is not a
+    // valid picture.
+    !matches!(
+        nal_unit_type,
+        UnitType::SeqParameterSet | UnitType::PicParameterSet | UnitType::SEI
+    )
 }
 
 impl AccessUnit {
@@ -1629,7 +1632,7 @@ mod tests {
         assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start.
+                // FU-A packet (non-IDR slice, type 1), start.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1639,7 +1642,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x86fu-a start, ")
+            .build(*b"\x7c\x81fu-a start, ")
             .unwrap(),
         )
         .unwrap();
@@ -1656,7 +1659,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x06fu-a middle, ")
+            .build(*b"\x7c\x01fu-a middle, ")
             .unwrap(),
         )
         .unwrap();
@@ -1673,7 +1676,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x46fu-a end")
+            .build(*b"\x7c\x41fu-a end")
             .unwrap(),
         )
         .unwrap();
@@ -1686,7 +1689,7 @@ mod tests {
             b"\x00\x00\x00\x06\x06plain\
                      \x00\x00\x00\x09\x06stap-a 1\
                      \x00\x00\x00\x09\x06stap-a 2\
-                     \x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
+                     \x00\x00\x00\x22\x61fu-a start, fu-a middle, fu-a end"
         );
         assert!(!d.seen_inconsistent_fu_a_nal_hdr);
     }
@@ -1711,7 +1714,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start.
+                // FU-A packet (non-IDR slice, type 1, reserved bit set), start.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1721,7 +1724,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\xa6fu-a start, ")
+            .build(*b"\x7c\xa1fu-a start, ")
             .unwrap(),
         )
         .unwrap();
@@ -1738,7 +1741,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x26fu-a middle, ")
+            .build(*b"\x7c\x21fu-a middle, ")
             .unwrap(),
         )
         .unwrap();
@@ -1755,7 +1758,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x66fu-a end")
+            .build(*b"\x7c\x61fu-a end")
             .unwrap(),
         )
         .unwrap();
@@ -1765,7 +1768,7 @@ mod tests {
         };
         assert_eq_hex!(
             frame.data(),
-            b"\x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
+            b"\x00\x00\x00\x22\x61fu-a start, fu-a middle, fu-a end"
         );
     }
 
@@ -2627,7 +2630,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start (with data).
+                // FU-A packet (non-IDR slice, type 1), start (with data).
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -2637,7 +2640,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x86start, ")
+            .build(*b"\x7c\x81start, ")
             .unwrap(),
         )
         .unwrap();
@@ -2654,7 +2657,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x06")
+            .build(*b"\x7c\x01")
             .unwrap(),
         )
         .unwrap();
@@ -2671,7 +2674,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x46end")
+            .build(*b"\x7c\x41end")
             .unwrap(),
         )
         .unwrap();
@@ -2679,7 +2682,7 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
-        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x66start, end");
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x61start, end");
     }
 
     /// Tests the `process_annex_b` function in isolation.
@@ -2770,7 +2773,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // plain SEI packet.
+                // plain non-IDR slice packet.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp: timestamp1,
@@ -2780,7 +2783,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x06plain")
+            .build(*b"\x01plain")
             .unwrap(),
         )
         .unwrap();
@@ -2794,7 +2797,124 @@ mod tests {
         let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
             panic!()
         };
-        assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x06plain");
+        assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x01plain");
+        assert_eq!(d.pull(), None);
+    }
+
+    /// Test that a SEI NAL with the mark bit set doesn't end an access unit.
+    ///
+    /// The LV-IP22IR40DVBL camera (and others using the same firmware, which
+    /// identifies itself as `H264DVR 1.0`) sends SPS, PPS, and SEI as
+    /// individual RTP packets each with the mark bit set, all at the same
+    /// timestamp as the following IDR slice. The SEI contains a single
+    /// reserved message (payload type 229). Per H.264 section 7.4.1.2.3,
+    /// SEI NAL units precede the primary coded picture, so they should not
+    /// end an access unit.
+    ///
+    /// See <https://github.com/scottlamb/moonfire-nvr/issues/352>.
+    #[test]
+    fn depacketize_sei_with_mark() {
+        init_logging();
+        let mut d = super::Depacketizer::new(
+            90_000,
+            Some(
+                "packetization-mode=1;profile-level-id=4d002a;\
+                  sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+            ),
+        )
+        .unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+
+        // SPS with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(
+                *b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+                       \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // PPS with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x68\xee\x3c\x80")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // SEI (reserved payload type 229) with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x06\xe5\x01\xa7\x80")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // IDR slice with mark (correct this time).
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x65slice")
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result {o:#?}"),
+        };
+        assert_eq_hex!(
+            frame.data(),
+            b"\x00\x00\x00\x16\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+              \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84\
+              \x00\x00\x00\x04\x68\xee\x3c\x80\
+              \x00\x00\x00\x05\x06\xe5\x01\xa7\x80\
+              \x00\x00\x00\x06\x65slice"
+        );
+        assert!(frame.is_random_access_point());
         assert_eq!(d.pull(), None);
     }
 }

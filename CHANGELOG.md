@@ -1,3 +1,9 @@
+## `v0.4.19` (2026-03-13)
+
+*   support cameras which improperly set the RTP "MARK" bit on SEI data,
+    including the [LV-IP22IR40DVBL](https://skyboo.net/2017/07/how-to-hack-my-own-ip-camera/) sold by Ivel.
+    See [moonfire-nvr#352](https://github.com/scottlamb/moonfire-nvr/issues/352).
+
 ## `v0.4.18` (2026-03-10)
 
 *   `retina::codec::FrameFormat`: support Annex B encoding
