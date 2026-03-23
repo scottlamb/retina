@@ -546,35 +546,32 @@ impl Depacketizer {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.unit_type() {
-                nal::UnitType::VpsNut => {
+                nal::UnitType::VpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.vps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
-                nal::UnitType::SpsNut => {
+                nal::UnitType::SpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
-                nal::UnitType::PpsNut => {
+                nal::UnitType::PpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
                 u if matches!(
                     u.unit_type_class(),

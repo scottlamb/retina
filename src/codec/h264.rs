@@ -746,25 +746,23 @@ impl Depacketizer {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.nal_unit_type() {
-                UnitType::SeqParameterSet => {
+                UnitType::SeqParameterSet
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
-                UnitType::PicParameterSet => {
+                UnitType::PicParameterSet
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
                 UnitType::SliceDataPartitionALayer
                 | UnitType::SliceDataPartitionBLayer
@@ -941,27 +939,23 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
             /* 5 */ UnitType::SliceLayerWithoutPartitioningIdr => {
                 seen_vcl = true;
             }
-            /* 6 */ UnitType::SEI => {
-                if seen_vcl {
+            /* 6 */ UnitType::SEI
+                if seen_vcl => {
                     errs.push_str("\n* SEI after VCL");
                 }
-            }
-            /* 9 */ UnitType::AccessUnitDelimiter => {
-                if i != 0 {
+            /* 9 */ UnitType::AccessUnitDelimiter
+                if i != 0 => {
                     let _ = write!(errs, "\n* access unit delimiter must be first in AU; was preceded by {:?}",
                                 nals[i-1].hdr);
                 }
-            }
-            /* 10 */ UnitType::EndOfSeq => {
-                if !seen_vcl {
+            /* 10 */ UnitType::EndOfSeq
+                if !seen_vcl => {
                     errs.push_str("\n* end of sequence without VCL");
                 }
-            }
-            /* 11 */ UnitType::EndOfStream => {
-                if i != nals.len() - 1 {
+            /* 11 */ UnitType::EndOfStream
+                if i != nals.len() - 1 => {
                     errs.push_str("\n* end of stream NAL isn't last");
                 }
-            }
             _ => {}
         }
     }
