@@ -106,6 +106,10 @@ pub(crate) struct Depacketizer {
     /// fragments.
     seen_inconsistent_fu_a_nal_hdr: bool,
 
+    /// True if we've seen a FU-A with both S and E bits set (a single-fragment
+    /// FU-A, forbidden by RFC 6184 section 5.8).
+    seen_single_fragment_fu_a: bool,
+
     /// Output format controlling NAL framing and parameter set insertion.
     frame_format: super::FrameFormat,
 }
@@ -257,6 +261,7 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
+            seen_single_fragment_fu_a: false,
             frame_format: Default::default(),
         })
     }
@@ -490,9 +495,6 @@ impl Depacketizer {
                     NalHeader::new((nal_header & 0b011100000) | (fu_header & 0b00011111))
                         .expect("NalHeader is valid");
                 data.advance(2);
-                if start && end {
-                    return Err(format!("Invalid FU-A header {fu_header:02x}"));
-                }
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
@@ -501,16 +503,42 @@ impl Depacketizer {
                         return Err("FU-A with start bit while frag in progress".into());
                     }
                     (true, None) => {
+                        if end {
+                            // RFC 6184 section 5.8: "the Start bit and End bit MUST NOT both be
+                            // set to one in the same FU header". Some cameras violate this by
+                            // wrapping small NALs in a single-fragment FU-A.
+                            // Tolerate by treating them as a complete NAL.
+                            if !self.seen_single_fragment_fu_a {
+                                log::warn!(
+                                    "FU-A header {fu_header:02x} has both start and end bits set; \
+                                     treating as a complete NAL. \
+                                     Will not log about this again for this stream."
+                                );
+                                self.seen_single_fragment_fu_a = true;
+                            }
+                        }
                         let mut cur_nal = Some(CurFuANal {
                             hdr: nal_header,
                             trailing_zeros: 0,
                             pieces_bytes: 0,
                         });
                         self.add_fu_a(&mut cur_nal, data)?;
-                        access_unit.fu_a = Some(FuA {
-                            initial_nal_header: nal_header,
-                            cur_nal,
-                        });
+                        if end {
+                            if let Some(cur_nal) = cur_nal {
+                                self.nals.push(Nal {
+                                    hdr: cur_nal.hdr,
+                                    next_piece_idx: u32::try_from(self.pieces.len())
+                                        .map_err(|_| "more than u32::MAX pieces!")?,
+                                    len: u32::try_from(cur_nal.pieces_bytes + 1)
+                                        .map_err(|_| "excessively long FU-A NAL")?,
+                                });
+                            }
+                        } else {
+                            access_unit.fu_a = Some(FuA {
+                                initial_nal_header: nal_header,
+                                cur_nal,
+                            });
+                        }
                     }
                     (false, Some(mut fu_a)) => {
                         if nal_header != fu_a.initial_nal_header
@@ -2611,6 +2639,51 @@ mod tests {
             &b"\x00\x00\x00\x24\x21start of non-idra wild sps appeared"
         );
         assert!(d.seen_inconsistent_fu_a_nal_hdr);
+    }
+
+    /// Tests that a FU-A with both S and E bits set is treated as a complete NAL
+    /// rather than rejected. RFC 6184 section 5.8 forbids this, but some cameras
+    /// send it anyway for small NALs.
+    #[test]
+    fn single_fragment_fu_a() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        assert!(!d.seen_single_fragment_fu_a);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A with S=1 E=1 type=1 (non-IDR slice) — FU header 0xc1,
+                // as observed in the wild.
+                // FU indicator \x7c = F=0 NRI=3 type=28.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\xc1small nal")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.seen_single_fragment_fu_a);
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        // Reconstructed NAL: NRI=3 (from indicator) | type=1 (from FU hdr)
+        // = 0x61, then payload. Length = 1 + 9 = 10 = 0x0a.
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0a\x61small nal");
     }
 
     /// Tests that empty FU-A fragments (no payload bytes after the 2-byte header) are
