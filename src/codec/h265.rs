@@ -392,31 +392,28 @@ impl Depacketizer {
                 }
                 let u32_len = u32::try_from(data.len())
                     .map_err(|_| "RTP packet len must be < u16::MAX".to_string())?;
-                match (start, access_unit.in_fu) {
+                let pieces = match (start, access_unit.in_fu) {
                     (true, true) => return Err("FU with start bit while frag in progress".into()),
                     (true, false) => {
-                        if end {
+                        if end && !self.seen_single_fragment_fu {
                             // RFC 7798 section 4.4.3: "the Start bit and End bit MUST NOT both be
                             // set to one in the same FU header". Some cameras violate this by
                             // wrapping small NALs in a single-fragment FU.
                             // Tolerate by treating them as a complete NAL.
-                            if !self.seen_single_fragment_fu {
-                                log::warn!(
-                                    "FU header {fu_header:02x} has both start and end bits set; \
-                                     treating as a complete NAL. \
-                                     Will not log about this again for this stream."
-                                );
-                                self.seen_single_fragment_fu = true;
-                            }
+                            log::warn!(
+                                "FU header {fu_header:02x} has both start and end bits set; \
+                                 treating as a complete NAL. \
+                                 Will not log about this again for this stream."
+                            );
+                            self.seen_single_fragment_fu = true;
                         }
                         let pieces = self.add_piece(data)?;
                         self.nals.push(Nal {
                             hdr,
-                            // Overwritten on the end fragment — which may be now.
-                            next_piece_idx: if end { pieces } else { u32::MAX },
+                            next_piece_idx: u32::MAX, // should be overwritten later.
                             len: 2 + u32_len,
                         });
-                        access_unit.in_fu = !end;
+                        pieces
                     }
                     (false, true) => {
                         let pieces = self.add_piece(data)?;
@@ -434,12 +431,7 @@ impl Depacketizer {
                             self.seen_inconsistent_fu_nal_hdr = true;
                         }
                         nal.len += u32_len;
-                        if end {
-                            nal.next_piece_idx = pieces;
-                            access_unit.in_fu = false;
-                        } else if mark {
-                            return Err("FU has MARK and no END".into());
-                        }
+                        pieces
                     }
                     (false, false) => {
                         if loss > 0 {
@@ -453,7 +445,14 @@ impl Depacketizer {
                         }
                         return Err("FU has start bit unset while no frag in progress".into());
                     }
+                };
+                if end {
+                    self.nals
+                        .last_mut()
+                        .expect("both match arms reaching here ensure a last nal")
+                        .next_piece_idx = pieces;
                 }
+                access_unit.in_fu = !end;
             }
             _ => return Err(format!("unexpected/bad nal header {hdr:?}")),
         }
