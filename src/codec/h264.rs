@@ -498,24 +498,22 @@ impl Depacketizer {
                 if !end && mark {
                     return Err("FU-A pkt with MARK && !END".into());
                 }
-                match (start, access_unit.fu_a.take()) {
+                let fu_a = match (start, access_unit.fu_a.take()) {
                     (true, Some(_)) => {
                         return Err("FU-A with start bit while frag in progress".into());
                     }
                     (true, None) => {
-                        if end {
+                        if end && !self.seen_single_fragment_fu_a {
                             // RFC 6184 section 5.8: "the Start bit and End bit MUST NOT both be
                             // set to one in the same FU header". Some cameras violate this by
                             // wrapping small NALs in a single-fragment FU-A.
                             // Tolerate by treating them as a complete NAL.
-                            if !self.seen_single_fragment_fu_a {
-                                log::warn!(
-                                    "FU-A header {fu_header:02x} has both start and end bits set; \
-                                     treating as a complete NAL. \
-                                     Will not log about this again for this stream."
-                                );
-                                self.seen_single_fragment_fu_a = true;
-                            }
+                            log::warn!(
+                                "FU-A header {fu_header:02x} has both start and end bits set; \
+                                 treating as a complete NAL. \
+                                 Will not log about this again for this stream."
+                            );
+                            self.seen_single_fragment_fu_a = true;
                         }
                         let mut cur_nal = Some(CurFuANal {
                             hdr: nal_header,
@@ -523,21 +521,9 @@ impl Depacketizer {
                             pieces_bytes: 0,
                         });
                         self.add_fu_a(&mut cur_nal, data)?;
-                        if end {
-                            if let Some(cur_nal) = cur_nal {
-                                self.nals.push(Nal {
-                                    hdr: cur_nal.hdr,
-                                    next_piece_idx: u32::try_from(self.pieces.len())
-                                        .map_err(|_| "more than u32::MAX pieces!")?,
-                                    len: u32::try_from(cur_nal.pieces_bytes + 1)
-                                        .map_err(|_| "excessively long FU-A NAL")?,
-                                });
-                            }
-                        } else {
-                            access_unit.fu_a = Some(FuA {
-                                initial_nal_header: nal_header,
-                                cur_nal,
-                            });
+                        FuA {
+                            initial_nal_header: nal_header,
+                            cur_nal,
                         }
                     }
                     (false, Some(mut fu_a)) => {
@@ -552,21 +538,7 @@ impl Depacketizer {
                             self.seen_inconsistent_fu_a_nal_hdr = true;
                         }
                         self.add_fu_a(&mut fu_a.cur_nal, data)?;
-                        if end {
-                            if let Some(cur_nal) = fu_a.cur_nal {
-                                self.nals.push(Nal {
-                                    hdr: cur_nal.hdr,
-                                    next_piece_idx: u32::try_from(self.pieces.len())
-                                        .map_err(|_| "more than u32::MAX pieces!")?,
-                                    len: u32::try_from(cur_nal.pieces_bytes + 1)
-                                        .map_err(|_| "excessively long FU-A NAL")?,
-                                });
-                            }
-                        } else if mark {
-                            return Err("FU-A has MARK and no END".into());
-                        } else {
-                            access_unit.fu_a = Some(fu_a);
-                        }
+                        fu_a
                     }
                     (false, None) => {
                         if loss > 0 {
@@ -580,6 +552,19 @@ impl Depacketizer {
                         }
                         return Err("FU-A has start bit unset while no frag in progress".into());
                     }
+                };
+                if end {
+                    if let Some(cur_nal) = fu_a.cur_nal {
+                        self.nals.push(Nal {
+                            hdr: cur_nal.hdr,
+                            next_piece_idx: u32::try_from(self.pieces.len())
+                                .map_err(|_| "more than u32::MAX pieces!")?,
+                            len: u32::try_from(cur_nal.pieces_bytes + 1)
+                                .map_err(|_| "excessively long FU-A NAL")?,
+                        });
+                    }
+                } else {
+                    access_unit.fu_a = Some(fu_a);
                 }
             }
             _ => return Err(format!("bad nal header {nal_header:02x}")),
