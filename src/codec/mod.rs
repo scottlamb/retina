@@ -510,7 +510,7 @@ impl AudioParameters {
         self.channels
     }
 
-    /// The codec-specific "extra data" to feed to a decoder, as specified in [`Config`].
+    /// The codec-specific "extra data" to feed to a decoder.
     ///
     /// * For AAC, see [`FrameFormat::aac_framing`].
     pub fn extra_data(&self) -> &[u8] {
