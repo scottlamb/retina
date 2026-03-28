@@ -1,3 +1,10 @@
+## unreleased
+
+*   accept schemeless `Content-Base` header (e.g. `192.168.1.10:554/stream0/`
+    instead of `rtsp://192.168.1.10:554/stream0/`) as sent by some Anjvision
+    cameras. See
+    [moonfire-nvr#356](https://github.com/scottlamb/moonfire-nvr/issues/356).
+
 ## `v0.4.19` (2026-03-13)
 
 *   support cameras which improperly set the RTP "MARK" bit on SEI data,

@@ -425,7 +425,17 @@ pub(crate) fn parse_describe(
                 .get("Content-Location")
                 .map(|v| ("Content-Location", v))
         })
-        .map(|(h, v)| Url::parse(v).map_err(|e| format!("bad {h} {v:?}: {e}")))
+        .map(|(h, v)| {
+            Url::parse(v).or_else(|_| {
+                // Some cameras (e.g. Anjvision) send a Content-Base without a
+                // scheme prefix. Try prepending the request URL's scheme.
+                // See <https://github.com/scottlamb/moonfire-nvr/issues/356>.
+                let fixed = format!("{}://{v}", request_url.scheme());
+                let url = Url::parse(&fixed).map_err(|e| format!("bad {h} {v:?}: {e}"))?;
+                warn!("repaired schemeless {h} {v:?} to {url}");
+                Ok::<_, String>(url)
+            })
+        })
         .unwrap_or_else(|| Ok(request_url.clone()))?;
 
     let mut control = None;
@@ -1591,6 +1601,26 @@ mod tests {
                 ssrc: Some(0x22345685),
                 server_port: Some(49152),
             }
+        );
+    }
+
+    /// Tests parsing a DESCRIBE response from an Anjvision camera whose
+    /// `Content-Base` header (`192.168.1.10:554/stream0/`) lacks the
+    /// `rtsp://` scheme prefix.
+    /// Reproduces <https://github.com/scottlamb/moonfire-nvr/issues/356>.
+    #[test]
+    fn anjvision() {
+        init_logging();
+        let prefix = "rtsp://192.168.1.10:554/stream0";
+        let p = parse_describe(prefix, include_bytes!("testdata/anjvision_describe.txt")).unwrap();
+        assert_eq!(
+            p.tool.as_deref(),
+            Some("LIVE555 Streaming Media v2011.05.25 CHAM.LI@ANJVISION.COM"),
+        );
+        assert_eq!(p.streams.len(), 1);
+        assert_eq!(
+            p.streams[0].control,
+            Some(Url::parse("rtsp://192.168.1.10:554/stream0/trackID=1").unwrap())
         );
     }
 }
