@@ -14,7 +14,7 @@ use super::msg::{
     Data, HeaderName, HeaderValue, Headers, Message, Method, Request, Response, StatusCode,
 };
 use super::table::is_tchar;
-use crate::inputs::{Input, Slice as _};
+use crate::inputs::Input;
 
 /// Error detail carried by [`FeedError::Invalid`].
 #[derive(Debug, Default, derive_more::Error)]
@@ -106,12 +106,8 @@ fn invalid_err<E: std::error::Error + Send + Sync + 'static>(
     })
 }
 
-fn incomplete_or_invalid<'i, I: Input<'i>>(input: &I) -> FeedError {
-    if input.is_partial() {
-        FeedError::Incomplete(None)
-    } else {
-        FeedError::invalid()
-    }
+fn incomplete() -> FeedError {
+    FeedError::Incomplete(None)
 }
 
 /// Builder for [`Parser`]. Obtain via [`Parser::builder`].
@@ -177,8 +173,8 @@ impl Parser {
     /// Parses the next message from `input`.
     ///
     /// Returns `Ok(Some(...))` when a complete message has been parsed.
-    /// Returns `Ok(None)` on a clean end-of-stream between messages (empty,
-    /// non-partial input while idle).
+    /// Returns `Ok(None)` when idle with no input bytes available; the caller
+    /// decides whether this is clean EOF or "need more data".
     /// On `Err(Incomplete(_))`, the caller should supply more bytes and call
     /// again; `input` reflects any bytes that were stably consumed (so the
     /// caller can advance its buffer accordingly).
@@ -187,7 +183,7 @@ impl Parser {
     pub fn feed<'i, I: Input<'i>>(
         &mut self,
         input: &mut I,
-    ) -> Result<Option<(Message, I::Slice)>, FeedError> {
+    ) -> Result<Option<(Message, I)>, FeedError> {
         let start_pos = self.stream_pos;
         let initial_len = input.len();
         let result = self.feed_inner(input);
@@ -199,7 +195,7 @@ impl Parser {
     fn feed_inner<'i, I: Input<'i>>(
         &mut self,
         input: &mut I,
-    ) -> Result<Option<(Message, I::Slice)>, FeedError> {
+    ) -> Result<Option<(Message, I)>, FeedError> {
         loop {
             match std::mem::take(&mut self.state) {
                 ParserState::Idle => {
@@ -287,20 +283,15 @@ impl Parser {
 }
 
 /// Skips any leading CRLFs, then parses the first line of the next message.
-/// Returns `Ok(None)` on a clean end-of-stream (empty, non-partial input).
+/// Returns `Ok(None)` when the input is empty (caller decides if that's
+/// clean EOF or needs more data).
 fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedError> {
     loop {
         match input.peek_byte() {
-            None => {
-                return if input.is_partial() {
-                    Err(FeedError::Incomplete(None))
-                } else {
-                    Ok(None) // clean EOF between messages
-                };
-            }
+            None => return Ok(None),
             Some(b'\r') => {
                 if input.len() < 2 {
-                    return Err(incomplete_or_invalid(input));
+                    return Err(incomplete());
                 }
                 if input.byte_at(1) != b'\n' {
                     return Err(FeedError::invalid());
@@ -314,11 +305,8 @@ fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedEr
             Some(_) => {
                 if input.len() >= 5 && input.starts_with_lit(b"RTSP/") {
                     return Ok(Some(Message::Response(parse_status_line(input)?)));
-                } else if input.len() < 5
-                    && input.is_partial()
-                    && input.starts_with_lit(&b"RTSP/"[..input.len()])
-                {
-                    return Err(FeedError::Incomplete(None));
+                } else if input.len() < 5 && input.starts_with_lit(&b"RTSP/"[..input.len()]) {
+                    return Err(incomplete());
                 } else {
                     return Ok(Some(Message::Request(parse_request_line(input)?)));
                 }
@@ -329,7 +317,7 @@ fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedEr
 
 fn parse_data<'i, I: Input<'i>>(input: &mut I) -> Result<Data, FeedError> {
     if input.len() < 3 {
-        return Err(incomplete_or_invalid(input).context("interleaved-data"));
+        return Err(incomplete().context("interleaved-data"));
     }
     let channel_id = input.byte_at(0);
     let body_len = (input.byte_at(1) as u16) << 8 | input.byte_at(2) as u16;
@@ -352,7 +340,7 @@ fn parse_status_line_inner<'i, I: Input<'i>>(input: &mut I) -> Result<Response, 
                 return Err(invalid("status-code"));
             }
         }
-        return Err(incomplete_or_invalid(input).context("status-code"));
+        return Err(incomplete().context("status-code"));
     }
     let b0 = input.byte_at(0);
     let b1 = input.byte_at(1);
@@ -410,10 +398,10 @@ fn parse_header_line<'i, I: Input<'i>>(
     input: &mut I,
 ) -> Result<Option<(HeaderName, HeaderValue)>, FeedError> {
     match input.peek_byte() {
-        None => Err(incomplete_or_invalid(input)),
+        None => Err(incomplete()),
         Some(b'\r') => {
             if input.len() < 2 {
-                return Err(incomplete_or_invalid(input));
+                return Err(incomplete());
             }
             if input.byte_at(1) != b'\n' {
                 return Err(FeedError::invalid());
@@ -435,7 +423,7 @@ fn parse_header_pair_inner<'i, I: Input<'i>>(
     input: &mut I,
 ) -> Result<(HeaderName, HeaderValue), FeedError> {
     let colon_pos = match input.find_bytes3(b':', b'\r', b'\n') {
-        None => return Err(incomplete_or_invalid(input).context("field-name")),
+        None => return Err(incomplete().context("field-name")),
         Some(n) => n,
     };
     if colon_pos == 0 || input.byte_at(colon_pos) != b':' {
@@ -447,18 +435,18 @@ fn parse_header_pair_inner<'i, I: Input<'i>>(
     // Skip OWS after colon.
     match input.find_first(|b| !matches!(b, b' ' | b'\t')) {
         Some(n) => input.advance(n),
-        None => return Err(incomplete_or_invalid(input).context("field-value")),
+        None => return Err(incomplete().context("field-value")),
     }
 
     let crlf_pos = match input.find_bytes2(b'\r', b'\n') {
-        None => return Err(incomplete_or_invalid(input).context("field-value")),
+        None => return Err(incomplete().context("field-value")),
         Some(n) => n,
     };
     if input.byte_at(crlf_pos) != b'\r' {
         return Err(invalid("field-value"));
     }
     if input.len() <= crlf_pos + 1 {
-        return Err(incomplete_or_invalid(input).context("field-value"));
+        return Err(incomplete().context("field-value"));
     }
     if input.byte_at(crlf_pos + 1) != b'\n' {
         return Err(invalid("field-value"));
@@ -498,13 +486,13 @@ fn content_length(headers: &Headers) -> Result<u64, FeedError> {
 // Primitive helpers
 // ---------------------------------------------------------------------------
 
-fn take_line<'i, I: Input<'i>>(input: &mut I) -> Result<I::Slice, FeedError> {
+fn take_line<'i, I: Input<'i>>(input: &mut I) -> Result<I, FeedError> {
     let cr_pos = match input.find_byte(b'\r') {
-        None => return Err(incomplete_or_invalid(input)),
+        None => return Err(incomplete()),
         Some(n) => n,
     };
     if input.len() <= cr_pos + 1 {
-        return Err(incomplete_or_invalid(input));
+        return Err(incomplete());
     }
     if input.byte_at(cr_pos + 1) != b'\n' {
         return Err(FeedError::invalid());
@@ -514,23 +502,18 @@ fn take_line<'i, I: Input<'i>>(input: &mut I) -> Result<I::Slice, FeedError> {
     Ok(line)
 }
 
-fn take_token<'i, I: Input<'i>>(input: &mut I) -> Result<I::Slice, FeedError> {
-    let len = input.len();
+fn take_token<'i, I: Input<'i>>(input: &mut I) -> Result<I, FeedError> {
     match input.find_first(|b| !is_tchar(b)) {
         Some(0) => Err(FeedError::invalid()),
         Some(n) => Ok(input.next_slice(n)),
-        None if len == 0 => Err(incomplete_or_invalid(input)),
-        None if input.is_partial() => Err(FeedError::Incomplete(None)),
-        None => Ok(input.next_slice(len)),
+        None => Err(incomplete()),
     }
 }
 
-fn take_vchar<'i, I: Input<'i>>(input: &mut I) -> Result<I::Slice, FeedError> {
-    let len = input.len();
+fn take_vchar<'i, I: Input<'i>>(input: &mut I) -> Result<I, FeedError> {
     match input.find_first(|b| !matches!(b, 0x21..=0x7E)) {
         Some(n) => Ok(input.next_slice(n)),
-        None if input.is_partial() => Err(FeedError::Incomplete(None)),
-        None => Ok(input.next_slice(len)),
+        None => Err(incomplete()),
     }
 }
 
@@ -539,7 +522,7 @@ fn eat_literal<'i, I: Input<'i>>(input: &mut I, lit: &[u8]) -> Result<(), FeedEr
         if !input.starts_with_lit(&lit[..input.len()]) {
             return Err(FeedError::invalid());
         }
-        return Err(incomplete_or_invalid(input));
+        return Err(incomplete());
     }
     if !input.starts_with_lit(lit) {
         return Err(FeedError::invalid());
@@ -550,7 +533,7 @@ fn eat_literal<'i, I: Input<'i>>(input: &mut I, lit: &[u8]) -> Result<(), FeedEr
 
 fn eat_byte<'i, I: Input<'i>>(input: &mut I, b: u8) -> Result<(), FeedError> {
     match input.peek_byte() {
-        None => Err(incomplete_or_invalid(input)),
+        None => Err(incomplete()),
         Some(x) if x != b => Err(FeedError::invalid()),
         Some(_) => {
             input.advance(1);
@@ -569,9 +552,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Exposed for `inputs::tests` to test `take_line` with different `Input` impls.
-    pub(crate) fn take_line_for_test<'i, I: Input<'i>>(
-        input: &mut I,
-    ) -> Result<I::Slice, FeedError> {
+    pub(crate) fn take_line_for_test<'i, I: Input<'i>>(input: &mut I) -> Result<I, FeedError> {
         take_line(input)
     }
 
@@ -581,14 +562,16 @@ pub(crate) mod tests {
         first: &'a [u8],
         second: &'a [u8],
     ) -> Result<Option<(Message, Split<'a>)>, FeedError> {
-        let mut p1 = Split::new(first, &[], true);
+        let mut p1 = Split::new(first, &[]);
         match parser.feed(&mut p1) {
-            Ok(r) => Ok(r),
-            Err(FeedError::Incomplete(_)) => {
+            // Ok(None) means idle with no data (first was empty) or
+            // Incomplete means parser needs more — either way, feed the rest.
+            Ok(None) | Err(FeedError::Incomplete(_)) => {
                 let consumed = first.len() - p1.len();
-                let mut p2 = Split::new(&first[consumed..], second, false);
+                let mut p2 = Split::new(&first[consumed..], second);
                 parser.feed(&mut p2)
             }
+            Ok(r) => Ok(r),
             Err(e) => Err(e),
         }
     }
@@ -598,7 +581,7 @@ pub(crate) mod tests {
         let data = &b"foo\r\nbar"[..];
         for split in 0..data.len() {
             let (first, second) = data.split_at(split);
-            let mut input = Split::new(first, second, false);
+            let mut input = Split::new(first, second);
             match take_line(&mut input) {
                 Err(e) => panic!("failed at split point {}: {:?}", split, e),
                 Ok(line) => {
@@ -639,7 +622,7 @@ pub(crate) mod tests {
             let (first, second) = data.split_at(split);
 
             // Discontiguous ring-buffer view, single feed.
-            let mut input = Split::new(first, second, false);
+            let mut input = Split::new(first, second);
             let (Message::Request(_), body) = Parser::default()
                 .feed(&mut input)
                 .unwrap_or_else(|e| panic!("ring-buf failed at split {split}: {e:?}"))
@@ -659,7 +642,7 @@ pub(crate) mod tests {
             assert!(body.to_cow().is_empty(), "split {split}");
         }
         // Verify the parsed content matches the expected request (spot-check one split).
-        let mut input = Split::new(data, &[], false);
+        let mut input = Split::new(data, &[]);
         let (Message::Request(req), _) = Parser::default().feed(&mut input).unwrap().unwrap()
         else {
             panic!()
@@ -674,7 +657,7 @@ pub(crate) mod tests {
             let (first, second) = data.split_at(split);
 
             // Discontiguous ring-buffer view, single feed.
-            let mut input = Split::new(first, second, false);
+            let mut input = Split::new(first, second);
             Parser::default()
                 .feed(&mut input)
                 .unwrap_or_else(|e| panic!("ring-buf failed at split {split}: {e:?}"))
@@ -694,7 +677,7 @@ pub(crate) mod tests {
             let (first, second) = data.split_at(split);
 
             // Discontiguous ring-buffer view, single feed.
-            let mut input = Split::new(first, second, false);
+            let mut input = Split::new(first, second);
             let (Message::Data(d), body) = Parser::default()
                 .feed(&mut input)
                 .unwrap_or_else(|e| panic!("ring-buf failed at split {split}: {e:?}"))
@@ -737,7 +720,7 @@ pub(crate) mod tests {
 
     #[test]
     fn clean_eof() {
-        let mut input = Split::new(&[], &[], false);
+        let mut input = Split::new(&[], &[]);
         let result = Parser::default().feed(&mut input);
         assert!(
             matches!(result, Ok(None)),
@@ -748,7 +731,7 @@ pub(crate) mod tests {
     #[test]
     fn error_display_rtsp_version_mismatch() {
         let data = b"RTSP/2.0 200 OK\r\n\r\n";
-        let mut input = Split::new(data, &[], false);
+        let mut input = Split::new(data, &[]);
         let err = Parser::default().feed(&mut input).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -759,7 +742,7 @@ pub(crate) mod tests {
     #[test]
     fn error_display_bad_url() {
         let data = b"DESCRIBE not-a-url RTSP/1.0\r\n\r\n";
-        let mut input = Split::new(data, &[], false);
+        let mut input = Split::new(data, &[]);
         let err = Parser::default().feed(&mut input).unwrap_err();
         let FeedError::Invalid(ref inv) = err else {
             panic!("expected Invalid, got {err:?}");
@@ -778,7 +761,7 @@ pub(crate) mod tests {
         let data = b"GET * RTSP/1.0\r\nContent-Length: 5\r\n\r\nhello";
         let total = data.len();
 
-        let mut input = Split::new(data, &[], false);
+        let mut input = Split::new(data, &[]);
         Parser::builder()
             .max_message_size(total)
             .build()
@@ -786,7 +769,7 @@ pub(crate) mod tests {
             .expect("should succeed at exact limit")
             .expect("unexpected EOF");
 
-        let mut input = Split::new(data, &[], false);
+        let mut input = Split::new(data, &[]);
         let err = Parser::builder()
             .max_message_size(total - 1)
             .build()
@@ -799,24 +782,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fail_eagerly() {
+    fn incomplete_truncated_request() {
+        // Truncated request: the parser returns Incomplete (the caller
+        // decides whether to wait for more data or treat it as an error).
         let data = b"A b";
-        let mut input = Split::new(data, &[], false);
-        let Err(FeedError::Invalid(inv)) = Parser::builder().build().feed(&mut input) else {
+        let mut input = Split::new(data, &[]);
+        let Err(FeedError::Incomplete(_)) = Parser::builder().build().feed(&mut input) else {
             panic!();
         };
-        let msg = inv.to_string();
-        assert!(
-            msg.contains("Request-URI"),
-            "expected Request-URI failure, got {msg}"
-        );
     }
 
     #[test]
     fn incomplete_body_reports_needed() {
         // Parse a response with Content-Length: 100 but only supply the head.
         let data = b"RTSP/1.0 200 OK\r\nContent-Length: 100\r\n\r\n";
-        let mut input = Split::new(data, &[], true);
+        let mut input = Split::new(data, &[]);
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {
@@ -829,7 +809,7 @@ pub(crate) mod tests {
     fn incomplete_data_body_reports_needed() {
         // Interleaved data: $\x00\x00\x05 but no body bytes.
         let data = b"$\x00\x00\x05";
-        let mut input = Split::new(data, &[], true);
+        let mut input = Split::new(data, &[]);
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {
@@ -842,7 +822,7 @@ pub(crate) mod tests {
     fn incomplete_head_reports_none() {
         // Partial status line.
         let data = b"RTSP/1.0 200";
-        let mut input = Split::new(data, &[], true);
+        let mut input = Split::new(data, &[]);
         let mut parser = Parser::default();
         let err = parser.feed(&mut input).unwrap_err();
         match err {

@@ -5,8 +5,7 @@
 //!
 //! Two [`Input`] implementations are provided:
 //!
-//! * [`Contiguous`] — wraps a single `&[u8]`, used for contiguous buffers
-//!   like `BytesMut`.
+//! * [`&[u8]`] — used for contiguous buffers like `BytesMut`.
 //! * [`Split`] — wraps two `&[u8]` halves, for discontiguous ring-buffer
 //!   views. Reserved for future use.
 
@@ -16,37 +15,16 @@ use derive_more::Debug;
 
 use crate::mostly_ascii::MostlyAscii;
 
-/// A parsed output slice from an [`Input`].
-pub trait Slice<'i>: Clone {
-    fn to_cow(self) -> Cow<'i, [u8]>;
-    fn to_cow_str(self) -> Result<Cow<'i, str>, std::str::Utf8Error> {
-        match self.to_cow() {
-            Cow::Borrowed(b) => std::str::from_utf8(b).map(Cow::Borrowed),
-            Cow::Owned(b) => String::from_utf8(b)
-                .map(Cow::Owned)
-                .map_err(|e| e.utf8_error()),
-        }
-    }
-}
-
-impl<'i> Slice<'i> for &'i [u8] {
-    fn to_cow(self) -> Cow<'i, [u8]> {
-        Cow::Borrowed(self)
-    }
-}
-
-/// Streaming byte input, usable as a checkpoint (since `Copy`).
+/// Byte input, usable as a checkpoint (since `Copy`).
+///
+/// This is a pure view over bytes with no streaming semantics.
+/// The caller decides whether incomplete parses are retriable.
 pub trait Input<'i>: Copy {
-    type Slice: Slice<'i>;
-
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Returns true if more bytes may be supplied in a future `feed` call.
-    fn is_partial(&self) -> bool;
 
     /// Returns the next byte without consuming it.
     fn peek_byte(&self) -> Option<u8>;
@@ -55,7 +33,7 @@ pub trait Input<'i>: Copy {
     fn advance(&mut self, n: usize);
 
     /// Consumes and returns the next `n` bytes as a slice. Panics if `n > self.len()`.
-    fn next_slice(&mut self, n: usize) -> Self::Slice;
+    fn next_slice(&mut self, n: usize) -> Self;
 
     /// Returns byte at index `i`. Panics if `i >= self.len()`.
     fn byte_at(&self, i: usize) -> u8;
@@ -75,72 +53,72 @@ pub trait Input<'i>: Copy {
 
     /// Returns the offset of the first byte satisfying `pred`, or `None` if none do.
     fn find_first<F: Fn(u8) -> bool>(&self, pred: F) -> Option<usize>;
-}
 
-// ---------------------------------------------------------------------------
-// Contiguous — single &[u8] input
-// ---------------------------------------------------------------------------
-
-/// Contiguous input wrapping a single `&[u8]`.
-#[derive(Copy, Clone)]
-pub struct Contiguous<'i> {
-    data: &'i [u8],
-    partial: bool,
-}
-
-impl<'i> Contiguous<'i> {
-    pub fn new(data: &'i [u8], partial: bool) -> Self {
-        Self { data, partial }
+    fn to_cow(self) -> Cow<'i, [u8]>;
+    fn to_cow_str(self) -> Result<Cow<'i, str>, std::str::Utf8Error> {
+        match self.to_cow() {
+            Cow::Borrowed(b) => std::str::from_utf8(b).map(Cow::Borrowed),
+            Cow::Owned(b) => String::from_utf8(b)
+                .map(Cow::Owned)
+                .map_err(|e| e.utf8_error()),
+        }
     }
+    fn to_owned(self) -> Vec<u8>;
 }
 
-impl<'i> Input<'i> for Contiguous<'i> {
-    type Slice = &'i [u8];
+// ---------------------------------------------------------------------------
+// single &[u8] input
+// ---------------------------------------------------------------------------
 
+impl<'i> Input<'i> for &'i [u8] {
     fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    fn is_partial(&self) -> bool {
-        self.partial
+        <[u8]>::len(self)
     }
 
     fn peek_byte(&self) -> Option<u8> {
-        self.data.first().copied()
+        self.first().copied()
     }
 
     fn advance(&mut self, n: usize) {
-        self.data = &self.data[n..];
+        *self = &self[n..];
     }
 
-    fn next_slice(&mut self, n: usize) -> &'i [u8] {
-        let (ret, rest) = self.data.split_at(n);
-        self.data = rest;
+    fn next_slice(&mut self, n: usize) -> Self {
+        let (ret, rest) = self.split_at(n);
+        *self = rest;
         ret
     }
 
     fn byte_at(&self, i: usize) -> u8 {
-        self.data[i]
+        self[i]
     }
 
     fn starts_with_lit(&self, lit: &[u8]) -> bool {
-        self.data.starts_with(lit)
+        self.starts_with(lit)
     }
 
     fn find_byte(&self, b: u8) -> Option<usize> {
-        memchr::memchr(b, self.data)
+        memchr::memchr(b, self)
     }
 
     fn find_bytes2(&self, a: u8, b: u8) -> Option<usize> {
-        memchr::memchr2(a, b, self.data)
+        memchr::memchr2(a, b, self)
     }
 
     fn find_bytes3(&self, a: u8, b: u8, c: u8) -> Option<usize> {
-        memchr::memchr3(a, b, c, self.data)
+        memchr::memchr3(a, b, c, self)
     }
 
     fn find_first<F: Fn(u8) -> bool>(&self, pred: F) -> Option<usize> {
-        self.data.iter().position(|&b| pred(b))
+        self.iter().position(|&b| pred(b))
+    }
+
+    fn to_cow(self) -> Cow<'i, [u8]> {
+        Cow::Borrowed(self)
+    }
+
+    fn to_owned(self) -> Vec<u8> {
+        Vec::from(self)
     }
 }
 
@@ -158,49 +136,28 @@ impl<'i> Input<'i> for Contiguous<'i> {
 pub struct Split<'i> {
     first: &'i [u8],
     second: &'i [u8], // empty if first is empty.
-    partial: bool,
 }
 
 impl<'i> Split<'i> {
-    pub fn new(first: &'i [u8], second: &'i [u8], partial: bool) -> Self {
+    pub fn new(first: &'i [u8], second: &'i [u8]) -> Self {
         if first.is_empty() {
             Self {
                 first: second,
                 second: &[],
-                partial,
             }
         } else {
-            Self {
-                first,
-                second,
-                partial,
-            }
-        }
-    }
-}
-
-impl<'i> Slice<'i> for Split<'i> {
-    fn to_cow(self) -> Cow<'i, [u8]> {
-        if self.second.is_empty() {
-            Cow::Borrowed(self.first)
-        } else {
-            let mut v = Vec::with_capacity(self.first.len() + self.second.len());
-            v.extend_from_slice(self.first);
-            v.extend_from_slice(self.second);
-            Cow::Owned(v)
+            Self { first, second }
         }
     }
 }
 
 impl<'i> Input<'i> for Split<'i> {
-    type Slice = Split<'i>;
-
     fn len(&self) -> usize {
         self.first.len() + self.second.len()
     }
 
-    fn is_partial(&self) -> bool {
-        self.partial
+    fn is_empty(&self) -> bool {
+        self.first.is_empty()
     }
 
     fn peek_byte(&self) -> Option<u8> {
@@ -215,12 +172,11 @@ impl<'i> Input<'i> for Split<'i> {
         }
     }
 
-    fn next_slice(&mut self, offset: usize) -> Self::Slice {
+    fn next_slice(&mut self, offset: usize) -> Self {
         if let Some(beyond_first) = offset.checked_sub(self.first.len()) {
             let ret = Split {
                 first: self.first,
                 second: &self.second[..beyond_first],
-                partial: false,
             };
             self.first = &std::mem::take(&mut self.second)[beyond_first..];
             ret
@@ -230,7 +186,6 @@ impl<'i> Input<'i> for Split<'i> {
             Split {
                 first: ret,
                 second: &[],
-                partial: false,
             }
         }
     }
@@ -275,6 +230,19 @@ impl<'i> Input<'i> for Split<'i> {
                 .map(|i| i + self.first.len())
         })
     }
+    fn to_cow(self) -> Cow<'i, [u8]> {
+        if self.second.is_empty() {
+            Cow::Borrowed(self.first)
+        } else {
+            Cow::Owned(self.to_owned())
+        }
+    }
+    fn to_owned(self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.first.len() + self.second.len());
+        v.extend_from_slice(self.first);
+        v.extend_from_slice(self.second);
+        v
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +263,8 @@ mod tests {
 
     #[test]
     fn contiguous_take_line() {
-        let data = b"foo\r\nbar";
-        check_take_line(Contiguous::new(data, false));
+        let data = &b"foo\r\nbar"[..];
+        check_take_line(data);
     }
 
     #[test]
@@ -304,13 +272,13 @@ mod tests {
         let data = &b"foo\r\nbar"[..];
         for split in 0..data.len() {
             let (first, second) = data.split_at(split);
-            check_take_line(Split::new(first, second, false));
+            check_take_line(Split::new(first, second));
         }
     }
 
     #[test]
     fn contiguous_find_bytes() {
-        let input = Contiguous::new(b"hello:world", false);
+        let input = &b"hello:world"[..];
         assert_eq!(input.find_byte(b':'), Some(5));
         assert_eq!(input.find_bytes2(b':', b'x'), Some(5));
         assert_eq!(input.find_bytes3(b'x', b'y', b':'), Some(5));
@@ -320,7 +288,7 @@ mod tests {
     #[test]
     fn split_find_bytes_across_boundary() {
         // Put the colon in the second half.
-        let input = Split::new(b"hello", b":world", false);
+        let input = Split::new(b"hello", b":world");
         assert_eq!(input.find_byte(b':'), Some(5));
         assert_eq!(input.find_bytes2(b':', b'x'), Some(5));
         assert_eq!(input.find_bytes3(b'x', b'y', b':'), Some(5));
@@ -329,7 +297,7 @@ mod tests {
 
     #[test]
     fn contiguous_advance_and_next_slice() {
-        let mut input = Contiguous::new(b"abcdef", false);
+        let mut input = &b"abcdef"[..];
         input.advance(2);
         assert_eq!(input.len(), 4);
         let s = input.next_slice(3);
@@ -340,7 +308,7 @@ mod tests {
 
     #[test]
     fn split_advance_across_boundary() {
-        let mut input = Split::new(b"ab", b"cdef", false);
+        let mut input = Split::new(b"ab", b"cdef");
         assert_eq!(input.len(), 6);
         input.advance(3); // past first, into second
         assert_eq!(input.len(), 3);
@@ -349,7 +317,7 @@ mod tests {
 
     #[test]
     fn split_next_slice_across_boundary() {
-        let mut input = Split::new(b"ab", b"cdef", false);
+        let mut input = Split::new(b"ab", b"cdef");
         let s = input.next_slice(4); // spans both halves
         let cow = s.to_cow();
         assert_eq!(cow.as_ref(), b"abcd");
@@ -358,30 +326,30 @@ mod tests {
 
     #[test]
     fn contiguous_starts_with_lit() {
-        let input = Contiguous::new(b"RTSP/1.0 200 OK", false);
+        let input = &b"RTSP/1.0 200 OK"[..];
         assert!(input.starts_with_lit(b"RTSP/"));
         assert!(!input.starts_with_lit(b"HTTP/"));
     }
 
     #[test]
     fn split_starts_with_lit_across_boundary() {
-        let input = Split::new(b"RT", b"SP/1.0", false);
+        let input = Split::new(b"RT", b"SP/1.0");
         assert!(input.starts_with_lit(b"RTSP/"));
         assert!(!input.starts_with_lit(b"HTTP/"));
     }
 
     #[test]
     fn contiguous_slice_to_cow_str() {
-        let mut input = Contiguous::new(b"hello", false);
+        let mut input = &b"hello"[..];
         let s: &[u8] = input.next_slice(5);
         // Since it's &[u8], we need to call Slice::to_cow_str.
-        let cow_str = Slice::to_cow_str(s).unwrap();
+        let cow_str = s.to_cow_str().unwrap();
         assert_eq!(&*cow_str, "hello");
     }
 
     #[test]
     fn split_slice_to_cow_str() {
-        let mut input = Split::new(b"hel", b"lo", false);
+        let mut input = Split::new(b"hel", b"lo");
         let s = input.next_slice(5);
         let cow_str = s.to_cow_str().unwrap();
         assert_eq!(&*cow_str, "hello");

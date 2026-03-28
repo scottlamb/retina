@@ -165,7 +165,6 @@ impl tokio_util::codec::Decoder for Codec {
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        use crate::inputs::{Contiguous, Input as _};
         use crate::rtsp::parse::FeedError;
 
         let pos = self.parser.stream_pos();
@@ -188,7 +187,7 @@ impl tokio_util::codec::Decoder for Codec {
         }
 
         let feed_result = {
-            let mut input = Contiguous::new(src, true);
+            let mut input = &src[..];
             let r = self.parser.feed(&mut input);
             let consumed = initial_len - input.len();
             match r {
