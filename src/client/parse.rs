@@ -537,8 +537,9 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
         },
         Some((id, timeout_str)) => {
             if let Some(v) = timeout_str.trim().strip_prefix("timeout=") {
+                let v = v.strip_suffix(";").unwrap_or(v);
                 let timeout_sec =
-                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout {v}"))?;
+                    u32::from_str_radix(v, 10).map_err(|_| format!("Unparseable timeout [{v}]"))?;
 
                 if timeout_sec == 0 {
                     // This would make Retina send keepalives at an absurd rate; reject.

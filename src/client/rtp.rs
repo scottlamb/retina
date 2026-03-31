@@ -135,6 +135,11 @@ impl InorderParser {
         stream_id: usize,
         data: Bytes,
     ) -> Result<Option<PacketItem>, Error> {
+        if !(data.len() >= 12 && data[0] > 127 && data[0] < 192) {
+            //this is for rtcp
+            debug!("skip invalid rtp pkt, maybe it is rtcp");
+            return Ok(None);
+        }
         let (raw, payload_range) = RawPacket::new(data).map_err(|e| {
             wrap!(ErrorInt::PacketError {
                 conn_ctx: *conn_ctx,
