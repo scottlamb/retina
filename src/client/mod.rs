@@ -1156,6 +1156,12 @@ enum SessionFlag {
     /// Set if an `OPTIONS` request has completed and advertised supported for
     /// `GET_PARAMETER`.
     GetParameterSupported = 0x10,
+
+    /// Set if a `SET_PARAMETER`/`GET_PARAMETER` keepalive was rejected by the
+    /// server, so subsequent keepalives should fall back to `OPTIONS`. Some
+    /// cameras advertise `SET_PARAMETER` support in `OPTIONS` but reject the
+    /// request itself with an error (occasionally even echoing the wrong `CSeq`).
+    KeepaliveUseOptions = 0x20,
 }
 
 impl RtspConnection {
@@ -2159,7 +2165,11 @@ impl Session<Playing> {
         // <https://github.com/aler9/rtsp-simple-server/issues/1066>. Initially
         // send `OPTIONS`, then follow recommendations to use (bodyless)
         // `SET_PARAMETER` or `GET_PARAMETER` if available.
-        let method = if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
+        let method = if *inner.flags & (SessionFlag::KeepaliveUseOptions as u8) != 0 {
+            // A prior `SET_PARAMETER`/`GET_PARAMETER` keepalive was rejected by the
+            // server. `OPTIONS` is universally supported, so fall back to it.
+            KeepaliveMethod::Options
+        } else if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
             KeepaliveMethod::SetParameter
         } else if *inner.flags & (SessionFlag::GetParameterSupported as u8) != 0 {
             KeepaliveMethod::GetParameter
@@ -2204,38 +2214,68 @@ impl Session<Playing> {
         response: msg::Response,
     ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
-        match inner.keepalive_state {
-            KeepaliveState::Waiting { cseq, method }
-                if parse::get_cseq(&response) == Some(*cseq) =>
-            {
-                // We don't care if the keepalive response succeeds or fails, but we should
-                // log it, to help debugging if on failure the server doesn't extend the
-                // timeout or gets angry and closes the connection. (rtsp-simple-server
-                // does the latter as of 2022-08-07, though I'm told this will be fixed.)
-                if !response.status_code.is_success() {
-                    warn!("keepalive failed with {:?}", response.status_code);
-                } else {
-                    trace!("keepalive succeeded with {:?}", response.status_code);
-                    if matches!(method, KeepaliveMethod::Options) {
-                        match parse::parse_options(&response) {
-                            Ok(r) => {
-                                if r.set_parameter_supported {
-                                    *inner.flags |= SessionFlag::SetParameterSupported as u8;
-                                }
-                                if r.get_parameter_supported {
-                                    *inner.flags |= SessionFlag::GetParameterSupported as u8;
-                                }
+        // A keepalive reply may arrive while the request is still `Flushing` locally
+        // (the server received it and replied before our `poll_flush` completed), so
+        // handle both outstanding states.
+        if let KeepaliveState::Waiting { cseq, method }
+        | KeepaliveState::Flushing { cseq, method } = &*inner.keepalive_state
+        {
+            let (cseq, method) = (*cseq, *method);
+            let response_cseq = parse::get_cseq(&response);
+            if response_cseq == Some(cseq) && response.status_code.is_success() {
+                trace!("keepalive succeeded with {:?}", response.status_code);
+                if matches!(method, KeepaliveMethod::Options) {
+                    match parse::parse_options(&response) {
+                        Ok(r) => {
+                            if r.set_parameter_supported {
+                                *inner.flags |= SessionFlag::SetParameterSupported as u8;
                             }
-                            Err(e) => {
-                                warn!("Unable to parse OPTIONS response: {}", e);
+                            if r.get_parameter_supported {
+                                *inner.flags |= SessionFlag::GetParameterSupported as u8;
                             }
+                        }
+                        Err(e) => {
+                            warn!("Unable to parse OPTIONS response: {}", e);
                         }
                     }
                 }
                 *inner.keepalive_state = KeepaliveState::Idle;
                 return Ok(());
             }
-            _ => {}
+            if !response.status_code.is_success() {
+                // A failed keepalive. Don't tear down the session over it: the
+                // server may still extend the timeout, and in practice ongoing TCP
+                // data traffic keeps many sessions alive regardless. Some cameras
+                // advertise `SET_PARAMETER`/`GET_PARAMETER` support in `OPTIONS` but
+                // then reject the request with an error, sometimes even echoing the
+                // wrong `CSeq` (so it doesn't match the branch above). While a
+                // keepalive is outstanding it's the only request we've sent, so
+                // treat any error response as that keepalive's reply and fall back
+                // to `OPTIONS` for subsequent keepalives.
+                if response_cseq == Some(cseq) {
+                    warn!(
+                        "keepalive ({method:?}) failed with {:?}",
+                        response.status_code
+                    );
+                } else {
+                    warn!(
+                        "keepalive ({method:?}) failed with {:?} and a mismatched CSeq \
+                         (got {response_cseq:?}, expected {cseq}); treating it as a buggy \
+                         server's keepalive reply and falling back to OPTIONS",
+                        response.status_code,
+                    );
+                }
+                if matches!(
+                    method,
+                    KeepaliveMethod::SetParameter | KeepaliveMethod::GetParameter
+                ) {
+                    *inner.flags |= SessionFlag::KeepaliveUseOptions as u8;
+                }
+                *inner.keepalive_state = KeepaliveState::Idle;
+                return Ok(());
+            }
+            // A *success* response with a mismatched CSeq is genuinely unexpected;
+            // fall through to the framing error below.
         }
 
         // The only response we expect in this state is to our keepalive request.
@@ -2913,6 +2953,119 @@ mod tests {
         );
         tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
+    }
+
+    /// A keepalive rejected by the server must not tear down an otherwise-healthy
+    /// session. Some cameras advertise `SET_PARAMETER` support in `OPTIONS` but
+    /// reject the request with `400`, occasionally echoing the wrong `CSeq`. Retina
+    /// should treat this as a failed keepalive (not a fatal framing error) and fall
+    /// back to `OPTIONS` keepalives.
+    #[tokio::test]
+    async fn keepalive_rejected_falls_back_to_options() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default()
+                    .unassigned_channel_data(UnassignedChannelDataPolicy::Ignore),
+                url
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // Pretend the server advertised `SET_PARAMETER` (so it's chosen as the
+        // keepalive method) and make the keepalive fire almost immediately.
+        session.0.flags |= SessionFlag::SetParameterSupported as u8;
+        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+
+        tokio::join!(
+            async {
+                // The session must survive the bogus keepalive reply and still
+                // deliver the following RTP packet, rather than erroring out.
+                match session.next().await {
+                    Some(Ok(PacketItem::Rtp(p))) => {
+                        assert_eq!(p.payload(), b"hello world");
+                    }
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                // Read the SET_PARAMETER keepalive, reply `400` with the WRONG CSeq.
+                let msg = server.next().await.unwrap().unwrap();
+                let req = match msg.msg {
+                    msg::Message::Request(r) => r,
+                    o => panic!("expected keepalive request, got {o:#?}"),
+                };
+                assert_eq!(req.method, msg::Method::SET_PARAMETER);
+                let real_cseq: u32 = req.headers.get("CSeq").unwrap().parse().unwrap();
+                let mut headers = msg::Headers::default();
+                headers.insert(
+                    msg::HeaderName::CSEQ,
+                    msg::HeaderValue::try_from((real_cseq - 1).to_string()).unwrap(),
+                );
+                server
+                    .send(OwnedMessage::Response {
+                        head: msg::Response {
+                            status_code: StatusCode::try_from(400u16).unwrap(),
+                            reason_phrase: "Bad Request".to_owned(),
+                            headers,
+                        },
+                        body: Bytes::new(),
+                    })
+                    .await
+                    .unwrap();
+                let good_pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+                server
+                    .send(OwnedMessage::Data {
+                        channel_id: 0,
+                        body: Bytes::from_static(good_pkt),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+
+        // Subsequent keepalives must use OPTIONS.
+        assert_ne!(
+            session.0.flags & (SessionFlag::KeepaliveUseOptions as u8),
+            0,
+            "expected fallback to OPTIONS after a rejected SET_PARAMETER keepalive"
+        );
     }
 
     /// As above, but TEARDOWN fails until session expiration.
