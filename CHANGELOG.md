@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.20` (2026-08-14)
 
 *   Retina now internally reads into and depacketizes from a ring buffer,
     finally realizing a change considered since the library's first days
