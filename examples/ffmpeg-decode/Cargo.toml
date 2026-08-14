@@ -11,7 +11,7 @@ h265 = ["retina/h265"]
 [dependencies]
 anyhow = "1.0.41"
 clap = { version = "4.1.4", features = ["derive"] }
-ffmpeg-next = { version = "8.0.0", default-features=false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "8.1.0", default-features=false, features = ["codec", "format", "software-scaling"] }
 futures = "0.3.14"
 log = "0.4.8"
 mylog = { git = "https://github.com/scottlamb/mylog" }
