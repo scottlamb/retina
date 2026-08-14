@@ -1190,7 +1190,7 @@ impl RtspConnection {
             return Err("URL must not contain credentials".to_owned());
         }
         url.host()
-            .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
+            .ok_or_else(|| format!("Must specify host in rtsp url {}", url))
     }
 
     /// Sends a request and expects an upcoming message from the peer to be its response.
@@ -1351,7 +1351,7 @@ impl RtspConnection {
                          conn: {}\nmsg: {}\ndata: {:#?}",
                         channel_id,
                         self.inner.ctx(),
-                        &msg_ctx,
+                        msg_ctx,
                         crate::hex::LimitedHex::new(&data, 128),
                     );
                     self.seen_unassigned = true;
@@ -1361,7 +1361,7 @@ impl RtspConnection {
                          conn: {}\nmsg: {}\ndata: {:#?}",
                         channel_id,
                         self.inner.ctx(),
-                        &msg_ctx,
+                        msg_ctx,
                         crate::hex::LimitedHex::new(&data, 128),
                     );
                 }
@@ -1626,7 +1626,7 @@ impl Session<Described> {
                 &mut req,
             )
             .await?;
-        debug!("SETUP response: {:#?}", &response);
+        debug!("SETUP response: {:#?}", response);
         let conn_ctx = conn.inner.ctx();
         let status = response.status_code;
         let response = parse::parse_setup(&response).map_err(|description| {
@@ -1781,7 +1781,7 @@ impl Session<Described> {
             );
         }
 
-        trace!("PLAY with channel mappings: {:#?}", &conn.channels);
+        trace!("PLAY with channel mappings: {:#?}", conn.channels);
         *inner.flags |= SessionFlag::MaybePlaying as u8;
         let (msg_ctx, cseq, response, _resp_body) = conn
             .send(
@@ -1861,7 +1861,7 @@ impl Session<Described> {
                                         "Expected rtptime on PLAY with mode {:?}, missing on \
                                              stream {} ({:?}). Consider setting initial timestamp \
                                              mode permissive.",
-                                        policy.initial_timestamp, i, &s.control
+                                        policy.initial_timestamp, i, s.control
                                     ),
                                 });
                             }
@@ -2695,7 +2695,7 @@ impl PinnedDrop for SessionInner {
                 "{:?}/{} tracking TEARDOWN of session id {}",
                 session_group.debug_id(),
                 seqnum,
-                &session.id
+                session.id
             );
             Some(seqnum)
         } else {

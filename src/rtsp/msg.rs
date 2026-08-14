@@ -232,7 +232,7 @@ impl Response {
         write!(
             w,
             "RTSP/1.0 {:03} {}\r\n",
-            self.status_code.0, &self.reason_phrase,
+            self.status_code.0, self.reason_phrase,
         )?;
         self.headers.write(w)?;
         Ok(())
@@ -244,7 +244,7 @@ impl fmt::Display for Response {
         write!(
             f,
             "RTSP/1.0 {:03} {}\r\n{}",
-            self.status_code.0, &self.reason_phrase, self.headers,
+            self.status_code.0, self.reason_phrase, self.headers,
         )
     }
 }
@@ -504,7 +504,7 @@ impl fmt::Display for HeaderValue {
 
 impl fmt::Debug for HeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", &self.0)
+        write!(f, "{:?}", self.0)
     }
 }
 

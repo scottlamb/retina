@@ -154,7 +154,7 @@ impl Processor {
             scaler.run(&decoded, &mut scaled)?;
 
             let filename = format!("frame{}.ppm", self.decoded_frame_i);
-            info!("writing {}", &filename);
+            info!("writing {}", filename);
             write_ppm(&scaled, filename)?;
             self.decoded_frame_i += 1;
         }

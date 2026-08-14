@@ -1072,7 +1072,7 @@ impl InternalParameters {
             has_extra_trailing_data: &mut sps_has_extra_trailing_data,
         })
         .map_err(|e| format!("Bad SPS {sps_hex}: {e:?}"))?;
-        debug!("SPS {sps_hex}: {:#?}", &sps);
+        debug!("SPS {sps_hex}: {:#?}", sps);
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
             log::warn!(
                 "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."

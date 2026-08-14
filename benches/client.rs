@@ -101,7 +101,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
 }
 
 async fn read_to_eof(addr: SocketAddr) {
-    let url = Url::parse(&format!("rtsp://{}/", &addr)).unwrap();
+    let url = Url::parse(&format!("rtsp://{}/", addr)).unwrap();
     let mut session =
         retina::client::Session::describe(url, retina::client::SessionOptions::default())
             .await

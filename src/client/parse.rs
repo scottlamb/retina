@@ -362,7 +362,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
             if type_.media != &*media {
                 return Err(format!(
                     "SDP media type {} must match RTP payload type {:#?}",
-                    &media, type_
+                    media, type_
                 ));
             }
         }
@@ -462,7 +462,7 @@ pub(crate) fn parse_describe(
                 |e| {
                     warn!(
                         "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
-                        i, &e, raw_sdp
+                        i, e, raw_sdp
                     );
                     None
                 },

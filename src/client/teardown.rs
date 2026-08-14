@@ -130,7 +130,7 @@ pub(super) async fn teardown_loop_forever(
                         // Also, don't update tx, so await_teardown() won't
                         // fail early. Let's at least do an attempt with a fresh
                         // connection first.
-                        log::debug!("TEARDOWN {} on existing conn failed: {}", session_id, &e);
+                        log::debug!("TEARDOWN {} on existing conn failed: {}", session_id, e);
                     },
                 }
             },
@@ -169,7 +169,7 @@ pub(super) async fn teardown_loop_forever(
                         return
                     },
                     Err(e) => {
-                        log::debug!("TEARDOWN {} fresh connection attempt {} failed: {}", session_id, attempt_num, &e);
+                        log::debug!("TEARDOWN {} fresh connection attempt {} failed: {}", session_id, attempt_num, e);
                         let _ = tx.send(Some(Err(e)));
 
                         // Wait out the remaining time before trying again, to

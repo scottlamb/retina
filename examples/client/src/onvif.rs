@@ -62,7 +62,7 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
                     CodecItem::MessageFrame(m) => {
                         info!(
                             "{}: {}\n",
-                            &m.timestamp(),
+                            m.timestamp(),
                             std::str::from_utf8(m.data()).unwrap(),
                         );
                     },

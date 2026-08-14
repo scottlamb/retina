@@ -285,7 +285,7 @@ impl Display for ConnectionContext {
         write!(
             f,
             "{}(me)->{}@{}",
-            &self.local_addr, &self.peer_addr, &self.established_wall,
+            self.local_addr, self.peer_addr, self.established_wall,
         )
     }
 }
@@ -328,7 +328,7 @@ impl RtspMessageContext {
 
 impl Display for RtspMessageContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.pos, &self.received_wall)
+        write!(f, "{}@{}", self.pos, self.received_wall)
     }
 }
 

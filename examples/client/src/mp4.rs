@@ -514,7 +514,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     ) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
-            &frame.timestamp(),
+            frame.timestamp(),
             frame.data().remaining(),
         );
         let sample_description_index = if let (Some(i), false) = (
