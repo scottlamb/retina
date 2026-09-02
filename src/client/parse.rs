@@ -676,10 +676,26 @@ pub(crate) fn parse_play(
                     Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
                 },
                 "ssrc" => {
+                    // RFC 2326 fixes the radix for `ssrc` in the Transport header
+                    // (section 12.39, eight hex digits) but says nothing about it
+                    // in RTP-Info (section 12.33). Dahua reads that gap the other
+                    // way and writes the same SSRC as hex in Transport and decimal
+                    // in RTP-Info, so a session that set up cleanly dies at PLAY.
+                    //
+                    // Hex first, since that is what the convention and every
+                    // conforming server produce. Decimal only as a fallback.
+                    //
+                    // And when neither parses, warn rather than fail. This field
+                    // is advisory; `rtptime` two arms up already warns for exactly
+                    // that reason, and killing the session over it loses the
+                    // stream to save nothing.
                     let value = value.trim();
-                    let ssrc = u32::from_str_radix(value, 16)
-                        .map_err(|_| format!("Unparseable ssrc {value}"))?;
-                    state.ssrc = Some(ssrc);
+                    match u32::from_str_radix(value, 16).or_else(|_| value.parse::<u32>()) {
+                        Ok(ssrc) => state.ssrc = Some(ssrc),
+                        Err(_) => {
+                            warn!("Unparseable ssrc in RTP-Info header {:?}", rtp_info)
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1536,6 +1552,40 @@ mod tests {
             StreamState::Init(s) => {
                 assert_eq!(s.initial_seq, Some(0));
                 assert_eq!(s.initial_rtptime, Some(0));
+            }
+            _ => panic!(),
+        };
+    }
+
+    /// Some Dahua firmware writes the SSRC in decimal in the `RTP-Info` header
+    /// while writing the same value in hex in `Transport`, as RFC 2326 section
+    /// 12.39 requires. One device sent `ssrc=FFFFEF2D` at SETUP and
+    /// `ssrc=4294962989` at PLAY, which are the same number.
+    ///
+    /// Section 12.33, which defines `RTP-Info`, does not fix the radix, so this
+    /// is not clearly a camera bug. Parsing it as hex only turned a session that
+    /// had set up cleanly into a hard failure at PLAY.
+    #[test]
+    fn dahua_rtp_info_decimal_ssrc() {
+        init_logging();
+        let prefix =
+            "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+        let mut p = parse_describe(
+            prefix,
+            include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
+        )
+        .unwrap();
+        p.streams[0].state = dummy_stream_state_init(Some(0xffff_ef2d));
+        super::parse_play(
+            &response(include_bytes!("testdata/dahua_play_decimal_ssrc.txt")).0,
+            &mut p,
+        )
+        .unwrap();
+        match &p.streams[0].state {
+            StreamState::Init(s) => {
+                assert_eq!(s.initial_seq, Some(13210));
+                assert_eq!(s.initial_rtptime, Some(1_067_824_145));
+                assert_eq!(s.ssrc, Some(0xffff_ef2d));
             }
             _ => panic!(),
         };
