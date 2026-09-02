@@ -686,12 +686,17 @@ pub(crate) fn parse_play(
                     Ok(v) => state.initial_rtptime = Some(v),
                     Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
                 },
-                "ssrc" => {
-                    let value = value.trim();
-                    let ssrc = u32::from_str_radix(value, 16)
-                        .map_err(|_| format!("Unparseable ssrc {value}"))?;
-                    state.ssrc = Some(ssrc);
-                }
+                // `ssrc` is deliberately not read here. RTSP/1.0 defines no
+                // `ssrc` parameter for `RTP-Info` (RFC 2326 section 12.33);
+                // it is RTSP/2.0 that adds one. Servers that send it anyway
+                // disagree about the radix: Reolink writes hex, while some
+                // Dahua firmware writes decimal here and the same value in
+                // hex in `Transport`. Guessing is worse than ignoring. About
+                // 2.3% of 32-bit values written in decimal also parse as hex,
+                // to a different number, and the session would then reject
+                // every packet for carrying the wrong SSRC. The SSRC comes
+                // from the `Transport` header at SETUP when the server
+                // supplies one there, and from the first packet otherwise.
                 _ => {}
             }
         }
@@ -1132,7 +1137,9 @@ mod tests {
         match &p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(3075976528));
-                assert_eq!(state.ssrc, Some(0x9fc9fff8));
+                // The `ssrc=9fc9fff8` in `RTP-Info` is not read; with none in
+                // `Transport` either, it is learned from the first packet.
+                assert_eq!(state.ssrc, None);
             }
             _ => panic!(),
         };
@@ -1547,6 +1554,41 @@ mod tests {
             StreamState::Init(s) => {
                 assert_eq!(s.initial_seq, Some(0));
                 assert_eq!(s.initial_rtptime, Some(0));
+            }
+            _ => panic!(),
+        };
+    }
+
+    /// Some Dahua firmware writes the SSRC in decimal in the `RTP-Info` header
+    /// while writing the same value in hex in `Transport`. One device sent
+    /// `ssrc=FFFFEF2D` at SETUP and `ssrc=4294962989` at PLAY, which are the
+    /// same number.
+    ///
+    /// RTSP/1.0 does not define `ssrc` in `RTP-Info` at all, so the parameter
+    /// is ignored whatever it says: PLAY succeeds, and the SSRC stays the one
+    /// the `Transport` header gave. Parsing it as hex used to turn a session
+    /// that had set up cleanly into a hard failure here.
+    #[test]
+    fn dahua_rtp_info_decimal_ssrc() {
+        init_logging();
+        let prefix =
+            "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+        let mut p = parse_describe(
+            prefix,
+            include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
+        )
+        .unwrap();
+        p.streams[0].state = dummy_stream_state_init(Some(0xffff_ef2d));
+        super::parse_play(
+            &response(include_bytes!("testdata/dahua_play_decimal_ssrc.txt")).0,
+            &mut p,
+        )
+        .unwrap();
+        match &p.streams[0].state {
+            StreamState::Init(s) => {
+                assert_eq!(s.initial_seq, Some(13210));
+                assert_eq!(s.initial_rtptime, Some(1_067_824_145));
+                assert_eq!(s.ssrc, Some(0xffff_ef2d));
             }
             _ => panic!(),
         };
