@@ -976,8 +976,10 @@ enum StreamState {
 struct StreamStateInit {
     /// The RTP synchronization source (SSRC), as defined in
     /// [RFC 3550](https://tools.ietf.org/html/rfc3550). This is normally
-    /// supplied in the `SETUP` response's `Transport` header. Reolink cameras
-    /// instead supply it in the `PLAY` response's `RTP-Info` header.
+    /// supplied in the `SETUP` response's `Transport` header; when it is not,
+    /// it is learned from the first packet. Reolink cameras, and some Dahua
+    /// firmware, also write an `ssrc` in the `PLAY` response's `RTP-Info`
+    /// header, which RTSP/1.0 does not define; that one is ignored.
     ssrc: Option<u32>,
 
     /// The initial RTP sequence number, as specified in the `PLAY` response's
