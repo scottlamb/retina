@@ -1,0 +1,6 @@
+RTSP/1.0 200 OK
+Server: Rtsp Server/2.0
+CSeq: 4
+Session: 555290206560
+RTP-Info: url=trackID=0;seq=13210;rtptime=1067824145;ssrc=4294962989
+
