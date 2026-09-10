@@ -567,9 +567,15 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let transport_str: &str = transport;
     for part in transport_str.split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
+            // Some cameras (eg Rubetek) send `ssrc=0x6f7c`, where RFC 2326
+            // section 12.39 asks for eight hex digits without a prefix. The
+            // value is advisory: when absent, the SSRC is learned from the
+            // first RTP packet. So warn and ignore it rather than fail SETUP.
             let v = v.trim();
-            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
-            ssrc = Some(v);
+            match u32::from_str_radix(v, 16) {
+                Ok(v) => ssrc = Some(v),
+                Err(_) => warn!("Ignoring unparseable ssrc in Transport header {transport_str:?}"),
+            }
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
@@ -1559,6 +1565,28 @@ mod tests {
                 },
                 channel_id: Some(0),
                 ssrc: Some(0x0d6d6627),
+                server_port: None,
+            }
+        );
+    }
+
+    /// Rubetek cameras send the SSRC with a `0x` prefix in the Transport
+    /// header (e.g. `ssrc=0x6f7c`). Ignore it rather than fail SETUP.
+    #[test]
+    fn rubetek_ssrc_with_0x_prefix() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/rubetek_setup_ssrc_0x.txt"));
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: "5657612475258969210".into(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: None,
                 server_port: None,
             }
         );
