@@ -1,0 +1,6 @@
+RTSP/1.0 200 OK
+CSeq: 4
+Session: 5657612475258969210
+Transport: RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=0x6f7c;mode="PLAY"
+WWW-Authenticate: Digest realm="Rubetek IP camera device",nonce="7257f76204da0f14294c763e2fba0411"
+
