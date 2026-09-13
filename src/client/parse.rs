@@ -740,6 +740,59 @@ mod tests {
         super::parse_describe(url, &resp, &body)
     }
 
+    #[test]
+    fn setup_transport_parameter_order() {
+        // Transport values captured from AERO CAM 907, GPI GPAL-0313M3G,
+        // and RVS FH8852V2_GC2053 cameras, including the AERO CAM UDP reply.
+        let cases = [
+            (
+                "RTP/AVP/TCP;unicast;ssrc=00000400;interleaved=0-1",
+                Some(0),
+                Some(0x400),
+                None,
+                None,
+            ),
+            (
+                "RTP/AVP/TCP;unicast;destination=192.168.1.214;source=192.168.1.20;interleaved=0-1",
+                Some(0),
+                None,
+                Some("192.168.1.20".parse().unwrap()),
+                None,
+            ),
+            (
+                "RTP/AVP/TCP;unicast;interleaved=0-1;ssrc=f8f79719;mode=play",
+                Some(0),
+                Some(0xf8f79719),
+                None,
+                None,
+            ),
+            (
+                "RTP/AVP;ssrc=00000401;unicast;client_port=50000-50001;server_port=56484-56485",
+                None,
+                Some(0x401),
+                None,
+                Some(56484),
+            ),
+        ];
+        for (transport, channel_id, ssrc, source, server_port) in cases {
+            let raw = format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: test;timeout=60\r\nTransport: {transport}\r\n\r\n"
+            );
+            let mut remaining = raw.as_bytes();
+            let mut parser = crate::rtsp::parse::Parser::default();
+            let (message, _) = parser.feed(&mut remaining).unwrap().unwrap();
+            assert!(remaining.is_empty());
+            let crate::rtsp::msg::Message::Response(response) = message else {
+                panic!("expected response");
+            };
+            let parsed = super::parse_setup(&response).unwrap();
+            assert_eq!(parsed.channel_id, channel_id, "{transport}");
+            assert_eq!(parsed.ssrc, ssrc, "{transport}");
+            assert_eq!(parsed.source, source, "{transport}");
+            assert_eq!(parsed.server_port, server_port, "{transport}");
+        }
+    }
+
     fn dummy_stream_state_init(ssrc: Option<u32>) -> StreamState {
         StreamState::Init(StreamStateInit {
             ssrc,
