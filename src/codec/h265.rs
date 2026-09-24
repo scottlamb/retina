@@ -435,97 +435,96 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let payload_len = pkt.payload_len();
         let buf = pkt.buf();
 
-        if meta.loss > 0 {
-            handler.loss(&Loss {
-                ctx: &meta.ctx,
-                reason: LossReason::PacketLoss { packets: meta.loss },
-            });
-        }
-
-        let mut r = Ok(());
-        let mut access_unit =
-            match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
-                DepacketizerInputState::New => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(meta, 0, false)
-                }
-                DepacketizerInputState::PreMark(mut access_unit) => {
-                    let loss = meta.loss;
-                    if loss > 0 {
-                        self.discard_au();
-                        if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
-                            // Loss within this access unit. Ignore until mark or new timestamp.
-                            self.input_state = if meta.mark {
-                                DepacketizerInputState::PostMark {
-                                    timestamp: meta.timestamp,
-                                    loss,
-                                }
-                            } else {
-                                DepacketizerInputState::Loss {
-                                    timestamp: meta.timestamp,
-                                    pkts: loss,
-                                }
-                            };
-                            return Ok(());
-                        }
-                        // A suffix of a previous access unit was lost; discard it.
-                        // A prefix of the new one may have been lost; try parsing.
-                        AccessUnit::start(meta, 0, false)
-                    } else if access_unit.timestamp.timestamp != meta.timestamp.timestamp {
-                        if access_unit.fu.is_some() {
-                            // Something went wrong: perhaps the end of the last fragmentation unit was dropped
-                            // without loss being indicated. Return error, but also process the current packet.
-                            r = Err(format!(
-                                "timestamp changed from {} to {} in the middle of a fragmented NAL",
-                                access_unit.timestamp, meta.timestamp
-                            ));
-                            self.discard_au();
-                            AccessUnit::start(meta, 0, false)
-                        } else {
-                            let last_nal_hdr = access_unit
-                                .meta
-                                .last_nal_hdr
-                                .ok_or("nals should not be empty".to_string())?;
-                            if can_end_au(last_nal_hdr.unit_type()) {
-                                access_unit.end_ctx = meta.ctx.clone();
-                                self.finalize_access_unit(access_unit, "ts change", buf, handler)?;
-                                AccessUnit::start(meta, 0, false)
-                            } else {
-                                log::debug!(
-                                    "Bogus mid-access unit timestamp change after {:?}",
-                                    last_nal_hdr
-                                );
-                                access_unit.timestamp.timestamp = meta.timestamp.timestamp;
-                                access_unit
+        let mut access_unit = match std::mem::replace(
+            &mut self.input_state,
+            DepacketizerInputState::New,
+        ) {
+            DepacketizerInputState::New => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                AccessUnit::start(meta, 0, false)
+            }
+            DepacketizerInputState::PreMark(mut access_unit) => {
+                let loss = meta.loss;
+                if loss > 0 {
+                    self.discard_au();
+                    if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
+                        // Loss within this access unit. Ignore until mark or new timestamp.
+                        self.input_state = if meta.mark {
+                            DepacketizerInputState::PostMark {
+                                timestamp: meta.timestamp,
+                                loss,
                             }
-                        }
-                    } else {
-                        access_unit
-                    }
-                }
-                DepacketizerInputState::PostMark {
-                    timestamp: state_ts,
-                    loss,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(meta, loss, state_ts.timestamp == meta.timestamp.timestamp)
-                }
-                DepacketizerInputState::Loss {
-                    timestamp,
-                    mut pkts,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    if meta.timestamp.timestamp == timestamp.timestamp {
-                        pkts += meta.loss;
-                        self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
+                        } else {
+                            DepacketizerInputState::Loss {
+                                timestamp: meta.timestamp,
+                                pkts: loss,
+                            }
+                        };
                         return Ok(());
                     }
-                    AccessUnit::start(meta, pkts, false)
+                    // A suffix of a previous access unit was lost; discard it.
+                    // A prefix of the new one may have been lost; try parsing.
+                    AccessUnit::start(meta, 0, false)
+                } else if access_unit.timestamp.timestamp != meta.timestamp.timestamp {
+                    if access_unit.fu.is_some() {
+                        // Something went wrong: perhaps the end of the last fragmentation unit was dropped
+                        // without loss being indicated. Report corruption, but also process the current packet.
+                        handler.loss(&Loss {
+                                ctx: &meta.ctx,
+                                reason: LossReason::Corrupt {
+                                    description: format!(
+                                        "timestamp changed from {} to {} in the middle of a fragmented NAL",
+                                        access_unit.timestamp, meta.timestamp
+                                    ),
+                                },
+                            });
+                        self.discard_au();
+                        AccessUnit::start(meta, 0, false)
+                    } else {
+                        let last_nal_hdr = access_unit
+                            .meta
+                            .last_nal_hdr
+                            .ok_or("nals should not be empty".to_string())?;
+                        if can_end_au(last_nal_hdr.unit_type()) {
+                            access_unit.end_ctx = meta.ctx.clone();
+                            self.finalize_access_unit(access_unit, "ts change", buf, handler)?;
+                            AccessUnit::start(meta, 0, false)
+                        } else {
+                            log::debug!(
+                                "Bogus mid-access unit timestamp change after {:?}",
+                                last_nal_hdr
+                            );
+                            access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                            access_unit
+                        }
+                    }
+                } else {
+                    access_unit
                 }
-            };
+            }
+            DepacketizerInputState::PostMark {
+                timestamp: state_ts,
+                loss,
+            } => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                AccessUnit::start(meta, loss, state_ts.timestamp == meta.timestamp.timestamp)
+            }
+            DepacketizerInputState::Loss {
+                timestamp,
+                mut pkts,
+            } => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                if meta.timestamp.timestamp == timestamp.timestamp {
+                    pkts += meta.loss;
+                    self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
+                    return Ok(());
+                }
+                AccessUnit::start(meta, pkts, false)
+            }
+        };
 
         let mark = meta.mark;
         let loss = meta.loss;
@@ -723,7 +722,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         } else {
             DepacketizerInputState::PreMark(access_unit)
         };
-        r
+        Ok(())
     }
 
     /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
@@ -1823,7 +1822,7 @@ mod tests {
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        let e = {
+        {
             let pkt = ReceivedPacketBuilder {
                 // plain PREFIX_SEI packet.
                 ctx: PacketContext::dummy(),
@@ -1844,9 +1843,10 @@ mod tests {
                 &mut buf,
             )
         }
-        .unwrap_err();
+        .unwrap();
+        let Some(Err(e)) = d.pull() else { panic!() };
         assert_eq!(
-            e,
+            e.description,
             "timestamp changed from 0 (mod-2^32: 0), npt 0.000 to 1 (mod-2^32: 1), npt 0.000 in the middle of a fragmented NAL"
         );
         let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {

@@ -600,13 +600,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let payload_len = pkt.payload_len();
         let buf = pkt.buf();
 
-        if meta.loss > 0 {
-            handler.loss(&Loss {
-                ctx: &meta.ctx,
-                reason: LossReason::PacketLoss { packets: meta.loss },
-            });
-        }
-
         let mut access_unit = match std::mem::replace(
             &mut self.input_state,
             DepacketizerInputState::New,
@@ -3656,6 +3649,16 @@ mod tests {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
+        if loss > 0 {
+            // As `crate::codec::Depacketizer::push` does.
+            crate::codec::Handler::<crate::PacketContext>::loss(
+                h,
+                &crate::codec::Loss {
+                    ctx: &meta.ctx,
+                    reason: crate::codec::LossReason::PacketLoss { packets: loss },
+                },
+            );
+        }
         d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
     }
 

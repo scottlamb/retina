@@ -1055,6 +1055,33 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// This never fails: lost packets and corrupt data are reported via
+    /// [`Handler::loss`], and the depacketizer resynchronizes at the next
+    /// frame boundary. It's up to the handler whether to treat this as fatal.
+    #[allow(dead_code)] // TODO: remove when this is public API.
+    pub(crate) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl Handler<Ctx>) {
+        if pkt.meta.loss > 0 {
+            handler.loss(&Loss {
+                ctx: &pkt.meta.ctx,
+                reason: LossReason::PacketLoss {
+                    packets: pkt.meta.loss,
+                },
+            });
+        }
+        if let Err(description) = self.push_with(pkt, handler) {
+            handler.loss(&Loss {
+                ctx: &pkt.meta.ctx,
+                reason: LossReason::Corrupt { description },
+            });
+        }
+    }
+
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// Unlike [`Depacketizer::push`], this doesn't report packet loss, and
+    /// it returns some errors (those detected before any events for the
+    /// packet) rather than reporting them via [`Handler::loss`].
     pub(crate) fn push_with(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
@@ -1080,7 +1107,7 @@ impl Depacketizer<crate::PacketContext> {
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `None`. The later
     /// `push` call may panic or drop data if this expectation is violated.
-    pub(crate) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    pub(crate) fn push_legacy(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
@@ -1110,6 +1137,244 @@ impl Depacketizer<crate::PacketContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buf::MarkBuf;
+    use events::testutil::{Event, Recorder, hex};
+
+    /// Pushes a packet via the infallible `push`.
+    fn push(
+        d: &mut Depacketizer,
+        buf: &mut MarkBuf,
+        (sequence_number, timestamp, mark, loss): (u16, i64, bool, u16),
+        payload: &[u8],
+        h: &mut Recorder,
+    ) {
+        let meta = crate::rtp::PacketMeta {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp::new(timestamp, NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            ssrc: 0,
+            sequence_number,
+            mark,
+            loss,
+        };
+        let pos = buf.end();
+        buf.extend(payload);
+        buf.advance_unparsed(buf.end());
+        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16), h);
+        d.check_invariants();
+    }
+
+    #[cfg(feature = "h264")]
+    fn h264() -> Depacketizer {
+        Depacketizer::new(
+            "video",
+            "h264",
+            90_000,
+            None,
+            Some(
+                "packetization-mode=1;profile-level-id=4d002a;\
+                 sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+            ),
+        )
+        .unwrap()
+    }
+
+    fn assert_corrupt(events: &[Event]) {
+        assert!(
+            matches!(events, [Event::Loss(LossReason::Corrupt { .. })]),
+            "{events:#?}"
+        );
+    }
+
+    #[cfg(feature = "h264")]
+    fn idr_frame() -> Vec<Event> {
+        vec![
+            Event::FrameStart {
+                loss: 0,
+                is_random_access_point: true,
+                is_disposable: false,
+                has_new_parameters: false,
+            },
+            Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
+            Event::FrameEnd {
+                loss: 0,
+                is_random_access_point: true,
+                is_disposable: false,
+                has_new_parameters: false,
+                data: Some(hex(b"\x00\x00\x00\x06\x65slice")),
+            },
+        ]
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn forbidden_bit_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\xe5slice", &mut h);
+        assert_corrupt(&h.take());
+        push(&mut d, &mut buf, (1, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn empty_payload_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"", &mut h);
+        assert_corrupt(&h.take());
+        push(&mut d, &mut buf, (1, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    /// Corruption after `frame_start` abandons the frame; the next frame recovers.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn recovery_after_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        assert_eq!(h.take().len(), 2); // FrameStart, Data(Start).
+
+        // A STAP-A isn't allowed while a FU-A is in progress.
+        push(
+            &mut d,
+            &mut buf,
+            (1, 0, false, 0),
+            b"\x18\x00\x02\x06x",
+            &mut h,
+        );
+        assert_corrupt(&h.take());
+
+        // The rest of the access unit is ignored until the next one starts.
+        push(&mut d, &mut buf, (2, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn loss_within_frame() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        h.take();
+        push(&mut d, &mut buf, (3, 0, true, 2), b"\x7c\x45end", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::PacketLoss { packets: 2 })]
+        );
+        push(&mut d, &mut buf, (4, 1, true, 0), b"\x65slice", &mut h);
+        let mut expected = idr_frame();
+        for e in &mut expected {
+            match e {
+                Event::FrameStart { loss, .. } | Event::FrameEnd { loss, .. } => *loss = 2,
+                _ => {}
+            }
+        }
+        assert_eq!(h.take(), expected);
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn loss_across_frames() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+        push(&mut d, &mut buf, (2, 1, true, 1), b"\x41slice", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Loss(LossReason::PacketLoss { packets: 1 }),
+                Event::FrameStart {
+                    loss: 1,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
+                Event::FrameEnd {
+                    loss: 1,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x41slice")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_events() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new("audio", "pcmu", 8_000, None, None).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"abcd", &mut h);
+        push(&mut d, &mut buf, (3, 4, true, 2), b"efgh", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::AudioFrame(hex(b"abcd")),
+                Event::Loss(LossReason::PacketLoss { packets: 2 }),
+                Event::AudioFrame(hex(b"efgh")),
+            ]
+        );
+    }
+
+    #[test]
+    fn aac_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new(
+            "audio",
+            "mpeg4-generic",
+            12_000,
+            NonZeroU16::new(2),
+            Some(
+                "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                 indexdeltalength=3;config=1490",
+            ),
+        )
+        .unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\x00", &mut h);
+        assert_corrupt(&h.take());
+
+        // One AU header (size 4), then the AU.
+        push(
+            &mut d,
+            &mut buf,
+            (1, 1024, true, 0),
+            b"\x00\x10\x00\x20abcd",
+            &mut h,
+        );
+        assert_eq!(h.take(), vec![Event::AudioFrame(hex(b"abcd"))]);
+    }
+
+    #[test]
+    fn message_events() {
+        crate::testutil::init_logging();
+        let mut d =
+            Depacketizer::new("application", "vnd.onvif.metadata", 90_000, None, None).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"<a>", &mut h);
+        push(&mut d, &mut buf, (1, 0, true, 0), b"</a>", &mut h);
+        assert_eq!(h.take(), vec![Event::MessageFrame(hex(b"<a></a>"))]);
+    }
 
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
