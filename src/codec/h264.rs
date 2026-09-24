@@ -15,7 +15,10 @@ use log::{debug, log_enabled, trace};
 
 use crate::Error;
 use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
-use crate::codec::{AllPixelDimensions, DepacketizeError};
+use crate::codec::{
+    Accumulate, AllPixelDimensions, DepacketizeError, FrameBody, FrameEnd, FrameStart, Handler,
+    Loss, LossReason, ParametersRef,
+};
 use crate::inputs::Input as _;
 use crate::{
     Timestamp,
@@ -23,7 +26,7 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoFrame, VideoParameters};
+use super::{CodecItem, VideoParameters};
 
 /// Produce [`VideoParameters`] from SPS and PPS NAL units.
 ///
@@ -87,11 +90,11 @@ pub fn parameters_from_sps_and_pps(
 /// Finally, it errors on the sequence `00 00 02`, which is not allowed in
 /// a single NAL or on an Annex B byte stream.
 #[derive(Debug)]
-pub(crate) struct Depacketizer {
-    input_state: DepacketizerInputState,
+pub(crate) struct Depacketizer<Ctx> {
+    input_state: DepacketizerInputState<Ctx>,
 
-    /// Completed items ready to be pulled.
-    pending: VecDeque<Result<VideoFrame, DepacketizeError>>,
+    /// Completed items ready to be pulled via the legacy `push`/`pull` interface.
+    pending: VecDeque<Result<CodecItem, DepacketizeError>>,
 
     parameters: Option<InternalParameters>,
 
@@ -133,11 +136,10 @@ struct Nal {
 
 /// An access unit that is currently being accumulated during `PreMark` state.
 #[derive(Debug)]
-struct AccessUnit {
-    start_ctx: crate::PacketContext,
-    end_ctx: crate::PacketContext,
+struct AccessUnit<Ctx> {
+    start_ctx: Ctx,
+    end_ctx: Ctx,
     timestamp: crate::Timestamp,
-    stream_id: usize,
 
     /// FU-A fragmentation unit state, if any.
     fu_a: Option<FuA>,
@@ -214,7 +216,7 @@ impl super::h26x::NalHandler for H264NalHandler<'_> {
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-enum DepacketizerInputState {
+enum DepacketizerInputState<Ctx> {
     /// Not yet processing an access unit.
     New,
 
@@ -226,7 +228,7 @@ enum DepacketizerInputState {
 
     /// Currently processing an access unit.
     /// This will be flushed after a marked packet or when receiving a later timestamp.
-    PreMark(AccessUnit),
+    PreMark(AccessUnit<Ctx>),
 
     /// Finished processing the given packet. It's an error to receive the same timestamp again.
     PostMark {
@@ -287,7 +289,7 @@ fn process_annex_b(
     Ok(())
 }
 
-impl Depacketizer {
+impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new(
         clock_rate: u32,
         format_specific_params: Option<&str>,
@@ -365,8 +367,13 @@ impl Depacketizer {
             .map(|p| super::ParametersRef::Video(&p.generic_parameters))
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        let r = self.push_inner(pkt);
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        let r = self.push_inner(pkt, handler);
 
         // Several error paths within `push_inner` just use the `?` operator to bail out with
         // `input_state` at `New` when they encounter a problem mid-access unit. Restore
@@ -377,109 +384,108 @@ impl Depacketizer {
         r
     }
 
-    fn push_inner(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        let meta = pkt.meta;
+    fn push_inner(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        let meta = &pkt.meta;
         let payload_pos = pkt.payload_pos();
         let payload_len = pkt.payload_len();
         let buf = pkt.buf();
-        // Push shouldn't be called until pull is exhausted.
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
 
-        let mut access_unit =
-            match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
-                DepacketizerInputState::New => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&meta, 0, false)
-                }
-                DepacketizerInputState::PreMark(mut access_unit) => {
-                    let loss = meta.loss;
-                    if loss > 0 {
-                        self.discard_au();
-                        if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
-                            // Loss within this access unit. Ignore until mark or new timestamp.
-                            self.input_state = if meta.mark {
-                                DepacketizerInputState::PostMark {
-                                    timestamp: meta.timestamp,
-                                    loss,
-                                }
-                            } else {
-                                DepacketizerInputState::Loss {
-                                    timestamp: meta.timestamp,
-                                    pkts: loss,
-                                }
-                            };
-                            return Ok(());
-                        }
-                        // A suffix of a previous access unit was lost; discard it.
-                        // A prefix of the new one may have been lost; try parsing.
-                        AccessUnit::start(&meta, 0, false)
-                    } else if access_unit.timestamp.timestamp != meta.timestamp.timestamp {
-                        if access_unit.fu_a.is_some() {
-                            self.pending.push_back(Err(DepacketizeError {
-                                pkt_ctx: meta.ctx,
-                                ssrc: meta.ssrc,
-                                sequence_number: meta.sequence_number,
-                                description: format!(
-                                "timestamp changed from {} to {} in the middle of a fragmented NAL",
-                                access_unit.timestamp,
-                                meta.timestamp),
-                            }));
-                            self.discard_au();
-                            AccessUnit::start(&meta, 0, false)
-                        } else {
-                            match self.nals.last() {
-                                Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
-                                    access_unit.end_ctx = meta.ctx;
-                                    let f =
-                                        self.finalize_access_unit(access_unit, "ts change", buf)?;
-                                    self.pending.push_back(Ok(f));
-                                    AccessUnit::start(&meta, 0, false)
-                                }
-                                Some(n) => {
-                                    log::debug!(
-                                        "Bogus mid-access unit timestamp change after {:?}",
-                                        n.hdr
-                                    );
-                                    access_unit.timestamp.timestamp = meta.timestamp.timestamp;
-                                    access_unit
-                                }
-                                None => {
-                                    access_unit.timestamp.timestamp = meta.timestamp.timestamp;
-                                    access_unit
-                                }
+        let mut access_unit = match std::mem::replace(
+            &mut self.input_state,
+            DepacketizerInputState::New,
+        ) {
+            DepacketizerInputState::New => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                AccessUnit::start(meta, 0, false)
+            }
+            DepacketizerInputState::PreMark(mut access_unit) => {
+                let loss = meta.loss;
+                if loss > 0 {
+                    self.discard_au();
+                    if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
+                        // Loss within this access unit. Ignore until mark or new timestamp.
+                        self.input_state = if meta.mark {
+                            DepacketizerInputState::PostMark {
+                                timestamp: meta.timestamp,
+                                loss,
                             }
-                        }
-                    } else {
-                        access_unit
-                    }
-                }
-                DepacketizerInputState::PostMark {
-                    timestamp: state_ts,
-                    loss,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&meta, loss, state_ts.timestamp == meta.timestamp.timestamp)
-                }
-                DepacketizerInputState::Loss {
-                    timestamp,
-                    mut pkts,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    if meta.timestamp.timestamp == timestamp.timestamp {
-                        pkts += meta.loss;
-                        self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
+                        } else {
+                            DepacketizerInputState::Loss {
+                                timestamp: meta.timestamp,
+                                pkts: loss,
+                            }
+                        };
                         return Ok(());
                     }
-                    AccessUnit::start(&meta, pkts, false)
+                    // A suffix of a previous access unit was lost; discard it.
+                    // A prefix of the new one may have been lost; try parsing.
+                    AccessUnit::start(meta, 0, false)
+                } else if access_unit.timestamp.timestamp != meta.timestamp.timestamp {
+                    if access_unit.fu_a.is_some() {
+                        handler.loss(&Loss {
+                                ctx: &meta.ctx,
+                                reason: LossReason::Corrupt {
+                                    description: format!(
+                                        "timestamp changed from {} to {} in the middle of a fragmented NAL",
+                                        access_unit.timestamp, meta.timestamp
+                                    ),
+                                },
+                            });
+                        self.discard_au();
+                        AccessUnit::start(meta, 0, false)
+                    } else {
+                        match self.nals.last() {
+                            Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+                                access_unit.end_ctx = meta.ctx.clone();
+                                self.finalize_access_unit(access_unit, "ts change", buf, handler)?;
+                                AccessUnit::start(meta, 0, false)
+                            }
+                            Some(n) => {
+                                log::debug!(
+                                    "Bogus mid-access unit timestamp change after {:?}",
+                                    n.hdr
+                                );
+                                access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                                access_unit
+                            }
+                            None => {
+                                access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                                access_unit
+                            }
+                        }
+                    }
+                } else {
+                    access_unit
                 }
-            };
+            }
+            DepacketizerInputState::PostMark {
+                timestamp: state_ts,
+                loss,
+            } => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                AccessUnit::start(meta, loss, state_ts.timestamp == meta.timestamp.timestamp)
+            }
+            DepacketizerInputState::Loss {
+                timestamp,
+                mut pkts,
+            } => {
+                debug_assert!(self.nals.is_empty());
+                debug_assert!(self.pieces.is_empty());
+                if meta.timestamp.timestamp == timestamp.timestamp {
+                    pkts += meta.loss;
+                    self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
+                    return Ok(());
+                }
+                AccessUnit::start(meta, pkts, false)
+            }
+        };
 
-        let ctx = meta.ctx;
         let mark = meta.mark;
         let loss = meta.loss;
         let timestamp = meta.timestamp;
@@ -646,9 +652,8 @@ impl Depacketizer {
         self.input_state = if mark {
             match self.nals.last() {
                 Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
-                    access_unit.end_ctx = ctx;
-                    let f = self.finalize_access_unit(access_unit, "mark", buf)?;
-                    self.pending.push_back(Ok(f));
+                    access_unit.end_ctx = meta.ctx.clone();
+                    self.finalize_access_unit(access_unit, "mark", buf, handler)?;
                     DepacketizerInputState::PostMark { timestamp, loss: 0 }
                 }
                 Some(n) => {
@@ -662,12 +667,6 @@ impl Depacketizer {
             DepacketizerInputState::PreMark(access_unit)
         };
         Ok(())
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
-        self.pending
-            .pop_front()
-            .map(|r| r.map(CodecItem::VideoFrame))
     }
 
     /// Scans ring buffer data for NAL units using `AnnexBScanner`, splitting
@@ -700,7 +699,7 @@ impl Depacketizer {
     /// Logs information about each access unit.
     /// Currently, "bad" access units (violating certain specification rules)
     /// are logged at debug priority, and others are logged at trace priority.
-    fn log_access_unit(&self, au: &AccessUnit, reason: &str) {
+    fn log_access_unit(&self, au: &AccessUnit<Ctx>, reason: &str) {
         let mut errs = String::new();
         if au.same_ts_as_prev {
             errs.push_str("\n* same timestamp as previous access unit");
@@ -729,14 +728,12 @@ impl Depacketizer {
 
     fn finalize_access_unit(
         &mut self,
-        au: AccessUnit,
+        au: AccessUnit<Ctx>,
         reason: &str,
         buf: &MarkBuf,
-    ) -> Result<VideoFrame, String> {
-        use super::{ParameterSetInsertion, h26x::Framing};
-
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
         let mut piece_idx = 0;
-        let mut retained_len = 0usize;
         let mut is_random_access_point = true;
         let mut is_disposable = true;
         let mut new_sps = None;
@@ -776,14 +773,6 @@ impl Depacketizer {
             if nal.hdr.nal_ref_idc() != 0 {
                 is_disposable = false;
             }
-            // Always strip inline parameter sets; they're handled via
-            // ParameterSetInsertion and the canonical copy in self.parameters.
-            if !matches!(
-                nal.hdr.nal_unit_type(),
-                UnitType::SeqParameterSet | UnitType::PicParameterSet
-            ) {
-                retained_len += 4usize + crate::to_usize(nal.len);
-            }
             piece_idx = next_piece_idx;
         }
 
@@ -821,75 +810,210 @@ impl Depacketizer {
             _ => false,
         };
 
-        // Determine whether to prepend parameter sets.
-        let prepend_params = is_random_access_point
-            && match self.frame_format.parameter_set_insertion {
-                ParameterSetInsertion::EachKeyFrame => true,
-                ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
-            };
-        if prepend_params && let Some(ref p) = self.parameters {
-            // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
-            retained_len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
-        }
+        let accumulate = handler.frame_start(&FrameStart {
+            timestamp: au.timestamp,
+            ctx: &au.start_ctx,
+            loss: au.loss,
+            is_random_access_point,
+            is_disposable,
+            has_new_parameters,
+            parameters: self
+                .parameters
+                .as_ref()
+                .map(|p| ParametersRef::Video(&p.generic_parameters)),
+        });
 
-        let mut data = Vec::with_capacity(retained_len);
-
-        // Prepend parameter sets if requested.
-        if prepend_params && let Some(ref p) = self.parameters {
-            for param_nal in [&p.sps_nal, &p.pps_nal] {
-                let prefix = match self.frame_format.h26x_framing {
-                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
-                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
-                };
-                data.extend_from_slice(&prefix);
-                data.extend_from_slice(param_nal);
-            }
-        }
-
-        // Write non-parameter-set NALs with the configured framing.
+        // Deliver non-parameter-set NALs.
         piece_idx = 0;
         for nal in &self.nals {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            if !matches!(
-                nal.hdr.nal_unit_type(),
-                UnitType::SeqParameterSet | UnitType::PicParameterSet
-            ) {
-                let prefix = match self.frame_format.h26x_framing {
+            if !is_parameter_set(nal.hdr) {
+                super::h26x::deliver(
+                    handler,
+                    &[u8::from(nal.hdr)],
+                    &self.pieces[piece_idx..next_piece_idx],
+                    buf,
+                    true,
+                    true,
+                );
+            }
+            piece_idx = next_piece_idx;
+        }
+
+        handler.frame_end(&mut FrameEnd {
+            timestamp: au.timestamp,
+            start_ctx: &au.start_ctx,
+            end_ctx: &au.end_ctx,
+            loss: au.loss,
+            is_random_access_point,
+            is_disposable,
+            has_new_parameters,
+            body: FrameBody::H264(FrameEndBody {
+                au: (accumulate == Accumulate::Yes).then_some(AuData {
+                    nals: &self.nals,
+                    pieces: &self.pieces,
+                    buf,
+                }),
+                parameters: &mut self.parameters,
+                is_random_access_point,
+                has_new_parameters,
+            }),
+        });
+        self.nals.clear();
+        self.pieces.clear();
+        self.mark = None;
+        Ok(())
+    }
+}
+
+impl Depacketizer<crate::PacketContext> {
+    /// Supplies a new packet via the legacy `push`/`pull` interface.
+    ///
+    /// Between any two calls to `push`, the caller must call `pull` until it
+    /// returns `None`.
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        if let Some(p) = self.pending.front() {
+            panic!("push with data already pending: {p:?}");
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        let format = self.frame_format;
+        let r = self.push_with(
+            pkt,
+            &mut super::LegacyHandler {
+                pending: &mut pending,
+                meta: &pkt.meta,
+                format,
+            },
+        );
+        self.pending = pending;
+        r
+    }
+
+    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
+        self.pending.pop_front()
+    }
+}
+
+/// Returns true if the given NAL is a parameter set.
+///
+/// These are stripped from frame data; see [`super::ParameterSetInsertion`].
+fn is_parameter_set(hdr: NalHeader) -> bool {
+    matches!(
+        hdr.nal_unit_type(),
+        UnitType::SeqParameterSet | UnitType::PicParameterSet
+    )
+}
+
+/// Access to a finished access unit, for [`FrameEnd`].
+pub(crate) struct FrameEndBody<'a> {
+    /// The access unit's data, if accumulated and not yet taken.
+    au: Option<AuData<'a>>,
+    parameters: &'a mut Option<InternalParameters>,
+    is_random_access_point: bool,
+    has_new_parameters: bool,
+}
+
+struct AuData<'a> {
+    nals: &'a [Nal],
+    pieces: &'a [BufRange],
+    buf: &'a MarkBuf,
+}
+
+impl FrameEndBody<'_> {
+    pub(super) fn parameters(&self) -> Option<ParametersRef<'_>> {
+        self.parameters
+            .as_ref()
+            .map(|p| ParametersRef::Video(&p.generic_parameters))
+    }
+
+    /// Returns the parameters to prepend to the frame in the given format, if any.
+    fn prepend_params(&self, format: super::FrameFormat) -> Option<&InternalParameters> {
+        use super::ParameterSetInsertion;
+        let prepend = self.is_random_access_point
+            && match format.parameter_set_insertion {
+                ParameterSetInsertion::EachKeyFrame => true,
+                ParameterSetInsertion::OnChange => self.has_new_parameters,
+                ParameterSetInsertion::Never => false,
+            };
+        if prepend {
+            self.parameters.as_ref()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn data_len(&self, format: super::FrameFormat) -> Option<usize> {
+        let au = self.au.as_ref()?;
+        let mut len = 0;
+        if let Some(p) = self.prepend_params(format) {
+            // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
+            len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+        }
+        for nal in au.nals {
+            if !is_parameter_set(nal.hdr) {
+                len += 4 + crate::to_usize(nal.len);
+            }
+        }
+        Some(len)
+    }
+
+    pub(super) fn visit(
+        &self,
+        format: super::FrameFormat,
+        visitor: &mut impl FnMut(&[u8]),
+    ) -> bool {
+        use super::h26x::Framing;
+        let Some(au) = self.au.as_ref() else {
+            return false;
+        };
+
+        // Prepend parameter sets if requested.
+        if let Some(p) = self.prepend_params(format) {
+            for param_nal in [&p.sps_nal, &p.pps_nal] {
+                let prefix = match format.h26x_framing {
+                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                visitor(&prefix);
+                visitor(param_nal);
+            }
+        }
+
+        // Write non-parameter-set NALs with the requested framing.
+        let mut piece_idx = 0;
+        for nal in au.nals {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            if !is_parameter_set(nal.hdr) {
+                let prefix = match format.h26x_framing {
                     Framing::FourByteLength => nal.len.to_be_bytes(),
                     Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
                 };
-                data.extend_from_slice(&prefix);
-                data.push(nal.hdr.into());
+                visitor(&prefix);
+                visitor(&[u8::from(nal.hdr)]);
                 let mut actual_len = 1usize;
-                for piece in nal_pieces {
+                for piece in &au.pieces[piece_idx..next_piece_idx] {
                     debug_assert!(piece.len > 0);
-                    let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
-                    data.extend_from_slice(s1);
-                    data.extend_from_slice(s2);
-                    actual_len += piece.len as usize;
+                    let (s1, s2) = au.buf.split(piece.pos, usize::from(piece.len)).slices();
+                    visitor(s1);
+                    if !s2.is_empty() {
+                        visitor(s2);
+                    }
+                    actual_len += usize::from(piece.len);
                 }
                 debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             }
             piece_idx = next_piece_idx;
         }
-        debug_assert_eq!(retained_len, data.len());
-        self.nals.clear();
-        self.pieces.clear();
-        self.mark = None;
+        true
+    }
 
-        Ok(VideoFrame {
-            has_new_parameters,
-            loss: au.loss,
-            start_ctx: au.start_ctx,
-            end_ctx: au.end_ctx,
-            timestamp: au.timestamp,
-            stream_id: au.stream_id,
-            is_random_access_point,
-            is_disposable,
-            data,
-        })
+    pub(super) fn build(&mut self, format: super::FrameFormat) -> Option<Vec<u8>> {
+        let len = self.data_len(format)?;
+        let mut data = Vec::with_capacity(len);
+        self.visit(format, &mut |chunk| data.extend_from_slice(chunk));
+        debug_assert_eq!(len, data.len());
+        self.au = None;
+        Some(data)
     }
 }
 
@@ -910,13 +1034,16 @@ fn can_end_au(nal_unit_type: UnitType) -> bool {
     )
 }
 
-impl AccessUnit {
-    fn start(meta: &crate::rtp::PacketMeta, additional_loss: u16, same_ts_as_prev: bool) -> Self {
+impl<Ctx: Clone> AccessUnit<Ctx> {
+    fn start(
+        meta: &crate::rtp::PacketMeta<Ctx>,
+        additional_loss: u16,
+        same_ts_as_prev: bool,
+    ) -> Self {
         AccessUnit {
-            start_ctx: meta.ctx,
-            end_ctx: meta.ctx,
+            start_ctx: meta.ctx.clone(),
+            end_ctx: meta.ctx.clone(),
             timestamp: meta.timestamp,
-            stream_id: meta.stream_id,
             fu_a: None,
 
             // TODO: overflow?
@@ -1547,7 +1674,7 @@ mod tests {
 
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
-        d: &mut Depacketizer,
+        d: &mut Depacketizer<crate::PacketContext>,
         meta: crate::rtp::PacketMeta,
         payload: &[u8],
         buf: &mut MarkBuf,
@@ -3369,5 +3496,173 @@ mod tests {
         );
         assert!(frame.is_random_access_point());
         assert_eq!(d.pull(), None);
+    }
+
+    /// Helper: writes payload into `buf`, then pushes to depacketizer with a handler.
+    #[allow(clippy::too_many_arguments)]
+    fn push_events(
+        d: &mut Depacketizer<crate::PacketContext>,
+        buf: &mut MarkBuf,
+        sequence_number: u16,
+        timestamp: i64,
+        mark: bool,
+        loss: u16,
+        payload: &[u8],
+        h: &mut crate::codec::events::testutil::Recorder,
+    ) -> Result<(), String> {
+        let meta = crate::rtp::PacketMeta {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            mark,
+            loss,
+        };
+        let pos = buf.end();
+        buf.extend(payload);
+        buf.advance_unparsed(buf.end());
+        d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
+    }
+
+    const EVENTS_FMTP: &str = "packetization-mode=1;profile-level-id=4d002a;\
+                               sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==";
+
+    #[test]
+    fn events_accumulate() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06plain", &mut h).unwrap();
+        push_events(
+            &mut d,
+            &mut buf,
+            1,
+            0,
+            false,
+            0,
+            b"\x7c\x85fu-a start, ",
+            &mut h,
+        )
+        .unwrap();
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x7c\x45fu-a end", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x06plain")),
+                Event::Data(UnitPosition::Complete, hex(b"\x65fu-a start, fu-a end")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(
+                        b"\x00\x00\x00\x06\x06plain\x00\x00\x00\x15\x65fu-a start, fu-a end"
+                    )),
+                },
+            ]
+        );
+
+        // A disposable, non-IDR frame ended by a timestamp change.
+        push_events(&mut d, &mut buf, 3, 1, false, 0, b"\x01slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 4, 2, false, 0, b"\x01next", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: true,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x01slice")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: true,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x01slice")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn events_no_accumulate() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::No);
+        push_events(&mut d, &mut buf, 0, 0, true, 0, b"\x65slice", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn events_fu_a_interrupted_by_timestamp_change() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, LossReason, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        let events = h.take();
+        assert!(
+            matches!(&events[..], [Event::Loss(LossReason::Corrupt { .. }), ..]),
+            "{events:#?}"
+        );
+        assert_eq!(
+            events[1..],
+            [
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x41slice")),
+                },
+            ]
+        );
     }
 }

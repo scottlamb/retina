@@ -484,18 +484,18 @@ impl MarkBuf {
 ///
 /// Passed to [`Depacketizer::push`](crate::codec::Depacketizer::push),
 /// bundling packet metadata with buffer access.
-pub(crate) struct PacketRef<'a> {
-    pub meta: crate::rtp::PacketMeta,
+pub(crate) struct PacketRef<'a, Ctx = crate::PacketContext> {
+    pub meta: crate::rtp::PacketMeta<Ctx>,
     buf: &'a MarkBuf,
     payload_pos: u64,
     payload_len: u16,
 }
 
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
-impl<'a> PacketRef<'a> {
+impl<'a, Ctx> PacketRef<'a, Ctx> {
     /// Creates a `PacketRef`.
     pub fn new(
-        meta: crate::rtp::PacketMeta,
+        meta: crate::rtp::PacketMeta<Ctx>,
         buf: &'a MarkBuf,
         payload_pos: u64,
         payload_len: u16,

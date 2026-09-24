@@ -9,6 +9,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use std::num::{NonZeroU16, NonZeroU32};
 
@@ -102,6 +103,7 @@ macro_rules! write_mpeg4_descriptor {
 }
 
 pub mod aac;
+mod events;
 pub(crate) mod g723;
 pub mod h26x;
 pub(crate) mod jpeg;
@@ -115,6 +117,12 @@ pub mod h265;
 
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
+
+#[allow(unused_imports)] // TODO: publish.
+pub(crate) use events::{
+    Accumulate, AudioFrameRef, CompleteFrame, Data, FrameBody, FrameEnd, FrameStart, Handler, Loss,
+    LossReason, MessageFrameRef, UnitPosition,
+};
 
 /// Configuration options controlling how depacketized frames are formatted.
 ///
@@ -812,9 +820,9 @@ enum DepacketizerInner {
     SimpleAudio(Box<simple_audio::Depacketizer>),
     G723(Box<g723::Depacketizer>),
     #[cfg(feature = "h264")]
-    H264(Box<h264::Depacketizer>),
+    H264(Box<h264::Depacketizer<crate::PacketContext>>),
     #[cfg(feature = "h265")]
-    H265(Box<h265::Depacketizer>),
+    H265(Box<h265::Depacketizer<crate::PacketContext>>),
     Onvif(Box<onvif::Depacketizer>),
     Jpeg(Box<jpeg::Depacketizer>),
 }
@@ -830,6 +838,55 @@ pub struct DepacketizeError {
     pub(crate) ssrc: u32,
     pub(crate) sequence_number: u16,
     pub(crate) description: String,
+}
+
+/// Adapts [`Handler`] events to the legacy `push`/`pull` interface.
+///
+/// Accumulates every frame, queueing it as a [`CodecItem`]. Queues corruption
+/// as an error.
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
+pub(crate) struct LegacyHandler<'a> {
+    pub(crate) pending: &'a mut VecDeque<Result<CodecItem, DepacketizeError>>,
+
+    /// The packet being pushed.
+    pub(crate) meta: &'a crate::rtp::PacketMeta,
+
+    pub(crate) format: FrameFormat,
+}
+
+impl Handler<crate::PacketContext> for LegacyHandler<'_> {
+    fn frame_start(&mut self, _frame_start: &FrameStart<'_, crate::PacketContext>) -> Accumulate {
+        Accumulate::Yes
+    }
+
+    fn frame_end(&mut self, frame_end: &mut FrameEnd<'_, crate::PacketContext>) {
+        let data = frame_end
+            .complete_frame(self.format)
+            .expect("frame should be accumulated")
+            .into_data();
+        self.pending.push_back(Ok(CodecItem::VideoFrame(VideoFrame {
+            start_ctx: *frame_end.start_ctx(),
+            end_ctx: *frame_end.end_ctx(),
+            has_new_parameters: frame_end.has_new_parameters(),
+            loss: frame_end.loss(),
+            timestamp: frame_end.timestamp(),
+            stream_id: self.meta.stream_id,
+            is_random_access_point: frame_end.is_random_access_point(),
+            is_disposable: frame_end.is_disposable(),
+            data,
+        })));
+    }
+
+    fn loss(&mut self, loss: &Loss<'_, crate::PacketContext>) {
+        if let LossReason::Corrupt { description } = loss.reason() {
+            self.pending.push_back(Err(DepacketizeError {
+                pkt_ctx: *loss.ctx(),
+                ssrc: self.meta.ssrc,
+                sequence_number: self.meta.sequence_number,
+                description: description.clone(),
+            }));
+        }
+    }
 }
 
 impl Depacketizer {
@@ -1022,12 +1079,12 @@ mod tests {
             #[cfg(feature = "h264")]
             (
                 "h264::Depacketizer",
-                std::mem::size_of::<h264::Depacketizer>(),
+                std::mem::size_of::<h264::Depacketizer<crate::PacketContext>>(),
             ),
             #[cfg(feature = "h265")]
             (
                 "h265::Depacketizer",
-                std::mem::size_of::<h265::Depacketizer>(),
+                std::mem::size_of::<h265::Depacketizer<crate::PacketContext>>(),
             ),
             (
                 "onvif::Depacketizer",

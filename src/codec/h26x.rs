@@ -8,6 +8,10 @@
 
 use crate::buf::BufRange;
 use crate::inputs::{Input as _, Split};
+use crate::{
+    buf::MarkBuf,
+    codec::{Data, Handler, UnitPosition},
+};
 
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
 ///
@@ -25,6 +29,53 @@ pub enum Framing {
 
     /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
     AnnexB,
+}
+
+/// Delivers part or all of a NAL unit to [`Handler::data`].
+///
+/// `header` holds the NAL header bytes if this is the NAL's first chunk and
+/// is empty otherwise. `first` and `last` say whether the chunk begins
+/// and/or ends the NAL.
+///
+/// Collects slices on the stack, splitting into several [`Data`] events if
+/// there are too many pieces to fit.
+pub(super) fn deliver<Ctx>(
+    handler: &mut impl Handler<Ctx>,
+    header: &[u8],
+    pieces: &[BufRange],
+    buf: &MarkBuf,
+    mut first: bool,
+    last: bool,
+) {
+    const MAX_SLICES: usize = 8;
+    let mut slices: [&[u8]; MAX_SLICES] = [&[]; MAX_SLICES];
+    let mut n = 0;
+    if !header.is_empty() {
+        debug_assert!(first);
+        slices[0] = header;
+        n = 1;
+    }
+    for piece in pieces {
+        if n + 2 > MAX_SLICES {
+            handler.data(&Data {
+                position: UnitPosition::new(first, false),
+                data: &slices[..n],
+            });
+            first = false;
+            n = 0;
+        }
+        let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
+        slices[n] = s1;
+        n += 1;
+        if !s2.is_empty() {
+            slices[n] = s2;
+            n += 1;
+        }
+    }
+    handler.data(&Data {
+        position: UnitPosition::new(first, last),
+        data: &slices[..n],
+    });
 }
 
 /// `h264_reader::rbsp::BitRead` impl that *notes* extra trailing data rather than failing on it.
