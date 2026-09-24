@@ -6,12 +6,9 @@
 // Some helpers are used by only one codec, so are dead when the other is disabled.
 #![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
 
-use crate::buf::BufRange;
+use crate::buf::{BufRange, MarkBuf};
+use crate::codec::{Data, Handler, UnitPosition};
 use crate::inputs::{Input as _, Split};
-use crate::{
-    buf::MarkBuf,
-    codec::{Data, Handler, UnitPosition},
-};
 
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
 ///
@@ -29,6 +26,194 @@ pub enum Framing {
 
     /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
     AnnexB,
+}
+
+/// A NAL unit header, as stored by the H.264 and H.265 depacketizers.
+pub(super) trait NalHeader: Copy + std::fmt::Debug {
+    /// The header's raw bytes: 1 for H.264, 2 for H.265.
+    type Bytes: AsRef<[u8]>;
+
+    fn bytes(self) -> Self::Bytes;
+
+    /// Returns true for parameter sets, which are stripped from frame data.
+    ///
+    /// These are instead reflected in the stream's parameters and optionally
+    /// prepended to frames; see [`super::ParameterSetInsertion`].
+    fn is_parameter_set(self) -> bool;
+}
+
+#[cfg(feature = "h264")]
+impl NalHeader for h264_reader::nal::NalHeader {
+    type Bytes = [u8; 1];
+
+    #[inline]
+    fn bytes(self) -> [u8; 1] {
+        [u8::from(self)]
+    }
+
+    #[inline]
+    fn is_parameter_set(self) -> bool {
+        use h264_reader::nal::UnitType;
+        matches!(
+            self.nal_unit_type(),
+            UnitType::SeqParameterSet | UnitType::PicParameterSet
+        )
+    }
+}
+
+/// A complete NAL unit within an access unit, as stored by the depacketizers.
+///
+/// The NAL's body is stored as a range of pieces in a separate vector.
+#[derive(Debug)]
+pub(super) struct Nal<H> {
+    pub(super) hdr: H,
+
+    /// The length of the pieces vector as this NAL finishes.
+    pub(super) next_piece_idx: u32,
+
+    /// The total length of this NAL, including the header bytes.
+    pub(super) len: u32,
+}
+
+/// Tracks progress delivering an access unit's NALs via [`Handler::data`].
+///
+/// Indices refer to the depacketizer's NAL and piece vectors; see
+/// [`Delivery::cleared`].
+#[derive(Debug, Default)]
+pub(super) struct Delivery {
+    /// The number of NALs fully delivered.
+    nals: u32,
+
+    /// The number of pieces delivered (or skipped as belonging to parameter sets).
+    pieces: u32,
+
+    /// True iff a first chunk has been delivered for the in-progress NAL.
+    in_progress_started: bool,
+}
+
+impl Delivery {
+    /// Delivers all not-yet-delivered data: completed NALs, then the
+    /// in-progress NAL's pieces so far, if any.
+    pub(super) fn deliver<H: NalHeader, Ctx>(
+        &mut self,
+        nals: &[Nal<H>],
+        pieces: &[BufRange],
+        in_progress: Option<H>,
+        buf: &MarkBuf,
+        handler: &mut impl Handler<Ctx>,
+    ) {
+        let mut piece_idx = crate::to_usize(self.pieces);
+        for nal in &nals[crate::to_usize(self.nals)..] {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            if !nal.hdr.is_parameter_set() {
+                let hdr = nal.hdr.bytes();
+                let first = !self.in_progress_started;
+                deliver(
+                    handler,
+                    if first { hdr.as_ref() } else { &[] },
+                    &pieces[piece_idx..next_piece_idx],
+                    buf,
+                    first,
+                    true,
+                );
+            }
+            self.in_progress_started = false;
+            piece_idx = next_piece_idx;
+        }
+        self.nals = u32::try_from(nals.len()).expect("NAL count fits in u32");
+        if let Some(hdr) = in_progress
+            && !hdr.is_parameter_set()
+            && (!self.in_progress_started || piece_idx < pieces.len())
+        {
+            let bytes = hdr.bytes();
+            let first = !self.in_progress_started;
+            deliver(
+                handler,
+                if first { bytes.as_ref() } else { &[] },
+                &pieces[piece_idx..],
+                buf,
+                first,
+                false,
+            );
+            self.in_progress_started = true;
+            piece_idx = pieces.len();
+        }
+        self.pieces = u32::try_from(piece_idx).expect("piece count fits in u32");
+    }
+
+    /// Returns true if all `pieces_len` pieces have been consumed, so the
+    /// depacketizer no longer needs them.
+    #[inline]
+    pub(super) fn caught_up(&self, pieces_len: usize) -> bool {
+        crate::to_usize(self.pieces) == pieces_len
+    }
+
+    /// Notes that the depacketizer has cleared its NAL and piece vectors.
+    #[inline]
+    pub(super) fn cleared(&mut self) {
+        self.nals = 0;
+        self.pieces = 0;
+    }
+}
+
+/// Returns the length of the frame [`visit_frame`] would produce.
+pub(super) fn frame_len<H: NalHeader>(nals: &[Nal<H>], params: &[&[u8]]) -> usize {
+    let mut len = 0;
+    for p in params {
+        len += 4 + p.len();
+    }
+    for nal in nals {
+        if !nal.hdr.is_parameter_set() {
+            len += 4 + crate::to_usize(nal.len);
+        }
+    }
+    len
+}
+
+/// Visits an access unit's data with the given framing.
+///
+/// `params` are parameter set NALs to prepend. Parameter sets within `nals`
+/// are skipped.
+pub(super) fn visit_frame<H: NalHeader>(
+    nals: &[Nal<H>],
+    pieces: &[BufRange],
+    buf: &MarkBuf,
+    params: &[&[u8]],
+    framing: Framing,
+    visitor: &mut impl FnMut(&[u8]),
+) {
+    for param_nal in params {
+        let prefix = match framing {
+            Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
+            Framing::AnnexB => ANNEX_B_START_CODE,
+        };
+        visitor(&prefix);
+        visitor(param_nal);
+    }
+    let mut piece_idx = 0;
+    for nal in nals {
+        let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+        if !nal.hdr.is_parameter_set() {
+            let prefix = match framing {
+                Framing::FourByteLength => nal.len.to_be_bytes(),
+                Framing::AnnexB => ANNEX_B_START_CODE,
+            };
+            visitor(&prefix);
+            let hdr = nal.hdr.bytes();
+            visitor(hdr.as_ref());
+            let mut actual_len = hdr.as_ref().len();
+            for piece in &pieces[piece_idx..next_piece_idx] {
+                let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
+                visitor(s1);
+                if !s2.is_empty() {
+                    visitor(s2);
+                }
+                actual_len += usize::from(piece.len);
+            }
+            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
+        }
+        piece_idx = next_piece_idx;
+    }
 }
 
 /// Delivers part or all of a NAL unit to [`Handler::data`].
@@ -202,6 +387,20 @@ pub(super) enum AnnexBScanner<A: U8Array> {
     },
 
     Mid(Mid),
+}
+
+impl<A: U8Array> AnnexBScanner<A> {
+    /// Returns true if the scanner holds positions of data not yet passed to
+    /// [`NalHandler::piece`], which must stay in the buffer.
+    pub(super) fn has_deferred(&self) -> bool {
+        matches!(
+            self,
+            AnnexBScanner::Mid(Mid {
+                deferred: Some(_),
+                ..
+            })
+        )
+    }
 }
 
 impl<A: U8Array> Default for AnnexBScanner<A> {

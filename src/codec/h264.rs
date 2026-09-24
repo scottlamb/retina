@@ -123,16 +123,7 @@ pub(crate) struct Depacketizer<Ctx> {
     frame_format: super::FrameFormat,
 }
 
-#[derive(Debug)]
-struct Nal {
-    hdr: h264_reader::nal::NalHeader,
-
-    /// The length of `Depacketizer::pieces` as this NAL finishes.
-    next_piece_idx: u32,
-
-    /// The total length of this NAL, including the header byte.
-    len: u32,
-}
+type Nal = super::h26x::Nal<NalHeader>;
 
 /// An access unit that is currently being accumulated during `PreMark` state.
 #[derive(Debug)]
@@ -148,6 +139,52 @@ struct AccessUnit<Ctx> {
     loss: u16,
 
     same_ts_as_prev: bool,
+
+    /// Metadata from the NALs scanned so far.
+    meta: FrameMeta,
+
+    /// The number of `Depacketizer::nals` reflected in `meta`.
+    scanned_nals: u32,
+
+    /// Set once `frame_start` has been called.
+    started: Option<Accumulate>,
+
+    delivery: super::h26x::Delivery,
+
+    /// True if `Depacketizer::nals` and `Depacketizer::pieces` have been
+    /// trimmed mid-access unit, so they no longer describe all of it.
+    /// Only happens under `Accumulate::No`.
+    trimmed: bool,
+}
+
+#[derive(Debug, Default)]
+struct NewParams {
+    sps: Option<Bytes>,
+    pps: Option<Bytes>,
+
+    /// Parameters parsed from `sps` and `pps` when the frame started, to be
+    /// committed when it ends. Reset if another parameter set arrives.
+    parsed: Option<InternalParameters>,
+}
+
+/// Metadata about an access unit, gathered as its NALs are scanned.
+#[derive(Debug)]
+struct FrameMeta {
+    /// True unless a non-IDR slice has been seen.
+    is_random_access_point: bool,
+
+    /// True unless a NAL with `nal_ref_idc != 0` has been seen.
+    is_disposable: bool,
+
+    /// True if a VCL (slice) NAL has been seen.
+    seen_vcl: bool,
+
+    /// Parameter sets which differ from `Depacketizer::parameters`, if any.
+    /// Boxed because they're rare, and `AccessUnit` moves on every packet.
+    new_params: Option<Box<NewParams>>,
+
+    /// The header of the last complete NAL, for `can_end_au`.
+    last_nal_hdr: Option<NalHeader>,
 }
 
 #[derive(Debug)]
@@ -367,6 +404,169 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             .map(|p| super::ParametersRef::Video(&p.generic_parameters))
     }
 
+    /// Returns the header of the NAL currently being assembled from FU-A
+    /// fragments, if any.
+    fn in_progress_hdr(au: &AccessUnit<Ctx>) -> Option<NalHeader> {
+        au.fu_a.as_ref()?.in_progress.as_ref().map(|ip| ip.hdr)
+    }
+
+    /// Updates `au.meta` to reflect NALs completed since the last call.
+    fn scan_meta(&self, au: &mut AccessUnit<Ctx>, buf: &MarkBuf) {
+        let scanned_nals = crate::to_usize(au.scanned_nals);
+        let mut piece_idx = match scanned_nals {
+            0 => 0,
+            i => crate::to_usize(self.nals[i - 1].next_piece_idx),
+        };
+        for nal in &self.nals[scanned_nals..] {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            match nal.hdr.nal_unit_type() {
+                UnitType::SeqParameterSet
+                    if self
+                        .parameters
+                        .as_ref()
+                        .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces, buf))
+                        .unwrap_or(true) =>
+                {
+                    let np = au.meta.new_params.get_or_insert_default();
+                    np.sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
+                    np.parsed = None;
+                }
+                UnitType::PicParameterSet
+                    if self
+                        .parameters
+                        .as_ref()
+                        .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces, buf))
+                        .unwrap_or(true) =>
+                {
+                    let np = au.meta.new_params.get_or_insert_default();
+                    np.pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
+                    np.parsed = None;
+                }
+                _ => {}
+            }
+            if is_vcl(nal.hdr) {
+                au.meta.seen_vcl = true;
+            }
+            if is_non_idr_slice(nal.hdr) {
+                au.meta.is_random_access_point = false;
+            }
+            if nal.hdr.nal_ref_idc() != 0 {
+                au.meta.is_disposable = false;
+            }
+            au.meta.last_nal_hdr = Some(nal.hdr);
+            piece_idx = next_piece_idx;
+        }
+        au.scanned_nals = u32::try_from(self.nals.len()).expect("NAL count fits in u32");
+    }
+
+    /// Parses new parameters, returning `None` if they're incomplete.
+    fn parse_new_params(&self, np: &NewParams) -> Result<Option<InternalParameters>, String> {
+        match (
+            np.sps.as_deref(),
+            np.pps.as_deref(),
+            self.parameters.as_ref(),
+        ) {
+            (Some(sps_nal), Some(pps_nal), old_ip) => {
+                let seen_extra_trailing_data =
+                    old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
+                // TODO: could map this to a RtpPacketError more accurately.
+                InternalParameters::parse_sps_and_pps(
+                    sps_nal,
+                    pps_nal,
+                    seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
+                )
+                .map(Some)
+            }
+            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
+                let sps_nal = np.sps.as_deref().unwrap_or(&old_ip.sps_nal);
+                let pps_nal = np.pps.as_deref().unwrap_or(&old_ip.pps_nal);
+                // TODO: as above, could map this to a RtpPacketError more accurately.
+                InternalParameters::parse_sps_and_pps(
+                    sps_nal,
+                    pps_nal,
+                    old_ip.seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Calls `frame_start` for a frame which is still in progress.
+    ///
+    /// The frame's metadata so far is provisional. In particular, parameters
+    /// are parsed but not committed to `self.parameters` until the frame ends.
+    fn start_frame(&self, au: &mut AccessUnit<Ctx>, handler: &mut impl Handler<Ctx>) {
+        let mut is_random_access_point = au.meta.is_random_access_point;
+        let mut is_disposable = au.meta.is_disposable;
+        if let Some(hdr) = Self::in_progress_hdr(au) {
+            if is_non_idr_slice(hdr) {
+                is_random_access_point = false;
+            }
+            if hdr.nal_ref_idc() != 0 {
+                is_disposable = false;
+            }
+        }
+        if let Some(np) = au.meta.new_params.as_mut()
+            && np.parsed.is_none()
+        {
+            // On error, leave `parsed` empty; `finalize_access_unit` will try
+            // again and report the error.
+            np.parsed = self.parse_new_params(np).ok().flatten();
+        }
+        let new_params = au
+            .meta
+            .new_params
+            .as_ref()
+            .and_then(|np| np.parsed.as_ref());
+        au.started = Some(
+            handler.frame_start(&FrameStart {
+                timestamp: au.timestamp,
+                ctx: &au.start_ctx,
+                loss: au.loss,
+                is_random_access_point,
+                is_disposable,
+                has_new_parameters: new_params.is_some(),
+                parameters: new_params
+                    .or(self.parameters.as_ref())
+                    .map(|p| ParametersRef::Video(&p.generic_parameters)),
+            }),
+        );
+    }
+
+    /// After scanning a packet, starts the frame if possible and delivers its data so far.
+    fn stream(&mut self, au: &mut AccessUnit<Ctx>, buf: &MarkBuf, handler: &mut impl Handler<Ctx>) {
+        self.scan_meta(au, buf);
+        let in_progress = Self::in_progress_hdr(au);
+        if au.started.is_none() && (au.meta.seen_vcl || in_progress.is_some_and(is_vcl)) {
+            self.start_frame(au, handler);
+        }
+        let Some(accumulate) = au.started else {
+            return;
+        };
+        au.delivery
+            .deliver(&self.nals, &self.pieces, in_progress, buf, handler);
+        if accumulate == Accumulate::No && au.delivery.caught_up(self.pieces.len()) {
+            // Everything has been delivered, and parameter sets have been
+            // copied into `au.meta`. Release the buffer space.
+            self.nals.clear();
+            self.pieces.clear();
+            au.scanned_nals = 0;
+            au.delivery.cleared();
+            au.trimmed = true;
+            if !au
+                .fu_a
+                .as_ref()
+                .is_some_and(|fu_a| fu_a.scanner.has_deferred())
+            {
+                self.mark = None;
+            }
+        }
+    }
+
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push_with(
         &mut self,
@@ -393,6 +593,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let payload_pos = pkt.payload_pos();
         let payload_len = pkt.payload_len();
         let buf = pkt.buf();
+
+        if meta.loss > 0 {
+            handler.loss(&Loss {
+                ctx: &meta.ctx,
+                reason: LossReason::PacketLoss { packets: meta.loss },
+            });
+        }
 
         let mut access_unit = match std::mem::replace(
             &mut self.input_state,
@@ -439,16 +646,16 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         self.discard_au();
                         AccessUnit::start(meta, 0, false)
                     } else {
-                        match self.nals.last() {
-                            Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+                        match access_unit.meta.last_nal_hdr {
+                            Some(hdr) if can_end_au(hdr.nal_unit_type()) => {
                                 access_unit.end_ctx = meta.ctx.clone();
                                 self.finalize_access_unit(access_unit, "ts change", buf, handler)?;
                                 AccessUnit::start(meta, 0, false)
                             }
-                            Some(n) => {
+                            Some(hdr) => {
                                 log::debug!(
                                     "Bogus mid-access unit timestamp change after {:?}",
-                                    n.hdr
+                                    hdr
                                 );
                                 access_unit.timestamp.timestamp = meta.timestamp.timestamp;
                                 access_unit
@@ -649,15 +856,16 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             }
             _ => return Err(format!("bad nal header {nal_header:02x}")),
         }
+        self.stream(&mut access_unit, buf, handler);
         self.input_state = if mark {
-            match self.nals.last() {
-                Some(n) if can_end_au(n.hdr.nal_unit_type()) => {
+            match access_unit.meta.last_nal_hdr {
+                Some(hdr) if can_end_au(hdr.nal_unit_type()) => {
                     access_unit.end_ctx = meta.ctx.clone();
                     self.finalize_access_unit(access_unit, "mark", buf, handler)?;
                     DepacketizerInputState::PostMark { timestamp, loss: 0 }
                 }
-                Some(n) => {
-                    log::debug!("Bogus mid-access unit mark on {:?}", n.hdr);
+                Some(hdr) => {
+                    log::debug!("Bogus mid-access unit mark on {:?}", hdr);
                     access_unit.timestamp.timestamp = timestamp.timestamp;
                     DepacketizerInputState::PreMark(access_unit)
                 }
@@ -728,134 +936,63 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
     fn finalize_access_unit(
         &mut self,
-        au: AccessUnit<Ctx>,
+        mut au: AccessUnit<Ctx>,
         reason: &str,
         buf: &MarkBuf,
         handler: &mut impl Handler<Ctx>,
     ) -> Result<(), String> {
-        let mut piece_idx = 0;
-        let mut is_random_access_point = true;
-        let mut is_disposable = true;
-        let mut new_sps = None;
-        let mut new_pps = None;
-
-        if log_enabled!(log::Level::Debug) {
+        if !au.trimmed && log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
         }
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            match nal.hdr.nal_unit_type() {
-                UnitType::SeqParameterSet
-                    if self
-                        .parameters
-                        .as_ref()
-                        .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces, buf))
-                        .unwrap_or(true) =>
-                {
-                    new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
-                }
-                UnitType::PicParameterSet
-                    if self
-                        .parameters
-                        .as_ref()
-                        .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces, buf))
-                        .unwrap_or(true) =>
-                {
-                    new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
-                }
-                UnitType::SliceDataPartitionALayer
-                | UnitType::SliceDataPartitionBLayer
-                | UnitType::SliceDataPartitionCLayer
-                | UnitType::SliceLayerWithoutPartitioningNonIdr => is_random_access_point = false,
-                _ => {}
-            }
-            if nal.hdr.nal_ref_idc() != 0 {
-                is_disposable = false;
-            }
-            piece_idx = next_piece_idx;
-        }
 
-        // Update parameters before building the frame, so prepended params
-        // reflect the latest SPS/PPS.
-        let has_new_parameters = match (
-            new_sps.as_deref(),
-            new_pps.as_deref(),
-            self.parameters.as_ref(),
-        ) {
-            (Some(sps_nal), Some(pps_nal), old_ip) => {
-                let seen_extra_trailing_data =
-                    old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
-                // TODO: could map this to a RtpPacketError more accurately.
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal,
-                    pps_nal,
-                    seen_extra_trailing_data,
-                    self.frame_format.h26x_framing,
-                )?);
-                true
-            }
-            (Some(_), None, Some(old_ip)) | (None, Some(_), Some(old_ip)) => {
-                let sps_nal = new_sps.as_deref().unwrap_or(&old_ip.sps_nal);
-                let pps_nal = new_pps.as_deref().unwrap_or(&old_ip.pps_nal);
-                // TODO: as above, could map this to a RtpPacketError more accurately.
-                self.parameters = Some(InternalParameters::parse_sps_and_pps(
-                    sps_nal,
-                    pps_nal,
-                    old_ip.seen_extra_trailing_data,
-                    self.frame_format.h26x_framing,
-                )?);
-                true
-            }
-            _ => false,
+        // Commit new parameters before building the frame, so prepended
+        // params reflect the latest SPS/PPS.
+        let new_params = match au.meta.new_params.take() {
+            None => None,
+            Some(mut np) => match np.parsed.take() {
+                Some(p) => Some(p),
+                None => self.parse_new_params(&np)?,
+            },
         };
-
-        let accumulate = handler.frame_start(&FrameStart {
-            timestamp: au.timestamp,
-            ctx: &au.start_ctx,
-            loss: au.loss,
-            is_random_access_point,
-            is_disposable,
-            has_new_parameters,
-            parameters: self
-                .parameters
-                .as_ref()
-                .map(|p| ParametersRef::Video(&p.generic_parameters)),
-        });
-
-        // Deliver non-parameter-set NALs.
-        piece_idx = 0;
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            if !is_parameter_set(nal.hdr) {
-                super::h26x::deliver(
-                    handler,
-                    &[u8::from(nal.hdr)],
-                    &self.pieces[piece_idx..next_piece_idx],
-                    buf,
-                    true,
-                    true,
-                );
-            }
-            piece_idx = next_piece_idx;
+        let has_new_parameters = new_params.is_some();
+        if new_params.is_some() {
+            self.parameters = new_params;
         }
+
+        let accumulate = match au.started {
+            Some(a) => a,
+            None => handler.frame_start(&FrameStart {
+                timestamp: au.timestamp,
+                ctx: &au.start_ctx,
+                loss: au.loss,
+                is_random_access_point: au.meta.is_random_access_point,
+                is_disposable: au.meta.is_disposable,
+                has_new_parameters,
+                parameters: self
+                    .parameters
+                    .as_ref()
+                    .map(|p| ParametersRef::Video(&p.generic_parameters)),
+            }),
+        };
+        au.delivery
+            .deliver(&self.nals, &self.pieces, None, buf, handler);
 
         handler.frame_end(&mut FrameEnd {
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx: &au.end_ctx,
             loss: au.loss,
-            is_random_access_point,
-            is_disposable,
+            is_random_access_point: au.meta.is_random_access_point,
+            is_disposable: au.meta.is_disposable,
             has_new_parameters,
             body: FrameBody::H264(FrameEndBody {
-                au: (accumulate == Accumulate::Yes).then_some(AuData {
+                au: (accumulate == Accumulate::Yes && !au.trimmed).then_some(AuData {
                     nals: &self.nals,
                     pieces: &self.pieces,
                     buf,
                 }),
                 parameters: &mut self.parameters,
-                is_random_access_point,
+                is_random_access_point: au.meta.is_random_access_point,
                 has_new_parameters,
             }),
         });
@@ -894,14 +1031,14 @@ impl Depacketizer<crate::PacketContext> {
     }
 }
 
-/// Returns true if the given NAL is a parameter set.
-///
-/// These are stripped from frame data; see [`super::ParameterSetInsertion`].
-fn is_parameter_set(hdr: NalHeader) -> bool {
-    matches!(
-        hdr.nal_unit_type(),
-        UnitType::SeqParameterSet | UnitType::PicParameterSet
-    )
+/// Returns true if the given NAL is a VCL (slice) NAL.
+fn is_vcl(hdr: NalHeader) -> bool {
+    matches!(u8::from(hdr) & 0b11111, 1..=5)
+}
+
+/// Returns true if the given NAL is a VCL NAL which is not part of an IDR picture.
+fn is_non_idr_slice(hdr: NalHeader) -> bool {
+    matches!(u8::from(hdr) & 0b11111, 1..=4)
 }
 
 /// Access to a finished access unit, for [`FrameEnd`].
@@ -944,17 +1081,15 @@ impl FrameEndBody<'_> {
 
     pub(super) fn data_len(&self, format: super::FrameFormat) -> Option<usize> {
         let au = self.au.as_ref()?;
-        let mut len = 0;
-        if let Some(p) = self.prepend_params(format) {
-            // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
-            len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
-        }
-        for nal in au.nals {
-            if !is_parameter_set(nal.hdr) {
-                len += 4 + crate::to_usize(nal.len);
+        let params_buf;
+        let params: &[&[u8]] = match self.prepend_params(format) {
+            Some(p) => {
+                params_buf = [&p.sps_nal[..], &p.pps_nal[..]];
+                &params_buf
             }
-        }
-        Some(len)
+            None => &[],
+        };
+        Some(super::h26x::frame_len(au.nals, params))
     }
 
     pub(super) fn visit(
@@ -962,48 +1097,25 @@ impl FrameEndBody<'_> {
         format: super::FrameFormat,
         visitor: &mut impl FnMut(&[u8]),
     ) -> bool {
-        use super::h26x::Framing;
         let Some(au) = self.au.as_ref() else {
             return false;
         };
-
-        // Prepend parameter sets if requested.
-        if let Some(p) = self.prepend_params(format) {
-            for param_nal in [&p.sps_nal, &p.pps_nal] {
-                let prefix = match format.h26x_framing {
-                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
-                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
-                };
-                visitor(&prefix);
-                visitor(param_nal);
+        let params_buf;
+        let params: &[&[u8]] = match self.prepend_params(format) {
+            Some(p) => {
+                params_buf = [&p.sps_nal[..], &p.pps_nal[..]];
+                &params_buf
             }
-        }
-
-        // Write non-parameter-set NALs with the requested framing.
-        let mut piece_idx = 0;
-        for nal in au.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            if !is_parameter_set(nal.hdr) {
-                let prefix = match format.h26x_framing {
-                    Framing::FourByteLength => nal.len.to_be_bytes(),
-                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
-                };
-                visitor(&prefix);
-                visitor(&[u8::from(nal.hdr)]);
-                let mut actual_len = 1usize;
-                for piece in &au.pieces[piece_idx..next_piece_idx] {
-                    debug_assert!(piece.len > 0);
-                    let (s1, s2) = au.buf.split(piece.pos, usize::from(piece.len)).slices();
-                    visitor(s1);
-                    if !s2.is_empty() {
-                        visitor(s2);
-                    }
-                    actual_len += usize::from(piece.len);
-                }
-                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
-            }
-            piece_idx = next_piece_idx;
-        }
+            None => &[],
+        };
+        super::h26x::visit_frame(
+            au.nals,
+            au.pieces,
+            au.buf,
+            params,
+            format.h26x_framing,
+            visitor,
+        );
         true
     }
 
@@ -1044,6 +1156,17 @@ impl<Ctx: Clone> AccessUnit<Ctx> {
             start_ctx: meta.ctx.clone(),
             end_ctx: meta.ctx.clone(),
             timestamp: meta.timestamp,
+            meta: FrameMeta {
+                is_random_access_point: true,
+                is_disposable: true,
+                seen_vcl: false,
+                new_params: None,
+                last_nal_hdr: None,
+            },
+            scanned_nals: 0,
+            started: None,
+            delivery: Default::default(),
+            trimmed: false,
             fu_a: None,
 
             // TODO: overflow?
@@ -3563,7 +3686,8 @@ mod tests {
                     has_new_parameters: false,
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x06plain")),
-                Event::Data(UnitPosition::Complete, hex(b"\x65fu-a start, fu-a end")),
+                Event::Data(UnitPosition::Start, hex(b"\x65fu-a start, ")),
+                Event::Data(UnitPosition::End, hex(b"fu-a end")),
                 Event::FrameEnd {
                     loss: 0,
                     is_random_access_point: true,
@@ -3596,6 +3720,14 @@ mod tests {
                     has_new_parameters: false,
                     data: Some(hex(b"\x00\x00\x00\x06\x01slice")),
                 },
+                // The next frame starts streaming immediately.
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: true,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x01next")),
             ]
         );
     }
@@ -3639,6 +3771,18 @@ mod tests {
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
         push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Start, hex(b"\x65start")),
+            ]
+        );
         push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h).unwrap();
         let events = h.take();
         assert!(
@@ -3657,6 +3801,287 @@ mod tests {
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
                     loss: 0,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x41slice")),
+                },
+            ]
+        );
+    }
+
+    /// Multi-slice pictures sent as single-NAL packets stream per packet;
+    /// earlier non-VCL NALs are held until the first slice.
+    #[test]
+    fn events_stream_single_nal_slices() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06sei", &mut h).unwrap();
+        assert_eq!(h.take(), vec![]);
+        push_events(&mut d, &mut buf, 1, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x06sei")),
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 1")),
+            ]
+        );
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x04\x06sei\
+                          \x00\x00\x00\x08\x65slice 1\
+                          \x00\x00\x00\x08\x65slice 2")),
+                },
+            ]
+        );
+    }
+
+    /// A slice within a STAP-A starts the frame; parameter sets are omitted from `data`.
+    #[test]
+    fn events_stream_stap_a() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::No);
+
+        // STAP-A with the same SPS and PPS as in `EVENTS_FMTP`, then a slice.
+        let mut stap_a = vec![0x18];
+        for nal in [
+            &b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84"[..],
+            b"\x68\xee\x3c\x80",
+            b"\x65slice 1",
+        ] {
+            stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            stap_a.extend_from_slice(nal);
+        }
+        push_events(&mut d, &mut buf, 0, 0, false, 0, &stap_a, &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 1")),
+            ]
+        );
+        assert!(d.mark.is_none(), "data should be released once delivered");
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: None,
+                },
+            ]
+        );
+    }
+
+    /// New parameters are available at `frame_start` but not committed until `frame_end`.
+    #[test]
+    fn events_new_parameters() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, None).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(
+            &mut d,
+            &mut buf,
+            0,
+            0,
+            false,
+            0,
+            b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
+            &mut h,
+        )
+        .unwrap();
+        push_events(
+            &mut d,
+            &mut buf,
+            1,
+            0,
+            false,
+            0,
+            b"\x68\xee\x3c\x80",
+            &mut h,
+        )
+        .unwrap();
+        push_events(&mut d, &mut buf, 2, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: true,
+                },
+                Event::Data(UnitPosition::Start, hex(b"\x65start")),
+            ]
+        );
+        assert!(d.parameters().is_none());
+        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Data(UnitPosition::End, hex(b" end")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: true,
+                    data: Some(hex(b"\x00\x00\x00\x0a\x65start end")),
+                },
+            ]
+        );
+        assert!(d.parameters().is_some());
+    }
+
+    /// The `can_end_au` workaround for cameras which set MARK on SEI NALs
+    /// must apply after streaming has begun.
+    #[test]
+    fn events_stream_sei_with_mark() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x06sei", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        let events = h.take();
+        assert_eq!(
+            events,
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 1")),
+                Event::Data(UnitPosition::Complete, hex(b"\x06sei")),
+                Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x08\x65slice 1\
+                          \x00\x00\x00\x04\x06sei\
+                          \x00\x00\x00\x08\x65slice 2")),
+                },
+            ]
+        );
+    }
+
+    /// Under `Accumulate::No`, a fragmented NAL occupies about one packet of buffer.
+    #[test]
+    fn events_stream_releases_buffer() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(64);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::No);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        for i in 1..100 {
+            push_events(
+                &mut d,
+                &mut buf,
+                i,
+                0,
+                false,
+                0,
+                b"\x7c\x05 middle.......",
+                &mut h,
+            )
+            .unwrap();
+            assert!(d.mark.is_none());
+            assert_eq!(
+                h.take().last(),
+                Some(&Event::Data(UnitPosition::Middle, hex(b" middle.......")))
+            );
+        }
+        push_events(&mut d, &mut buf, 100, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        assert_eq!(buf.capacity(), 64, "buffer should not have grown");
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Data(UnitPosition::End, hex(b" end")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: None,
+                },
+            ]
+        );
+    }
+
+    /// Packet loss mid-frame abandons it with a `loss` event.
+    #[test]
+    fn events_loss_mid_frame() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, LossReason, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 2, 0, true, 1, b"\x7c\x45 end", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 3, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Start, hex(b"\x65start")),
+                Event::Loss(LossReason::PacketLoss { packets: 1 }),
+                Event::FrameStart {
+                    loss: 1,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
+                Event::FrameEnd {
+                    loss: 1,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,

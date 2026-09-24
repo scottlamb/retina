@@ -592,6 +592,13 @@ pub(crate) mod testutil {
         pub(crate) events: Vec<Event>,
         pub(crate) accumulate: Accumulate,
         pub(crate) format: FrameFormat,
+
+        /// The current frame as reassembled from `data` events, with 4-byte
+        /// length prefixes, for comparison with the accumulated frame.
+        streamed: Vec<u8>,
+
+        /// The start of the current unit within `streamed`, if one is in progress.
+        unit_start: Option<usize>,
     }
 
     impl Recorder {
@@ -600,6 +607,8 @@ pub(crate) mod testutil {
                 events: Vec::new(),
                 accumulate,
                 format: FrameFormat::MP4,
+                streamed: Vec::new(),
+                unit_start: None,
             }
         }
 
@@ -620,12 +629,25 @@ pub(crate) mod testutil {
                 is_disposable: frame_start.is_disposable(),
                 has_new_parameters: frame_start.has_new_parameters(),
             });
+            self.streamed.clear();
+            self.unit_start = None;
             self.accumulate
         }
 
         fn data(&mut self, data: &Data<'_>) {
             let flat = data.data.concat();
             assert_eq!(flat.len(), data.len());
+            assert_eq!(data.position.is_first(), self.unit_start.is_none());
+            if data.position.is_first() {
+                self.unit_start = Some(self.streamed.len());
+                self.streamed.extend_from_slice(&[0; 4]);
+            }
+            self.streamed.extend_from_slice(&flat);
+            if data.position.is_last() {
+                let start = self.unit_start.take().unwrap();
+                let len = u32::try_from(self.streamed.len() - start - 4).unwrap();
+                self.streamed[start..start + 4].copy_from_slice(&len.to_be_bytes());
+            }
             self.events
                 .push(Event::Data(data.position, crate::testutil::HexDebug(flat)));
         }
@@ -642,6 +664,16 @@ pub(crate) mod testutil {
                 assert_eq!(&visited, d);
             }
             assert!(frame_end.complete_frame(self.format).is_none());
+            assert!(self.unit_start.is_none(), "frame ended mid-unit");
+            if self.format == FrameFormat::MP4
+                && let Some(d) = data.as_ref()
+            {
+                assert_eq!(
+                    crate::testutil::HexDebug(self.streamed.clone()),
+                    crate::testutil::HexDebug(d.clone()),
+                    "streamed data should match accumulated frame"
+                );
+            }
             self.events.push(Event::FrameEnd {
                 loss: frame_end.loss(),
                 is_random_access_point: frame_end.is_random_access_point(),
@@ -652,6 +684,7 @@ pub(crate) mod testutil {
         }
 
         fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+            self.unit_start = None;
             self.events.push(Event::Loss(loss.reason().clone()));
         }
 
