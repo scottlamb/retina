@@ -102,7 +102,7 @@ macro_rules! write_mpeg4_descriptor {
 }
 
 pub mod aac;
-mod events;
+pub(crate) mod events;
 pub(crate) mod g723;
 pub mod h26x;
 pub(crate) mod jpeg;
@@ -940,7 +940,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// As in [`VideoDepacketizer::push`].
-    #[cfg_attr(not(test), allow(dead_code))] // TODO: used by `Session::poll_handle`.
     pub(crate) fn push(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
@@ -1306,19 +1305,22 @@ mod tests {
                     .unwrap()
             };
 
-            // Legacy.
+            // Legacy, as used by `Demuxed`.
             let mut legacy = new();
             let mut legacy_frames = Vec::new();
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
                 let mut pending = VecDeque::new();
-                crate::client::push_legacy(
-                    &mut legacy,
-                    &PacketRef::new(meta, buf, pos, len),
-                    0,
-                    FrameFormat::default(),
-                    &mut pending,
-                )
-                .unwrap();
+                legacy
+                    .push_with(
+                        &PacketRef::new(meta, buf, pos, len),
+                        &mut crate::client::LegacyHandler {
+                            pending: &mut pending,
+                            meta: &meta,
+                            stream_id: 0,
+                            format: FrameFormat::default(),
+                        },
+                    )
+                    .unwrap();
                 for item in pending {
                     legacy_frames.push(match item.unwrap() {
                         CodecItem::VideoFrame(f) => f.into_data(),

@@ -8,10 +8,9 @@ use std::num::NonZeroU32;
 
 use bytes::Bytes;
 
-use crate::buf::PacketRef;
 use crate::codec::{
-    Accumulate, AudioFrameRef, AudioHandler, Depacketizer, FrameFormat, Loss, LossReason,
-    MessageFrameRef, MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
+    Accumulate, AudioFrameRef, AudioHandler, FrameFormat, Loss, LossReason, MessageFrameRef,
+    MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
@@ -360,23 +359,4 @@ impl MessageHandler<crate::PacketContext> for LegacyHandler<'_> {
     fn loss(&mut self, loss: &Loss<'_, crate::PacketContext>) {
         self.corrupt(loss);
     }
-}
-
-/// Supplies a new packet, queueing resulting items for `Demuxed`.
-pub(crate) fn push_legacy(
-    d: &mut Depacketizer<crate::PacketContext>,
-    pkt: &PacketRef<'_, crate::PacketContext>,
-    stream_id: usize,
-    format: FrameFormat,
-    pending: &mut VecDeque<Result<CodecItem, DepacketizeError>>,
-) -> Result<(), String> {
-    d.push_with(
-        pkt,
-        &mut LegacyHandler {
-            pending,
-            meta: &pkt.meta,
-            stream_id,
-            format,
-        },
-    )
 }

@@ -259,7 +259,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             let p = self.parameters.as_ref();
             match nal.hdr.unit_type() {
                 nal::UnitType::VpsNut
-                    if p.map(|p| !nal_matches(&p.vps_nal[..], nal.hdr, nal_pieces, buf))
+                    if p.map(|p| !nal_matches(p.in_band_vps(), nal.hdr, nal_pieces, buf))
                         .unwrap_or(true) =>
                 {
                     let np = au.meta.new_params.get_or_insert_default();
@@ -267,7 +267,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     np.parsed = None;
                 }
                 nal::UnitType::SpsNut
-                    if p.map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces, buf))
+                    if p.map(|p| !nal_matches(p.in_band_sps(), nal.hdr, nal_pieces, buf))
                         .unwrap_or(true) =>
                 {
                     let np = au.meta.new_params.get_or_insert_default();
@@ -275,7 +275,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     np.parsed = None;
                 }
                 nal::UnitType::PpsNut
-                    if p.map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces, buf))
+                    if p.map(|p| !nal_matches(p.in_band_pps(), nal.hdr, nal_pieces, buf))
                         .unwrap_or(true) =>
                 {
                     let np = au.meta.new_params.get_or_insert_default();
@@ -798,7 +798,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     pieces: &self.pieces,
                     buf,
                 }),
-                parameters: self.parameters.as_ref(),
+                parameters: &mut self.parameters,
                 is_random_access_point: au.meta.is_random_access_point,
                 has_new_parameters,
             }),
@@ -841,7 +841,7 @@ impl Depacketizer<crate::PacketContext> {
 pub(crate) struct FrameEndBody<'a> {
     /// The access unit's data, if accumulated and not yet taken.
     au: Option<AuData<'a>>,
-    parameters: Option<&'a InternalParameters>,
+    parameters: &'a mut Option<InternalParameters>,
     is_random_access_point: bool,
     has_new_parameters: bool,
 }
@@ -854,7 +854,7 @@ struct AuData<'a> {
 
 impl FrameEndBody<'_> {
     pub(super) fn parameters(&self) -> Option<&VideoParameters> {
-        self.parameters.map(|p| &p.generic_parameters)
+        self.parameters.as_ref().map(|p| &p.generic_parameters)
     }
 
     /// Returns the parameter set NALs to prepend to the frame in the given format.
@@ -870,6 +870,7 @@ impl FrameEndBody<'_> {
             return None;
         }
         self.parameters
+            .as_ref()
             .map(|p| [&p.vps_nal[..], &p.sps_nal[..], &p.pps_nal[..]])
     }
 
@@ -900,6 +901,32 @@ impl FrameEndBody<'_> {
             visitor,
         );
         true
+    }
+
+    /// Overrides the parameters for this and subsequent frames.
+    pub(super) fn set_parameters(
+        &mut self,
+        vps: &[u8],
+        sps: &[u8],
+        pps: &[u8],
+    ) -> Result<(), String> {
+        let old = self.parameters.as_ref();
+        let mut new = InternalParameters::parse_vps_sps_pps(
+            vps,
+            sps,
+            pps,
+            old.is_some_and(|p| p.seen_extra_trailing_data),
+        )?;
+        new.overridden = old.map(|p| {
+            Box::new((
+                Bytes::copy_from_slice(p.in_band_vps()),
+                Bytes::copy_from_slice(p.in_band_sps()),
+                Bytes::copy_from_slice(p.in_band_pps()),
+            ))
+        });
+        *self.parameters = Some(new);
+        self.has_new_parameters = true;
+        Ok(())
     }
 
     pub(super) fn build(&mut self, format: super::FrameFormat) -> Option<Vec<u8>> {
@@ -1016,6 +1043,12 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
+
+    /// If set via [`VideoFrameEnd::set_h265_parameters`], the in-band VPS, SPS,
+    /// and PPS which were overridden. Parameter sets received later are
+    /// compared against these to detect changes, so that a camera repeating
+    /// its original parameters doesn't undo the override.
+    overridden: Option<Box<(Bytes, Bytes, Bytes)>>,
 }
 
 impl InternalParameters {
@@ -1156,7 +1189,29 @@ impl InternalParameters {
             sps_nal: sps_nal_b,
             pps_nal: pps_nal_b,
             seen_extra_trailing_data,
+            overridden: None,
         })
+    }
+
+    /// Returns the VPS as last received in-band (or via `sprop-vps`).
+    fn in_band_vps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.vps_nal[..], |o| &o.0[..])
+    }
+
+    /// Returns the SPS as last received in-band (or via `sprop-sps`).
+    fn in_band_sps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.sps_nal[..], |o| &o.1[..])
+    }
+
+    /// Returns the PPS as last received in-band (or via `sprop-pps`).
+    fn in_band_pps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.pps_nal[..], |o| &o.2[..])
     }
 }
 
@@ -1926,5 +1981,101 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// `VideoFrameEnd::set_h265_parameters` overrides parameters, surviving
+    /// repeats of the in-band parameters it replaced.
+    #[test]
+    fn set_h265_parameters() {
+        use crate::codec::{Accumulate, FrameFormat, VideoFrameEnd, VideoFrameStart, VideoHandler};
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+        let (vps_a, sps_a, pps_a) = (
+            b64("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA=="),
+            b64("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE="),
+            b64("RAHA8saNA7NA"),
+        );
+        let (vps_b, sps_b, pps_b) = (
+            b64("QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA=="),
+            b64("QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I="),
+            b64("RAHA8vAzJA=="),
+        );
+
+        struct Overrider<'a> {
+            b: [&'a [u8]; 3],
+            overridden: bool,
+            frames: Vec<(bool, Vec<u8>)>,
+        }
+        impl VideoHandler<PacketContext> for Overrider<'_> {
+            fn frame_start(&mut self, _: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+                Accumulate::Yes
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, PacketContext>) {
+                if !self.overridden {
+                    let [vps, sps, pps] = self.b;
+                    fe.set_h265_parameters(vps, sps, pps).unwrap();
+                    self.overridden = true;
+                }
+                let data = fe.complete_frame(FrameFormat::default()).unwrap();
+                self.frames.push((fe.has_new_parameters(), data));
+            }
+        }
+
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let mut h = Overrider {
+            b: [&vps_b, &sps_b, &pps_b],
+            overridden: false,
+            frames: Vec::new(),
+        };
+        let mut push =
+            |d: &mut super::Depacketizer<_>, seq: u16, ts: i64, mark: bool, payload: &[u8]| {
+                let meta = crate::rtp::PacketMeta {
+                    ctx: PacketContext::dummy(),
+                    timestamp: crate::Timestamp {
+                        timestamp: ts,
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: seq,
+                    mark,
+                    loss: 0,
+                };
+                let pos = buf.end();
+                buf.extend(payload);
+                buf.advance_unparsed(buf.end());
+                d.push_with(
+                    &PacketRef::new(meta, &buf, pos, payload.len() as u16),
+                    &mut h,
+                )
+                .unwrap();
+            };
+        const IDR: &[u8] = b"\x26\x01slice";
+        let mut expected_frame = Vec::new();
+        for nal in [&vps_b[..], &sps_b[..], &pps_b[..], IDR] {
+            expected_frame.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            expected_frame.extend_from_slice(nal);
+        }
+        for (i, ts) in [0, 1].into_iter().enumerate() {
+            let seq = 4 * i as u16;
+            push(&mut d, seq, ts, false, &vps_a);
+            push(&mut d, seq + 1, ts, false, &sps_a);
+            push(&mut d, seq + 2, ts, false, &pps_a);
+            push(&mut d, seq + 3, ts, true, IDR);
+        }
+        assert_eq!(
+            h.frames,
+            vec![
+                (true, expected_frame.clone()), // overridden
+                (false, expected_frame),        // in-band set A doesn't undo override
+            ]
+        );
+        let Some(v) = d.parameters() else { panic!() };
+        let crate::codec::VideoParametersCodec::H265 { sps, .. } = v.codec_params() else {
+            panic!()
+        };
+        assert_eq!(&sps[..], &sps_b[..]);
     }
 }

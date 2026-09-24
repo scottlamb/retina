@@ -413,7 +413,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     if self
                         .parameters
                         .as_ref()
-                        .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces, buf))
+                        .map(|p| !nal_matches(p.in_band_sps(), nal.hdr, nal_pieces, buf))
                         .unwrap_or(true) =>
                 {
                     let np = au.meta.new_params.get_or_insert_default();
@@ -424,7 +424,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     if self
                         .parameters
                         .as_ref()
-                        .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces, buf))
+                        .map(|p| !nal_matches(p.in_band_pps(), nal.hdr, nal_pieces, buf))
                         .unwrap_or(true) =>
                 {
                     let np = au.meta.new_params.get_or_insert_default();
@@ -1099,6 +1099,25 @@ impl FrameEndBody<'_> {
         true
     }
 
+    /// Overrides the parameters for this and subsequent frames.
+    pub(super) fn set_parameters(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), String> {
+        let old = self.parameters.as_ref();
+        let mut new = InternalParameters::parse_sps_and_pps(
+            sps,
+            pps,
+            old.is_some_and(|p| p.seen_extra_trailing_data),
+        )?;
+        new.overridden = old.map(|p| {
+            Box::new((
+                Bytes::copy_from_slice(p.in_band_sps()),
+                Bytes::copy_from_slice(p.in_band_pps()),
+            ))
+        });
+        *self.parameters = Some(new);
+        self.has_new_parameters = true;
+        Ok(())
+    }
+
     pub(super) fn build(&mut self, format: super::FrameFormat) -> Option<Vec<u8>> {
         let len = self.data_len(format)?;
         let mut data = Vec::with_capacity(len);
@@ -1207,6 +1226,12 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
+
+    /// If set via [`FrameEnd::set_h264_parameters`], the in-band SPS and PPS
+    /// which were overridden. Parameter sets received later are compared
+    /// against these to detect changes, so that a camera repeating its
+    /// original parameters doesn't undo the override.
+    overridden: Option<Box<(Bytes, Bytes)>>,
 }
 
 impl InternalParameters {
@@ -1393,7 +1418,22 @@ impl InternalParameters {
             sps_nal,
             pps_nal,
             seen_extra_trailing_data,
+            overridden: None,
         })
+    }
+
+    /// Returns the SPS as last received in-band (or via `sprop-parameter-sets`).
+    fn in_band_sps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.sps_nal[..], |o| &o.0[..])
+    }
+
+    /// Returns the PPS as last received in-band (or via `sprop-parameter-sets`).
+    fn in_band_pps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.pps_nal[..], |o| &o.1[..])
     }
 
     // XXX: copy'n'pasted'n'modified from `h264-reader`.
@@ -4041,5 +4081,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `FrameEnd::set_h264_parameters` overrides parameters, surviving repeats
+    /// of the in-band parameters it replaced.
+    #[test]
+    fn set_h264_parameters() {
+        use crate::codec::{Accumulate, FrameFormat, VideoFrameEnd, VideoFrameStart, VideoHandler};
+        const SPS_A: &[u8] = b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84";
+        const PPS_A: &[u8] = b"\x68\xee\x3c\x80";
+        const SPS_B: &[u8] = b"\x67\x64\x00\x1e\xac\x2c\x6a\x82\xc0\xf6\x9b\x82\x80\x82\xa0\x00\x00\x03\x00\x20\x00\x00\x03\x03\xd0\x80";
+        const PPS_B: &[u8] = b"\x68\xee\x31\xb2\x1b";
+
+        #[derive(Default)]
+        struct Overrider {
+            overridden: bool,
+            frames: Vec<(bool, Vec<u8>)>,
+        }
+        impl VideoHandler<crate::PacketContext> for Overrider {
+            fn frame_start(&mut self, _: &VideoFrameStart<'_, crate::PacketContext>) -> Accumulate {
+                Accumulate::Yes
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, crate::PacketContext>) {
+                if !self.overridden {
+                    fe.set_h264_parameters(SPS_B, PPS_B).unwrap();
+                    self.overridden = true;
+                }
+                let data = fe.complete_frame(FrameFormat::default()).unwrap();
+                self.frames.push((fe.has_new_parameters(), data));
+            }
+        }
+
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Overrider::default();
+        let mut push = |d: &mut Depacketizer<_>, seq: u16, ts: i64, mark: bool, payload: &[u8]| {
+            let meta = crate::rtp::PacketMeta {
+                ctx: crate::PacketContext::dummy(),
+                timestamp: crate::Timestamp {
+                    timestamp: ts,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number: seq,
+                mark,
+                loss: 0,
+            };
+            let pos = buf.end();
+            buf.extend(payload);
+            buf.advance_unparsed(buf.end());
+            d.push_with(
+                &PacketRef::new(meta, &buf, pos, payload.len() as u16),
+                &mut h,
+            )
+            .unwrap();
+        };
+        let mut expected_frame = Vec::new();
+        for nal in [SPS_B, PPS_B, b"\x65slice"] {
+            expected_frame.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            expected_frame.extend_from_slice(nal);
+        }
+        for (i, ts) in [0, 1].into_iter().enumerate() {
+            let seq = 3 * i as u16;
+            push(&mut d, seq, ts, false, SPS_A);
+            push(&mut d, seq + 1, ts, false, PPS_A);
+            push(&mut d, seq + 2, ts, true, b"\x65slice");
+        }
+        assert_eq!(
+            h.frames,
+            vec![
+                (true, expected_frame.clone()), // overridden
+                (false, expected_frame),        // in-band SPS_A doesn't undo override
+            ]
+        );
+        let Some(v) = d.parameters() else { panic!() };
+        let crate::codec::VideoParametersCodec::H264 { sps, .. } = v.codec_params() else {
+            panic!()
+        };
+        assert_eq!(&sps[..], SPS_B);
     }
 }

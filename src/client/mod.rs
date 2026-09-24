@@ -15,12 +15,12 @@ use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
+pub(crate) use self::demux::LegacyHandler;
 pub use self::demux::{AudioFrame, CodecItem, MessageFrame, VideoFrame};
-pub(crate) use self::demux::{DepacketizeError, push_legacy};
 pub use self::received::{ReceivedPacket, ReceivedPacketBuilder};
 pub use self::timeline::Timeline;
 #[cfg(test)]
-pub(crate) use self::{demux::LegacyHandler, received::build_raw_rtp};
+pub(crate) use self::{demux::DepacketizeError, received::build_raw_rtp};
 use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
 use bytes::Bytes;
@@ -793,8 +793,8 @@ impl SetupOptions {
     /// available via [`Stream::frame_format`], e.g. to pass to
     /// [`VideoParameters::extra_data`](crate::codec::VideoParameters::extra_data).
     ///
-    /// It has no effect on handler events, such as [`crate::codec::VideoHandler`]'s, which take the
-    /// format on each call, such as [`VideoFrameEnd::complete_frame`](crate::codec::VideoFrameEnd::complete_frame).
+    /// It has no effect on [`Session::handle_next`], whose handler events take
+    /// the format on each call, such as [`VideoFrameEnd::complete_frame`](crate::codec::VideoFrameEnd::complete_frame).
     #[inline]
     pub fn frame_format(mut self, format: crate::codec::FrameFormat) -> Self {
         self.frame_format = Some(format);
@@ -2251,9 +2251,9 @@ impl Session<Playing> {
             }
         }
         Ok(Demuxed {
-            state: DemuxedState::Waiting,
             session: self,
             pending: VecDeque::new(),
+            fused: false,
         })
     }
 
@@ -3061,19 +3061,176 @@ impl ValidatedRtp {
     }
 }
 
-enum DemuxedState {
-    Waiting,
-    Pulling(usize),
-    Fused,
+/// Receives events from [`Session::poll_handle`] and [`Session::handle_next`].
+///
+/// This extends the codec handler traits (which receive frames) with
+/// session-level concerns. The audio and message traits have default
+/// implementations of all methods, so a handler which only cares about video
+/// can implement them with empty `impl` blocks.
+pub trait SessionHandler:
+    crate::codec::VideoHandler<crate::PacketContext>
+    + crate::codec::AudioHandler<crate::PacketContext>
+    + crate::codec::MessageHandler<crate::PacketContext>
+{
+    /// Called before any events arising from an RTP packet, with the index of
+    /// its stream within [`Session::streams`].
+    fn stream(&mut self, _stream_id: usize) {}
+
+    /// Called with each RTCP compound packet.
+    fn rtcp(&mut self, _pkt: &crate::rtcp::ReceivedCompoundPacket) {}
+}
+
+/// An item from [`Session::poll_depacketize`].
+enum DepacketizeItem<'a> {
+    /// An RTP packet, ready to push to its stream's depacketizer.
+    Rtp {
+        depacketizer: &'a mut crate::codec::Depacketizer<crate::PacketContext>,
+        pkt: crate::buf::PacketRef<'a, crate::PacketContext>,
+        stream_id: usize,
+
+        /// The format for [`Demuxed`]; see [`SetupOptions::frame_format`].
+        frame_format: crate::codec::FrameFormat,
+        conn_ctx: &'a crate::ConnectionContext,
+        stream_ctx: &'a StreamContext,
+    },
+    Rtcp(crate::rtcp::ReceivedCompoundPacket),
+}
+
+impl Session<Playing> {
+    /// Polls for the next RTP or RTCP packet, passing it to `f`.
+    fn poll_depacketize<T>(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        f: impl FnOnce(DepacketizeItem<'_>) -> T,
+    ) -> Poll<Option<Result<T, Error>>> {
+        let rtp = match ready!(self.as_mut().poll_stream_item(cx)) {
+            None => return Poll::Ready(None),
+            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            Some(Ok(ValidatedItem::Rtcp(PacketItem::Rtcp(pkt)))) => {
+                return Poll::Ready(Some(Ok(f(DepacketizeItem::Rtcp(pkt)))));
+            }
+            Some(Ok(ValidatedItem::Rtcp(_))) => unreachable!(),
+            Some(Ok(ValidatedItem::Rtp(rtp))) => rtp,
+        };
+        let inner = &mut *self.0;
+        let conn = inner.conn.as_ref().unwrap();
+        let stream = &mut inner.presentation.streams[rtp.stream_id];
+        let depacketizer = match &mut stream.depacketizer {
+            Ok(d) => d,
+            Err(description) => {
+                return Poll::Ready(Some(Err(wrap!(ErrorInt::RtspResponseError {
+                    conn_ctx: *conn.inner.ctx(),
+                    msg_ctx: inner.describe_ctx,
+                    method: msg::Method::DESCRIBE,
+                    cseq: inner.describe_cseq,
+                    status: inner.describe_status,
+                    description: description.clone(),
+                }))));
+            }
+        };
+        let StreamState::Playing {
+            ctx: stream_ctx,
+            udp_sockets,
+            ..
+        } = &stream.state
+        else {
+            unreachable!("stream {} not in Playing state", rtp.stream_id);
+        };
+        let buf = match udp_sockets {
+            Some(udp_sockets) => &udp_sockets.read_buf,
+            None => conn.inner.read_buf(),
+        };
+        let pkt = crate::buf::PacketRef::new(
+            rtp.meta,
+            buf,
+            rtp.body_pos + u64::from(rtp.payload_range.start),
+            rtp.payload_range.end - rtp.payload_range.start,
+        );
+        Poll::Ready(Some(Ok(f(DepacketizeItem::Rtp {
+            depacketizer,
+            pkt,
+            stream_id: rtp.stream_id,
+            frame_format: stream.frame_format,
+            conn_ctx: conn.inner.ctx(),
+            stream_ctx,
+        }))))
+    }
+
+    /// Processes the next RTP or RTCP packet, delivering the resulting events
+    /// to `handler`.
+    ///
+    /// Returns `Ready(Some(Ok(())))` after each packet, whether or not it
+    /// produced events, and `Ready(None)` at the end of the session.
+    ///
+    /// Unlike the [`futures::Stream`] impls of [`Session`] and [`Demuxed`],
+    /// this can hand video frame data to the handler without copying it, and
+    /// before the frame is complete. See [`crate::codec::VideoHandler`].
+    ///
+    /// Corrupt data is reported via the handler's `loss` methods rather than
+    /// as an error; it's up to the handler whether to treat it as fatal.
+    ///
+    /// The handler runs within this call, so a slow handler delays reading
+    /// from the network. This provides backpressure, but a handler shouldn't
+    /// block the async runtime.
+    ///
+    /// Returns an error on any packet for a stream which can't be
+    /// depacketized; see [`Session::demuxed`].
+    pub fn poll_handle(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        handler: &mut impl SessionHandler,
+    ) -> Poll<Option<Result<(), Error>>> {
+        self.poll_depacketize(cx, |item| match item {
+            DepacketizeItem::Rtp {
+                depacketizer,
+                pkt,
+                stream_id,
+                ..
+            } => {
+                handler.stream(stream_id);
+                depacketizer.push(&pkt, handler);
+            }
+            DepacketizeItem::Rtcp(pkt) => handler.rtcp(&pkt),
+        })
+    }
+
+    /// Processes the next RTP or RTCP packet, delivering the resulting events
+    /// to `handler`.
+    ///
+    /// This is an `async` wrapper around [`Session::poll_handle`]:
+    ///
+    /// ```no_run
+    /// # async fn f(
+    /// #     mut session: retina::client::Session<retina::client::Playing>,
+    /// #     mut handler: impl retina::client::SessionHandler,
+    /// # ) -> Result<(), retina::Error> {
+    /// while let Some(r) = session.handle_next(&mut handler).await {
+    ///     r?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn handle_next(
+        &mut self,
+        handler: &mut impl SessionHandler,
+    ) -> Option<Result<(), Error>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_handle(cx, handler)).await
+    }
 }
 
 /// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
+///
+/// This accumulates each frame and returns it as an owned [`CodecItem`]. See
+/// [`Session::handle_next`] for an alternative which avoids copying and can
+/// deliver data before the frame is complete.
 pub struct Demuxed {
-    state: DemuxedState,
     session: Session<Playing>,
 
-    /// Items ready to return, from the most recently pushed packet.
-    pending: VecDeque<Result<CodecItem, crate::client::DepacketizeError>>,
+    /// Items ready to return.
+    pending: VecDeque<Result<CodecItem, Error>>,
+
+    /// True if a depacketization error has ended the stream.
+    fused: bool,
 }
 
 impl Demuxed {
@@ -3097,105 +3254,70 @@ impl futures::Stream for Demuxed {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         loop {
-            let stream_id = match self.state {
-                DemuxedState::Waiting => {
-                    match ready!(Pin::new(&mut self.session).poll_stream_item(cx)) {
-                        Some(Ok(ValidatedItem::Rtp(rtp))) => {
-                            let stream_id = rtp.stream_id;
-                            let mut pending = std::mem::take(&mut self.pending);
-                            let inner = &mut *self.session.0;
-                            let stream = &mut inner.presentation.streams[stream_id];
-                            let payload_pos = rtp.body_pos + u64::from(rtp.payload_range.start);
-                            let payload_len = rtp.payload_range.end - rtp.payload_range.start;
-                            let depacketizer = match &mut stream.depacketizer {
-                                Ok(d) => d,
-                                Err(_) => unreachable!("depacketizer was Ok"),
-                            };
-                            let buf = match &stream.state {
-                                StreamState::Playing {
-                                    udp_sockets: Some(udp_sockets),
-                                    ..
-                                } => &udp_sockets.read_buf,
-                                _ => inner.conn.as_ref().unwrap().inner.read_buf(),
-                            };
-                            push_legacy(
-                                depacketizer,
-                                &crate::buf::PacketRef::new(
-                                    rtp.meta,
-                                    buf,
-                                    payload_pos,
-                                    payload_len,
-                                ),
-                                stream_id,
-                                stream.frame_format,
-                                &mut pending,
-                            )
-                            .map_err(|description| {
-                                let conn_ctx = *inner.conn.as_ref().unwrap().inner.ctx();
-                                wrap!(ErrorInt::RtpPacketError {
-                                    conn_ctx,
-                                    stream_ctx: stream.ctx().unwrap().to_owned(),
-                                    pkt_ctx: rtp.meta.ctx,
-                                    stream_id,
-                                    ssrc: rtp.meta.ssrc,
-                                    sequence_number: rtp.meta.sequence_number,
-                                    description,
-                                })
-                            })?;
-                            self.pending = pending;
-                            stream_id
-                        }
-                        Some(Ok(ValidatedItem::Rtcp(pkt))) => {
-                            let p = match pkt {
-                                PacketItem::Rtcp(r) => r,
-                                _ => unreachable!(),
-                            };
-                            return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))));
-                        }
-                        Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                        None => return Poll::Ready(None),
-                    }
-                }
-                DemuxedState::Pulling(stream_id) => stream_id,
-                DemuxedState::Fused => return Poll::Ready(None),
-            };
-            let next = self.pending.pop_front();
-            let inner = self.session.0.as_mut().project();
-            let stream = &mut inner.presentation.streams[stream_id];
-            let stream_ctx = match stream.state {
-                StreamState::Playing { ref ctx, .. } => ctx,
-                _ => unreachable!(),
-            };
-            let conn_ctx = inner
-                .conn
-                .as_ref()
-                .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?
-                .inner
-                .ctx();
-
-            match next {
-                Some(Ok(item)) => {
-                    self.state = DemuxedState::Pulling(stream_id);
-                    return Poll::Ready(Some(Ok(item)));
-                }
-                None => {
-                    self.state = DemuxedState::Waiting;
-                    continue;
-                }
-                Some(Err(e)) => {
-                    let conn_ctx = *conn_ctx;
-                    let stream_ctx = *stream_ctx;
-                    self.state = DemuxedState::Fused;
-                    return Poll::Ready(Some(Err(Error(Arc::new(ErrorInt::RtpPacketError {
+            if let Some(item) = self.pending.pop_front() {
+                return Poll::Ready(Some(item));
+            }
+            if self.fused {
+                return Poll::Ready(None);
+            }
+            let this = &mut *self;
+            let pending = &mut this.pending;
+            let fused = &mut this.fused;
+            let r = ready!(
+                Pin::new(&mut this.session).poll_depacketize(cx, |item| match item {
+                    DepacketizeItem::Rtcp(pkt) => pending.push_back(Ok(CodecItem::Rtcp(pkt))),
+                    DepacketizeItem::Rtp {
+                        depacketizer,
+                        pkt,
+                        stream_id,
+                        frame_format: format,
                         conn_ctx,
                         stream_ctx,
-                        pkt_ctx: e.pkt_ctx,
-                        stream_id,
-                        ssrc: e.ssrc,
-                        sequence_number: e.sequence_number,
-                        description: e.description,
-                    })))));
-                }
+                    } => {
+                        let mut items = VecDeque::new();
+                        let r = depacketizer.push_with(
+                            &pkt,
+                            &mut LegacyHandler {
+                                pending: &mut items,
+                                meta: &pkt.meta,
+                                stream_id,
+                                format,
+                            },
+                        );
+                        let error = |pkt_ctx, description| {
+                            wrap!(ErrorInt::RtpPacketError {
+                                conn_ctx: *conn_ctx,
+                                stream_ctx: *stream_ctx,
+                                pkt_ctx,
+                                stream_id,
+                                ssrc: pkt.meta.ssrc,
+                                sequence_number: pkt.meta.sequence_number,
+                                description,
+                            })
+                        };
+
+                        // Errors found mid-frame end the stream; those found as a
+                        // packet arrives are returned without ending it.
+                        for item in items {
+                            match item {
+                                Ok(item) => pending.push_back(Ok(item)),
+                                Err(e) => {
+                                    pending.push_back(Err(error(e.pkt_ctx, e.description)));
+                                    *fused = true;
+                                    return;
+                                }
+                            }
+                        }
+                        if let Err(description) = r {
+                            pending.push_back(Err(error(pkt.meta.ctx, description)));
+                        }
+                    }
+                })
+            );
+            match r {
+                None => return Poll::Ready(None),
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Ok(())) => {}
             }
         }
     }
@@ -3498,6 +3620,115 @@ mod tests {
         );
         tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
+    }
+
+    impl SessionHandler for crate::codec::events::testutil::Recorder {}
+
+    /// Frames via `Session::handle_next`, then via `Demuxed`.
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "h264")]
+    async fn handle_next_then_demuxed() {
+        use crate::codec::Accumulate;
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().teardown(TeardownPolicy::Never),
+                url
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        session.0.keepalive_timer = None; // see `simple`.
+
+        // An IDR slice as a single, marked packet.
+        let mut h = Recorder::new(Accumulate::Yes);
+        tokio::join!(
+            async {
+                session.handle_next(&mut h).await.unwrap().unwrap();
+            },
+            async {
+                server
+                    .send(OwnedMessage::Data {
+                        channel_id: 0,
+                        body: Bytes::from_static(
+                            b"\x80\xe0\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8\x65slice",
+                        ),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(crate::codec::UnitPosition::Complete, hex(b"\x65slice")),
+                Event::FrameEnd {
+                    loss: 0,
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x65slice")),
+                },
+            ]
+        );
+
+        // A non-IDR slice via `Demuxed`.
+        let mut demuxed = session.demuxed().unwrap();
+        tokio::join!(
+            async {
+                match demuxed.next().await {
+                    Some(Ok(CodecItem::VideoFrame(f))) => {
+                        assert_eq!(f.stream_id(), 0);
+                        assert!(!f.is_random_access_point());
+                        assert_eq!(f.data(), b"\x00\x00\x00\x06\x41slice");
+                    }
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                server
+                    .send(OwnedMessage::Data {
+                        channel_id: 0,
+                        body: Bytes::from_static(
+                            b"\x80\xe0\x41\xd5\x00\x00\x0b\xb8\xdc\xc4\xa0\xd8\x41slice",
+                        ),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
     }
 
     /// As above, but TEARDOWN fails until session expiration.

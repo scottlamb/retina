@@ -3,10 +3,15 @@
 
 use anyhow::{Error, bail};
 use base64::{Engine as _, engine::general_purpose};
+use bytes::BytesMut;
 use clap::Parser;
-use futures::StreamExt;
 use log::{error, info, warn};
-use retina::client::{CodecItem, SetupOptions};
+use retina::PacketContext;
+use retina::client::SetupOptions;
+use retina::codec::{
+    Accumulate, AudioHandler, Loss, MessageHandler, VideoData, VideoFrameEnd, VideoFrameStart,
+    VideoHandler, VideoParametersCodec,
+};
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
     api::{APIBuilder, interceptor_registry::register_default_interceptors},
@@ -94,6 +99,70 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
 struct Frame {
     stream_id: usize,
     annexb_data: bytes::Bytes,
+}
+
+/// Assembles Annex B frames from the upstream session's streaming events.
+///
+/// Rather than having Retina accumulate each frame and then copy it, this
+/// appends each NAL unit to `buf` as it arrives, applying its own framing.
+struct UpstreamHandler {
+    stream_id: usize,
+    buf: BytesMut,
+    tx: tokio::sync::broadcast::Sender<Frame>,
+}
+
+impl VideoHandler<PacketContext> for UpstreamHandler {
+    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+        self.buf.clear();
+
+        // Browsers need parameter sets in-band before each key frame.
+        if frame_start.is_random_access_point()
+            && let Some(p) = frame_start.parameters()
+        {
+            let nals: &[&[u8]] = match p.codec_params() {
+                VideoParametersCodec::H264 { sps, pps } => &[sps, pps],
+                VideoParametersCodec::H265 { vps, sps, pps } => &[vps, sps, pps],
+                _ => &[],
+            };
+            for nal in nals {
+                self.buf
+                    .extend_from_slice(&retina::codec::h26x::ANNEX_B_START_CODE);
+                self.buf.extend_from_slice(nal);
+            }
+        }
+        Accumulate::No
+    }
+
+    fn data(&mut self, data: &VideoData<'_>) {
+        if data.position.is_first() {
+            self.buf
+                .extend_from_slice(&retina::codec::h26x::ANNEX_B_START_CODE);
+        }
+        for d in data.data {
+            self.buf.extend_from_slice(d);
+        }
+    }
+
+    fn frame_end(&mut self, _frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
+        let _ = self.tx.send(Frame {
+            stream_id: self.stream_id,
+            annexb_data: self.buf.split().freeze(),
+        });
+    }
+
+    fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
+        warn!("upstream loss: {:?}", loss.reason());
+    }
+}
+
+// This only proxies video.
+impl AudioHandler<PacketContext> for UpstreamHandler {}
+impl MessageHandler<PacketContext> for UpstreamHandler {}
+
+impl retina::client::SessionHandler for UpstreamHandler {
+    fn stream(&mut self, stream_id: usize) {
+        self.stream_id = stream_id;
+    }
 }
 
 async fn run() -> Result<(), Error> {
@@ -206,12 +275,7 @@ async fn run() -> Result<(), Error> {
         .filter_map(|(i, track)| track.as_ref().map(|_| i))
     {
         upstream_session
-            .setup(
-                i,
-                SetupOptions::default()
-                    .transport(opts.transport.clone())
-                    .frame_format(retina::codec::FrameFormat::SIMPLE),
-            )
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
             .await?;
     }
 
@@ -228,23 +292,18 @@ async fn run() -> Result<(), Error> {
     // afterward with "framing error".
     let mut upstream_session = upstream_session
         .play(retina::client::PlayOptions::default())
-        .await?
-        .demuxed()?;
+        .await?;
     let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
     tokio::spawn(async move {
-        while let Some(item) = upstream_session.next().await {
-            match item {
-                Ok(CodecItem::VideoFrame(f)) => {
-                    let _ = upstream_frames_tx.send(Frame {
-                        stream_id: f.stream_id(),
-                        annexb_data: f.into_data().into(),
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!("upstream failed: {e}");
-                    break;
-                }
+        let mut handler = UpstreamHandler {
+            stream_id: 0,
+            buf: BytesMut::new(),
+            tx: upstream_frames_tx,
+        };
+        while let Some(r) = upstream_session.handle_next(&mut handler).await {
+            if let Err(e) = r {
+                error!("upstream failed: {e}");
+                break;
             }
         }
     });
