@@ -7,7 +7,7 @@
 #![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
 
 use crate::buf::{BufRange, MarkBuf};
-use crate::codec::{Data, Handler, UnitPosition};
+use crate::codec::{UnitPosition, VideoData, VideoHandler};
 use crate::inputs::{Input as _, Split};
 
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
@@ -26,6 +26,16 @@ pub enum Framing {
 
     /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
     AnnexB,
+}
+
+/// Returns the given parameter set NALs, each preceded by [`ANNEX_B_START_CODE`].
+pub(super) fn annex_b_parameter_sets(nals: &[&[u8]]) -> bytes::Bytes {
+    let mut buf = Vec::with_capacity(nals.iter().map(|n| 4 + n.len()).sum());
+    for nal in nals {
+        buf.extend_from_slice(&ANNEX_B_START_CODE);
+        buf.extend_from_slice(nal);
+    }
+    buf.into()
 }
 
 /// A NAL unit header, as stored by the H.264 and H.265 depacketizers.
@@ -100,7 +110,7 @@ impl Delivery {
         pieces: &[BufRange],
         in_progress: Option<H>,
         buf: &MarkBuf,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) {
         let mut piece_idx = crate::to_usize(self.pieces);
         for nal in &nals[crate::to_usize(self.nals)..] {
@@ -225,7 +235,7 @@ pub(super) fn visit_frame<H: NalHeader>(
 /// Collects slices on the stack, splitting into several [`Data`] events if
 /// there are too many pieces to fit.
 pub(super) fn deliver<Ctx>(
-    handler: &mut impl Handler<Ctx>,
+    handler: &mut impl VideoHandler<Ctx>,
     header: &[u8],
     pieces: &[BufRange],
     buf: &MarkBuf,
@@ -242,7 +252,7 @@ pub(super) fn deliver<Ctx>(
     }
     for piece in pieces {
         if n + 2 > MAX_SLICES {
-            handler.data(&Data {
+            handler.data(&VideoData {
                 position: UnitPosition::new(first, false),
                 data: &slices[..n],
             });
@@ -257,7 +267,7 @@ pub(super) fn deliver<Ctx>(
             n += 1;
         }
     }
-    handler.data(&Data {
+    handler.data(&VideoData {
         position: UnitPosition::new(first, last),
         data: &slices[..n],
     });

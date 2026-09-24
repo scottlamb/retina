@@ -162,10 +162,28 @@ impl<'i> Split<'i> {
     /// Returns the two underlying slices.
     ///
     /// Useful when raw slice access is needed (e.g. for vectored I/O or
-    /// copying into a contiguous buffer).
+    /// copying into a contiguous buffer). The second is empty unless the
+    /// bytes wrap around the end of a ring buffer.
     #[inline]
     pub fn slices(&self) -> (&'i [u8], &'i [u8]) {
         (self.first, self.second)
+    }
+
+    /// Returns the total length in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.first.len() + self.second.len()
+    }
+
+    /// Returns true if there are no bytes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.first.is_empty()
+    }
+
+    /// Copies the bytes into a new vector.
+    pub fn to_vec(&self) -> Vec<u8> {
+        [self.first, self.second].concat()
     }
 }
 

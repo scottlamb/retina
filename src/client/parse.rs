@@ -373,6 +373,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp);
 
     Ok(Stream {
+        frame_format: Default::default(),
         media,
         encoding_name,
         clock_rate_hz: clock_rate,

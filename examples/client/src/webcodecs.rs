@@ -11,10 +11,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures::{StreamExt as _, stream::FuturesUnordered};
 use log::{debug, info};
-use retina::{
-    client::SetupOptions,
-    codec::{VideoFrame, VideoParameters},
-};
+use retina::{client::SetupOptions, client::VideoFrame, codec::VideoParameters};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -117,7 +114,8 @@ fn make_parameters_msg(parameters: &VideoParameters) -> axum::extract::ws::Messa
     let (coded_width, coded_height) = parameters.coded_pixel_dimensions();
     out.put_u16(u16::try_from(coded_width).unwrap_or(u16::MAX));
     out.put_u16(u16::try_from(coded_height).unwrap_or(u16::MAX));
-    out.put_slice(parameters.extra_data());
+    // This matches the `FrameFormat::MP4` set up below.
+    out.put_slice(parameters.extra_data(retina::codec::FrameFormat::MP4));
     axum::extract::ws::Message::Binary(out.freeze())
 }
 
@@ -138,7 +136,7 @@ async fn receive_frames(
     let mut next_frame_num = 0;
     let mut cur_parameters = None;
     while let Some(item) = session.next().await {
-        if let retina::codec::CodecItem::VideoFrame(frame) = item? {
+        if let retina::client::CodecItem::VideoFrame(frame) = item? {
             let stream_params = session.streams()[frame.stream_id()].parameters();
             let parameters = if let Some(cur_parameters) = cur_parameters.as_ref()
                 && !frame.has_new_parameters()

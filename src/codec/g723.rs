@@ -7,7 +7,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::buf::PacketRef;
 
-use super::{AudioFrameRef, AudioParameters, Handler};
+use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
 const FIXED_CLOCK_RATE: u32 = 8_000;
 
@@ -36,8 +36,8 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        Some(super::ParametersRef::Audio(&self.parameters))
+    pub(super) fn parameters(&self) -> &super::AudioParameters {
+        &self.parameters
     }
 
     fn validate(payload: &[u8]) -> bool {
@@ -55,7 +55,7 @@ impl Depacketizer {
     pub(super) fn push_with<Ctx>(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl AudioHandler<Ctx>,
     ) -> Result<(), String> {
         let (s1, s2) = pkt.payload().slices();
         let joined;
@@ -77,6 +77,7 @@ impl Depacketizer {
             frame_length: NonZeroU32::new(240).unwrap(),
             loss: pkt.meta.loss,
             data: payload,
+            adts: None,
         });
         Ok(())
     }

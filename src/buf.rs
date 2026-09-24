@@ -1,9 +1,59 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Power-of-two ring buffer for network I/O.
+//! Buffers for received RTP data.
+//!
+//! A [`PacketRef`] is how a packet reaches any depacketizer, such as
+//! [`crate::codec::VideoDepacketizer`]. It refers to the packet's payload in
+//! place within a [`MarkBuf`], which holds received bytes—for example, RTSP
+//! interleaved data read from a TCP connection, or UDP datagrams. The
+//! depacketizer refers to payload bytes in place rather than copying them, and
+//! the buffer keeps them available as long as a depacketizer needs them.
+//!
+//! # Supplying packets yourself
+//!
+//! The caller fills a `MarkBuf`, parses RTP packets out of it, and hands each
+//! packet's payload to a depacketizer as a `PacketRef`. This module does no
+//! I/O itself; see the `depacketize-dump` example for a caller that reads from
+//! a file.
+//!
+//! ```
+//! # use retina::buf::{MarkBuf, PacketRef};
+//! # use retina::codec::{AudioDepacketizer, AudioFrameRef, AudioHandler};
+//! # use retina::rtp::PacketMeta;
+//! struct MyHandler;
+//! impl AudioHandler<u64> for MyHandler {
+//!     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, u64>) {
+//!         // ...
+//!     }
+//! }
+//!
+//! let mut d = AudioDepacketizer::<u64>::new("pcmu", 8_000, None, None).unwrap();
+//! let mut buf = MarkBuf::new(65536);
+//! let received = b"payload";
+//!
+//! // Fill.
+//! let pos = buf.end();
+//! buf.extend(received);
+//!
+//! // Parse. Here the payload is all of `received`; typically there would be
+//! // RTP headers to skip, as with `retina::rtp::PacketHeader::validate`.
+//! buf.advance_unparsed(buf.end());
+//!
+//! // Depacketize.
+//! let meta = PacketMeta {
+//!     ctx: 0, // e.g. a file offset.
+//!     timestamp: retina::Timestamp::new(0, std::num::NonZeroU32::new(8_000).unwrap(), 0)
+//!         .unwrap(),
+//!     sequence_number: 0,
+//!     ssrc: 0,
+//!     mark: true,
+//!     loss: 0,
+//! };
+//! d.push(&PacketRef::new(meta, &buf, pos, received.len() as u16), &mut MyHandler);
+//! ```
 
-use crate::inputs::Split;
+pub use crate::inputs::Split;
 use crate::to_u64;
 use std::sync::{Arc, Mutex};
 
@@ -188,7 +238,6 @@ impl RingBuf {
     }
 
     /// Appends `data` to the buffer, growing if necessary.
-    #[cfg(test)]
     pub fn extend(&mut self, data: &[u8]) {
         let (s1, s2) = self.spare_capacity(data.len());
         let mid = data.len().min(s1.len());
@@ -315,40 +364,60 @@ impl Drop for Mark {
     }
 }
 
+impl Mark {
+    /// Returns true if this mark was created by `buf`.
+    #[inline]
+    #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
+    pub(crate) fn belongs_to(&self, buf: &MarkBuf) -> bool {
+        Arc::ptr_eq(&self.registry, &buf.registry)
+    }
+}
+
 impl std::fmt::Debug for Mark {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mark").field("pos", &self.pos).finish()
     }
 }
 
-/// A [`RingBuf`] wrapper with mark-based retention.
+/// A growable ring buffer with mark-based retention.
 ///
-/// Marks pin stream positions so data from that point onward stays
-/// accessible. The buffer can only reclaim space behind the oldest mark.
+/// Bytes are addressed by *stream position*: a `u64` offset from the first
+/// byte ever written, which increases monotonically and never wraps.
 ///
-/// Mark operations use interior mutability (`&self`) so they can be used
-/// while the depacketizer borrows the buffer. Only `spare_capacity` /
-/// `advance_end` / `advance_unparsed` require `&mut self`.
+/// The buffer has three regions:
 ///
-/// # Invariant: marks never sit after `unparsed`
+/// ```text
+///   retained                 unparsed               free
+/// |---------------------|-----------------------|------------...
+/// ^ oldest mark         ^ unparsed()            ^ end()
+/// ```
 ///
-/// Every live [`Mark`] is at a position `<= unparsed`. [`reclaim`](Self::reclaim)
-/// depends on this: it advances the ring's `start` to the earliest mark, which
-/// would discard not-yet-parsed bytes if a mark could be beyond `unparsed`.
+/// * *Unparsed* bytes, `[unparsed(), end())`, have been received but not yet
+///   parsed by the caller. The caller fills this region with
+///   [`MarkBuf::spare_capacity`] and [`MarkBuf::advance_end`] (or
+///   [`MarkBuf::extend`]) and consumes it with [`MarkBuf::advance_unparsed`].
+/// * *Retained* bytes before `unparsed()` are kept only while something—
+///   typically a depacketizer holding a partial frame—has marked them. They're
+///   reclaimed lazily, when the caller next asks for spare capacity.
 ///
-/// Callers get this for free by parsing a packet out of the buffer (which
-/// advances `unparsed` past it) before handing it to a depacketizer that may
-/// mark it. [`add_mark_at`](Self::add_mark_at) asserts it.
+/// # Contract
+///
+/// Depacketizers only mark bytes which the caller has already parsed: marks
+/// are never beyond `unparsed()`. This guarantees reclaiming space never
+/// discards unparsed data. The caller upholds it simply by advancing
+/// `unparsed()` past a packet (as with [`MarkBuf::advance_unparsed`]) before
+/// constructing a [`PacketRef`] to it; [`PacketRef::new`] panics otherwise.
 #[derive(Debug)]
-pub(crate) struct MarkBuf {
+pub struct MarkBuf {
     ring: RingBuf,
     registry: Arc<MarkRegistry>,
     unparsed: u64,
 }
 
-#[allow(dead_code)] // Some methods reserved for future steps.
 impl MarkBuf {
     /// Creates a new buffer with at least `capacity` bytes.
+    ///
+    /// The buffer grows as needed; see [`MarkBuf::spare_capacity`].
     pub fn new(capacity: usize) -> Self {
         Self {
             ring: RingBuf::new(capacity),
@@ -357,25 +426,25 @@ impl MarkBuf {
         }
     }
 
-    /// The current unparsed position (where new marks are created).
+    /// Returns the stream position of the first unparsed byte.
     #[inline]
     pub fn unparsed(&self) -> u64 {
         self.unparsed
     }
 
-    /// Stream position one past the last buffered byte.
+    /// Returns the stream position one past the last buffered byte.
     #[inline]
     pub fn end(&self) -> u64 {
         self.ring.end()
     }
 
-    /// Number of bytes between unparsed and end.
+    /// Returns the number of unparsed bytes.
     #[inline]
     pub fn unparsed_len(&self) -> usize {
         (self.ring.end() - self.unparsed) as usize
     }
 
-    /// Returns unparsed data as a [`Split`].
+    /// Returns the unparsed bytes.
     pub fn unparsed_split(&self) -> Split<'_> {
         let len = self.unparsed_len();
         if len == 0 {
@@ -385,7 +454,8 @@ impl MarkBuf {
     }
 
     /// Creates a new mark at the current unparsed position.
-    pub fn add_mark(&self) -> Mark {
+    #[allow(dead_code)]
+    pub(crate) fn add_mark(&self) -> Mark {
         self.add_mark_at(self.unparsed)
     }
 
@@ -395,7 +465,7 @@ impl MarkBuf {
     /// the buffer, and must already have been parsed out of it. See the
     /// invariant documented on [`MarkBuf`]; this is the sole chokepoint for
     /// creating marks, so asserting here enforces it for all of them.
-    pub fn add_mark_at(&self, pos: u64) -> Mark {
+    pub(crate) fn add_mark_at(&self, pos: u64) -> Mark {
         assert!(
             pos >= self.ring.start() && pos <= self.unparsed,
             "add_mark_at({pos}): must be within [{}, {}]",
@@ -409,23 +479,29 @@ impl MarkBuf {
         }
     }
 
-    /// Ring buffer capacity (always a power of two).
-    #[inline]
-    pub fn capacity(&self) -> usize {
+    /// Returns the current capacity, which is always a power of two.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
         self.ring.capacity()
     }
 
-    /// Returns data at `[pos, pos+len)` as a [`Split`].
+    /// Returns the stream position of the oldest byte still in the buffer.
+    #[inline]
+    pub(crate) fn start(&self) -> u64 {
+        self.ring.start()
+    }
+
+    /// Returns bytes at stream positions `[pos, pos+len)`.
     ///
     /// # Panics
     ///
-    /// Panics if the range is outside valid buffer bounds.
+    /// Panics if the range is not within `[start(), end())`.
     #[inline]
     pub fn split(&self, pos: u64, len: usize) -> Split<'_> {
         self.ring.split(pos, len)
     }
 
-    /// Advances the unparsed position.
+    /// Marks bytes before `new_unparsed` as parsed.
     ///
     /// Does **not** reclaim ring buffer space; that happens lazily in
     /// [`spare_capacity`](Self::spare_capacity). This ensures that data
@@ -447,9 +523,13 @@ impl MarkBuf {
 
     /// Returns the free space as up to two mutable slices.
     ///
-    /// Ensures at least `reserve` bytes of free space (reclaiming behind
-    /// the oldest mark/unparsed position and growing if needed). After
-    /// writing into these slices, call [`advance_end`](Self::advance_end).
+    /// Ensures at least `reserve` bytes of free space, reclaiming space behind
+    /// the oldest mark (or the unparsed position, if there are no marks) and
+    /// growing if needed. The slices may be larger than `reserve`.
+    ///
+    /// After writing `n` bytes into these slices (filling the first before the
+    /// second), call [`advance_end`](Self::advance_end). The slices are
+    /// initialized memory, suitable for `std::io::Read` or `IoSliceMut`.
     pub fn spare_capacity(&mut self, reserve: usize) -> (&mut [u8], &mut [u8]) {
         self.reclaim();
         self.ring.spare_capacity(reserve)
@@ -458,6 +538,10 @@ impl MarkBuf {
     /// Marks `n` additional bytes at the end as valid.
     ///
     /// Call after writing into slices returned by [`spare_capacity`](Self::spare_capacity).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` exceeds the available space.
     pub fn advance_end(&mut self, n: usize) {
         self.ring.advance_end(n);
     }
@@ -472,19 +556,23 @@ impl MarkBuf {
         self.ring.advance_to(floor);
     }
 
-    /// Appends data directly to the buffer.
-    #[cfg(test)]
+    /// Appends `data` to the buffer, growing if necessary.
+    ///
+    /// This is a convenience for callers which already have the data in hand;
+    /// [`spare_capacity`](Self::spare_capacity) avoids an extra copy when
+    /// reading from a socket or file.
     pub fn extend(&mut self, data: &[u8]) {
         self.reclaim();
         self.ring.extend(data);
     }
 }
 
-/// An RTP packet referencing payload data in a [`MarkBuf`].
+/// An RTP packet whose payload is in a [`MarkBuf`].
 ///
-/// Passed to [`Depacketizer::push`](crate::codec::Depacketizer::push),
+/// Passed to depacketizers such as [`crate::codec::VideoDepacketizer::push`],
 /// bundling packet metadata with buffer access.
-pub(crate) struct PacketRef<'a, Ctx = crate::PacketContext> {
+pub struct PacketRef<'a, Ctx> {
+    /// The packet's metadata.
     pub meta: crate::rtp::PacketMeta<Ctx>,
     buf: &'a MarkBuf,
     payload_pos: u64,
@@ -493,13 +581,28 @@ pub(crate) struct PacketRef<'a, Ctx = crate::PacketContext> {
 
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 impl<'a, Ctx> PacketRef<'a, Ctx> {
-    /// Creates a `PacketRef`.
+    /// Creates a `PacketRef` for a payload at stream positions
+    /// `[payload_pos, payload_pos + payload_len)` in `buf`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload isn't within `buf`'s parsed bytes, `[start(),
+    /// unparsed())`. See the [`MarkBuf`] contract.
     pub fn new(
         meta: crate::rtp::PacketMeta<Ctx>,
         buf: &'a MarkBuf,
         payload_pos: u64,
         payload_len: u16,
     ) -> Self {
+        assert!(
+            payload_pos >= buf.start()
+                && payload_pos
+                    .checked_add(u64::from(payload_len))
+                    .is_some_and(|end| end <= buf.unparsed()),
+            "payload [{payload_pos}, +{payload_len}) must be within parsed bytes [{}, {})",
+            buf.start(),
+            buf.unparsed(),
+        );
         Self {
             meta,
             buf,
@@ -510,33 +613,32 @@ impl<'a, Ctx> PacketRef<'a, Ctx> {
 
     /// Pin the payload position so the data stays accessible until the
     /// returned [`Mark`] is dropped.
-    pub fn mark(&self) -> Mark {
+    pub(crate) fn mark(&self) -> Mark {
         self.buf.add_mark_at(self.payload_pos)
     }
 
     /// Ring-buffer position of the first payload byte.
     #[inline]
-    pub fn payload_pos(&self) -> u64 {
+    pub(crate) fn payload_pos(&self) -> u64 {
         self.payload_pos
     }
 
     /// Payload length in bytes.
     #[inline]
-    pub fn payload_len(&self) -> u16 {
+    pub(crate) fn payload_len(&self) -> u16 {
         self.payload_len
     }
 
-    /// Returns the payload data as a [`Split`].
+    /// Returns the payload.
     #[inline]
-    pub fn payload(&self) -> Split<'_> {
+    pub fn payload(&self) -> Split<'a> {
         self.buf
             .split(self.payload_pos, usize::from(self.payload_len))
     }
 
-    /// The underlying [`MarkBuf`], for internal helper functions that
-    /// need arbitrary buffer access (e.g. reading accumulated NAL data).
+    /// Returns the buffer holding the payload.
     #[inline]
-    pub fn buf(&self) -> &MarkBuf {
+    pub(crate) fn buf(&self) -> &'a MarkBuf {
         self.buf
     }
 }
@@ -835,5 +937,43 @@ mod tests {
             assert_eq!(got, model, "mark_round={mark_round}");
             drop(mark);
         }
+    }
+
+    fn meta() -> crate::rtp::PacketMeta<()> {
+        crate::rtp::PacketMeta {
+            ctx: (),
+            timestamp: crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            sequence_number: 0,
+            ssrc: 0,
+            mark: false,
+            loss: 0,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_unparsed() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        let _ = PacketRef::new(meta(), &buf, 0, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_beyond_end() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let _ = PacketRef::new(meta(), &buf, 1, 5);
+    }
+
+    #[test]
+    fn packet_ref_ok() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let pkt = PacketRef::new(meta(), &buf, 1, 4);
+        assert_eq!(pkt.payload().to_vec(), b"ello");
     }
 }

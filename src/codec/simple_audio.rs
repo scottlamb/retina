@@ -8,7 +8,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::buf::PacketRef;
 
-use super::{AudioFrameRef, AudioParameters, Handler};
+use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
@@ -32,8 +32,8 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        Some(super::ParametersRef::Audio(&self.parameters))
+    pub(super) fn parameters(&self) -> &super::AudioParameters {
+        &self.parameters
     }
 
     fn frame_length(&self, payload_len: usize) -> Option<NonZeroU32> {
@@ -51,7 +51,7 @@ impl Depacketizer {
     pub(super) fn push_with<Ctx>(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl AudioHandler<Ctx>,
     ) -> Result<(), String> {
         let payload_len = pkt.payload_len();
         let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
@@ -74,6 +74,7 @@ impl Depacketizer {
             frame_length,
             loss: pkt.meta.loss,
             data,
+            adts: None,
         });
         Ok(())
     }
