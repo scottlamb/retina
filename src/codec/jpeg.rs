@@ -21,9 +21,10 @@ use bytes::{Buf, Bytes};
 
 use crate::buf::PacketRef;
 
-use crate::{PacketContext, Timestamp, codec::AllPixelDimensions};
+use crate::{Timestamp, codec::AllPixelDimensions};
 
-use super::{VideoFrame, VideoParameters};
+use super::{Accumulate, Data, FrameBody, FrameEnd, FrameStart, Handler, UnitPosition};
+use super::{ParametersRef, VideoParameters};
 
 const MAX_FRAME_LEN: usize = 2_000_000;
 
@@ -277,8 +278,8 @@ fn make_headers(
 // End of Appendix B.
 
 #[derive(Debug)]
-struct JpegFrameMetadata {
-    start_ctx: PacketContext,
+struct JpegFrameMetadata<Ctx> {
+    start_ctx: Ctx,
     timestamp: Timestamp,
     parameters: Option<VideoParameters>,
 }
@@ -287,9 +288,9 @@ struct JpegFrameMetadata {
 /// into complete image frames as specified in [RFC
 /// 2435](https://www.rfc-editor.org/rfc/rfc2435.txt).
 #[derive(Debug)]
-pub struct Depacketizer {
+pub struct Depacketizer<Ctx> {
     /// Holds metadata for the current frame.
-    metadata: Option<JpegFrameMetadata>,
+    metadata: Option<JpegFrameMetadata<Ctx>>,
 
     /// Backing storage to the assembled frame.
     data: Vec<u8>,
@@ -297,35 +298,37 @@ pub struct Depacketizer {
     /// Cached quantization tables.
     qtables: Vec<Option<Bytes>>,
 
-    /// A complete video frame ready for pull.
-    pending: Option<VideoFrame>,
+    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    pending: std::collections::VecDeque<Result<super::CodecItem, super::DepacketizeError>>,
 
     parameters: Option<VideoParameters>,
 }
 
-impl Depacketizer {
+impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new() -> Self {
         Depacketizer {
             metadata: None,
             data: Vec::new(),
-            pending: None,
+            #[cfg(test)]
+            pending: Default::default(),
             qtables: vec![None; 255],
             parameters: None,
         }
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        if let Some(p) = self.pending.as_ref() {
-            panic!("push with data already pending: {p:?}");
-        }
-
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
         if (pkt.payload_len() as usize) < 8 {
             return Err("Too short RTP/JPEG packet".to_string());
         }
 
-        let ctx = pkt.meta.ctx;
+        let ctx = &pkt.meta.ctx;
         let loss = pkt.meta.loss;
-        let stream_id = pkt.meta.stream_id;
         let timestamp = pkt.meta.timestamp;
         let last_packet_in_frame = pkt.meta.mark;
 
@@ -449,7 +452,7 @@ impl Depacketizer {
                     )?;
 
                     self.metadata.replace(JpegFrameMetadata {
-                        start_ctx: ctx,
+                        start_ctx: ctx.clone(),
                         timestamp,
                         parameters: Some(VideoParameters {
                             all_pixel_dimensions: AllPixelDimensions {
@@ -495,24 +498,53 @@ impl Depacketizer {
             }
 
             let has_new_parameters = self.parameters != metadata.parameters;
+            let metadata = self.metadata.take().expect("metadata is present");
+            if has_new_parameters {
+                self.parameters = metadata.parameters;
+            }
+            let parameters = self.parameters.as_ref().map(ParametersRef::Video);
 
-            self.pending = Some(VideoFrame {
-                start_ctx: metadata.start_ctx,
-                end_ctx: ctx,
-                has_new_parameters,
-                loss,
+            let accumulate = handler.frame_start(&FrameStart {
                 timestamp,
-                stream_id,
+                ctx: &metadata.start_ctx,
+                loss,
                 is_random_access_point: true,
                 is_disposable: true,
-                data: std::mem::take(&mut self.data),
+                has_new_parameters,
+                parameters: parameters.clone(),
             });
-
-            let metadata = self.metadata.take();
-            if let Some(metadata) = metadata
-                && has_new_parameters
+            handler.data(&Data {
+                position: UnitPosition::Complete,
+                data: &[&self.data],
+            });
+            let data = match accumulate {
+                Accumulate::Yes => std::mem::take(&mut self.data),
+                Accumulate::No => Vec::new(),
+            };
+            let mut frame_end = FrameEnd {
+                timestamp,
+                start_ctx: &metadata.start_ctx,
+                end_ctx: ctx,
+                loss,
+                is_random_access_point: true,
+                is_disposable: true,
+                has_new_parameters,
+                body: FrameBody::Owned {
+                    data: (accumulate == Accumulate::Yes).then_some(data),
+                    parameters,
+                },
+            };
+            handler.frame_end(&mut frame_end);
+            if let FrameBody::Owned {
+                data: Some(mut data),
+                ..
+            } = frame_end.body
             {
-                self.parameters = metadata.parameters;
+                // The handler didn't take the data; reuse the allocation.
+                data.clear();
+                self.data = data;
+            } else {
+                self.data.clear();
             }
         }
 
@@ -522,12 +554,6 @@ impl Depacketizer {
         }
 
         Ok(())
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
-        self.pending
-            .take()
-            .map(|f| Ok(super::CodecItem::VideoFrame(f)))
     }
 
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
@@ -575,9 +601,34 @@ pub(super) fn append_esds(buf: &mut Vec<u8>) {
     });
 }
 
-impl Default for Depacketizer {
+impl<Ctx: Clone> Default for Depacketizer<Ctx> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl Depacketizer<crate::PacketContext> {
+    /// Supplies a new packet via the legacy `push`/`pull` interface.
+    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        if let Some(p) = self.pending.front() {
+            panic!("push with data already pending: {p:?}");
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        let r = self.push_with(
+            pkt,
+            &mut super::LegacyHandler {
+                pending: &mut pending,
+                meta: &pkt.meta,
+                format: super::FrameFormat::default(),
+            },
+        );
+        self.pending = pending;
+        r
+    }
+
+    fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+        self.pending.pop_front()
     }
 }
 
@@ -591,7 +642,7 @@ mod tests {
 
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
-        d: &mut super::Depacketizer,
+        d: &mut super::Depacketizer<crate::PacketContext>,
         meta: crate::rtp::PacketMeta,
         payload: &[u8],
         buf: &mut MarkBuf,

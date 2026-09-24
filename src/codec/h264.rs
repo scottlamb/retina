@@ -4,8 +4,10 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
 //! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::fmt::Write;
-use std::{collections::VecDeque, convert::TryFrom};
 
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -16,9 +18,11 @@ use log::{debug, log_enabled, trace};
 use crate::Error;
 use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
 use crate::codec::{
-    Accumulate, AllPixelDimensions, DepacketizeError, FrameBody, FrameEnd, FrameStart, Handler,
-    Loss, LossReason, ParametersRef,
+    Accumulate, AllPixelDimensions, FrameBody, FrameEnd, FrameStart, Handler, Loss, LossReason,
+    ParametersRef,
 };
+#[cfg(test)]
+use crate::codec::{CodecItem, DepacketizeError};
 use crate::inputs::Input as _;
 use crate::{
     Timestamp,
@@ -26,7 +30,7 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoParameters};
+use super::VideoParameters;
 
 /// Produce [`VideoParameters`] from SPS and PPS NAL units.
 ///
@@ -93,7 +97,8 @@ pub fn parameters_from_sps_and_pps(
 pub(crate) struct Depacketizer<Ctx> {
     input_state: DepacketizerInputState<Ctx>,
 
-    /// Completed items ready to be pulled via the legacy `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    #[cfg(test)]
     pending: VecDeque<Result<CodecItem, DepacketizeError>>,
 
     parameters: Option<InternalParameters>,
@@ -349,6 +354,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         };
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
+            #[cfg(test)]
             pending: VecDeque::with_capacity(1),
             mark: None,
             pieces: Vec::new(),
@@ -1003,12 +1009,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 }
 
+#[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the legacy `push`/`pull` interface.
     ///
     /// Between any two calls to `push`, the caller must call `pull` until it
     /// returns `None`.
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
@@ -1026,7 +1033,7 @@ impl Depacketizer<crate::PacketContext> {
         r
     }
 
-    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
+    fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
         self.pending.pop_front()
     }
 }

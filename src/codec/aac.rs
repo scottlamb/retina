@@ -15,7 +15,7 @@
 //!     *   ISO/IEC 14496-14: MP4 File Format.
 
 use bitstream_io::BitRead;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 /// How to frame AAC audio in output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,9 +41,9 @@ use std::{
 };
 
 use crate::buf::PacketRef;
-use crate::{Error, codec::DepacketizeError, error::ErrorInt, rtp::PacketMeta};
+use crate::{Error, error::ErrorInt, rtp::PacketMeta};
 
-use super::{AudioParameters, CodecItem};
+use super::{AudioFrameRef, AudioParameters, Handler, Loss, LossReason};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -372,14 +372,45 @@ fn parse_format_specific_params(
 }
 
 #[derive(Debug)]
-pub(crate) struct Depacketizer {
+pub(crate) struct Depacketizer<Ctx> {
     config: AudioSpecificConfig,
-    state: DepacketizerState,
+    state: DepacketizerState<Ctx>,
     framing: Framing,
 
     /// The original `AudioSpecificConfig` bytes, preserved so that
     /// `extra_data` can be restored if framing is switched back to `Raw`.
     audio_specific_config: Vec<u8>,
+
+    /// The current packet's payload, copied contiguously. Kept around to
+    /// re-use the allocation.
+    payload: Vec<u8>,
+
+    /// Scratch space for an ADTS-framed frame. Kept around to re-use the allocation.
+    adts: Vec<u8>,
+
+    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    pending: std::collections::VecDeque<Result<super::CodecItem, super::DepacketizeError>>,
+}
+
+/// A complete AAC frame.
+#[derive(Debug)]
+struct AacFrame<Ctx> {
+    ctx: Ctx,
+    loss: u16,
+    frame_length: NonZeroU32,
+    timestamp: crate::Timestamp,
+    data: FrameData,
+}
+
+/// The raw data of an [`AacFrame`].
+#[derive(Debug)]
+enum FrameData {
+    /// A range within `Depacketizer::payload`.
+    Payload(std::ops::Range<usize>),
+
+    /// A reassembled fragmented frame.
+    Owned(BytesMut),
 }
 
 /// [DepacketizerState] holding access units within a single RTP packet.
@@ -388,9 +419,8 @@ pub(crate) struct Depacketizer {
 /// (thus the name), when there's a single access unit, and even at the
 /// beginning of a fragment.
 #[derive(Debug)]
-struct Aggregate {
-    meta: PacketMeta,
-    payload: Bytes,
+struct Aggregate<Ctx> {
+    meta: PacketMeta<Ctx>,
 
     /// RTP packets lost before the next frame in this aggregate. Includes old
     /// loss that caused a previous fragment to be too short.
@@ -434,7 +464,7 @@ struct Fragment {
 /// State of the depacketizer between calls to `push` and `pull`.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-enum DepacketizerState {
+enum DepacketizerState<Ctx> {
     /// State when there's no buffered data.
     Idle {
         prev_loss: u16,
@@ -444,14 +474,14 @@ enum DepacketizerState {
     /// State after a packet has been RTP packet has been received. As described at
     /// [`Aggregate`], this may hold the first packet of a fragment, one packet, or multiple
     /// complete packets.
-    Aggregated(Aggregate),
+    Aggregated(Aggregate<Ctx>),
 
     /// State when a prefix of a fragmented packet has been received.
     Fragmented(Fragment),
-    Ready(super::AudioFrame),
+    Ready(AacFrame<Ctx>),
 }
 
-impl Default for DepacketizerState {
+impl<Ctx> Default for DepacketizerState<Ctx> {
     fn default() -> Self {
         DepacketizerState::Idle {
             prev_loss: 0,
@@ -460,7 +490,7 @@ impl Default for DepacketizerState {
     }
 }
 
-impl Depacketizer {
+impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new(
         clock_rate: u32,
         channels: Option<NonZeroU16>,
@@ -481,6 +511,10 @@ impl Depacketizer {
             state: DepacketizerState::default(),
             framing: Framing::default(),
             audio_specific_config,
+            payload: Vec::new(),
+            adts: Vec::new(),
+            #[cfg(test)]
+            pending: Default::default(),
         })
     }
 
@@ -539,12 +573,54 @@ impl Depacketizer {
         Some(super::ParametersRef::Audio(&self.config.parameters))
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        let meta = pkt.meta;
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        self.push_inner(pkt)?;
+        while let Some(r) = self.pull_inner() {
+            match r {
+                Ok(f) => {
+                    let raw = match &f.data {
+                        FrameData::Payload(r) => &self.payload[r.clone()],
+                        FrameData::Owned(b) => &b[..],
+                    };
+                    let data = match self.framing {
+                        Framing::Raw => raw,
+                        Framing::Adts => {
+                            let header = self.adts_header(raw.len());
+                            self.adts.clear();
+                            self.adts.extend_from_slice(&header);
+                            self.adts.extend_from_slice(raw);
+                            &self.adts[..]
+                        }
+                    };
+                    handler.audio_frame(&AudioFrameRef {
+                        ctx: &f.ctx,
+                        timestamp: f.timestamp,
+                        frame_length: f.frame_length,
+                        loss: f.loss,
+                        data,
+                    })
+                }
+                Err(description) => handler.loss(&Loss {
+                    ctx: &pkt.meta.ctx,
+                    reason: LossReason::Corrupt { description },
+                }),
+            }
+        }
+        Ok(())
+    }
+
+    fn push_inner(&mut self, pkt: &PacketRef<'_, Ctx>) -> Result<(), String> {
+        let meta = &pkt.meta;
         let (s1, s2) = pkt.payload().slices();
-        let mut payload = Vec::with_capacity(crate::to_usize(pkt.payload_len()));
-        payload.extend_from_slice(s1);
-        payload.extend_from_slice(s2);
+        self.payload.clear();
+        self.payload.extend_from_slice(s1);
+        self.payload.extend_from_slice(s2);
+        let payload = &self.payload;
         if meta.loss > 0
             && let DepacketizerState::Fragmented(ref mut f) = self.state
         {
@@ -618,13 +694,12 @@ impl Depacketizer {
                             );
                         }
                         frag.buf.extend_from_slice(data);
-                        self.state = DepacketizerState::Ready(super::AudioFrame {
-                            ctx: meta.ctx,
+                        self.state = DepacketizerState::Ready(AacFrame {
+                            ctx: meta.ctx.clone(),
                             loss: frag.loss,
                             frame_length: NonZeroU32::from(self.config.frame_length),
-                            stream_id: meta.stream_id,
                             timestamp: meta.timestamp,
-                            data: std::mem::take(&mut frag.buf).freeze(),
+                            data: FrameData::Owned(std::mem::take(&mut frag.buf)),
                         });
                     }
                     std::cmp::Ordering::Greater => return Err("too much data in fragment".into()),
@@ -640,8 +715,7 @@ impl Depacketizer {
                 }
                 let loss = meta.loss;
                 self.state = DepacketizerState::Aggregated(Aggregate {
-                    meta,
-                    payload: Bytes::from(payload),
+                    meta: meta.clone(),
                     loss: *prev_loss + loss,
                     loss_since_mark: *loss_since_mark || loss > 0,
                     frame_i: 0,
@@ -654,34 +728,19 @@ impl Depacketizer {
         Ok(())
     }
 
-    /// Wraps raw AAC frame data in an ADTS header if configured.
-    fn wrap_frame_data(&self, raw: Bytes) -> Bytes {
-        match self.framing {
-            Framing::Raw => raw,
-            Framing::Adts => {
-                let header = self.adts_header(raw.len());
-                let mut buf = BytesMut::with_capacity(header.len() + raw.len());
-                buf.extend_from_slice(&header);
-                buf.extend_from_slice(&raw);
-                buf.freeze()
-            }
-        }
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
+    fn pull_inner(&mut self) -> Option<Result<AacFrame<Ctx>, String>> {
         match std::mem::take(&mut self.state) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
                 self.state = s;
                 None
             }
-            DepacketizerState::Ready(mut f) => {
+            DepacketizerState::Ready(f) => {
                 self.state = DepacketizerState::default();
-                f.data = self.wrap_frame_data(f.data);
-                Some(Ok(CodecItem::AudioFrame(f)))
+                Some(Ok(f))
             }
             DepacketizerState::Aggregated(mut agg) => {
                 let i = usize::from(agg.frame_i);
-                let payload = &agg.payload;
+                let payload = &self.payload;
                 let mark = agg.meta.mark;
                 let au_header = u16::from_be_bytes([payload[2 + (i << 1)], payload[3 + (i << 1)]]);
                 let size = usize::from(au_header >> 3);
@@ -691,22 +750,12 @@ impl Depacketizer {
                     // indicate interleaving, which we don't support.
                     // TODO: https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6
                     // says "receivers MUST support de-interleaving".
-                    return Some(Err(DepacketizeError {
-                        pkt_ctx: agg.meta.ctx,
-                        ssrc: agg.meta.ssrc,
-                        sequence_number: agg.meta.sequence_number,
-                        description: "interleaving not yet supported".to_owned(),
-                    }));
+                    return Some(Err("interleaving not yet supported".to_owned()));
                 }
                 if size > payload.len() - agg.data_off {
                     // start of fragment
                     if agg.frame_count != 1 {
-                        return Some(Err(DepacketizeError {
-                            pkt_ctx: agg.meta.ctx,
-                            ssrc: agg.meta.ssrc,
-                            sequence_number: agg.meta.sequence_number,
-                            description: "fragmented AUs must not share packets".to_owned(),
-                        }));
+                        return Some(Err("fragmented AUs must not share packets".to_owned()));
                     }
                     if mark {
                         if agg.loss_since_mark {
@@ -720,12 +769,7 @@ impl Depacketizer {
                             };
                             return None;
                         }
-                        return Some(Err(DepacketizeError {
-                            pkt_ctx: agg.meta.ctx,
-                            ssrc: agg.meta.ssrc,
-                            sequence_number: agg.meta.sequence_number,
-                            description: "mark can't be set on beginning of fragment".to_owned(),
-                        }));
+                        return Some(Err("mark can't be set on beginning of fragment".to_owned()));
                     }
                     let mut buf = BytesMut::with_capacity(size);
                     buf.extend_from_slice(&payload[agg.data_off..]);
@@ -739,39 +783,26 @@ impl Depacketizer {
                     return None;
                 }
                 if !mark {
-                    return Some(Err(DepacketizeError {
-                        pkt_ctx: agg.meta.ctx,
-                        ssrc: agg.meta.ssrc,
-                        sequence_number: agg.meta.sequence_number,
-                        description: "mark must be set on non-fragmented au".to_owned(),
-                    }));
+                    return Some(Err("mark must be set on non-fragmented au".to_owned()));
                 }
 
                 let delta = u32::from(agg.frame_i) * u32::from(self.config.frame_length.get());
                 let agg_timestamp = agg.meta.timestamp;
-                let frame = super::AudioFrame {
-                    ctx: agg.meta.ctx,
+                let frame = AacFrame {
+                    ctx: agg.meta.ctx.clone(),
                     loss: agg.loss,
-                    stream_id: agg.meta.stream_id,
                     frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
                     timestamp: match agg_timestamp.try_add(delta) {
                         Some(t) => t,
                         None => {
-                            return Some(Err(DepacketizeError {
-                                pkt_ctx: agg.meta.ctx,
-                                ssrc: agg.meta.ssrc,
-                                sequence_number: agg.meta.sequence_number,
-                                description: format!(
-                                    "aggregate timestamp {agg_timestamp} + {delta} overflows"
-                                ),
-                            }));
+                            return Some(Err(format!(
+                                "aggregate timestamp {agg_timestamp} + {delta} overflows"
+                            )));
                         }
                     },
-                    data: self.wrap_frame_data(Bytes::copy_from_slice(
-                        &payload[agg.data_off..agg.data_off + size],
-                    )),
+                    data: FrameData::Payload(agg.data_off..agg.data_off + size),
                 };
                 agg.loss = 0;
                 agg.data_off += size;
@@ -779,22 +810,48 @@ impl Depacketizer {
                 if agg.frame_i < agg.frame_count {
                     self.state = DepacketizerState::Aggregated(agg);
                 }
-                Some(Ok(CodecItem::AudioFrame(frame)))
+                Some(Ok(frame))
             }
         }
     }
 }
 
 #[cfg(test)]
+impl Depacketizer<crate::PacketContext> {
+    /// Supplies a new packet via the legacy `push`/`pull` interface.
+    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        if let Some(p) = self.pending.front() {
+            panic!("push with data already pending: {p:?}");
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        let r = self.push_with(
+            pkt,
+            &mut super::LegacyHandler {
+                pending: &mut pending,
+                meta: &pkt.meta,
+                format: super::FrameFormat::default(),
+            },
+        );
+        self.pending = pending;
+        r
+    }
+
+    fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+        self.pending.pop_front()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::buf::{MarkBuf, PacketRef};
+    use crate::codec::CodecItem;
     use crate::{PacketContext, rtp::ReceivedPacketBuilder};
 
     use super::*;
 
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
-        d: &mut super::Depacketizer,
+        d: &mut super::Depacketizer<crate::PacketContext>,
         meta: crate::rtp::PacketMeta,
         payload: &[u8],
         buf: &mut MarkBuf,
@@ -1454,7 +1511,7 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let mut buf = MarkBuf::new(65536);
-        let get_extra_data = |d: &Depacketizer| match d.parameters().unwrap() {
+        let get_extra_data = |d: &Depacketizer<PacketContext>| match d.parameters().unwrap() {
             crate::codec::ParametersRef::Audio(a) => a.extra_data().to_vec(),
             _ => panic!(),
         };
