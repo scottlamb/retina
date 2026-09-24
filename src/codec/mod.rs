@@ -623,7 +623,63 @@ fn report_corrupt<Ctx>(
 ///
 /// `Ctx` is a caller-chosen packet context type; see [`VideoHandler`].
 #[derive(Debug)]
-pub struct VideoDepacketizer<Ctx>(VideoInner<Ctx>);
+pub struct VideoDepacketizer<Ctx> {
+    inner: VideoInner<Ctx>,
+
+    /// True if data has been lost since the last random access point.
+    /// See [`VideoFrameEnd::is_decodable`].
+    tainted: bool,
+}
+
+/// Wraps a [`VideoHandler`] to track [`VideoFrameEnd::is_decodable`].
+struct DecodabilityTracker<'a, H> {
+    tainted: &'a mut bool,
+    inner: &'a mut H,
+}
+
+impl<H> DecodabilityTracker<'_, H> {
+    /// Updates the taint for a frame, returning whether the frame is decodable.
+    fn update(&mut self, is_random_access_point: bool, missing_prefix: bool) -> bool {
+        if missing_prefix {
+            // Loss taints until the next *complete* random access point.
+            *self.tainted = true;
+            return false;
+        }
+        if is_random_access_point {
+            *self.tainted = false;
+        }
+        !*self.tainted
+    }
+}
+
+impl<Ctx, H: VideoHandler<Ctx>> VideoHandler<Ctx> for DecodabilityTracker<'_, H> {
+    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+        let is_decodable = self.update(
+            frame_start.is_random_access_point,
+            frame_start.missing_prefix,
+        );
+        self.inner.frame_start(&VideoFrameStart {
+            is_decodable,
+            ..*frame_start
+        })
+    }
+
+    #[inline]
+    fn data(&mut self, data: &VideoData<'_>) {
+        self.inner.data(data)
+    }
+
+    fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, Ctx>) {
+        frame_end.is_decodable =
+            self.update(frame_end.is_random_access_point, frame_end.missing_prefix);
+        self.inner.frame_end(frame_end)
+    }
+
+    fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+        *self.tainted = true;
+        self.inner.loss(loss)
+    }
+}
 
 #[derive(Debug)]
 enum VideoInner<Ctx> {
@@ -648,7 +704,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         clock_rate: u32,
         format_specific_params: Option<&str>,
     ) -> Result<Self, String> {
-        Ok(Self(match encoding_name {
+        let inner = match encoding_name {
             #[cfg(feature = "h264")]
             "h264" => VideoInner::H264(Box::new(h264::Depacketizer::new(
                 clock_rate,
@@ -665,12 +721,16 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
                     "no video depacketizer for encoding_name {encoding_name}"
                 ));
             }
-        }))
+        };
+        Ok(Self {
+            inner,
+            tainted: true,
+        })
     }
 
     #[doc(hidden)]
     pub fn check_invariants(&self) {
-        match &self.0 {
+        match &self.inner {
             #[cfg(feature = "h264")]
             VideoInner::H264(d) => d.check_invariants(),
             #[cfg(feature = "h265")]
@@ -684,7 +744,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// These may change as frames arrive; see
     /// [`VideoFrameEnd::has_new_parameters`].
     pub fn parameters(&self) -> Option<&VideoParameters> {
-        match &self.0 {
+        match &self.inner {
             #[cfg(feature = "h264")]
             VideoInner::H264(d) => d.parameters(),
             #[cfg(feature = "h265")]
@@ -704,6 +764,16 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// Panics if a depacketizer which has retained data from one
     /// [`crate::buf::MarkBuf`] is supplied a packet from another.
     pub fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+        let mut tainted = self.tainted;
+        let handler = &mut DecodabilityTracker {
+            tainted: &mut tainted,
+            inner: handler,
+        };
+        self.push_tracked(pkt, handler);
+        self.tainted = tainted;
+    }
+
+    fn push_tracked(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
         report_packet_loss(pkt, |l| handler.loss(l));
         let r = self.push_with(pkt, handler);
         report_corrupt(pkt, r, |l| handler.loss(l));
@@ -719,7 +789,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         pkt: &PacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
-        match &mut self.0 {
+        match &mut self.inner {
             #[cfg(feature = "h264")]
             VideoInner::H264(d) => d.push_with(pkt, handler),
             #[cfg(feature = "h265")]
@@ -1058,6 +1128,180 @@ mod tests {
             &mut h,
         );
         push(&mut d, &mut buf2, (1, 0, true, 0), b"\x7c\x45end", &mut h);
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn is_decodable() {
+        /// Records `(is_decodable at start, is_decodable at end)` per frame.
+        #[derive(Default)]
+        struct H(Vec<(bool, bool)>, Option<bool>);
+        impl AudioHandler<crate::PacketContext> for H {}
+        impl MessageHandler<crate::PacketContext> for H {}
+        impl VideoHandler<crate::PacketContext> for H {
+            fn frame_start(
+                &mut self,
+                fs: &VideoFrameStart<'_, crate::PacketContext>,
+            ) -> Accumulate {
+                self.1 = Some(fs.is_decodable());
+                Accumulate::No
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, crate::PacketContext>) {
+                self.0.push((self.1.take().unwrap(), fe.is_decodable()));
+            }
+        }
+
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = H::default();
+        let mut push = |seq: u16, ts: i64, loss: u16, payload: &[u8], h: &mut H| {
+            let meta = crate::rtp::PacketMeta {
+                ctx: crate::PacketContext::dummy(),
+                timestamp: crate::Timestamp::new(ts, NonZeroU32::new(90_000).unwrap(), 0).unwrap(),
+                ssrc: 0,
+                sequence_number: seq,
+                mark: true,
+                loss,
+            };
+            let pos = buf.end();
+            buf.extend(payload);
+            buf.advance_unparsed(buf.end());
+            d.push(&PacketRef::new(meta, &buf, pos, payload.len() as u16), h);
+        };
+        push(0, 0, 0, b"\x41p", &mut h); // before the first IDR.
+        push(1, 1, 0, b"\x65idr", &mut h);
+        push(2, 2, 0, b"\x41p", &mut h);
+        push(4, 3, 1, b"\x41p", &mut h); // after loss.
+        push(5, 4, 0, b"\x41p", &mut h);
+        push(6, 5, 0, b"\x65idr", &mut h);
+        push(7, 6, 0, b"\xe5corrupt", &mut h);
+        push(8, 7, 0, b"\x41p", &mut h); // after corruption.
+        push(9, 8, 0, b"\x65idr", &mut h);
+        assert_eq!(
+            h.0,
+            [
+                (false, false),
+                (true, true),
+                (true, true),
+                (false, false),
+                (false, false),
+                (true, true),
+                (false, false),
+                (true, true),
+            ]
+        );
+    }
+
+    /// A random access point preceded by loss is decodable only if it starts a picture.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn is_decodable_missing_prefix() {
+        /// Records `(is_decodable at start, is_decodable at end)` per frame.
+        #[derive(Default)]
+        struct H(Vec<(bool, bool)>, Option<bool>);
+        impl AudioHandler<crate::PacketContext> for H {}
+        impl MessageHandler<crate::PacketContext> for H {}
+        impl VideoHandler<crate::PacketContext> for H {
+            fn frame_start(
+                &mut self,
+                fs: &VideoFrameStart<'_, crate::PacketContext>,
+            ) -> Accumulate {
+                self.1 = Some(fs.is_decodable());
+                Accumulate::No
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, crate::PacketContext>) {
+                self.0.push((self.1.take().unwrap(), fe.is_decodable()));
+            }
+        }
+
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = H::default();
+        let mut push = |seq: u16, ts: i64, loss: u16, payload: &[u8], h: &mut H| {
+            let meta = crate::rtp::PacketMeta {
+                ctx: crate::PacketContext::dummy(),
+                timestamp: crate::Timestamp::new(ts, NonZeroU32::new(90_000).unwrap(), 0).unwrap(),
+                ssrc: 0,
+                sequence_number: seq,
+                mark: true,
+                loss,
+            };
+            let pos = buf.end();
+            buf.extend(payload);
+            buf.advance_unparsed(buf.end());
+            d.push(&PacketRef::new(meta, &buf, pos, payload.len() as u16), h);
+        };
+
+        // Slice bodies starting with bit 1 have `first_mb_in_slice == 0`.
+        push(0, 0, 0, b"\x65\x88idr", &mut h);
+        push(1, 1, 0, b"\x41\x88p", &mut h);
+        push(3, 2, 1, b"\x65\x40idr, missing first slice", &mut h);
+        push(4, 3, 0, b"\x41\x88p", &mut h);
+        push(6, 4, 1, b"\x65\x88idr, complete", &mut h);
+        push(7, 5, 0, b"\x41\x88p", &mut h);
+        assert_eq!(
+            h.0,
+            [
+                (true, true),
+                (true, true),
+                (false, false),
+                (false, false),
+                (true, true),
+                (true, true),
+            ]
+        );
+    }
+
+    /// JPEG frames with lost or misplaced fragments are discarded.
+    #[test]
+    fn jpeg_discards_incomplete_frames() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new("video", "jpeg", 90_000, None, None).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::No);
+
+        /// Returns a RTP/JPEG packet: type 1, Q 50, 8x8, then the given scan data.
+        fn pkt(frag_offset: u32, data: &[u8]) -> Vec<u8> {
+            let mut p = vec![0];
+            p.extend_from_slice(&frag_offset.to_be_bytes()[1..]);
+            p.extend_from_slice(&[1, 50, 1, 1]);
+            p.extend_from_slice(data);
+            p
+        }
+        let kinds = |events: Vec<Event>| -> Vec<&'static str> {
+            events
+                .into_iter()
+                .map(|e| match e {
+                    Event::FrameStart { .. } => "start",
+                    Event::Data(..) => "data",
+                    Event::FrameEnd { .. } => "end",
+                    Event::Loss(LossReason::PacketLoss { .. }) => "packet loss",
+                    Event::Loss(LossReason::Corrupt { .. }) => "corrupt",
+                    e => panic!("unexpected {e:?}"),
+                })
+                .collect()
+        };
+
+        // Complete.
+        push(&mut d, &mut buf, (0, 0, false, 0), &pkt(0, b"abcd"), &mut h);
+        push(&mut d, &mut buf, (1, 0, true, 0), &pkt(4, b"efgh"), &mut h);
+        assert_eq!(kinds(h.take()), ["start", "data", "end"]);
+
+        // Interior loss.
+        push(&mut d, &mut buf, (2, 1, false, 0), &pkt(0, b"abcd"), &mut h);
+        push(&mut d, &mut buf, (4, 1, true, 1), &pkt(8, b"ijkl"), &mut h);
+        assert_eq!(kinds(h.take()), ["packet loss"]);
+
+        // Misplaced fragment without loss.
+        push(&mut d, &mut buf, (5, 2, false, 0), &pkt(0, b"abcd"), &mut h);
+        push(&mut d, &mut buf, (6, 2, true, 0), &pkt(5, b"efgh"), &mut h);
+        assert_eq!(kinds(h.take()), ["corrupt"]);
+
+        // Recovers.
+        push(&mut d, &mut buf, (7, 3, true, 0), &pkt(0, b"abcd"), &mut h);
+        assert_eq!(kinds(h.take()), ["start", "data", "end"]);
     }
 
     #[test]

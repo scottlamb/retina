@@ -153,6 +153,11 @@ pub struct VideoFrameStart<'a, Ctx> {
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
+    pub(crate) is_decodable: bool,
+
+    /// True if packets were lost immediately before this frame, and it may be
+    /// missing its beginning. Used to compute `is_decodable`.
+    pub(crate) missing_prefix: bool,
     pub(crate) parameters: Option<&'a VideoParameters>,
 }
 
@@ -183,6 +188,15 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     #[inline]
     pub fn is_disposable(&self) -> bool {
         self.is_disposable
+    }
+
+    /// Returns if this frame appears to be decodable.
+    ///
+    ///
+    /// See [`VideoFrameEnd::is_decodable`].
+    #[inline]
+    pub fn is_decodable(&self) -> bool {
+        self.is_decodable
     }
 
     /// Returns if this frame appears to set new parameters.
@@ -300,6 +314,11 @@ pub struct VideoFrameEnd<'a, Ctx> {
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
+    pub(crate) is_decodable: bool,
+
+    /// True if packets were lost immediately before this frame, and it may be
+    /// missing its beginning. Used to compute `is_decodable`.
+    pub(crate) missing_prefix: bool,
     pub(crate) body: FrameBody<'a>,
 }
 
@@ -367,6 +386,30 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
     #[inline]
     pub fn is_disposable(&self) -> bool {
         self.is_disposable
+    }
+
+    /// Returns if this frame is likely decodable.
+    ///
+    /// A frame is decodable if it's complete, and either it's a random access
+    /// point or no packets have been lost and no corrupt data has been found
+    /// since the last complete random access point. Frames before the first
+    /// random access point are not decodable.
+    ///
+    /// A frame is complete unless packets were lost immediately before it and
+    /// its first slice isn't the first slice of its picture. (Loss within a
+    /// frame abandons it; see [`VideoHandler::loss`].)
+    ///
+    /// This is conservative: loss taints every frame until the next random
+    /// access point, even though the lost data may have been disposable. One
+    /// case isn't detected: if packets carrying new parameter sets are lost
+    /// immediately before a random access point whose slices all arrive, the
+    /// frame is reported decodable, but a decoder will use stale parameters.
+    ///
+    /// This is only tracked by [`super::VideoDepacketizer::push`]; it's always
+    /// true in other contexts, such as within [`crate::client::Demuxed`].
+    #[inline]
+    pub fn is_decodable(&self) -> bool {
+        self.is_decodable
     }
 
     /// Returns true if this frame set new video parameters.

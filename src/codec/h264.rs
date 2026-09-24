@@ -188,6 +188,11 @@ struct FrameMeta {
     /// Boxed because they're rare, and `AccessUnit` moves on every packet.
     new_params: Option<Box<NewParams>>,
 
+    /// Whether the first VCL NAL begins a picture, once known. If packets
+    /// were lost just before this access unit and this isn't `Some(true)`,
+    /// the access unit may be missing its beginning.
+    first_vcl_starts_picture: Option<bool>,
+
     /// The header of the last complete NAL, for `can_end_au`.
     last_nal_hdr: Option<NalHeader>,
 }
@@ -435,6 +440,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             }
             if is_vcl(nal.hdr) {
                 au.meta.seen_vcl = true;
+                au.meta
+                    .first_vcl_starts_picture
+                    .get_or_insert_with(|| super::h26x::starts_picture(nal_pieces, buf));
             }
             if is_non_idr_slice(nal.hdr) {
                 au.meta.is_random_access_point = false;
@@ -481,7 +489,24 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     ///
     /// The frame's metadata so far is provisional. In particular, parameters
     /// are parsed but not committed to `self.parameters` until the frame ends.
-    fn start_frame(&self, au: &mut AccessUnit<Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    fn start_frame(
+        &self,
+        au: &mut AccessUnit<Ctx>,
+        buf: &MarkBuf,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
+        if au.meta.first_vcl_starts_picture.is_none() {
+            // The first VCL NAL is still in progress; its pieces follow the
+            // last complete NAL's.
+            let first_piece = self
+                .nals
+                .last()
+                .map_or(0, |n| crate::to_usize(n.next_piece_idx));
+            au.meta.first_vcl_starts_picture = Some(super::h26x::starts_picture(
+                &self.pieces[first_piece..],
+                buf,
+            ));
+        }
         let mut is_random_access_point = au.meta.is_random_access_point;
         let mut is_disposable = au.meta.is_disposable;
         if let Some(hdr) = Self::in_progress_hdr(au) {
@@ -506,6 +531,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             .and_then(|np| np.parsed.as_ref());
         au.started = Some(
             handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point,
@@ -528,7 +555,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         self.scan_meta(au, buf);
         let in_progress = Self::in_progress_hdr(au);
         if au.started.is_none() && (au.meta.seen_vcl || in_progress.is_some_and(is_vcl)) {
-            self.start_frame(au, handler);
+            self.start_frame(au, buf, handler);
         }
         let Some(accumulate) = au.started else {
             return;
@@ -946,6 +973,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let accumulate = match au.started {
             Some(a) => a,
             None => handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point: au.meta.is_random_access_point,
@@ -958,6 +987,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             .deliver(&self.nals, &self.pieces, None, buf, handler);
 
         handler.frame_end(&mut VideoFrameEnd {
+            is_decodable: true,
+            missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx: &au.end_ctx,
@@ -1160,6 +1191,7 @@ impl<Ctx: Clone> AccessUnit<Ctx> {
                 is_disposable: true,
                 seen_vcl: false,
                 new_params: None,
+                first_vcl_starts_picture: None,
                 last_nal_hdr: None,
             },
             scanned_nals: 0,
@@ -1227,7 +1259,7 @@ struct InternalParameters {
 
     seen_extra_trailing_data: bool,
 
-    /// If set via [`FrameEnd::set_h264_parameters`], the in-band SPS and PPS
+    /// If set via [`crate::codec::VideoFrameEnd::set_h264_parameters`], the in-band SPS and PPS
     /// which were overridden. Parameter sets received later are compared
     /// against these to detect changes, so that a camera repeating its
     /// original parameters doesn't undo the override.
