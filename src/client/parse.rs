@@ -567,14 +567,19 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let transport_str: &str = transport;
     for part in transport_str.split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
-            // Some cameras (eg Rubetek) send `ssrc=0x6f7c`, where RFC 2326
-            // section 12.39 asks for eight hex digits without a prefix. The
-            // value is advisory: when absent, the SSRC is learned from the
-            // first RTP packet. So warn and ignore it rather than fail SETUP.
+            // RFC 2326 section 12.39 asks for eight hex digits without a
+            // prefix. Some cameras send a 16-bit value instead: Rubetek sends
+            // `ssrc=0x6f7c`, and another camera sends `ssrc=A046` while its
+            // RTP packets carry a different, full 32-bit SSRC, so every packet
+            // would be rejected as a stale session's. The value is advisory:
+            // when absent, the SSRC is learned from the first RTP packet. So
+            // warn and ignore one that does not parse or has four digits or
+            // fewer. Fewer than eight is fine otherwise: Hikvision drops a
+            // leading zero (`ssrc= d6d6627`), and its value is real.
             let v = v.trim();
             match u32::from_str_radix(v, 16) {
-                Ok(v) => ssrc = Some(v),
-                Err(_) => warn!("Ignoring unparseable ssrc in Transport header {transport_str:?}"),
+                Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
+                _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
             }
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
@@ -1583,6 +1588,30 @@ mod tests {
                 source: None,
                 session: SessionHeader {
                     id: "5657612475258969210".into(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: None,
+                server_port: None,
+            }
+        );
+    }
+
+    /// A camera that sends a four-digit SSRC (`ssrc=A046`) in the Transport
+    /// header and a different one in its RTP packets. The Transport header is
+    /// as the camera sent it; the rest of the response is minimal. Ignore the
+    /// value, so the SSRC is learned from the first RTP packet.
+    #[test]
+    fn setup_ssrc_with_four_hex_digits() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/setup_ssrc_4_hex_digits.txt"));
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: "1066441024".into(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
