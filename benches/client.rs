@@ -80,7 +80,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
     let mut dummy_frame = vec![1; 1048576];
     dummy_frame[4] = h264_reader::nal::UnitType::SliceLayerWithoutPartitioningIdr.id();
     let mut p =
-        retina::codec::h264::Packetizer::new(max_payload_size, 0, 24104, 96, 0x4cacc3d1).unwrap();
+        retina::codec::h264::Packetizer::new(max_payload_size, 24104, 96, 0x4cacc3d1).unwrap();
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     for _ in 0..30 {
         for &f in &frame_sizes {
@@ -88,11 +88,10 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
             let frame = Bytes::copy_from_slice(&dummy_frame[..(usize::try_from(f).unwrap() + 4)]);
             p.push(timestamp, frame).unwrap();
             while let Some(pkt) = p.pull().unwrap() {
-                let pkt = pkt.raw();
                 data.push(b'$'); // interleaved data
                 data.push(0); // channel 0
                 data.extend_from_slice(&u16::try_from(pkt.len()).unwrap().to_be_bytes()[..]);
-                data.extend_from_slice(pkt);
+                data.extend_from_slice(&pkt);
             }
             timestamp = timestamp.try_add(3000).unwrap();
         }

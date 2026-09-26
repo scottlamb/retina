@@ -46,7 +46,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         }
     }
 
-    let mut p = match retina::codec::h264::Packetizer::new(input.max_payload_size, 0, 0, 0, 0) {
+    let mut p = match retina::codec::h264::Packetizer::new(input.max_payload_size, 0, 0, 0) {
         Ok(p) => p,
         Err(_) => return Corpus::Reject,
     };
@@ -70,16 +70,26 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
     let frame = loop {
         match p.pull() {
             Ok(Some(pkt)) => {
-                let mark = pkt.mark();
+                // Recover the metadata from the header, which also checks
+                // header parsing in the round trip.
+                let (header, payload) = retina::rtp::PacketHeader::validate(&pkt[..])
+                    .expect("packetizer should produce valid RTP packets");
+                let mark = header.mark();
                 let meta = retina::rtp::PacketMeta {
                     ctx: 0,
-                    timestamp: pkt.timestamp(),
-                    sequence_number: pkt.sequence_number(),
-                    ssrc: pkt.ssrc(),
+                    timestamp: retina::Timestamp::new(
+                        i64::from(header.timestamp()),
+                        timestamp.clock_rate(),
+                        0,
+                    )
+                    .unwrap(),
+                    sequence_number: header.sequence_number(),
+                    ssrc: header.ssrc(),
                     mark,
-                    loss: pkt.loss(),
+                    loss: 0,
                 };
-                retina_fuzz::push(&mut buf, meta, pkt.payload(), &mut [(&mut d, &mut h)]);
+                let payload = &pkt[usize::from(payload.start)..usize::from(payload.end)];
+                retina_fuzz::push(&mut buf, meta, payload, &mut [(&mut d, &mut h)]);
                 if h.events
                     .iter()
                     .any(|e| matches!(e, retina_fuzz::Event::Loss(_)))

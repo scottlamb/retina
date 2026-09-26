@@ -118,6 +118,9 @@ pub mod h265;
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
+#[cfg(test)]
+mod testutil;
+
 pub(crate) use events::FrameBody;
 pub use events::{
     Accumulate, AudioFrameRef, AudioHandler, Corruption, Loss, LossReason, MessageFrameRef,
@@ -1176,7 +1179,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 mod tests {
     use super::*;
     use crate::buf::MarkBuf;
-    use crate::client::{AudioFrame, CodecItem, MessageFrame, VideoFrame};
     #[cfg(feature = "h264")]
     use crate::rtp::PacketMeta;
     use events::testutil::{Event, Recorder, hex};
@@ -1666,8 +1668,8 @@ mod tests {
     const BUNNY_AAC_FMTP: &str = "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
                                   indexdeltalength=3;config=1490";
 
-    /// The legacy interface (used by `Demuxed`) and the handler interface produce
-    /// identical frames; streamed data matches accumulated data.
+    /// The test harness and the handler interface produce identical frames;
+    /// streamed data matches accumulated data.
     #[test]
     #[cfg(feature = "h264")]
     fn bunny_legacy_vs_handler() {
@@ -1685,7 +1687,7 @@ mod tests {
                 .unwrap()
             };
 
-            // Legacy, as used by `Demuxed`.
+            // The test harness.
             let mut legacy = new();
             let mut legacy_frames = Vec::new();
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
@@ -1693,18 +1695,16 @@ mod tests {
                 legacy
                     .push_with(
                         &PacketRef::new(meta, buf, pos, len),
-                        &mut crate::client::LegacyHandler {
+                        &mut testutil::Collector {
                             pending: &mut pending,
-                            meta: &meta,
-                            stream_id: 0,
                             format: FrameFormat::default(),
                         },
                     )
                     .unwrap();
                 for item in pending {
                     legacy_frames.push(match item.unwrap() {
-                        CodecItem::VideoFrame(f) => f.into_data(),
-                        CodecItem::AudioFrame(f) => f.data().to_vec(),
+                        testutil::Item::Video(f) => f.into_data(),
+                        testutil::Item::Audio(f) => f.data().to_vec(),
                         _ => unreachable!(),
                     });
                 }
@@ -1796,10 +1796,6 @@ mod tests {
                 "simple_audio::Depacketizer",
                 std::mem::size_of::<simple_audio::Depacketizer>(),
             ),
-            ("CodecItem", std::mem::size_of::<CodecItem>()),
-            ("VideoFrame", std::mem::size_of::<VideoFrame>()),
-            ("AudioFrame", std::mem::size_of::<AudioFrame>()),
-            ("MessageFrame", std::mem::size_of::<MessageFrame>()),
             ("VideoParameters", std::mem::size_of::<VideoParameters>()),
             ("AudioParameters", std::mem::size_of::<AudioParameters>()),
             (

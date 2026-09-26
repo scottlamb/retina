@@ -155,6 +155,32 @@ pub struct PacketMeta<Ctx> {
     pub loss: u16,
 }
 
+/// Builds a raw RTP packet with the given header fields and payload.
+pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
+    sequence_number: u16,
+    timestamp: u32,
+    payload_type: u8,
+    ssrc: u32,
+    mark: bool,
+    payload: P,
+) -> Result<bytes::Bytes, &'static str> {
+    if payload_type >= 0x80 {
+        return Err("payload type too large");
+    }
+    let data: bytes::Bytes = [
+        2 << 6, // version=2, no padding, no extensions, no CSRCs.
+        if mark { 0b1000_0000 } else { 0 } | payload_type,
+    ]
+    .into_iter()
+    .chain(sequence_number.to_be_bytes())
+    .chain(timestamp.to_be_bytes())
+    .chain(ssrc.to_be_bytes())
+    .chain(payload)
+    .collect();
+    let _ = u16::try_from(data.len()).map_err(|_| "payload too long")?;
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

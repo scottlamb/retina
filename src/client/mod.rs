@@ -19,8 +19,6 @@ pub(crate) use self::demux::LegacyHandler;
 pub use self::demux::{AudioFrame, CodecItem, MessageFrame, VideoFrame};
 pub use self::received::{ReceivedPacket, ReceivedPacketBuilder};
 pub use self::timeline::Timeline;
-#[cfg(test)]
-pub(crate) use self::{demux::DepacketizeError, received::build_raw_rtp};
 use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
 use bytes::Bytes;

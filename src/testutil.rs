@@ -157,3 +157,52 @@ pub(crate) fn response(mut raw: &'static [u8]) -> (crate::rtsp::msg::Response, B
         _ => panic!("unexpected message type"),
     }
 }
+
+/// An RTP packet to write into a [`crate::buf::MarkBuf`] for a depacketizer test.
+#[cfg(test)]
+pub(crate) struct TestPacket {
+    pub(crate) ctx: crate::PacketContext,
+    pub(crate) timestamp: crate::Timestamp,
+    pub(crate) sequence_number: u16,
+    pub(crate) payload_type: u8,
+    pub(crate) ssrc: u32,
+    pub(crate) mark: bool,
+    pub(crate) loss: u16,
+}
+
+#[cfg(test)]
+impl TestPacket {
+    /// Writes the whole packet into `buf`, returning a reference to its payload.
+    pub(crate) fn write<'b>(
+        self,
+        buf: &'b mut crate::buf::MarkBuf,
+        payload: impl IntoIterator<Item = u8>,
+    ) -> crate::buf::PacketRef<'b, crate::PacketContext> {
+        let raw = crate::rtp::build_raw_rtp(
+            self.sequence_number,
+            self.timestamp.timestamp() as u32,
+            self.payload_type,
+            self.ssrc,
+            self.mark,
+            payload,
+        )
+        .unwrap();
+        let (_, payload_range) = crate::rtp::PacketHeader::validate(&raw[..]).unwrap();
+        let pos = buf.end();
+        buf.extend(&raw);
+        buf.advance_unparsed(buf.end());
+        crate::buf::PacketRef::new(
+            crate::rtp::PacketMeta {
+                ctx: self.ctx,
+                timestamp: self.timestamp,
+                sequence_number: self.sequence_number,
+                ssrc: self.ssrc,
+                mark: self.mark,
+                loss: self.loss,
+            },
+            buf,
+            pos + u64::from(payload_range.start),
+            payload_range.end - payload_range.start,
+        )
+    }
+}

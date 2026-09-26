@@ -302,11 +302,9 @@ pub struct Depacketizer<Ctx> {
     /// Cached quantization tables.
     qtables: Vec<Option<Bytes>>,
 
-    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
-    pending: std::collections::VecDeque<
-        Result<crate::client::CodecItem, crate::client::DepacketizeError>,
-    >,
+    pending: super::testutil::Pending,
 
     parameters: Option<VideoParameters>,
 }
@@ -635,18 +633,16 @@ impl<Ctx: Clone> Default for Depacketizer<Ctx> {
 
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
-    /// Supplies a new packet via the legacy `push`/`pull` interface.
-    fn push(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
+    /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
+    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
         let mut pending = std::mem::take(&mut self.pending);
         let r = self.push_with(
             pkt,
-            &mut crate::client::LegacyHandler {
+            &mut super::testutil::Collector {
                 pending: &mut pending,
-                meta: &pkt.meta,
-                stream_id: 0,
                 format: super::FrameFormat::default(),
             },
         );
@@ -654,9 +650,7 @@ impl Depacketizer<crate::PacketContext> {
         r
     }
 
-    fn pull(
-        &mut self,
-    ) -> Option<Result<crate::client::CodecItem, crate::client::DepacketizeError>> {
+    fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
         self.pending.pop_front()
     }
 }
@@ -665,22 +659,10 @@ impl Depacketizer<crate::PacketContext> {
 mod tests {
     use std::num::NonZeroU32;
 
-    use crate::buf::{MarkBuf, PacketRef};
+    use crate::buf::MarkBuf;
+    use crate::codec::testutil::Item;
+    use crate::testutil::TestPacket;
     use crate::testutil::{assert_eq_hex, init_logging};
-    use crate::{client::CodecItem, client::ReceivedPacketBuilder};
-
-    /// Helper: writes payload into `buf`, then pushes to depacketizer.
-    fn push_via_buf(
-        d: &mut super::Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::PacketMeta<crate::PacketContext>,
-        payload: &[u8],
-        buf: &mut MarkBuf,
-    ) -> Result<(), String> {
-        let pos = buf.end();
-        buf.extend(payload);
-        buf.advance_unparsed(buf.end());
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
-    }
 
     // Raw RTP payload from a MJPEG encoded Big Buck Bunny stream
     // Big Buck Bunny is (c) copyright 2008, Blender Foundation, licensed via
@@ -945,9 +927,8 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -955,21 +936,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(START_PACKET.iter().copied())
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, START_PACKET.iter().copied());
+            d.push_collect(&pkt)
         }
         .unwrap();
         assert!(d.pull().is_none());
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -977,19 +951,13 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(END_PACKET.iter().copied())
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, END_PACKET.iter().copied());
+            d.push_collect(&pkt)
         }
         .unwrap();
 
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)

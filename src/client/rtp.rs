@@ -358,8 +358,7 @@ mod tests {
         let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
-        let pkt =
-            crate::client::build_raw_rtp(0x1234, 141000, 105, 0xd25614e, true, *b"foo").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 105, 0xd25614e, true, *b"foo").unwrap();
         let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &SessionOptions::default(),
@@ -376,8 +375,7 @@ mod tests {
         }
 
         // Mystery pt=50 packet with same sequence number.
-        let pkt =
-            crate::client::build_raw_rtp(0x1234, 141000, 50, 0xd25614e, true, *b"bar").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 50, 0xd25614e, true, *b"bar").unwrap();
         let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &SessionOptions::default(),
@@ -405,7 +403,7 @@ mod tests {
             peer_rtp_port: 0,
         }));
         let session_options = SessionOptions::default();
-        let pkt = crate::client::build_raw_rtp(2, 2, 96, 0xd25614e, true, *b"pkt 2").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(2, 2, 96, 0xd25614e, true, *b"pkt 2").unwrap();
         let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
@@ -423,7 +421,7 @@ mod tests {
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
 
-        let pkt = crate::client::build_raw_rtp(1, 1, 96, 0xd25614e, true, *b"pkt 1").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(1, 1, 96, 0xd25614e, true, *b"pkt 1").unwrap();
         let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
@@ -439,7 +437,7 @@ mod tests {
             o => panic!("unexpected packet 1 result: {o:#?}"),
         }
 
-        let pkt = crate::client::build_raw_rtp(3, 3, 96, 0xd25614e, true, *b"pkt 3").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(3, 3, 96, 0xd25614e, true, *b"pkt 3").unwrap();
         let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         match parser.rtp(
             &session_options,
