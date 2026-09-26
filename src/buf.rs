@@ -404,6 +404,18 @@ impl std::fmt::Debug for Mark {
 ///   typically a depacketizer holding a partial frame—has marked them. They're
 ///   reclaimed lazily, when the caller next asks for spare capacity.
 ///
+/// # Retention
+///
+/// Space is reclaimed only up to the *oldest* mark, so one long-retained
+/// mark keeps everything received after it, and the buffer grows to hold it.
+/// This matters when several streams share a buffer, as all of an RTSP
+/// session's interleaved (TCP) streams do: a depacketizer holding a frame for
+/// a long time, such as one accumulating ([`crate::codec::Accumulate::Yes`])
+/// a frame on a stream whose packets have stalled, grows the buffer by
+/// every other stream's data received in the meantime. (UDP streams each have
+/// their own buffer.) Depacketizers release their marks when a frame ends or
+/// is abandoned, and when they're dropped.
+///
 /// # Contract
 ///
 /// Depacketizers only mark bytes which the caller has already parsed: marks
