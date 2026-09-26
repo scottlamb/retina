@@ -171,7 +171,7 @@ impl VideoFrame {
 
     /// Returns true if this frame set new video parameters.
     ///
-    /// The parameters can be obtained via [`crate::client::Stream::parameters`].
+    /// The parameters can be obtained via [`crate::client::Demuxed::parameters`].
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
         self.has_new_parameters

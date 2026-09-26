@@ -137,7 +137,7 @@ async fn receive_frames(
     let mut cur_parameters = None;
     while let Some(item) = session.next().await {
         if let retina::client::CodecItem::VideoFrame(frame) = item? {
-            let stream_params = session.streams()[frame.stream_id()].parameters();
+            let stream_params = session.parameters(frame.stream_id());
             let parameters = if let Some(cur_parameters) = cur_parameters.as_ref()
                 && !frame.has_new_parameters()
             {

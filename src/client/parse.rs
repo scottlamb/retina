@@ -369,8 +369,23 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     }
 
     let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
-    let depacketizer =
-        crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp);
+    let mut format =
+        crate::codec::PayloadFormat::new(media.to_string(), encoding_name.to_string(), clock_rate);
+    if let Some(c) = channels {
+        format = format.with_channels(c);
+    }
+    if let Some(f) = fmtp {
+        format = format.with_fmtp(f);
+    }
+    let depacketizer = crate::codec::Depacketizer::new(&format).map_err(|e| e.to_string());
+    if let Err(e) = &depacketizer {
+        log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}: {e}");
+    }
+    let parameters = depacketizer
+        .as_ref()
+        .ok()
+        .and_then(|d| d.parameters())
+        .map(crate::codec::Parameters::from);
 
     Ok(Stream {
         frame_format: Default::default(),
@@ -378,6 +393,8 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         encoding_name,
         clock_rate_hz: clock_rate,
         rtp_payload_type,
+        fmtp: fmtp.map(Into::into),
+        parameters,
         depacketizer,
         control,
         channels,

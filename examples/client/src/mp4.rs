@@ -510,7 +510,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 
     async fn video(
         &mut self,
-        stream: &retina::client::Stream,
+        parameters: Option<ParametersRef<'_>>,
         frame: retina::client::VideoFrame,
     ) -> Result<(), Error> {
         println!(
@@ -526,7 +526,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             // scan through self.video_sample_index.
             i
         } else {
-            match stream.parameters() {
+            match parameters {
                 Some(ParametersRef::Video(params)) => {
                     log::info!("new video params: {:?}", params);
                     let pos = self.video_params.iter().position(|p| p == params);
@@ -609,9 +609,9 @@ async fn copy<'a>(
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => {
-                        let stream = &session.streams()[f.stream_id()];
+                        let parameters = session.parameters(f.stream_id());
                         let start_ctx = *f.start_ctx();
-                        mp4.video(stream, f).await.with_context(
+                        mp4.video(parameters, f).await.with_context(
                             || format!("Error processing video frame starting with {start_ctx}"))?;
                     },
                     CodecItem::AudioFrame(f) => {

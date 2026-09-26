@@ -913,6 +913,7 @@ impl std::ops::Deref for Tool {
 ///
 /// Currently if multiple formats are offered, this only describes the first.
 pub struct Stream {
+    /// The depacketizer used by [`Demuxed`] and [`Session::handle_next`].
     depacketizer: Result<crate::codec::Depacketizer<crate::PacketContext>, String>,
     state: StreamState,
 
@@ -927,6 +928,12 @@ pub struct Stream {
     channels: Option<NonZeroU16>,
     framerate: Option<f32>,
     control: Option<Url>,
+
+    /// The format-specific parameters from the SDP `fmtp` attribute.
+    fmtp: Option<Box<str>>,
+
+    /// Codec parameters as described in the SDP.
+    parameters: Option<crate::codec::Parameters>,
 }
 
 impl std::fmt::Debug for Stream {
@@ -939,6 +946,8 @@ impl std::fmt::Debug for Stream {
             .field("clock_rate", &self.clock_rate_hz)
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
+            .field("fmtp", &self.fmtp)
+            .field("parameters", &self.parameters)
             .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
@@ -1029,43 +1038,70 @@ impl Stream {
         self.frame_format
     }
 
-    /// Returns codec-specified parameters for this stream, if available.
+    /// Returns codec-specific parameters for this stream as described in the
+    /// `DESCRIBE` response's SDP, if available.
     ///
-    /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't (yet) known.
+    /// Returns `None` on unknown codecs, bad parameters, or if the SDP doesn't
+    /// supply them. Not all codecs guarantee parameters are provided in the
+    /// SDP. Notably, H.264 allows parameters to be specified "in-band" (with
+    /// the data packets) instead of or in addition to "out-of-band" (via SDP).
     ///
-    /// This is initially populated from the `DESCRIBE` response's SDP. Not all codecs guarantee
-    /// parameters are provided in the SDP. Notably, H.264 allows parameters to be specified
-    /// "in-band" (with the data packets) instead of or in addition to "out-of-band" (via SDP).
-    /// Thus, it's unspecified whether a `parameters` call immediately after `Session::describe`
-    /// will return `Some` or `None`.
+    /// This never changes. Current parameters, which may differ, are available
+    /// from the stream's depacketizer via
+    /// [`VideoFrameStart::parameters`](crate::codec::VideoFrameStart::parameters),
+    /// [`VideoFrameEnd::parameters`](crate::codec::VideoFrameEnd::parameters),
+    /// or [`Depacketizer::parameters`](crate::codec::Depacketizer::parameters).
+    /// With [`Demuxed`], use [`Demuxed::parameters`].
     ///
-    /// To get "extra data" matching frames from [`Demuxed`], pass
-    /// [`Stream::frame_format`] to
-    /// [`VideoParameters::extra_data`](crate::codec::VideoParameters::extra_data) or
-    /// [`AudioParameters::extra_data`](crate::codec::AudioParameters::extra_data).
-    ///
-    /// # With [`Demuxed`]
-    ///
-    /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl, `parameters` reflects
-    /// all parameters as of returned frames that have been returned from from `poll_next` via
-    /// `Poll::Ready`.
-    ///
-    /// It's guaranteed to *not* reflect any parameter changes in the upcoming frame, even after
-    /// a `Poll::Pending` return.
-    ///
-    /// If there is no packet loss, parameters are generally available after the first frame is
-    /// returned. In the case of H.264, [RFC 6184 section
-    /// 8.4](https://datatracker.ietf.org/doc/html/rfc6184#section-8.4) says "when parameter sets
-    /// are added or updated, care SHOULD be taken to ensure that any parameter set is delivered
-    /// prior to its usage."
-    ///
-    /// # Without [`Demuxed`]
-    ///
-    /// When directly using [`Session`]'s packet-by-packet `futures::Stream` impl, codec
-    /// depacketization logic is bypassed. The parameters returned by this function may be out of
-    /// date.
+    /// If there is no packet loss, parameters are generally available after
+    /// the first frame. In the case of H.264, [RFC 6184 section
+    /// 8.4](https://datatracker.ietf.org/doc/html/rfc6184#section-8.4) says
+    /// "when parameter sets are added or updated, care SHOULD be taken to
+    /// ensure that any parameter set is delivered prior to its usage."
     pub fn parameters(&self) -> Option<crate::codec::ParametersRef<'_>> {
-        self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
+        self.parameters
+            .as_ref()
+            .map(crate::codec::Parameters::as_ref)
+    }
+
+    /// Returns the payload format as described in the SDP.
+    ///
+    /// The encoding name is lowercase, as with [`Stream::encoding_name`].
+    pub fn payload_format(&self) -> crate::codec::PayloadFormat {
+        let mut f = crate::codec::PayloadFormat::new(
+            self.media.to_string(),
+            self.encoding_name.to_string(),
+            self.clock_rate_hz,
+        );
+        if let Some(c) = self.channels {
+            f = f.with_channels(c);
+        }
+        if let Some(fmtp) = &self.fmtp {
+            f = f.with_fmtp(fmtp.to_string());
+        }
+        f
+    }
+
+    /// Creates a depacketizer for this stream, as described in the SDP.
+    ///
+    /// This is equivalent to [`crate::codec::Depacketizer::new`] with
+    /// [`Stream::payload_format`].
+    ///
+    /// Returns an error if the codec is unsupported or the SDP's parameters
+    /// for it are invalid.
+    ///
+    /// Each depacketizer should be used with a single session; see
+    /// [`crate::codec::VideoDepacketizer::push`].
+    pub fn new_depacketizer<Ctx: Clone>(&self) -> Result<crate::codec::Depacketizer<Ctx>, Error> {
+        crate::codec::Depacketizer::new(&self.payload_format())
+    }
+
+    /// Returns true if this stream has been set up via [`Session::setup`].
+    ///
+    /// Once playing, only streams which have been set up produce packets.
+    #[inline]
+    pub fn is_setup(&self) -> bool {
+        !matches!(self.state, StreamState::Uninit)
     }
 
     /// Returns a context for this stream, if it has been set up.
@@ -3348,6 +3384,21 @@ impl Demuxed {
     pub fn streams(&self) -> &[Stream] {
         self.session.streams()
     }
+
+    /// Returns the current codec parameters of stream `stream_id`, if known.
+    ///
+    /// These reflect all frames returned so far, and none that haven't been.
+    /// A frame which changes the parameters has
+    /// [`VideoFrame::has_new_parameters`] set.
+    ///
+    /// Panics if `stream_id >= self.streams().len()`.
+    pub fn parameters(&self, stream_id: usize) -> Option<crate::codec::ParametersRef<'_>> {
+        self.streams()[stream_id]
+            .depacketizer
+            .as_ref()
+            .ok()
+            .and_then(|d| d.parameters())
+    }
 }
 
 impl futures::Stream for Demuxed {
@@ -3771,7 +3822,9 @@ mod tests {
         let mut session = session.unwrap();
         session.0.keepalive_timer = None; // see `simple`.
 
-        let mut d = crate::codec::Depacketizer::new("video", "h264", 90_000, None, None).unwrap();
+        assert!(session.streams()[0].is_setup());
+        assert!(!session.streams()[1].is_setup());
+        let mut d = session.streams()[0].new_depacketizer().unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
         const PKT: &[u8] = b"\x80\xe0\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8\x65slice";
         tokio::join!(
