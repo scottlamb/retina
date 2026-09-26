@@ -156,7 +156,7 @@ pub struct PacketMeta<Ctx> {
 }
 
 /// Builds a raw RTP packet with the given header fields and payload.
-#[cfg_attr(not(feature = "h264"), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
     sequence_number: u16,
     timestamp: u32,
@@ -180,6 +180,157 @@ pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
     .collect();
     let _ = u16::try_from(data.len()).map_err(|_| "payload too long")?;
     Ok(data)
+}
+
+/// The RTP session state of an outgoing stream.
+///
+/// Turns payloads (such as [`crate::codec::Payload`]s) into complete RTP packets, assigning
+/// sequence numbers and mapping timestamps. The counterpart on the receive
+/// side is the validation a [`crate::client`] session does before handing
+/// packets to a depacketizer.
+///
+/// Every packet built by one `Sender` has the same SSRC and one sequence of
+/// sequence numbers, so identical packets can be sent to any number of
+/// receivers.
+#[derive(Debug)]
+pub struct Sender {
+    ssrc: u32,
+    payload_type: u8,
+    next_sequence_number: u16,
+    timestamp_offset: u32,
+
+    /// Space for packets, split off as they're built, to amortize allocation.
+    arena: bytes::BytesMut,
+}
+
+/// A complete outgoing RTP packet, as built by [`Sender`].
+#[derive(Clone, Debug)]
+pub struct OutgoingPacket {
+    /// The packet, including its RTP header.
+    pub raw: bytes::Bytes,
+
+    /// The packet's sequence number.
+    pub sequence_number: u16,
+}
+
+impl Sender {
+    const ARENA_SIZE: usize = 64 * 1024;
+
+    /// Creates a new sender.
+    ///
+    /// RFC 3550 recommends choosing `ssrc`, `initial_sequence_number`, and
+    /// `timestamp_offset` randomly.
+    ///
+    /// # Panics
+    ///
+    /// If `payload_type` doesn't fit in 7 bits.
+    pub fn new(
+        payload_type: u8,
+        ssrc: u32,
+        initial_sequence_number: u16,
+        timestamp_offset: u32,
+    ) -> Self {
+        assert!(payload_type < 0x80, "payload type {payload_type} too large");
+        Self {
+            ssrc,
+            payload_type,
+            next_sequence_number: initial_sequence_number,
+            timestamp_offset,
+            arena: bytes::BytesMut::new(),
+        }
+    }
+
+    /// Returns the SSRC.
+    #[inline]
+    pub fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+
+    /// Returns the sequence number the next packet will have, e.g. for a
+    /// `PLAY` response's `RTP-Info` header.
+    #[inline]
+    pub fn next_sequence_number(&self) -> u16 {
+        self.next_sequence_number
+    }
+
+    /// Returns the RTP timestamp that will represent `timestamp`.
+    #[inline]
+    pub fn rtp_timestamp(&self, timestamp: crate::Timestamp) -> u32 {
+        (timestamp.timestamp as u32).wrapping_add(self.timestamp_offset)
+    }
+
+    /// Builds a packet with the given timestamp, marker bit, and payload
+    /// (as a sequence of slices to be concatenated).
+    ///
+    /// For a [`crate::codec::Payload`] `p`, pass `p.timestamp()`, `p.mark()`,
+    /// and `p.data()`; or use [`Sender::sink`].
+    ///
+    /// # Panics
+    ///
+    /// If the packet exceeds 65,535 bytes.
+    pub fn packet(
+        &mut self,
+        timestamp: crate::Timestamp,
+        mark: bool,
+        payload: &[&[u8]],
+    ) -> OutgoingPacket {
+        let payload_len: usize = payload.iter().map(|d| d.len()).sum();
+        let len = usize::from(PacketHeader::LEN) + payload_len;
+        assert!(
+            len <= usize::from(u16::MAX),
+            "RTP packet of {len} bytes is too long"
+        );
+        if self.arena.capacity() < len {
+            self.arena.reserve(len.max(Self::ARENA_SIZE));
+        }
+        let sequence_number = self.next_sequence_number;
+        self.next_sequence_number = sequence_number.wrapping_add(1);
+        self.arena.extend_from_slice(&[
+            2 << 6, // version=2, no padding, no extensions, no CSRCs.
+            if mark { 0b1000_0000 } else { 0 } | self.payload_type,
+        ]);
+        self.arena.extend_from_slice(&sequence_number.to_be_bytes());
+        self.arena
+            .extend_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
+        self.arena.extend_from_slice(&self.ssrc.to_be_bytes());
+        for d in payload {
+            self.arena.extend_from_slice(d);
+        }
+        OutgoingPacket {
+            raw: self.arena.split().freeze(),
+            sequence_number,
+        }
+    }
+
+    /// Skips a sequence number, so receivers see lost data as packet loss.
+    pub fn skip(&mut self) {
+        self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
+    }
+
+    /// Returns a [`crate::codec::PayloadSink`] which builds packets and passes
+    /// them to `f`, skipping a sequence number on each discontinuity.
+    pub fn sink<F: FnMut(OutgoingPacket)>(&mut self, f: F) -> SenderSink<'_, F> {
+        SenderSink { sender: self, f }
+    }
+}
+
+/// Returned by [`Sender::sink`].
+pub struct SenderSink<'a, F> {
+    sender: &'a mut Sender,
+    f: F,
+}
+
+impl<F: FnMut(OutgoingPacket)> crate::codec::PayloadSink for SenderSink<'_, F> {
+    fn payload(&mut self, payload: &crate::codec::Payload<'_>) {
+        (self.f)(
+            self.sender
+                .packet(payload.timestamp(), payload.mark(), payload.data()),
+        );
+    }
+
+    fn discontinuity(&mut self) {
+        self.sender.skip();
+    }
 }
 
 #[cfg(test)]

@@ -7,8 +7,11 @@
 #![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
 
 use crate::buf::{BufRange, MarkBuf};
-use crate::codec::{UnitPosition, VideoData, VideoHandler};
+use crate::codec::{Position, VideoData, VideoHandler};
 use crate::inputs::{Input as _, Split};
+
+#[cfg(any(feature = "h264", feature = "h265"))]
+pub(crate) mod packetizer;
 
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
 ///
@@ -266,7 +269,7 @@ pub(super) fn deliver<Ctx>(
     for piece in pieces {
         if n + 2 > MAX_SLICES {
             handler.data(&VideoData {
-                position: UnitPosition::new(first, false),
+                position: Position::new(first, false),
                 data: &slices[..n],
             });
             first = false;
@@ -281,7 +284,7 @@ pub(super) fn deliver<Ctx>(
         }
     }
     handler.data(&VideoData {
-        position: UnitPosition::new(first, last),
+        position: Position::new(first, last),
         data: &slices[..n],
     });
 }

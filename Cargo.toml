@@ -65,3 +65,11 @@ required-features = ["h264"]
 name = "depacketize"
 harness = false
 required-features = ["h264"]
+
+[[test]]
+name = "repacketize"
+required-features = ["h264"]
+
+[[test]]
+name = "repacketize_h265"
+required-features = ["h265"]

@@ -42,6 +42,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "roundtrip_h265"
+path = "fuzz_targets/roundtrip_h265.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "depacketize_jpeg"
 path = "fuzz_targets/depacketize_jpeg.rs"
 test = false

@@ -79,20 +79,43 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
     ];
     let mut dummy_frame = vec![1; 1048576];
     dummy_frame[4] = h264_reader::nal::UnitType::SliceLayerWithoutPartitioningIdr.id();
-    let mut p =
-        retina::codec::h264::Packetizer::new(max_payload_size, 24104, 96, 0x4cacc3d1).unwrap();
+    let parameters = retina::codec::VideoDepacketizer::<()>::new(
+        "h264",
+        90_000,
+        Some("sprop-parameter-sets=Z00AKZpkA8ARPyzUBAQFAAADA+gAAOpgBA==,aO48gA=="),
+    )
+    .unwrap()
+    .parameters()
+    .unwrap()
+    .clone();
+    let mut p = retina::codec::VideoPacketizer::new(
+        &parameters,
+        retina::codec::PacketizeOptions::default()
+            .max_payload_size(max_payload_size)
+            .parameter_set_insertion(retina::codec::ParameterSetInsertion::Never)
+            .aggregate(false),
+    )
+    .unwrap();
+    let mut sender = retina::rtp::Sender::new(96, 0x4cacc3d1, 24104, 0);
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     for _ in 0..30 {
         for &f in &frame_sizes {
             dummy_frame[0..4].copy_from_slice(&f.to_be_bytes()[..]);
-            let frame = Bytes::copy_from_slice(&dummy_frame[..(usize::try_from(f).unwrap() + 4)]);
-            p.push(timestamp, frame).unwrap();
-            while let Some(pkt) = p.pull().unwrap() {
-                data.push(b'$'); // interleaved data
-                data.push(0); // channel 0
-                data.extend_from_slice(&u16::try_from(pkt.len()).unwrap().to_be_bytes()[..]);
-                data.extend_from_slice(&pkt);
-            }
+            let frame = &dummy_frame[..(usize::try_from(f).unwrap() + 4)];
+            p.push_frame(
+                retina::codec::FrameInfo::new(timestamp).with_random_access_point(true),
+                retina::codec::h26x::Framing::FourByteLength,
+                frame,
+                &mut sender.sink(|pkt| {
+                    data.push(b'$'); // interleaved data
+                    data.push(0); // channel 0
+                    data.extend_from_slice(
+                        &u16::try_from(pkt.raw.len()).unwrap().to_be_bytes()[..],
+                    );
+                    data.extend_from_slice(&pkt.raw);
+                }),
+            )
+            .unwrap();
             timestamp = timestamp.try_add(3000).unwrap();
         }
     }

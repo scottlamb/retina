@@ -3,9 +3,19 @@
 
 //! Codec-specific logic (for audio, video, and application media types).
 //!
-//! Currently this primarily consists of RTP depacketization logic for each
-//! codec, as needed for a client during `PLAY` and a server during `RECORD`.
-//! Packetization (needed for the reverse) may be added in the future.
+//! This has a receive side and a send side, each usable by either a client or
+//! a server:
+//!
+//! | | receive side | send side |
+//! |---|---|---|
+//! | used by | client `PLAY`; server `RECORD` | server `PLAY`; client `RECORD` |
+//! | converts | RTP packets → frames | frames → RTP payloads |
+//! | entry point | [`Depacketizer`] | [`VideoPacketizer`] |
+//! | delivers to | [`VideoHandler`], [`AudioHandler`], [`MessageHandler`] | [`PayloadSink`] |
+//!
+//! Parameter types such as [`VideoParameters`], and [`PayloadFormat`], are
+//! shared by both. A proxy can connect the receive side to the send side; see
+//! "Repacketizing" on [`VideoPacketizer`].
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -116,6 +126,7 @@ pub mod h264;
 pub mod h265;
 
 pub(crate) mod onvif;
+pub(crate) mod packetize;
 pub(crate) mod simple_audio;
 
 #[cfg(test)]
@@ -124,8 +135,9 @@ mod testutil;
 pub(crate) use events::FrameBody;
 pub use events::{
     Accumulate, AudioFrameRef, AudioHandler, Corruption, Loss, LossReason, MessageFrameRef,
-    MessageHandler, UnitPosition, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
+    MessageHandler, Position, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+pub use packetize::{FrameInfo, PacketizeOptions, Payload, PayloadSink, VideoPacketizer};
 
 /// Options controlling how frames are formatted.
 ///
@@ -176,18 +188,30 @@ impl FrameFormat {
 }
 
 /// When to insert parameter sets (SPS/PPS for H.264; VPS/SPS/PPS for H.265)
-/// into frame data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// in-band.
+///
+/// This is used in two places:
+///
+/// *   [`FrameFormat::parameter_set_insertion`]: when a depacketizer prepends
+///     parameter sets to the frame data it produces, as with
+///     [`VideoFrameEnd::complete_frame`]. A depacketizer only prepends them
+///     to random access points.
+/// *   [`PacketizeOptions::parameter_set_insertion`]: when a packetizer sends
+///     parameter sets in the RTP stream, before a frame's own codec units.
+///
+/// Either way, they're also available out of band via [`VideoParameters`]
+/// (and, for an RTP stream, the SDP; see [`VideoPacketizer::payload_format`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ParameterSetInsertion {
-    /// Prepend to every key frame. Default.
+    /// Insert at each key frame (random access point), and whenever the
+    /// parameters change. Default.
     #[default]
     EachKeyFrame,
 
-    /// Prepend only when parameters have changed since the last frame.
+    /// Insert only when the parameters change.
     OnChange,
 
-    /// Never insert in-band; caller retrieves them out-of-band via
-    /// [`VideoParameters`].
+    /// Never insert in-band.
     Never,
 }
 
@@ -368,6 +392,15 @@ impl VideoParameters {
             h26x::Framing::FourByteLength => &self.decoder_config_record,
             h26x::Framing::AnnexB => &self.annex_b_parameter_sets,
         }
+    }
+
+    /// Returns the RTP payload format for sending a stream with these
+    /// parameters, as a [`VideoPacketizer`] would, or `None` if Retina can't
+    /// packetize this codec.
+    ///
+    /// Currently H.264 and H.265 are supported.
+    pub fn payload_format(&self) -> Option<PayloadFormat> {
+        packetize::payload_format(self)
     }
 }
 
@@ -958,8 +991,9 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
 /// An RTP payload format, as described by an SDP media description: its media
 /// type, and its `rtpmap` and `fmtp` attributes.
 ///
-/// A [`Depacketizer`] is created from one; see
-/// [`crate::client::Stream::payload_format`].
+/// A [`Depacketizer`] is created from one (see
+/// [`crate::client::Stream::payload_format`]), and a [`VideoPacketizer`]
+/// describes its output with one (see [`VideoPacketizer::payload_format`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadFormat {
     media: Cow<'static, str>,
@@ -1179,7 +1213,7 @@ mod tests {
                 is_disposable: false,
                 has_new_parameters: false,
             },
-            Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
+            Event::Data(Position::Complete, hex(b"\x65slice")),
             Event::FrameEnd {
                 is_random_access_point: true,
                 is_disposable: false,
@@ -1470,7 +1504,7 @@ mod tests {
                     is_disposable: false,
                     has_new_parameters: false,
                 },
-                Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
+                Event::Data(Position::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
                     is_random_access_point: false,
                     is_disposable: false,

@@ -1289,6 +1289,94 @@ fn to_bytes(hdr: nal::Header, len: u32, pieces: &[BufRange], buf: &MarkBuf) -> B
     out.into()
 }
 
+/// Packetizes H.265 NAL units per RFC 7798.
+///
+/// Emits single NAL unit packets, aggregation packets (if enabled), and
+/// fragmentation units. Only `tx-mode=SRST` with `sprop-max-don-diff=0` is
+/// supported, so there are no DONL or DOND fields. See
+/// [`crate::codec::VideoPacketizer`].
+pub(crate) type Packetizer = super::h26x::packetizer::Packetizer<PacketizeCodec>;
+
+#[derive(Debug)]
+pub(crate) enum PacketizeCodec {}
+
+impl super::h26x::packetizer::Codec for PacketizeCodec {
+    type Header = [u8; 2];
+    type FuHeader = [u8; 3];
+    const PARAMETER_SETS: usize = 3;
+
+    fn parameter_sets(parameters: &VideoParameters) -> Option<Vec<Bytes>> {
+        match parameters.codec_params() {
+            super::VideoParametersCodec::H265 { vps, sps, pps } => {
+                Some(vec![vps.clone(), sps.clone(), pps.clone()])
+            }
+            _ => None,
+        }
+    }
+
+    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+        let &[vps, sps, pps] = sets else {
+            unreachable!("expected VPS, SPS, and PPS");
+        };
+        InternalParameters::parse_vps_sps_pps(vps, sps, pps, true).map(|p| p.generic_parameters)
+    }
+
+    fn payload_format(_parameters: &VideoParameters, sets: &[Bytes]) -> super::PayloadFormat {
+        let e = &base64::engine::general_purpose::STANDARD;
+        super::PayloadFormat::new("video", "H265", 90_000).with_fmtp(format!(
+            "sprop-vps={};sprop-sps={};sprop-pps={}",
+            e.encode(&sets[0]),
+            e.encode(&sets[1]),
+            e.encode(&sets[2]),
+        ))
+    }
+
+    fn parameter_set_index(hdr: [u8; 2]) -> Option<usize> {
+        match hdr[0] >> 1 & 0b11_1111 {
+            32 => Some(0),
+            33 => Some(1),
+            34 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Types 48–63 are unspecified by H.265, and RFC 7798 uses 48–50 for
+    /// aggregation packets, fragmentation units, and PACI packets.
+    fn invalid_header(hdr: [u8; 2]) -> Option<&'static str> {
+        if hdr[0] >> 1 & 0b11_1111 >= 48 {
+            Some("invalid type")
+        } else if hdr[1] & 0b111 == 0 {
+            Some("zero TemporalId plus 1")
+        } else {
+            None
+        }
+    }
+
+    /// Per RFC 7798 section 4.4.2, the F bit is the OR of the aggregated NALs'
+    /// F bits, and the LayerId and TID are the minimums of theirs.
+    fn aggregation_header(a: [u8; 2], b: [u8; 2]) -> [u8; 2] {
+        let f = (a[0] | b[0]) & 0b1000_0000;
+        let layer_id = |h: [u8; 2]| (h[0] & 0b1) << 5 | h[1] >> 3;
+        let layer_id = layer_id(a).min(layer_id(b));
+        let tid = (a[1] & 0b111).min(b[1] & 0b111);
+        [
+            f | 48 << 1 | layer_id >> 5,
+            (layer_id & 0b1_1111) << 3 | tid,
+        ]
+    }
+
+    /// Per RFC 7798 section 4.4.3, the payload header is the NAL's header with
+    /// type 49, followed by an FU header with the start and end bits and the
+    /// NAL's type.
+    fn fu_header(hdr: [u8; 2], start: bool, end: bool) -> [u8; 3] {
+        [
+            (hdr[0] & 0b1000_0001) | 49 << 1,
+            hdr[1],
+            u8::from(start) << 7 | u8::from(end) << 6 | (hdr[0] >> 1 & 0b11_1111),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -1794,7 +1882,7 @@ mod tests {
     #[test]
     fn events_stream() {
         use crate::codec::events::testutil::{Event, Recorder, hex};
-        use crate::codec::{Accumulate, UnitPosition};
+        use crate::codec::{Accumulate, Position};
         init_logging();
         let mut buf = MarkBuf::new(65536);
         let mut d = super::Depacketizer::new(90_000, None).unwrap();
@@ -1835,14 +1923,14 @@ mod tests {
                         is_disposable: false,
                         has_new_parameters: false,
                     },
-                    Event::Data(UnitPosition::Start, hex(b"\x26\x01start")),
+                    Event::Data(Position::Start, hex(b"\x26\x01start")),
                 ]
             );
             push(&mut d, &mut buf, 1, 0, true, b"\x62\x01\x53 end", &mut h);
             assert_eq!(
                 h.take(),
                 vec![
-                    Event::Data(UnitPosition::End, hex(b" end")),
+                    Event::Data(Position::End, hex(b" end")),
                     Event::FrameEnd {
                         is_random_access_point: true,
                         is_disposable: false,
@@ -1864,7 +1952,7 @@ mod tests {
                         is_disposable: false,
                         has_new_parameters: false,
                     },
-                    Event::Data(UnitPosition::Complete, hex(b"\x02\x01slice")),
+                    Event::Data(Position::Complete, hex(b"\x02\x01slice")),
                     Event::FrameEnd {
                         is_random_access_point: false,
                         is_disposable: false,
@@ -1984,5 +2072,262 @@ mod tests {
             panic!()
         };
         assert_eq!(&sps[..], &sps_b[..]);
+    }
+}
+
+#[cfg(test)]
+mod packetizer_tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+    use crate::codec::{
+        FrameInfo, PacketizeOptions, ParameterSetInsertion, Payload, PayloadSink, Position,
+    };
+    use crate::testutil::HexDebug;
+
+    fn b64(s: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    fn parameter_sets() -> [Vec<u8>; 3] {
+        [
+            b64("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA=="),
+            b64("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE="),
+            b64("RAHA8saNA7NA"),
+        ]
+    }
+
+    /// A payload as recorded by `Recorder`: `(mark, frame_start, data)`.
+    type Recorded = (bool, bool, HexDebug);
+
+    #[derive(Default)]
+    struct Recorder {
+        payloads: Vec<Recorded>,
+    }
+
+    impl Recorder {
+        fn take(&mut self) -> Vec<Recorded> {
+            std::mem::take(&mut self.payloads)
+        }
+    }
+
+    impl PayloadSink for Recorder {
+        fn payload(&mut self, p: &Payload<'_>) {
+            self.payloads.push((
+                p.mark(),
+                p.position().is_first(),
+                HexDebug(p.data().concat()),
+            ));
+        }
+    }
+
+    fn rec(mark: bool, frame_start: bool, data: &[u8]) -> Recorded {
+        (mark, frame_start, HexDebug(data.to_vec()))
+    }
+
+    fn packetizer(
+        max_payload_size: u16,
+        parameter_set_insertion: ParameterSetInsertion,
+    ) -> Packetizer {
+        let [vps, sps, pps] = parameter_sets();
+        let params = InternalParameters::parse_vps_sps_pps(&vps, &sps, &pps, false)
+            .unwrap()
+            .generic_parameters;
+        Packetizer::new(
+            &params,
+            PacketizeOptions::default()
+                .max_payload_size(max_payload_size)
+                .parameter_set_insertion(parameter_set_insertion),
+        )
+        .unwrap()
+    }
+
+    fn frame(ts: i64, is_random_access_point: bool) -> FrameInfo {
+        FrameInfo::new(crate::Timestamp::new(ts, NonZeroU32::new(90_000).unwrap(), 0).unwrap())
+            .with_random_access_point(is_random_access_point)
+    }
+
+    /// Parameter sets and small NALs are aggregated into an aggregation packet.
+    #[test]
+    fn aggregation() {
+        let mut p = packetizer(1400, ParameterSetInsertion::EachKeyFrame);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x4e\x01sei"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x26\x01", b"idr"], &mut r);
+        assert_eq!(r.take(), []); // held until the frame's end.
+        p.end_frame(&mut r);
+        let [vps, sps, pps] = parameter_sets();
+        let mut expected = vec![0x60, 0x01]; // AP with layer 0, TID 0.
+        for nal in [&vps[..], &sps, &pps, b"\x4e\x01sei", b"\x26\x01idr"] {
+            expected.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            expected.extend_from_slice(nal);
+        }
+        assert_eq!(r.take(), [rec(true, true, &expected)]);
+
+        // No parameter sets for a non-key frame; a lone NAL goes in a single NAL unit packet.
+        p.start_frame(frame(1, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01p"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x02\x01p")]);
+    }
+
+    /// The aggregation packet's header has the minimum layer ID and TID.
+    #[test]
+    fn aggregation_header() {
+        let mut p = packetizer(1400, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x0bp"], &mut r); // layer 1, TID plus 1 = 3
+        p.push_unit(Position::Complete, &[b"\x03\x02q"], &mut r); // layer 32, TID plus 1 = 2
+        p.end_frame(&mut r);
+        assert_eq!(
+            r.take(),
+            [rec(
+                true,
+                true,
+                b"\x60\x0a\x00\x03\x02\x0bp\x00\x03\x03\x02q"
+            )]
+        );
+    }
+
+    /// Fragments are delivered as soon as they're known not to be last,
+    /// referencing the input; the final fragment is held for the marker bit.
+    #[test]
+    fn fu_streaming() {
+        let mut p = packetizer(7, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Start, &[b"\x02\x01abc"], &mut r);
+        assert_eq!(r.take(), []); // might still fit in a single NAL unit packet.
+        p.push_unit(Position::Middle, &[b"defghij"], &mut r);
+        assert_eq!(
+            r.take(),
+            [
+                rec(false, true, b"\x62\x01\x81abcd"),
+                rec(false, false, b"\x62\x01\x01efgh")
+            ]
+        );
+        p.push_unit(Position::End, &[b""], &mut r);
+        assert_eq!(r.take(), []);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, false, b"\x62\x01\x41ij")]);
+    }
+
+    /// A NAL which exactly fits isn't fragmented; one byte more is.
+    #[test]
+    fn fu_boundary() {
+        let mut p = packetizer(5, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01abc"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01abcd"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(
+            r.take(),
+            [
+                rec(false, true, b"\x02\x01abc"),
+                rec(false, false, b"\x62\x01\x81ab"),
+                rec(true, false, b"\x62\x01\x41cd"),
+            ]
+        );
+    }
+
+    /// The two-byte NAL header may be split across chunks.
+    #[test]
+    fn split_header() {
+        let mut p = packetizer(1400, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02", b"\x01p"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x02\x01p")]);
+    }
+
+    /// Invalid NALs are discarded by `push_unit`, including any continuation
+    /// chunks: types which would be mistaken for aggregation or fragmentation
+    /// packets, a zero TID, or a truncated header.
+    #[test]
+    fn invalid_nal() {
+        let mut p = packetizer(100, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x62\x01x"], &mut r); // type 49 (FU)
+        p.push_unit(Position::Start, &[b"\x02\x00x"], &mut r); // TID 0
+        p.push_unit(Position::End, &[b"yz"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x02"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01p"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x02\x01p")]);
+    }
+
+    /// `push_frame` rejects invalid NALs without delivering anything.
+    #[test]
+    fn push_frame_invalid_nal() {
+        let mut p = packetizer(100, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        for (data, expected) in [
+            (
+                &b"\x00\x00\x00\x03\x02\x01p\x00\x00\x00\x03\x60\x01x"[..],
+                "invalid type",
+            ),
+            (b"\x00\x00\x00\x03\x82\x01p", "F bit"),
+            (b"\x00\x00\x00\x03\x02\x00p", "zero TemporalId"),
+            (b"\x00\x00\x00\x01\x02", "shorter than a NAL header"),
+        ] {
+            let e = p
+                .push_frame(
+                    frame(0, false),
+                    crate::codec::h26x::Framing::FourByteLength,
+                    data,
+                    &mut r,
+                )
+                .unwrap_err();
+            assert!(e.to_string().contains(expected), "{e}");
+            assert_eq!(r.take(), []);
+        }
+    }
+
+    /// `push_frame` splits Annex B data and takes over in-band parameter sets.
+    #[test]
+    fn push_frame_annex_b() {
+        let vps_b = b64("QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==");
+        let sps_b = b64("QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=");
+        let pps_b = b64("RAHA8vAzJA==");
+        let mut p = packetizer(1400, ParameterSetInsertion::OnChange);
+        let mut r = Recorder::default();
+        let mut data = Vec::new();
+        for nal in [&vps_b[..], &sps_b, &pps_b, b"\x26\x01idr"] {
+            data.extend_from_slice(b"\x00\x00\x00\x01");
+            data.extend_from_slice(nal);
+        }
+        p.push_frame(
+            frame(0, true),
+            crate::codec::h26x::Framing::AnnexB,
+            &data,
+            &mut r,
+        )
+        .unwrap();
+        let mut expected = vec![0x60, 0x01];
+        for nal in [&vps_b[..], &sps_b, &pps_b, b"\x26\x01idr"] {
+            expected.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            expected.extend_from_slice(nal);
+        }
+        assert_eq!(r.take(), [rec(true, true, &expected)]);
+        assert_eq!(
+            p.payload_format().fmtp().unwrap(),
+            "sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==;\
+             sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=;sprop-pps=RAHA8vAzJA=="
+        );
+
+        // Repeated parameter sets aren't a change, so they aren't inserted.
+        p.push_frame(
+            frame(1, true),
+            crate::codec::h26x::Framing::AnnexB,
+            &data,
+            &mut r,
+        )
+        .unwrap();
+        assert_eq!(r.take(), [rec(true, true, b"\x26\x01idr")]);
     }
 }
