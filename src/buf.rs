@@ -10,6 +10,10 @@
 //! depacketizer refers to payload bytes in place rather than copying them, and
 //! the buffer keeps them available as long as a depacketizer needs them.
 //!
+//! A [`crate::client`] session fills its own buffers and lends out
+//! `PacketRef`s; see [`crate::client::Session::next_item`]. Callers doing
+//! their own I/O fill a `MarkBuf` themselves, as below.
+//!
 //! # Supplying packets yourself
 //!
 //! The caller fills a `MarkBuf`, parses RTP packets out of it, and hands each
