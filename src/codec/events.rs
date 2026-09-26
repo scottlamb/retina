@@ -310,6 +310,7 @@ pub struct VideoFrameEnd<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) start_ctx: &'a Ctx,
     pub(crate) end_ctx: &'a Ctx,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) loss: u16,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
@@ -365,6 +366,7 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
     /// Returns the number of lost RTP packets before this frame, for
     /// `Demuxed`. Handlers learn of loss via [`VideoHandler::loss`].
     #[inline]
+    #[cfg(test)]
     pub(crate) fn loss(&self) -> u16 {
         self.loss
     }
@@ -404,9 +406,6 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
     /// case isn't detected: if packets carrying new parameter sets are lost
     /// immediately before a random access point whose slices all arrive, the
     /// frame is reported decodable, but a decoder will use stale parameters.
-    ///
-    /// This is only tracked by [`super::VideoDepacketizer::push`]; it's always
-    /// true in other contexts, such as within [`crate::client::Demuxed`].
     #[inline]
     pub fn is_decodable(&self) -> bool {
         self.is_decodable
@@ -597,6 +596,7 @@ pub struct AudioFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) frame_length: NonZeroU32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) loss: u16,
 
     /// The raw frame data.
@@ -628,6 +628,7 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
     /// Returns the number of lost RTP packets before this frame, for
     /// `Demuxed`. Handlers learn of loss via [`AudioHandler::loss`].
     #[inline]
+    #[cfg(test)]
     pub(crate) fn loss(&self) -> u16 {
         self.loss
     }
@@ -656,6 +657,7 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
 pub struct MessageFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) loss: u16,
     pub(crate) data: &'a [u8],
 }
@@ -676,6 +678,7 @@ impl<Ctx> MessageFrameRef<'_, Ctx> {
     /// Returns the number of lost RTP packets before this message, for
     /// `Demuxed`. Handlers learn of loss via [`MessageHandler::loss`].
     #[inline]
+    #[cfg(test)]
     pub(crate) fn loss(&self) -> u16 {
         self.loss
     }

@@ -136,8 +136,7 @@ pub use events::{
 /// It's supplied wherever frame data or matching "extra data" is produced:
 /// [`VideoFrameEnd::complete_frame`], [`VideoFrameEnd::visit_frame_data`],
 /// [`AudioFrameRef::data`], [`VideoParameters::extra_data`], and
-/// [`AudioParameters::extra_data`]. [`crate::client::Demuxed`] uses the
-/// format given by [`SetupOptions::frame_format`](crate::client::SetupOptions::frame_format).
+/// [`AudioParameters::extra_data`].
 ///
 /// Preset constants are provided for common use cases:
 ///
@@ -1146,9 +1145,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
     ///
-    /// This is crate-internal: a public equivalent would need a handler bound
+    /// This is test-only: a public equivalent would need a handler bound
     /// naming every media type, which a new variant would break. Callers
     /// match on the variant and use its `push` instead.
+    #[cfg(test)]
     pub(crate) fn push(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
@@ -1162,6 +1162,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// As in [`VideoDepacketizer::push_with`].
+    #[cfg_attr(not(feature = "h264"), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn push_with(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,

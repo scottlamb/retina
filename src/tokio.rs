@@ -113,9 +113,9 @@ impl Connection {
 
     /// Reads body data from the ring buffer as `Bytes`.
     ///
-    /// This copies the data out. Use for cold paths (RTSP responses) or the
-    /// public `PacketItem` API. The `Demuxed` path reads directly from the
-    /// ring buffer to avoid this copy.
+    /// This copies the data out, so it's for cold paths: RTSP message bodies
+    /// and RTCP packets. RTP packets are lent out directly from the ring
+    /// buffer; see [`crate::client::RtpPacket`].
     pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
         let (s1, s2) = self.read_buf.split(body_pos, body_len as usize).slices();
         let mut buf = Vec::with_capacity(body_len as usize);

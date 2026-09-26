@@ -3,7 +3,6 @@
 
 //! RTSP client: connect to a server via [`Session`].
 
-use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::io;
 use std::mem::MaybeUninit;
@@ -15,9 +14,6 @@ use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
-pub(crate) use self::demux::LegacyHandler;
-pub use self::demux::{AudioFrame, CodecItem, MessageFrame, VideoFrame};
-pub use self::received::{ReceivedPacket, ReceivedPacketBuilder};
 pub use self::timeline::Timeline;
 use crate::inputs::Input;
 use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
@@ -36,9 +32,7 @@ use crate::{
 };
 
 mod channel_mapping;
-mod demux;
 mod parse;
-mod received;
 mod receiver_report;
 
 /// Internal API, public for a benchmark only.
@@ -771,7 +765,6 @@ impl SessionOptions {
 #[derive(Default)]
 pub struct SetupOptions {
     transport: Transport,
-    frame_format: Option<crate::codec::FrameFormat>,
 }
 
 impl SetupOptions {
@@ -779,23 +772,6 @@ impl SetupOptions {
     #[inline]
     pub fn transport(mut self, transport: Transport) -> Self {
         self.transport = transport;
-        self
-    }
-
-    /// Sets the format of frames returned by [`Demuxed`].
-    ///
-    /// This controls H.26x NAL framing (length-prefixed vs Annex B), parameter
-    /// set insertion, and AAC framing. See [`crate::codec::FrameFormat`] for
-    /// details and preset constants like
-    /// [`FrameFormat::MP4`](crate::codec::FrameFormat::MP4). It's also
-    /// available via [`Stream::frame_format`], e.g. to pass to
-    /// [`VideoParameters::extra_data`](crate::codec::VideoParameters::extra_data).
-    ///
-    /// It has no effect on [`Session::handle_next`], whose handler events take
-    /// the format on each call, such as [`VideoFrameEnd::complete_frame`](crate::codec::VideoFrameEnd::complete_frame).
-    #[inline]
-    pub fn frame_format(mut self, format: crate::codec::FrameFormat) -> Self {
-        self.frame_format = Some(format);
         self
     }
 }
@@ -911,12 +887,7 @@ impl std::ops::Deref for Tool {
 ///
 /// Currently if multiple formats are offered, this only describes the first.
 pub struct Stream {
-    /// The depacketizer used by [`Demuxed`] and [`Session::handle_next`].
-    depacketizer: Result<crate::codec::Depacketizer<crate::PacketContext>, String>,
     state: StreamState,
-
-    /// The format of frames returned by [`Demuxed`]; see [`SetupOptions::frame_format`].
-    frame_format: crate::codec::FrameFormat,
 
     // See the matching accessors for descriptions of these fields.
     media: Box<str>,
@@ -946,7 +917,6 @@ impl std::fmt::Debug for Stream {
             .field("framerate", &self.framerate)
             .field("fmtp", &self.fmtp)
             .field("parameters", &self.parameters)
-            .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
     }
@@ -1029,13 +999,6 @@ impl std::fmt::Debug for UdpSockets {
 }
 
 impl Stream {
-    /// Returns the format of frames returned by [`Demuxed`], as set by
-    /// [`SetupOptions::frame_format`].
-    #[inline]
-    pub fn frame_format(&self) -> crate::codec::FrameFormat {
-        self.frame_format
-    }
-
     /// Returns codec-specific parameters for this stream as described in the
     /// `DESCRIBE` response's SDP, if available.
     ///
@@ -1049,7 +1012,6 @@ impl Stream {
     /// [`VideoFrameStart::parameters`](crate::codec::VideoFrameStart::parameters),
     /// [`VideoFrameEnd::parameters`](crate::codec::VideoFrameEnd::parameters),
     /// or [`Depacketizer::parameters`](crate::codec::Depacketizer::parameters).
-    /// With [`Demuxed`], use [`Demuxed::parameters`].
     ///
     /// If there is no packet loss, parameters are generally available after
     /// the first frame. In the case of H.264, [RFC 6184 section
@@ -1257,9 +1219,8 @@ enum ResponseMode {
 /// 2. Examine the session's available streams via [`Session::streams`] and set
 ///    up one or more via [`Session::setup`].
 /// 3. Start playing via [`Session::play`].
-/// 4. Get packets via [`Session<Playing>::next_item`] and push them to
-///    depacketizers, or frames via the [`futures::stream::Stream`] impl
-///    returned by [`Session<Playing>::demuxed`].
+/// 4. Get packets via [`Session<Playing>::next_item`], and turn them into
+///    frames by pushing them to depacketizers from [`Stream::new_depacketizer`].
 /// 5. Drop the session. Retina may issue a `TEARDOWN` in the background, depending on the
 ///    [`SessionOptions::teardown`] parameter.
 /// 6. Possibly wait for `TEARDOWN` to complete; see
@@ -1287,15 +1248,6 @@ struct SessionInner {
     /// This is sometimes true in state `Described` and always true in state
     /// `Playing`.
     session: Option<parse::SessionHeader>,
-
-    // Keep some information about the DESCRIBE response. If a depacketizer
-    // couldn't be constructed correctly for one or more streams, this will be
-    // used to create a RtspResponseError on `State<Playing>::demuxed()`.
-    // We defer such errors from DESCRIBE time until then because they only
-    // matter if the stream is setup and the caller wants depacketization.
-    describe_ctx: RtspMessageContext,
-    describe_cseq: u32,
-    describe_status: StatusCode,
 
     /// The state of the keepalive request; only used in state `Playing`.
     keepalive_state: KeepaliveState,
@@ -1642,9 +1594,8 @@ impl Session<Described> {
     ///
     /// This method is permissive; it will return success even if there are
     /// errors in the SDP that would prevent one or more streams from being
-    /// depacketized correctly. If those streams are setup via
-    /// `Session<Described>::setup`, the erorrs in question will be ultimately
-    /// returned from `Stream<Playing>::demuxed`.
+    /// depacketized correctly. The errors in question are returned from
+    /// [`Stream::new_depacketizer`].
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
@@ -1690,7 +1641,6 @@ impl Session<Described> {
                     description,
                 })
             })?;
-        let describe_status = response.status_code;
         let sdp = resp_body;
         Ok(Session(
             Box::pin(SessionInner {
@@ -1699,9 +1649,6 @@ impl Session<Described> {
                 requested_auth,
                 presentation,
                 session: None,
-                describe_ctx: msg_ctx,
-                describe_cseq: cseq,
-                describe_status,
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
                 reports: None,
@@ -1929,9 +1876,6 @@ impl Session<Described> {
                 udp_sockets = Some(sockets);
             }
         };
-        if let Some(format) = options.frame_format {
-            stream.frame_format = format;
-        }
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
@@ -2263,14 +2207,6 @@ async fn punch_firewall_hole(sockets: &UdpSockets) -> Result<(), std::io::Error>
     Ok(())
 }
 
-/// An item yielded by [`Session<Playing>`]'s [`futures::stream::Stream`] impl.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum PacketItem {
-    Rtp(crate::client::ReceivedPacket),
-    Rtcp(crate::rtcp::ReceivedCompoundPacket),
-}
-
 /// An item returned by [`Session<Playing>::next_item`].
 #[derive(Debug)]
 #[non_exhaustive]
@@ -2334,19 +2270,6 @@ impl<'a> RtpPacket<'a> {
             .buf()
             .split(self.raw_pos, usize::from(self.raw_len))
     }
-
-    /// Copies into a [`ReceivedPacket`], for the [`futures::Stream`] impl.
-    fn to_received_packet(&self) -> ReceivedPacket {
-        let payload_start = (self.pkt.payload_pos() - self.raw_pos) as u16;
-        ReceivedPacket {
-            ctx: self.pkt.meta.ctx,
-            stream_id: self.stream_id,
-            timestamp: self.pkt.meta.timestamp,
-            data: Bytes::from(self.raw().to_vec()),
-            payload_range: payload_start..payload_start + self.pkt.payload_len(),
-            loss: self.pkt.meta.loss,
-        }
-    }
 }
 
 impl std::fmt::Debug for RtpPacket<'_> {
@@ -2369,36 +2292,6 @@ impl std::fmt::Debug for RtpPacket<'_> {
 }
 
 impl Session<Playing> {
-    /// Returns a wrapper which demuxes/depacketizes into frames.
-    ///
-    /// Fails if a stream that has been setup can't be depacketized.
-    pub fn demuxed(self) -> Result<Demuxed, Error> {
-        for s in self.streams() {
-            if matches!(s.state, StreamState::Playing { .. })
-                && let Err(ref description) = s.depacketizer
-            {
-                return Err(self.depacketizer_error(description));
-            }
-        }
-        Ok(Demuxed {
-            session: self,
-            pending: VecDeque::new(),
-            fused: false,
-        })
-    }
-
-    /// Returns an error for a stream whose depacketizer couldn't be created.
-    fn depacketizer_error(&self, description: &str) -> Error {
-        wrap!(ErrorInt::RtspResponseError {
-            conn_ctx: *self.conn_ctx(),
-            msg_ctx: self.0.describe_ctx,
-            method: msg::Method::DESCRIBE,
-            cseq: self.0.describe_cseq,
-            status: self.0.describe_status,
-            description: description.to_owned(),
-        })
-    }
-
     /// Polls for the next RTP or RTCP packet.
     ///
     /// Returns `Ready(None)` when the server closes the connection.
@@ -2468,42 +2361,6 @@ impl Session<Playing> {
             raw_pos: rtp.body_pos,
             raw_len: rtp.body_len,
         })
-    }
-
-    /// As in [`Session::poll_next_item`], but also lends the session's own
-    /// depacketizer for an RTP packet's stream.
-    ///
-    /// Scaffolding for [`Session::poll_handle`] and [`Demuxed`], which use
-    /// the depacketizers built at `DESCRIBE` time.
-    fn poll_next_item_with_depacketizer<T>(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        f: impl FnOnce(
-            PlayingItem<'_>,
-            Option<&mut crate::codec::Depacketizer<crate::PacketContext>>,
-        ) -> T,
-    ) -> Poll<Option<Result<T, Error>>> {
-        let v = match ready!(Pin::new(&mut *self).poll_stream_item(cx)) {
-            None => return Poll::Ready(None),
-            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-            Some(Ok(v)) => v,
-        };
-        let stream_id = match &v {
-            ValidatedItem::Rtp(rtp) => rtp.stream_id,
-            ValidatedItem::Rtcp(_) => return Poll::Ready(Some(Ok(f(self.item(v), None)))),
-        };
-        if let Err(description) = &self.streams()[stream_id].depacketizer {
-            return Poll::Ready(Some(Err(self.depacketizer_error(description))));
-        }
-
-        // Move the depacketizer out of the stream while the item borrows it.
-        let slot = &mut self.0.presentation.streams[stream_id].depacketizer;
-        let Ok(mut depacketizer) = std::mem::replace(slot, Err(String::new())) else {
-            unreachable!()
-        };
-        let r = f(self.item(v), Some(&mut depacketizer));
-        self.0.presentation.streams[stream_id].depacketizer = Ok(depacketizer);
-        Poll::Ready(Some(Ok(r)))
     }
 
     fn handle_keepalive_timer(
@@ -3231,23 +3088,6 @@ impl PinnedDrop for SessionInner {
     }
 }
 
-impl futures::Stream for Session<Playing> {
-    type Item = Result<PacketItem, Error>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let item = ready!(self.get_mut().poll_next_item(cx));
-        Poll::Ready(item.map(|r| {
-            r.map(|item| match item {
-                PlayingItem::Rtp(p) => PacketItem::Rtp(p.to_received_packet()),
-                PlayingItem::Rtcp(p) => PacketItem::Rtcp(p),
-            })
-        }))
-    }
-}
-
 /// Raw received packet before validation.
 ///
 /// Both TCP and UDP paths produce this minimal descriptor; validation
@@ -3275,204 +3115,6 @@ struct ValidatedRtp {
     body_pos: u64,
     body_len: u16,
     payload_range: std::ops::Range<u16>,
-}
-
-/// Receives events from [`Session::poll_handle`] and [`Session::handle_next`].
-///
-/// This extends the codec handler traits (which receive frames) with
-/// session-level concerns. The audio and message traits have default
-/// implementations of all methods, so a handler which only cares about video
-/// can implement them with empty `impl` blocks.
-pub trait SessionHandler:
-    crate::codec::VideoHandler<crate::PacketContext>
-    + crate::codec::AudioHandler<crate::PacketContext>
-    + crate::codec::MessageHandler<crate::PacketContext>
-{
-    /// Called before any events arising from an RTP packet, with the index of
-    /// its stream within [`Session::streams`].
-    fn stream(&mut self, _stream_id: usize) {}
-
-    /// Called with each RTCP compound packet.
-    fn rtcp(&mut self, _pkt: &crate::rtcp::ReceivedCompoundPacket) {}
-}
-
-impl Session<Playing> {
-    /// Processes the next RTP or RTCP packet, delivering the resulting events
-    /// to `handler`.
-    ///
-    /// Returns `Ready(Some(Ok(())))` after each packet, whether or not it
-    /// produced events, and `Ready(None)` at the end of the session.
-    ///
-    /// Unlike the [`futures::Stream`] impls of [`Session`] and [`Demuxed`],
-    /// this can hand video frame data to the handler without copying it, and
-    /// before the frame is complete. See [`crate::codec::VideoHandler`].
-    ///
-    /// Corrupt data is reported via the handler's `loss` methods rather than
-    /// as an error; it's up to the handler whether to treat it as fatal.
-    ///
-    /// The handler runs within this call, so a slow handler delays reading
-    /// from the network. This provides backpressure, but a handler shouldn't
-    /// block the async runtime.
-    ///
-    /// Returns an error on any packet for a stream which can't be
-    /// depacketized; see [`Session::demuxed`].
-    pub fn poll_handle(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        handler: &mut impl SessionHandler,
-    ) -> Poll<Option<Result<(), Error>>> {
-        self.get_mut()
-            .poll_next_item_with_depacketizer(cx, |item, depacketizer| match (item, depacketizer) {
-                (PlayingItem::Rtp(p), Some(depacketizer)) => {
-                    handler.stream(p.stream_id());
-                    depacketizer.push(p.packet(), handler);
-                }
-                (PlayingItem::Rtcp(pkt), _) => handler.rtcp(&pkt),
-                (PlayingItem::Rtp(_), None) => unreachable!(),
-            })
-    }
-
-    /// Processes the next RTP or RTCP packet, delivering the resulting events
-    /// to `handler`.
-    ///
-    /// This is an `async` wrapper around [`Session::poll_handle`]:
-    ///
-    /// ```no_run
-    /// # async fn f(
-    /// #     mut session: retina::client::Session<retina::client::Playing>,
-    /// #     mut handler: impl retina::client::SessionHandler,
-    /// # ) -> Result<(), retina::Error> {
-    /// while let Some(r) = session.handle_next(&mut handler).await {
-    ///     r?;
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn handle_next(
-        &mut self,
-        handler: &mut impl SessionHandler,
-    ) -> Option<Result<(), Error>> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_handle(cx, handler)).await
-    }
-}
-
-/// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
-///
-/// This accumulates each frame and returns it as an owned [`CodecItem`]. See
-/// [`Session::handle_next`] for an alternative which avoids copying and can
-/// deliver data before the frame is complete.
-pub struct Demuxed {
-    session: Session<Playing>,
-
-    /// Items ready to return.
-    pending: VecDeque<Result<CodecItem, Error>>,
-
-    /// True if a depacketization error has ended the stream.
-    fused: bool,
-}
-
-impl Demuxed {
-    /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
-    /// attribute.
-    pub fn tool(&self) -> Option<&Tool> {
-        self.session.tool()
-    }
-
-    /// Returns the available streams as described by the server.
-    pub fn streams(&self) -> &[Stream] {
-        self.session.streams()
-    }
-
-    /// Returns the current codec parameters of stream `stream_id`, if known.
-    ///
-    /// These reflect all frames returned so far, and none that haven't been.
-    /// A frame which changes the parameters has
-    /// [`VideoFrame::has_new_parameters`] set.
-    ///
-    /// Panics if `stream_id >= self.streams().len()`.
-    pub fn parameters(&self, stream_id: usize) -> Option<crate::codec::ParametersRef<'_>> {
-        self.streams()[stream_id]
-            .depacketizer
-            .as_ref()
-            .ok()
-            .and_then(|d| d.parameters())
-    }
-}
-
-impl futures::Stream for Demuxed {
-    type Item = Result<CodecItem, Error>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        loop {
-            if let Some(item) = self.pending.pop_front() {
-                return Poll::Ready(Some(item));
-            }
-            if self.fused {
-                return Poll::Ready(None);
-            }
-            let this = &mut *self;
-            let pending = &mut this.pending;
-            let fused = &mut this.fused;
-            let conn_ctx = *this.session.conn_ctx();
-            let r = ready!(this.session.poll_next_item_with_depacketizer(
-                cx,
-                |item, depacketizer| match (item, depacketizer) {
-                    (PlayingItem::Rtcp(pkt), _) => pending.push_back(Ok(CodecItem::Rtcp(pkt))),
-                    (PlayingItem::Rtp(p), Some(depacketizer)) => {
-                        let pkt = p.packet();
-                        let stream_id = p.stream_id();
-                        let stream = p.stream();
-                        let mut items = VecDeque::new();
-                        let r = depacketizer.push_with(
-                            pkt,
-                            &mut LegacyHandler {
-                                pending: &mut items,
-                                meta: &pkt.meta,
-                                stream_id,
-                                format: stream.frame_format(),
-                            },
-                        );
-                        let error = |pkt_ctx, description| {
-                            wrap!(ErrorInt::RtpPacketError {
-                                conn_ctx,
-                                stream_ctx: *stream.ctx().expect("stream is playing"),
-                                pkt_ctx,
-                                stream_id,
-                                ssrc: pkt.meta.ssrc,
-                                sequence_number: pkt.meta.sequence_number,
-                                description,
-                            })
-                        };
-
-                        // Errors found mid-frame end the stream; those found as a
-                        // packet arrives are returned without ending it.
-                        for item in items {
-                            match item {
-                                Ok(item) => pending.push_back(Ok(item)),
-                                Err(e) => {
-                                    pending.push_back(Err(error(e.pkt_ctx, e.description)));
-                                    *fused = true;
-                                    return;
-                                }
-                            }
-                        }
-                        if let Err(description) = r {
-                            pending.push_back(Err(error(pkt.meta.ctx, description)));
-                        }
-                    }
-                    (PlayingItem::Rtp(_), None) => unreachable!(),
-                }
-            ));
-            match r {
-                None => return Poll::Ready(None),
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                Some(Ok(())) => {}
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3708,8 +3350,7 @@ mod tests {
             ),
         );
         {
-            let session = session.unwrap();
-            tokio::pin!(session);
+            let mut session = session.unwrap();
 
             // XXX: tokio will "auto-advance" paused time when timers are polled.
             // This is not great for this test. Disable keepalives to prevent it.
@@ -3719,11 +3360,11 @@ mod tests {
             // Packets: first ignored one (unassigned channel), then one passed through.
             tokio::join!(
                 async {
-                    match session.next().await {
-                        Some(Ok(PacketItem::Rtp(p))) => {
-                            assert_eq!(p.ssrc(), 0xdcc4a0d8);
-                            assert_eq!(p.sequence_number(), 0x41d4);
-                            assert_eq!(p.payload(), b"hello world");
+                    match session.next_item().await {
+                        Some(Ok(PlayingItem::Rtp(p))) => {
+                            assert_eq!(p.packet().meta.ssrc, 0xdcc4a0d8);
+                            assert_eq!(p.packet().meta.sequence_number, 0x41d4);
+                            assert_eq!(p.packet().payload().to_vec(), b"hello world");
                         }
                         o => panic!("unexpected item: {o:#?}"),
                     }
@@ -3773,8 +3414,6 @@ mod tests {
         tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
     }
-
-    impl SessionHandler for crate::codec::events::testutil::Recorder {}
 
     /// Borrowed packets via `Session::next_item`, pushed to a caller-owned
     /// depacketizer.
@@ -3873,113 +3512,6 @@ mod tests {
         );
     }
 
-    /// Frames via `Session::handle_next`, then via `Demuxed`.
-    #[tokio::test(start_paused = true)]
-    #[cfg(feature = "h264")]
-    async fn handle_next_then_demuxed() {
-        use crate::codec::Accumulate;
-        use crate::codec::events::testutil::{Event, Recorder, hex};
-        init_logging();
-        let (conn, mut server) = connect_to_mock().await;
-        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
-        let (session, _) = tokio::join!(
-            Session::describe_with_conn(
-                conn,
-                SessionOptions::default().teardown(TeardownPolicy::Never),
-                url
-            ),
-            req_response(
-                &mut server,
-                msg::Method::DESCRIBE,
-                response(include_bytes!("testdata/reolink_describe.txt"))
-            ),
-        );
-        let mut session = session.unwrap();
-        tokio::join!(
-            async {
-                session.setup(0, SetupOptions::default()).await.unwrap();
-            },
-            req_response(
-                &mut server,
-                msg::Method::SETUP,
-                response(include_bytes!("testdata/reolink_setup.txt"))
-            ),
-        );
-        let (session, _) = tokio::join!(
-            session.play(PlayOptions::default()),
-            req_response(
-                &mut server,
-                msg::Method::PLAY,
-                response(include_bytes!("testdata/reolink_play.txt"))
-            ),
-        );
-        let mut session = session.unwrap();
-        session.0.keepalive_timer = None; // see `simple`.
-
-        // An IDR slice as a single, marked packet.
-        let mut h = Recorder::new(Accumulate::Yes);
-        tokio::join!(
-            async {
-                session.handle_next(&mut h).await.unwrap().unwrap();
-            },
-            async {
-                server
-                    .send(OwnedMessage::Data {
-                        channel_id: 0,
-                        body: Bytes::from_static(
-                            b"\x80\xe0\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8\x65slice",
-                        ),
-                    })
-                    .await
-                    .unwrap();
-            },
-        );
-        assert_eq!(
-            h.take(),
-            vec![
-                Event::FrameStart {
-                    is_random_access_point: true,
-                    is_disposable: false,
-                    has_new_parameters: false,
-                },
-                Event::Data(crate::codec::UnitPosition::Complete, hex(b"\x65slice")),
-                Event::FrameEnd {
-                    loss: 0,
-                    is_random_access_point: true,
-                    is_disposable: false,
-                    has_new_parameters: false,
-                    data: Some(hex(b"\x00\x00\x00\x06\x65slice")),
-                },
-            ]
-        );
-
-        // A non-IDR slice via `Demuxed`.
-        let mut demuxed = session.demuxed().unwrap();
-        tokio::join!(
-            async {
-                match demuxed.next().await {
-                    Some(Ok(CodecItem::VideoFrame(f))) => {
-                        assert_eq!(f.stream_id(), 0);
-                        assert!(!f.is_random_access_point());
-                        assert_eq!(f.data(), b"\x00\x00\x00\x06\x41slice");
-                    }
-                    o => panic!("unexpected item: {o:#?}"),
-                }
-            },
-            async {
-                server
-                    .send(OwnedMessage::Data {
-                        channel_id: 0,
-                        body: Bytes::from_static(
-                            b"\x80\xe0\x41\xd5\x00\x00\x0b\xb8\xdc\xc4\xa0\xd8\x41slice",
-                        ),
-                    })
-                    .await
-                    .unwrap();
-            },
-        );
-    }
-
     /// As above, but TEARDOWN fails until session expiration.
     #[tokio::test(start_paused = true)]
     async fn session_expiration() {
@@ -4027,18 +3559,17 @@ mod tests {
         );
         let drop_time;
         {
-            let session = session.unwrap();
-            tokio::pin!(session);
+            let mut session = session.unwrap();
             session.0.keepalive_timer = None; // see `simple`.
 
             // Packet.
             tokio::join!(
                 async {
-                    match session.next().await {
-                        Some(Ok(PacketItem::Rtp(p))) => {
-                            assert_eq!(p.ssrc(), 0xdcc4a0d8);
-                            assert_eq!(p.sequence_number(), 0x41d4);
-                            assert_eq!(p.payload(), b"hello world");
+                    match session.next_item().await {
+                        Some(Ok(PlayingItem::Rtp(p))) => {
+                            assert_eq!(p.packet().meta.ssrc, 0xdcc4a0d8);
+                            assert_eq!(p.packet().meta.sequence_number, 0x41d4);
+                            assert_eq!(p.packet().payload().to_vec(), b"hello world");
                         }
                         o => panic!("unexpected item: {o:#?}"),
                     }
@@ -4182,7 +3713,7 @@ mod tests {
 
         tokio::join!(
             async {
-                match session.next().await {
+                match session.next_item().await {
                     Some(Err(e)) => {
                         assert!(
                             matches!(*e.0, ErrorInt::RtspFramingError { .. }),
@@ -4598,7 +4129,7 @@ mod tests {
         server: &mut crate::tokio::Connection,
     ) -> (msg::Message, Bytes) {
         tokio::select! {
-            item = session.next() => panic!("unexpected item: {item:#?}"),
+            item = session.next_item() => panic!("unexpected item: {item:#?}"),
             msg = server.next() => {
                 let msg = msg.unwrap().unwrap();
                 let body = server.body_bytes(msg.body_pos, msg.body_len);
@@ -4664,7 +4195,7 @@ mod tests {
         tokio::join!(
             async {
                 for _ in 0..4 {
-                    match session.next().await {
+                    match session.next_item().await {
                         Some(Ok(_)) => {}
                         o => panic!("unexpected item: {o:#?}"),
                     }
@@ -4728,7 +4259,7 @@ mod tests {
 
         // Poll the session from its own task, so only its own wakers wake it.
         let session = tokio::spawn(async move {
-            let item = session.next().await;
+            let item = session.next_item().await;
             panic!("unexpected item: {item:#?}");
         });
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -4796,8 +4327,8 @@ mod tests {
         )));
         tokio::join!(
             async {
-                match session.next().await {
-                    Some(Ok(PacketItem::Rtp(_))) => {}
+                match session.next_item().await {
+                    Some(Ok(PlayingItem::Rtp(_))) => {}
                     o => panic!("unexpected item: {o:#?}"),
                 }
             },
@@ -4929,8 +4460,8 @@ mod tests {
                 .send_to(&rtp_pkt(seq, 0), client_rtp_addr)
                 .await
                 .unwrap();
-            match session.next().await {
-                Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.sequence_number(), seq),
+            match session.next_item().await {
+                Some(Ok(PlayingItem::Rtp(p))) => assert_eq!(p.header().sequence_number(), seq),
                 o => panic!("unexpected item: {o:#?}"),
             }
         }
@@ -4939,7 +4470,7 @@ mod tests {
         reports.timer.as_mut().reset(tokio::time::Instant::now());
         session.0.reports = Some(reports);
         let (n, from) = tokio::select! {
-            item = session.next() => panic!("unexpected item: {item:#?}"),
+            item = session.next_item() => panic!("unexpected item: {item:#?}"),
             r = server_udp.rtcp_socket.recv_from(&mut buf) => r.unwrap(),
         };
         assert_eq!(from, client_rtcp_addr);
@@ -4974,7 +4505,7 @@ mod tests {
     fn print_sizes() {
         init_logging();
         for (name, size) in &[
-            ("PacketItem", std::mem::size_of::<PacketItem>()),
+            ("PlayingItem", std::mem::size_of::<PlayingItem>()),
             ("Presentation", std::mem::size_of::<Presentation>()),
             ("RtspConnection", std::mem::size_of::<RtspConnection>()),
             (
@@ -4983,7 +4514,6 @@ mod tests {
             ),
             ("SessionInner", std::mem::size_of::<SessionInner>()),
             ("SessionOptions", std::mem::size_of::<SessionOptions>()),
-            ("Demuxed", std::mem::size_of::<Demuxed>()),
             ("Stream", std::mem::size_of::<Stream>()),
         ] {
             log::info!("{name:-40} {size:4}");

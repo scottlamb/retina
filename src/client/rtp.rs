@@ -50,7 +50,7 @@ struct Seq {
 /// When using UDP, skips and logs out-of-order packets. When using TCP,
 /// fails on them.
 ///
-/// This reports packet loss (via [ReceivedPacket::loss]) but doesn't prohibit it
+/// This reports packet loss (via [`PacketMeta::loss`]) but doesn't prohibit it
 /// of more than `i16::MAX` which would be indistinguishable from non-monotonic sequence numbers.
 /// Servers sometimes drop packets internally even when sending data via TCP.
 ///

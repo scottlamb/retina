@@ -11,8 +11,8 @@ use crate::inputs::Input;
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor
-/// methods for the individual fields. It can be constructed on-the-fly
-/// from a [`crate::client::ReceivedPacket`] or via [`PacketHeader::validate`].
+/// methods for the individual fields. It can be obtained via
+/// [`PacketHeader::validate`] or [`crate::client::RtpPacket::header`].
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PacketHeader(
     /// ```text
@@ -156,6 +156,7 @@ pub struct PacketMeta<Ctx> {
 }
 
 /// Builds a raw RTP packet with the given header fields and payload.
+#[cfg_attr(not(feature = "h264"), allow(dead_code))]
 pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
     sequence_number: u16,
     timestamp: u32,
