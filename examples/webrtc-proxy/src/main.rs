@@ -7,9 +7,9 @@ use bytes::BytesMut;
 use clap::Parser;
 use log::{error, info, warn};
 use retina::PacketContext;
-use retina::client::SetupOptions;
+use retina::client::{PlayingItem, SetupOptions};
 use retina::codec::{
-    Accumulate, AudioHandler, Loss, MessageHandler, VideoData, VideoFrameEnd, VideoFrameStart,
+    Accumulate, Depacketizer, Loss, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart,
     VideoHandler, VideoParametersCodec,
 };
 use std::{str::FromStr, sync::Arc};
@@ -101,7 +101,7 @@ struct Frame {
     annexb_data: bytes::Bytes,
 }
 
-/// Assembles Annex B frames from the upstream session's streaming events.
+/// Assembles Annex B frames from an upstream stream's streaming events.
 ///
 /// Rather than having Retina accumulate each frame and then copy it, this
 /// appends each NAL unit to `buf` as it arrives, applying its own framing.
@@ -152,16 +152,6 @@ impl VideoHandler<PacketContext> for UpstreamHandler {
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
         warn!("upstream loss: {:?}", loss.reason());
-    }
-}
-
-// This only proxies video.
-impl AudioHandler<PacketContext> for UpstreamHandler {}
-impl MessageHandler<PacketContext> for UpstreamHandler {}
-
-impl retina::client::SessionHandler for UpstreamHandler {
-    fn stream(&mut self, stream_id: usize) {
-        self.stream_id = stream_id;
     }
 }
 
@@ -228,12 +218,12 @@ async fn run() -> Result<(), Error> {
         // This could work in a few different ways:
         //
         // 1. Pass RTP packets from upstream to downstream unmodified. (From
-        //    retina::client::Session's Stream impl to
+        //    retina::client::Session::next_item to
         //    webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRtp.)
         //    This only works if the upstream and downstream agree on an
         //    acceptable MTU.
         // 2. Pass whole frames (aka samples or H.264 access units). (From
-        //    retina::client::Demuxed's Stream impl to
+        //    a retina::codec::VideoDepacketizer to
         //    webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample.)
         //    This introduces a slight lag if it takes a long time to receive a
         //    complete frame from upstream.
@@ -290,20 +280,42 @@ async fn run() -> Result<(), Error> {
     // [*] some cameras drop the TCP connection when their send buffers fill.
     // Others truncate the current packet, which causes Retina to fail shortly
     // afterward with "framing error".
+    let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
+    let mut upstream_streams: Vec<Option<(VideoDepacketizer<PacketContext>, UpstreamHandler)>> =
+        Vec::new();
+    for (i, track) in tracks.iter().enumerate() {
+        if track.is_none() {
+            upstream_streams.push(None);
+            continue;
+        }
+        let depacketizer = match upstream_session.streams()[i].new_depacketizer() {
+            Ok(Depacketizer::Video(d)) => d,
+            Ok(_) => bail!("stream {i}: expected a video depacketizer"),
+            Err(e) => bail!("stream {i}: {e}"),
+        };
+        let handler = UpstreamHandler {
+            stream_id: i,
+            buf: BytesMut::new(),
+            tx: upstream_frames_tx.clone(),
+        };
+        upstream_streams.push(Some((depacketizer, handler)));
+    }
     let mut upstream_session = upstream_session
         .play(retina::client::PlayOptions::default())
         .await?;
-    let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
     tokio::spawn(async move {
-        let mut handler = UpstreamHandler {
-            stream_id: 0,
-            buf: BytesMut::new(),
-            tx: upstream_frames_tx,
-        };
-        while let Some(r) = upstream_session.handle_next(&mut handler).await {
-            if let Err(e) = r {
-                error!("upstream failed: {e}");
-                break;
+        while let Some(item) = upstream_session.next_item().await {
+            match item {
+                Ok(PlayingItem::Rtp(pkt)) => {
+                    if let Some((d, h)) = &mut upstream_streams[pkt.stream_id()] {
+                        d.push(pkt.packet(), h);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("upstream failed: {e}");
+                    break;
+                }
             }
         }
     });

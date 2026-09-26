@@ -18,15 +18,16 @@
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
 use anyhow::{Context, Error, anyhow, bail};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use clap::Parser;
-use futures::{Future, StreamExt};
+use futures::Future;
 use log::{debug, info, warn};
 use retina::{
-    client::CodecItem,
     client::{SetupOptions, Transport},
-    codec::{AudioParameters, ParametersRef, VideoParameters},
+    codec::{AudioParameters, VideoParameters},
 };
+
+use crate::demux::{Demuxer, Frame, Item, VideoFrame};
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -508,26 +509,18 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn video(
-        &mut self,
-        parameters: Option<ParametersRef<'_>>,
-        frame: retina::client::VideoFrame,
-    ) -> Result<(), Error> {
-        println!(
-            "{}: {}-byte video frame",
-            frame.timestamp(),
-            frame.data().remaining(),
-        );
+    async fn video(&mut self, frame: VideoFrame) -> Result<(), Error> {
+        println!("{}: {}-byte video frame", frame.timestamp, frame.data.len(),);
         let sample_description_index = if let (Some(i), false) = (
             self.cur_video_params_sample_description_index,
-            frame.has_new_parameters(),
+            frame.has_new_parameters,
         ) {
             // Use the most recent sample description index for most frames, without having to
             // scan through self.video_sample_index.
             i
         } else {
-            match parameters {
-                Some(ParametersRef::Video(params)) => {
+            match frame.parameters.as_deref() {
+                Some(params) => {
                     log::info!("new video params: {:?}", params);
                     let pos = self.video_params.iter().position(|p| p == params);
                     if let Some(pos) = pos {
@@ -541,50 +534,45 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                     debug!("Discarding video frame received before parameters");
                     return Ok(());
                 }
-                _ => unreachable!(),
             }
         };
         self.cur_video_params_sample_description_index = Some(sample_description_index);
-        let size = u32::try_from(frame.data().remaining())?;
+        let size = u32::try_from(frame.data.len())?;
         self.video_trak.add_sample(
             sample_description_index,
             self.mdat_pos,
             size,
-            frame.timestamp(),
-            frame.loss(),
+            frame.timestamp,
+            frame.loss,
             self.allow_loss,
         )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
-        if frame.is_random_access_point() {
+        if frame.is_random_access_point {
             self.video_sync_sample_nums.push(self.video_trak.samples);
         }
-        self.inner.write_all(frame.data()).await?;
+        self.inner.write_all(&frame.data).await?;
         Ok(())
     }
 
-    async fn audio(&mut self, frame: retina::client::AudioFrame) -> Result<(), Error> {
-        println!(
-            "{}: {}-byte audio frame",
-            frame.timestamp(),
-            frame.data().remaining()
-        );
-        let size = u32::try_from(frame.data().remaining())?;
+    async fn audio(&mut self, frame: Frame) -> Result<(), Error> {
+        println!("{}: {}-byte audio frame", frame.timestamp, frame.data.len());
+        let size = u32::try_from(frame.data.len())?;
         self.audio_trak.add_sample(
             /* sample_description_index */ 1,
             self.mdat_pos,
             size,
-            frame.timestamp(),
-            frame.loss(),
+            frame.timestamp,
+            frame.loss,
             self.allow_loss,
         )?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
             .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
-        self.inner.write_all(frame.data()).await?;
+        self.inner.write_all(&frame.data).await?;
         Ok(())
     }
 }
@@ -592,7 +580,8 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 /// Copies packets from `session` to `mp4` without handling any cleanup on error.
 async fn copy<'a>(
     opts: &'a Opts,
-    session: &'a mut retina::client::Demuxed,
+    session: &'a mut retina::client::Session<retina::client::Playing>,
+    demuxer: &'a mut Demuxer,
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
     mp4: &'a mut Mp4Writer<File>,
 ) -> Result<(), Error> {
@@ -606,20 +595,19 @@ async fn copy<'a>(
     tokio::pin!(sleep);
     loop {
         tokio::select! {
-            pkt = session.next() => {
-                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
-                    CodecItem::VideoFrame(f) => {
-                        let parameters = session.parameters(f.stream_id());
-                        let start_ctx = *f.start_ctx();
-                        mp4.video(parameters, f).await.with_context(
+            item = demuxer.next(session) => {
+                match item?.ok_or_else(|| anyhow!("EOF"))? {
+                    Item::Video(f) => {
+                        let start_ctx = f.start_ctx;
+                        mp4.video(f).await.with_context(
                             || format!("Error processing video frame starting with {start_ctx}"))?;
                     },
-                    CodecItem::AudioFrame(f) => {
-                        let ctx = *f.ctx();
+                    Item::Audio(f) => {
+                        let ctx = f.ctx;
                         mp4.audio(f).await.with_context(
                             || format!("Error processing audio frame, {ctx}"))?;
                     },
-                    CodecItem::Rtcp(rtcp) => {
+                    Item::Rtcp(rtcp) => {
                         if let (Some(t), Some(Ok(Some(sr)))) = (rtcp.rtp_timestamp(), rtcp.pkts().next().map(retina::rtcp::PacketRef::as_sender_report)) {
                             println!("{}: SR ts={}", t, sr.ntp_timestamp());
                         }
@@ -654,8 +642,8 @@ async fn write_mp4(
                 .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap())
                 .unknown_rtcp_ssrc(opts.unknown_rtcp_ssrc),
         )
-        .await?
-        .demuxed()?;
+        .await?;
+    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::MP4)?;
 
     // Append into a filename suffixed with ".partial", then try to either rename it into
     // place if it's complete or delete it otherwise.
@@ -665,7 +653,7 @@ async fn write_mp4(
     let tmp_filename: PathBuf = tmp_filename.into();
     let out = tokio::fs::File::create(&tmp_filename).await?;
     let mut mp4 = Mp4Writer::new(audio_params, opts.allow_loss, out).await?;
-    let result = copy(opts, &mut session, stop_signal, &mut mp4).await;
+    let result = copy(opts, &mut session, &mut demuxer, stop_signal, &mut mp4).await;
     if let Err(e) = result {
         // Log errors about finishing, returning the original error.
         if let Err(e) = mp4.finish().await {
@@ -734,12 +722,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some(i) = video_stream_i {
         session
-            .setup(
-                i,
-                SetupOptions::default()
-                    .transport(opts.transport.clone())
-                    .frame_format(retina::codec::FrameFormat::MP4),
-            )
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
             .await?;
     }
     let audio_stream = if !opts.no_audio {
@@ -770,12 +753,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some((i, _)) = audio_stream {
         session
-            .setup(
-                i,
-                SetupOptions::default()
-                    .transport(opts.transport.clone())
-                    .frame_format(retina::codec::FrameFormat::MP4),
-            )
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
             .await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {

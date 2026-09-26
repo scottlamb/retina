@@ -3,6 +3,7 @@
 
 //! RTSP client examples.
 
+mod demux;
 mod info;
 mod jpeg;
 mod mp4;
