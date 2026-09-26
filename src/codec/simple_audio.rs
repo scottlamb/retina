@@ -48,18 +48,22 @@ impl Depacketizer {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with<Ctx>(
+    pub(super) fn push<Ctx>(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         let payload_len = pkt.payload_len();
-        let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
-            format!(
-                "invalid length {} for payload of {}-bit audio samples",
-                payload_len, self.bits_per_sample
-            )
-        })?;
+        let Some(frame_length) = self.frame_length(payload_len as usize) else {
+            return super::report_corrupt(
+                pkt,
+                format!(
+                    "invalid length {} for payload of {}-bit audio samples",
+                    payload_len, self.bits_per_sample
+                ),
+                |l| handler.loss(l),
+            );
+        };
         let (s1, s2) = pkt.payload().slices();
         let joined;
         let data = if s2.is_empty() {
@@ -72,11 +76,9 @@ impl Depacketizer {
             ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length,
-            loss: pkt.meta.loss,
             data,
             adts: None,
         });
-        Ok(())
     }
 }
 

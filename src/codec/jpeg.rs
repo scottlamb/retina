@@ -322,7 +322,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+        if let Err(description) = self.push_inner(pkt, handler) {
+            super::report_corrupt(pkt, description, |l| handler.loss(l));
+        }
+    }
+
+    fn push_inner(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
@@ -549,7 +555,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 timestamp,
                 start_ctx: &metadata.start_ctx,
                 end_ctx: ctx,
-                loss,
                 is_random_access_point: true,
                 is_disposable: true,
                 has_new_parameters,
@@ -634,24 +639,17 @@ impl<Ctx: Clone> Default for Depacketizer<Ctx> {
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    ///
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let r = self.push_with(
-            pkt,
-            &mut super::testutil::Collector {
-                pending: &mut pending,
-                format: super::FrameFormat::default(),
-            },
-        );
+        pending.push(pkt, super::FrameFormat::default(), |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
     fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
-        self.pending.pop_front()
+        self.pending.pull()
     }
 }
 
@@ -937,9 +935,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, START_PACKET.iter().copied());
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert!(d.pull().is_none());
         {
             let pkt = TestPacket {
@@ -952,9 +949,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, END_PACKET.iter().copied());
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
 
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,

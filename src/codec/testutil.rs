@@ -12,9 +12,40 @@ use super::{
     MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 use crate::PacketContext;
+use crate::buf::PacketRef;
 
 /// Frames and errors from a depacketizer, in order.
-pub(crate) type Pending = VecDeque<Result<Item, String>>;
+#[derive(Debug, Default)]
+pub(crate) struct Pending {
+    items: VecDeque<Result<Item, String>>,
+
+    /// Packets lost since the previous frame.
+    loss: u16,
+}
+
+impl Pending {
+    /// Supplies `pkt` to a codec's depacketizer via `push`, first reporting
+    /// packet loss as the public depacketizers do.
+    ///
+    /// Panics if items from a previous packet haven't been pulled.
+    pub(crate) fn push(
+        &mut self,
+        pkt: &PacketRef<'_, PacketContext>,
+        format: FrameFormat,
+        push: impl FnOnce(&mut Collector<'_>),
+    ) {
+        if let Some(i) = self.items.front() {
+            panic!("push with data already pending: {i:?}");
+        }
+        let mut c = Collector::new(self, format);
+        super::report_packet_loss(pkt, |l| c.on_loss(l));
+        push(&mut c);
+    }
+
+    pub(crate) fn pull(&mut self) -> Option<Result<Item, String>> {
+        self.items.pop_front()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -91,15 +122,25 @@ pub(crate) struct MessageFrame {
 
 /// Accumulates each frame as an [`Item`], queueing corruption as an error.
 pub(crate) struct Collector<'a> {
-    pub(crate) pending: &'a mut Pending,
-    pub(crate) format: FrameFormat,
+    pending: &'a mut Pending,
+    format: FrameFormat,
 }
 
-impl Collector<'_> {
-    fn corrupt(&mut self, loss: &Loss<'_, PacketContext>) {
-        if let LossReason::Corrupt(c) = loss.reason() {
-            self.pending.push_back(Err(c.to_string()));
+impl<'a> Collector<'a> {
+    pub(crate) fn new(pending: &'a mut Pending, format: FrameFormat) -> Self {
+        Self { pending, format }
+    }
+
+    fn on_loss(&mut self, loss: &Loss<'_, PacketContext>) {
+        match loss.reason() {
+            LossReason::PacketLoss { packets } => self.pending.loss += packets,
+            LossReason::Corrupt(c) => self.pending.items.push_back(Err(c.to_string())),
         }
+    }
+
+    fn push(&mut self, item: impl FnOnce(u16) -> Item) {
+        let loss = std::mem::take(&mut self.pending.loss);
+        self.pending.items.push_back(Ok(item(loss)));
     }
 }
 
@@ -112,50 +153,57 @@ impl VideoHandler<PacketContext> for Collector<'_> {
         let data = frame_end
             .complete_frame(self.format)
             .expect("frame should be accumulated");
-        self.pending.push_back(Ok(Item::Video(VideoFrame {
-            start_ctx: *frame_end.start_ctx(),
-            end_ctx: *frame_end.end_ctx(),
-            has_new_parameters: frame_end.has_new_parameters(),
-            loss: frame_end.loss(),
-            timestamp: frame_end.timestamp(),
-            is_random_access_point: frame_end.is_random_access_point(),
-            is_disposable: frame_end.is_disposable(),
-            data,
-        })));
+        self.push(|loss| {
+            Item::Video(VideoFrame {
+                start_ctx: *frame_end.start_ctx(),
+                end_ctx: *frame_end.end_ctx(),
+                has_new_parameters: frame_end.has_new_parameters(),
+                loss,
+                timestamp: frame_end.timestamp(),
+                is_random_access_point: frame_end.is_random_access_point(),
+                is_disposable: frame_end.is_disposable(),
+                data,
+            })
+        });
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        self.corrupt(loss);
+        self.on_loss(loss);
     }
 }
 
 impl AudioHandler<PacketContext> for Collector<'_> {
     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
-        self.pending.push_back(Ok(Item::Audio(AudioFrame {
-            ctx: *frame.ctx(),
-            timestamp: frame.timestamp(),
-            frame_length: frame.frame_length(),
-            loss: frame.loss(),
-            data: frame.data(self.format).into_owned(),
-        })));
+        let data = frame.data(self.format).into_owned();
+        self.push(|loss| {
+            Item::Audio(AudioFrame {
+                ctx: *frame.ctx(),
+                timestamp: frame.timestamp(),
+                frame_length: frame.frame_length(),
+                loss,
+                data,
+            })
+        });
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        self.corrupt(loss);
+        self.on_loss(loss);
     }
 }
 
 impl MessageHandler<PacketContext> for Collector<'_> {
     fn message_frame(&mut self, frame: &MessageFrameRef<'_, PacketContext>) {
-        self.pending.push_back(Ok(Item::Message(MessageFrame {
-            ctx: *frame.ctx(),
-            timestamp: frame.timestamp(),
-            loss: frame.loss(),
-            data: frame.data().to_vec(),
-        })));
+        self.push(|loss| {
+            Item::Message(MessageFrame {
+                ctx: *frame.ctx(),
+                timestamp: frame.timestamp(),
+                loss,
+                data: frame.data().to_vec(),
+            })
+        });
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        self.corrupt(loss);
+        self.on_loss(loss);
     }
 }

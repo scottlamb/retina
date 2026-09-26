@@ -43,7 +43,7 @@ use std::{
 use crate::buf::PacketRef;
 use crate::{Error, error::ErrorInt, rtp::PacketMeta};
 
-use super::{AudioFrameRef, AudioHandler, AudioParameters, Loss, LossReason};
+use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -437,7 +437,6 @@ pub(crate) struct Depacketizer<Ctx> {
 #[derive(Debug)]
 struct AacFrame<Ctx> {
     ctx: Ctx,
-    loss: u16,
     frame_length: NonZeroU32,
     timestamp: crate::Timestamp,
     data: FrameData,
@@ -462,11 +461,6 @@ enum FrameData {
 struct Aggregate<Ctx> {
     meta: PacketMeta<Ctx>,
 
-    /// RTP packets lost before the next frame in this aggregate. Includes old
-    /// loss that caused a previous fragment to be too short.
-    /// This should be 0 when `frame_i > 0`.
-    loss: u16,
-
     /// True iff there was loss immediately before the packet that started this
     /// aggregate. The distinction between old and recent loss is relevant
     /// because only the latter should be capable of causing following fragments
@@ -489,10 +483,6 @@ struct Aggregate<Ctx> {
 struct Fragment {
     rtp_timestamp: u16,
 
-    /// Number of RTP packets lost before between the previous output AudioFrame
-    /// and now.
-    loss: u16,
-
     /// True iff packets have been lost since the last mark. If so, this
     /// fragment may be incomplete.
     loss_since_mark: bool,
@@ -507,7 +497,6 @@ struct Fragment {
 enum DepacketizerState<Ctx> {
     /// State when there's no buffered data.
     Idle {
-        prev_loss: u16,
         loss_since_mark: bool,
     },
 
@@ -524,7 +513,6 @@ enum DepacketizerState<Ctx> {
 impl<Ctx> Default for DepacketizerState<Ctx> {
     fn default() -> Self {
         DepacketizerState::Idle {
-            prev_loss: 0,
             loss_since_mark: false,
         }
     }
@@ -577,12 +565,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
-        &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
-        self.push_inner(pkt)?;
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
+        if let Err(description) = self.push_inner(pkt) {
+            return super::report_corrupt(pkt, description, |l| handler.loss(l));
+        }
         while let Some(r) = self.pull_inner() {
             match r {
                 Ok(f) => {
@@ -594,18 +580,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         ctx: &f.ctx,
                         timestamp: f.timestamp,
                         frame_length: f.frame_length,
-                        loss: f.loss,
                         data,
                         adts: Some(self.adts),
                     })
                 }
-                Err(description) => handler.loss(&Loss {
-                    ctx: &pkt.meta.ctx,
-                    reason: LossReason::Corrupt(super::Corruption::new(description)),
-                }),
+                Err(description) => super::report_corrupt(pkt, description, |l| handler.loss(l)),
             }
         }
-        Ok(())
     }
 
     fn push_inner(&mut self, pkt: &PacketRef<'_, Ctx>) -> Result<(), String> {
@@ -615,15 +596,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         self.payload.extend_from_slice(s1);
         self.payload.extend_from_slice(s2);
         let payload = &self.payload;
-        if meta.loss > 0
-            && let DepacketizerState::Fragmented(ref mut f) = self.state
-        {
+        if meta.loss > 0 && matches!(self.state, DepacketizerState::Fragmented(_)) {
             log::debug!(
                 "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
                 meta.loss,
             );
             self.state = DepacketizerState::Idle {
-                prev_loss: f.loss, // note this packet's loss will be added in later.
                 loss_since_mark: true,
             };
         }
@@ -667,7 +645,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         if meta.mark {
                             if frag.loss_since_mark {
                                 self.state = DepacketizerState::Idle {
-                                    prev_loss: frag.loss,
                                     loss_since_mark: false,
                                 };
                                 return Ok(());
@@ -690,7 +667,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         frag.buf.extend_from_slice(data);
                         self.state = DepacketizerState::Ready(AacFrame {
                             ctx: meta.ctx.clone(),
-                            loss: frag.loss,
                             frame_length: NonZeroU32::from(self.config.frame_length),
                             timestamp: meta.timestamp,
                             data: FrameData::Owned(std::mem::take(&mut frag.buf)),
@@ -700,18 +676,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 }
             }
             DepacketizerState::Aggregated(_) => panic!("push when already in state aggregated"),
-            DepacketizerState::Idle {
-                prev_loss,
-                loss_since_mark,
-            } => {
+            DepacketizerState::Idle { loss_since_mark } => {
                 if au_headers_count == 0 {
                     return Err("aggregate with no headers".to_string());
                 }
-                let loss = meta.loss;
                 self.state = DepacketizerState::Aggregated(Aggregate {
                     meta: meta.clone(),
-                    loss: *prev_loss + loss,
-                    loss_since_mark: *loss_since_mark || loss > 0,
+                    loss_since_mark: *loss_since_mark || meta.loss > 0,
                     frame_i: 0,
                     frame_count: au_headers_count,
                     data_off,
@@ -754,11 +725,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     if mark {
                         if agg.loss_since_mark {
                             log::debug!(
-                                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                                agg.loss
+                                "Discarding in-progress fragmented AAC frame due to earlier loss."
                             );
                             self.state = DepacketizerState::Idle {
-                                prev_loss: agg.loss,
                                 loss_since_mark: false,
                             };
                             return None;
@@ -769,7 +738,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     buf.extend_from_slice(&payload[agg.data_off..]);
                     self.state = DepacketizerState::Fragmented(Fragment {
                         rtp_timestamp: agg.meta.timestamp.timestamp as u16,
-                        loss: agg.loss,
                         loss_since_mark: agg.loss_since_mark,
                         size: size as u16,
                         buf,
@@ -784,7 +752,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 let agg_timestamp = agg.meta.timestamp;
                 let frame = AacFrame {
                     ctx: agg.meta.ctx.clone(),
-                    loss: agg.loss,
                     frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
@@ -798,7 +765,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     },
                     data: FrameData::Payload(agg.data_off..agg.data_off + size),
                 };
-                agg.loss = 0;
                 agg.data_off += size;
                 agg.frame_i += 1;
                 if agg.frame_i < agg.frame_count {
@@ -813,24 +779,17 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    ///
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let r = self.push_with(
-            pkt,
-            &mut super::testutil::Collector {
-                pending: &mut pending,
-                format: self.test_format,
-            },
-        );
+        pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
     fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
-        self.pending.pop_front()
+        self.pending.pull()
     }
 }
 
@@ -896,9 +855,8 @@ mod tests {
                     b'a', b's', b'd', b'f',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -930,9 +888,8 @@ mod tests {
                     b'f', b'o', b'o', b'b', b'a', b'r', b'b', b'a', b'z',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -975,9 +932,8 @@ mod tests {
                     b'f', b'o', b'o',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1000,9 +956,8 @@ mod tests {
                     b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1025,9 +980,8 @@ mod tests {
                     b'b', b'a', b'z',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -1073,9 +1027,8 @@ mod tests {
                     b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1097,9 +1050,8 @@ mod tests {
                     b'b', b'a', b'z',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
@@ -1124,9 +1076,8 @@ mod tests {
                     b'a', b's', b'd', b'f',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -1172,9 +1123,8 @@ mod tests {
                     b'f', b'o', b'o',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         {
@@ -1198,9 +1148,8 @@ mod tests {
                     b'b', b'a', b'z',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
@@ -1225,9 +1174,8 @@ mod tests {
                     b'a', b's', b'd', b'f',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -1273,9 +1221,8 @@ mod tests {
                     b'f', b'o', b'o',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         {
@@ -1299,9 +1246,8 @@ mod tests {
                     b'b', b'a', b'z',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
@@ -1326,9 +1272,8 @@ mod tests {
                     b'a', b's', b'd', b'f',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
@@ -1377,9 +1322,8 @@ mod tests {
                     b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Incomplete fragment with no reported loss.
@@ -1404,9 +1348,8 @@ mod tests {
                     b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         match d.pull() {
             Some(Err(e)) => assert!(
                 e.contains("mark can't be set on beginning of fragment"),
@@ -1457,9 +1400,8 @@ mod tests {
                     b'a', b's', b'd', b'f',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
@@ -1504,9 +1446,8 @@ mod tests {
                     b'f', b'o', b'o', b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a1 = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
@@ -1541,9 +1482,8 @@ mod tests {
                     b'f', b'o', b'o',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1563,9 +1503,8 @@ mod tests {
                     b'b', b'a', b'r',
                 ],
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
             Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),

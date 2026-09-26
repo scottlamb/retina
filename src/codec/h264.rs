@@ -4,8 +4,6 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
 //! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt::Write;
 
@@ -354,7 +352,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             #[cfg(test)]
-            pending: VecDeque::with_capacity(1),
+            pending: Default::default(),
             mark: None,
             pieces: Vec::new(),
             nals: Vec::new(),
@@ -575,11 +573,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
-        &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl VideoHandler<Ctx>,
-    ) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
         let r = self.push_inner(pkt, handler);
 
         // Several error paths within `push_inner` just use the `?` operator to bail out with
@@ -588,7 +582,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
             self.discard_au();
         }
-        r
+        if let Err(description) = r {
+            super::report_corrupt(pkt, description, |l| handler.loss(l));
+        }
     }
 
     fn push_inner(
@@ -986,7 +982,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx: &au.end_ctx,
-            loss: au.loss,
             is_random_access_point: au.meta.is_random_access_point,
             is_disposable: au.meta.is_disposable,
             has_new_parameters,
@@ -1012,27 +1007,16 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
     ///
-    /// Between any two calls to `push`, the caller must call `pull` until it
-    /// returns `None`.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let format = self.test_format;
-        let r = self.push_with(
-            pkt,
-            &mut super::testutil::Collector {
-                pending: &mut pending,
-                format,
-            },
-        );
+        pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
     fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
-        self.pending.pop_front()
+        self.pending.pull()
     }
 }
 
@@ -1879,9 +1863,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, b"\x06plain".iter().copied());
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1895,9 +1878,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1911,9 +1893,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x81fu-a start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1927,9 +1908,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x01fu-a middle, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1943,9 +1923,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x41fu-a end");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -1991,9 +1970,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\xa1fu-a start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2007,9 +1985,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x21fu-a middle, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2023,9 +2000,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x61fu-a end");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -2069,9 +2045,8 @@ mod tests {
                 &mut buf,
                 *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50",
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2085,9 +2060,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x68\xee\x3c\xb0");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2105,9 +2079,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x65slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
@@ -2152,9 +2125,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x01slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
@@ -2176,9 +2148,8 @@ mod tests {
                 &mut buf,
                 *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50",
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2192,9 +2163,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x68\xee\x3c\xb0");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2208,9 +2178,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x65slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
@@ -2251,7 +2220,7 @@ mod tests {
             payload_type: 0,
         }
             .write(&mut buf, *b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10");
-            d.push_collect(&pkt).unwrap()
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
@@ -2266,9 +2235,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x68\xee\x3c\x80");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2282,9 +2250,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x65slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
 
         // By codec::Depacketizer::parameters's contract, it's unspecified what the depacketizer
         // parameters are set to between push and pull.
@@ -2363,7 +2330,7 @@ mod tests {
             payload_type: 0,
         }
             .write(&mut buf, *b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20");
-            d.push_collect(&pkt).unwrap()
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
@@ -2378,9 +2345,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x68\xea\x8f\x20");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2394,9 +2360,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x65idr slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -2432,7 +2397,7 @@ mod tests {
             payload_type: 0,
         }
             .write(&mut buf, *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x3d\xa1\x00\x00\x04\xf6\x00\x00\x63\x38\x04\x04");
-            d.push_collect(&pkt).unwrap()
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
@@ -2447,9 +2412,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x68\xee\x3c\xb0");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -2463,9 +2427,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x65idr slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -2551,9 +2514,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, ANNEX_B_NALS);
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
@@ -2603,9 +2565,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, first_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
@@ -2626,9 +2587,8 @@ mod tests {
                             payload_type: 0,
                         }
                         .write(&mut buf, middle_pkt);
-                        d.push_collect(&pkt)
+                        d.push_collect(&pkt);
                     }
-                    .unwrap();
                     assert_eq!(d.pull(), None);
                 }
                 let mut last_pkt =
@@ -2648,9 +2608,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, last_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 println!("  pulling");
                 let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!();
@@ -2707,9 +2666,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, first_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 let mut last_pkt = Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len + 2);
                 last_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28);
@@ -2726,9 +2684,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, last_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!(
                         "wrap_offset={wrap_offset}, first_pkt_len={first_pkt_len}: \
@@ -2765,9 +2722,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, ANNEX_B_NALS);
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
@@ -2810,9 +2766,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, first_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
@@ -2832,9 +2787,8 @@ mod tests {
                             payload_type: 0,
                         }
                         .write(&mut buf, middle_pkt);
-                        d.push_collect(&pkt)
+                        d.push_collect(&pkt);
                     }
-                    .unwrap();
                     assert_eq!(d.pull(), None);
                 }
                 let mut last_pkt =
@@ -2853,9 +2807,8 @@ mod tests {
                         payload_type: 0,
                     }
                     .write(&mut buf, last_pkt);
-                    d.push_collect(&pkt)
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!();
                 };
@@ -2890,9 +2843,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, ANNEX_B_NALS);
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
@@ -2921,9 +2873,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x3c\x81start of non-idr");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         {
@@ -2938,9 +2889,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x3c\x47a wild sps appeared");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         // assert!(push_result.is_err());
         let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
@@ -2983,7 +2933,7 @@ mod tests {
             payload_type: 0,
         }
         .write(&mut buf, *b"\x7c\xc1small nal");
-        d.push_collect(&pkt).unwrap();
+        d.push_collect(&pkt);
         assert!(d.seen_single_fragment_fu_a);
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
@@ -3022,9 +2972,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x81start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -3038,9 +2987,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x01");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -3054,9 +3002,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x41end");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -3139,9 +3086,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x7c\x86fu-a start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         let timestamp1 = crate::Timestamp {
             timestamp: 1,
@@ -3160,9 +3106,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x01plain");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         match d.pull() {
             Some(Err(e)) => assert_eq!(
                 e,
@@ -3222,9 +3167,8 @@ mod tests {
                 *b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
                        \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // PPS with (incorrect) mark.
@@ -3239,9 +3183,8 @@ mod tests {
                 payload_type: 96,
             }
             .write(&mut buf, *b"\x68\xee\x3c\x80");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // SEI (reserved payload type 229) with (incorrect) mark.
@@ -3256,9 +3199,8 @@ mod tests {
                 payload_type: 96,
             }
             .write(&mut buf, *b"\x06\xe5\x01\xa7\x80");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // IDR slice with mark (correct this time).
@@ -3273,9 +3215,8 @@ mod tests {
                 payload_type: 96,
             }
             .write(&mut buf, *b"\x65slice");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
@@ -3303,7 +3244,7 @@ mod tests {
         loss: u16,
         payload: &[u8],
         h: &mut crate::codec::events::testutil::Recorder,
-    ) -> Result<(), String> {
+    ) {
         let meta = crate::rtp::PacketMeta {
             ctx: crate::PacketContext::dummy(),
             timestamp: crate::Timestamp {
@@ -3319,17 +3260,12 @@ mod tests {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        if loss > 0 {
-            // As `crate::codec::Depacketizer<crate::PacketContext>::push` does.
-            crate::codec::VideoHandler::<crate::PacketContext>::loss(
-                h,
-                &crate::codec::Loss {
-                    ctx: &meta.ctx,
-                    reason: crate::codec::LossReason::PacketLoss { packets: loss },
-                },
-            );
-        }
-        d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
+        let pkt = PacketRef::new(meta, buf, pos, payload.len() as u16);
+        // As `crate::codec::VideoDepacketizer::push` does.
+        crate::codec::report_packet_loss(&pkt, |l| {
+            crate::codec::VideoHandler::<crate::PacketContext>::loss(h, l)
+        });
+        d.push(&pkt, h)
     }
 
     const EVENTS_FMTP: &str = "packetization-mode=1;profile-level-id=4d002a;\
@@ -3343,7 +3279,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06plain", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06plain", &mut h);
         push_events(
             &mut d,
             &mut buf,
@@ -3353,9 +3289,8 @@ mod tests {
             0,
             b"\x7c\x85fu-a start, ",
             &mut h,
-        )
-        .unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x7c\x45fu-a end", &mut h).unwrap();
+        );
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x7c\x45fu-a end", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3368,7 +3303,6 @@ mod tests {
                 Event::Data(UnitPosition::Start, hex(b"\x65fu-a start, ")),
                 Event::Data(UnitPosition::End, hex(b"fu-a end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3380,8 +3314,8 @@ mod tests {
         );
 
         // A disposable, non-IDR frame ended by a timestamp change.
-        push_events(&mut d, &mut buf, 3, 1, false, 0, b"\x01slice", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 4, 2, false, 0, b"\x01next", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 3, 1, false, 0, b"\x01slice", &mut h);
+        push_events(&mut d, &mut buf, 4, 2, false, 0, b"\x01next", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3392,7 +3326,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x01slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: true,
                     has_new_parameters: false,
@@ -3417,7 +3350,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::No);
-        push_events(&mut d, &mut buf, 0, 0, true, 0, b"\x65slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, true, 0, b"\x65slice", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3428,7 +3361,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3446,7 +3378,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3458,7 +3390,7 @@ mod tests {
                 Event::Data(UnitPosition::Start, hex(b"\x65start")),
             ]
         );
-        push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h);
         let events = h.take();
         assert!(
             matches!(&events[..], [Event::Loss(LossReason::Corrupt { .. }), ..]),
@@ -3474,7 +3406,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3494,9 +3425,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06sei", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06sei", &mut h);
         assert_eq!(h.take(), vec![]);
-        push_events(&mut d, &mut buf, 1, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 0, false, 0, b"\x65slice 1", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3509,13 +3440,12 @@ mod tests {
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 1")),
             ]
         );
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3547,7 +3477,7 @@ mod tests {
             stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
             stap_a.extend_from_slice(nal);
         }
-        push_events(&mut d, &mut buf, 0, 0, false, 0, &stap_a, &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, &stap_a, &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3560,13 +3490,12 @@ mod tests {
             ]
         );
         assert!(d.mark.is_none(), "data should be released once delivered");
-        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x65slice 2", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3594,8 +3523,7 @@ mod tests {
             0,
             b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
             &mut h,
-        )
-        .unwrap();
+        );
         push_events(
             &mut d,
             &mut buf,
@@ -3605,9 +3533,8 @@ mod tests {
             0,
             b"\x68\xee\x3c\x80",
             &mut h,
-        )
-        .unwrap();
-        push_events(&mut d, &mut buf, 2, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        );
+        push_events(&mut d, &mut buf, 2, 0, false, 0, b"\x7c\x85start", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3620,13 +3547,12 @@ mod tests {
             ]
         );
         assert!(d.parameters().is_none());
-        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x7c\x45 end", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::End, hex(b" end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: true,
@@ -3647,9 +3573,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x06sei", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice 1", &mut h);
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x06sei", &mut h);
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h);
         let events = h.take();
         assert_eq!(
             events,
@@ -3663,7 +3589,6 @@ mod tests {
                 Event::Data(UnitPosition::Complete, hex(b"\x06sei")),
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3684,7 +3609,7 @@ mod tests {
         let mut buf = MarkBuf::new(64);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::No);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
         for i in 1..100 {
             push_events(
                 &mut d,
@@ -3695,22 +3620,20 @@ mod tests {
                 0,
                 b"\x7c\x05 middle.......",
                 &mut h,
-            )
-            .unwrap();
+            );
             assert!(d.mark.is_none());
             assert_eq!(
                 h.take().last(),
                 Some(&Event::Data(UnitPosition::Middle, hex(b" middle.......")))
             );
         }
-        push_events(&mut d, &mut buf, 100, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 100, 0, true, 0, b"\x7c\x45 end", &mut h);
         assert_eq!(buf.capacity(), 64, "buffer should not have grown");
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::End, hex(b" end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3729,9 +3652,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 1, b"\x7c\x45 end", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 3, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
+        push_events(&mut d, &mut buf, 2, 0, true, 1, b"\x7c\x45 end", &mut h);
+        push_events(&mut d, &mut buf, 3, 1, true, 0, b"\x41slice", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3749,7 +3672,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
-                    loss: 1,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3808,11 +3730,10 @@ mod tests {
             let pos = buf.end();
             buf.extend(payload);
             buf.advance_unparsed(buf.end());
-            d.push_with(
+            d.push(
                 &PacketRef::new(meta, &buf, pos, payload.len() as u16),
                 &mut h,
-            )
-            .unwrap();
+            );
         };
         let mut expected_frame = Vec::new();
         for nal in [SPS_B, PPS_B, b"\x65slice"] {

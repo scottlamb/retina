@@ -3502,7 +3502,6 @@ mod tests {
                 },
                 Event::Data(crate::codec::UnitPosition::Complete, hex(b"\x65slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,

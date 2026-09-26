@@ -9,8 +9,6 @@ pub mod nal;
 
 mod record;
 
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::fmt::Write;
 
@@ -213,7 +211,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             #[cfg(test)]
-            pending: VecDeque::with_capacity(1),
+            pending: Default::default(),
             mark: None,
             pieces: Vec::new(),
             nals: Vec::new(),
@@ -417,11 +415,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
-        &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl VideoHandler<Ctx>,
-    ) -> Result<(), String> {
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
         let r = self.push_inner(pkt, handler);
 
         // Several error paths within `push_inner` just use the `?` operator to bail out with
@@ -430,7 +424,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
             self.discard_au();
         }
-        r
+        if let Err(description) = r {
+            super::report_corrupt(pkt, description, |l| handler.loss(l));
+        }
     }
 
     fn push_inner(
@@ -817,7 +813,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx: &au.end_ctx,
-            loss: au.loss,
             is_random_access_point: au.meta.is_random_access_point,
             is_disposable: false,
             has_new_parameters,
@@ -842,25 +837,17 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    ///
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let format = self.test_format;
-        let r = self.push_with(
-            pkt,
-            &mut super::testutil::Collector {
-                pending: &mut pending,
-                format,
-            },
-        );
+        pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
     fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
-        self.pending.pop_front()
+        self.pending.pull()
     }
 }
 
@@ -1318,9 +1305,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x4e\x01plain");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1338,9 +1324,8 @@ mod tests {
                 &mut buf,
                 *b"\x60\x01\x00\x0a\x4e\x01stap-a 1\x00\x0a\x4e\x01stap-a 2",
             );
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1354,9 +1339,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x94fu start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1370,9 +1354,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x14fu middle, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1386,9 +1369,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x54fu end");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -1447,9 +1429,8 @@ mod tests {
                     payload_type: 0,
                 }
                 .write(buf, vps_nal.clone());
-                d.push_collect(&pkt)
+                d.push_collect(&pkt);
             }
-            .unwrap();
             assert_eq!(d.pull(), None);
             // SPS
             {
@@ -1463,9 +1444,8 @@ mod tests {
                     payload_type: 0,
                 }
                 .write(buf, sps_nal.clone());
-                d.push_collect(&pkt)
+                d.push_collect(&pkt);
             }
-            .unwrap();
             assert_eq!(d.pull(), None);
             // PPS
             {
@@ -1479,9 +1459,8 @@ mod tests {
                     payload_type: 0,
                 }
                 .write(buf, pps_nal.clone());
-                d.push_collect(&pkt)
+                d.push_collect(&pkt);
             }
-            .unwrap();
             assert_eq!(d.pull(), None);
             // IDR_W_RADL (mark=true: ends the access unit).
             {
@@ -1495,9 +1474,8 @@ mod tests {
                     payload_type: 0,
                 }
                 .write(buf, idr_nal.iter().copied());
-                d.push_collect(&pkt)
+                d.push_collect(&pkt);
             }
-            .unwrap();
         };
 
         // Without stripping: VPS/SPS/PPS are included in frame data.
@@ -1575,9 +1553,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x94fu start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1591,9 +1568,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x66fu end"); // incorrect NAL type FdNut.
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -1628,7 +1604,7 @@ mod tests {
             payload_type: 0,
         }
         .write(&mut buf, *b"\x62\x01\xc1small nal");
-        d.push_collect(&pkt).unwrap();
+        d.push_collect(&pkt);
         assert!(d.seen_single_fragment_fu);
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
@@ -1663,9 +1639,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x94start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1679,9 +1654,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x14");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
             let pkt = TestPacket {
@@ -1695,9 +1669,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x54end");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
             Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
@@ -1727,9 +1700,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x62\x01\x94fu start, ");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         let timestamp1 = crate::Timestamp {
             timestamp: 1,
@@ -1748,9 +1720,8 @@ mod tests {
                 payload_type: 0,
             }
             .write(&mut buf, *b"\x4e\x01plain");
-            d.push_collect(&pkt)
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let Some(Err(e)) = d.pull() else { panic!() };
         assert_eq!(
             e,
@@ -1829,8 +1800,7 @@ mod tests {
                 let pos = buf.end();
                 buf.extend(payload);
                 buf.advance_unparsed(buf.end());
-                d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
-                    .unwrap();
+                d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16), h);
             };
 
             // IDR_W_RADL, fragmented.
@@ -1852,7 +1822,6 @@ mod tests {
                 vec![
                     Event::Data(UnitPosition::End, hex(b" end")),
                     Event::FrameEnd {
-                        loss: 0,
                         is_random_access_point: true,
                         is_disposable: false,
                         has_new_parameters: false,
@@ -1875,7 +1844,6 @@ mod tests {
                     },
                     Event::Data(UnitPosition::Complete, hex(b"\x02\x01slice")),
                     Event::FrameEnd {
-                        loss: 0,
                         is_random_access_point: false,
                         is_disposable: false,
                         has_new_parameters: false,
@@ -1950,11 +1918,10 @@ mod tests {
                 let pos = buf.end();
                 buf.extend(payload);
                 buf.advance_unparsed(buf.end());
-                d.push_with(
+                d.push(
                     &PacketRef::new(meta, &buf, pos, payload.len() as u16),
                     &mut h,
-                )
-                .unwrap();
+                );
             };
         const IDR: &[u8] = b"\x26\x01slice";
         let mut expected_frame = Vec::new();

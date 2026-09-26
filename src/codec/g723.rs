@@ -52,11 +52,11 @@ impl Depacketizer {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with<Ctx>(
+    pub(super) fn push<Ctx>(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         let (s1, s2) = pkt.payload().slices();
         let joined;
         let payload = if s2.is_empty() {
@@ -66,19 +66,21 @@ impl Depacketizer {
             &joined[..]
         };
         if !Self::validate(payload) {
-            return Err(format!(
-                "Invalid G.723 packet: {:#?}",
-                crate::hex::LimitedHex::new(payload, 64),
-            ));
+            return super::report_corrupt(
+                pkt,
+                format!(
+                    "Invalid G.723 packet: {:#?}",
+                    crate::hex::LimitedHex::new(payload, 64),
+                ),
+                |l| handler.loss(l),
+            );
         }
         handler.audio_frame(&AudioFrameRef {
             ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length: NonZeroU32::new(240).unwrap(),
-            loss: pkt.meta.loss,
             data: payload,
             adts: None,
         });
-        Ok(())
     }
 }
