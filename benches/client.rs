@@ -103,7 +103,7 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
 struct Counter(usize);
 
 impl VideoHandler<PacketContext> for Counter {
-    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, _frame_start: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         Accumulate::Yes
     }
 

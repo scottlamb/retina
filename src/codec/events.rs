@@ -43,7 +43,7 @@ pub trait VideoHandler<Ctx> {
     /// Return [`Accumulate::Yes`] to have the depacketizer retain the frame's
     /// data for [`VideoFrameEnd::complete_frame`]. [`VideoHandler::data`]
     /// events are delivered either way.
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate;
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate;
 
     /// A chunk of unframed codec unit data. See [`VideoData`].
     fn data(&mut self, _data: &VideoData<'_>) {}
@@ -84,7 +84,7 @@ pub trait MessageHandler<Ctx> {
 
 impl<Ctx, H: VideoHandler<Ctx> + ?Sized> VideoHandler<Ctx> for &mut H {
     #[inline]
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
         (**self).frame_start(frame_start)
     }
 
@@ -159,6 +159,29 @@ pub struct VideoFrameStart<'a, Ctx> {
     /// missing its beginning. Used to compute `is_decodable`.
     pub(crate) missing_prefix: bool,
     pub(crate) parameters: Option<&'a VideoParameters>,
+
+    /// For H.264 and H.265, where [`VideoFrameStart::set_h264_parameters`] or
+    /// [`VideoFrameStart::set_h265_parameters`] stores its override for the
+    /// depacketizer to commit when the frame ends.
+    pub(crate) param_override: Option<&'a mut dyn ParametersOverrideSlot>,
+}
+
+/// Storage for a parameter override set via [`VideoFrameStart`], not yet
+/// committed. Each codec that supports overrides implements this for its own
+/// override type; the defaults reject other codecs' parameters.
+pub(crate) trait ParametersOverrideSlot {
+    /// Returns the override's parameters, if set.
+    fn parameters(&self) -> Option<&VideoParameters>;
+
+    #[cfg(feature = "h264")]
+    fn set_h264(&mut self, _sps: &[u8], _pps: &[u8]) -> Result<(), String> {
+        Err("not an H.264 stream".to_owned())
+    }
+
+    #[cfg(feature = "h265")]
+    fn set_h265(&mut self, _vps: &[u8], _sps: &[u8], _pps: &[u8]) -> Result<(), String> {
+        Err("not an H.265 stream".to_owned())
+    }
 }
 
 impl<Ctx> VideoFrameStart<'_, Ctx> {
@@ -204,7 +227,7 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// See [`VideoFrameEnd::has_new_parameters`].
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
-        self.has_new_parameters
+        self.has_new_parameters || self.overridden_parameters().is_some()
     }
 
     /// Returns the parameters in effect for this frame, if known.
@@ -214,7 +237,59 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// until the frame ends.
     #[inline]
     pub fn parameters(&self) -> Option<&VideoParameters> {
-        self.parameters
+        self.overridden_parameters().or(self.parameters)
+    }
+
+    fn overridden_parameters(&self) -> Option<&VideoParameters> {
+        self.param_override.as_deref().and_then(|o| o.parameters())
+    }
+
+    /// Overrides the H.264 SPS and PPS for this frame and later ones.
+    ///
+    /// This is useful to "fix" a camera's parameters, such as adding missing
+    /// pixel aspect ratio information to the SPS VUI, or bitstream
+    /// restrictions which reduce decode latency. See
+    /// [`super::h264::parameters_from_sps_and_pps`].
+    ///
+    /// Afterward, [`VideoFrameStart::parameters`] returns the new parameters
+    /// and [`VideoFrameStart::has_new_parameters`] returns true, as do their
+    /// [`VideoFrameEnd`] counterparts. The frame's data doesn't include
+    /// parameter sets either way; [`VideoFrameEnd::complete_frame`] and
+    /// [`VideoFrameEnd::visit_frame_data`] prepend these if the
+    /// [`FrameFormat`] requests it.
+    ///
+    /// The override stays in effect until the stream's in-band parameters
+    /// change; repeats of the parameters it replaced don't undo it. Parameter
+    /// sets which arrive after the frame's first slice (an ordering violation)
+    /// are overridden too.
+    ///
+    /// Returns an error if this isn't an H.264 stream or the parameters are invalid.
+    #[cfg(feature = "h264")]
+    pub fn set_h264_parameters(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), crate::Error> {
+        match self.param_override.as_deref_mut() {
+            Some(slot) => slot.set_h264(sps, pps),
+            None => Err("not an H.264 stream".to_owned()),
+        }
+        .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))
+    }
+
+    /// Overrides the H.265 VPS, SPS, and PPS for this frame and later ones.
+    ///
+    /// As in [`VideoFrameStart::set_h264_parameters`].
+    ///
+    /// Returns an error if this isn't an H.265 stream or the parameters are invalid.
+    #[cfg(feature = "h265")]
+    pub fn set_h265_parameters(
+        &mut self,
+        vps: &[u8],
+        sps: &[u8],
+        pps: &[u8],
+    ) -> Result<(), crate::Error> {
+        match self.param_override.as_deref_mut() {
+            Some(slot) => slot.set_h265(vps, sps, pps),
+            None => Err("not an H.265 stream".to_owned()),
+        }
+        .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))
     }
 }
 
@@ -415,74 +490,6 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.parameters(),
             FrameBody::Owned { parameters, .. } => *parameters,
-        }
-    }
-
-    /// Overrides the H.264 SPS and PPS for this frame and later ones.
-    ///
-    /// This is useful to "fix" a camera's parameters, such as adding missing
-    /// pixel aspect ratio information to the SPS VUI, or bitstream
-    /// restrictions which reduce decode latency. See
-    /// [`super::h264::parameters_from_sps_and_pps`].
-    ///
-    /// If called before [`VideoFrameEnd::complete_frame`] or
-    /// [`VideoFrameEnd::visit_frame_data`], these parameters are the ones
-    /// prepended to the frame, as requested by [`FrameFormat`]. Afterward,
-    /// [`VideoFrameEnd::has_new_parameters`] returns true, and
-    /// [`super::VideoDepacketizer::parameters`] returns the new parameters.
-    ///
-    /// The override stays in effect until the stream's in-band parameters
-    /// change; repeats of the parameters it replaced don't undo it.
-    ///
-    /// Returns an error if this isn't an H.264 stream or the parameters are invalid.
-    #[cfg(feature = "h264")]
-    pub fn set_h264_parameters(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), crate::Error> {
-        match &mut self.body {
-            FrameBody::H264(b) => {
-                b.set_parameters(sps, pps)
-                    .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))?;
-                self.has_new_parameters = true;
-                Ok(())
-            }
-            _ => Err(wrap!(crate::error::ErrorInt::InvalidArgument(
-                "not an H.264 stream".to_owned()
-            ))),
-        }
-    }
-
-    /// Overrides the H.265 VPS, SPS, and PPS for this frame and later ones.
-    ///
-    /// This is useful to "fix" a camera's parameters, such as adding missing
-    /// pixel aspect ratio information to the SPS VUI, or bitstream
-    /// restrictions which reduce decode latency.
-    ///
-    /// If called before [`VideoFrameEnd::complete_frame`] or
-    /// [`VideoFrameEnd::visit_frame_data`], these parameters are the ones
-    /// prepended to the frame, as requested by [`FrameFormat`]. Afterward,
-    /// [`VideoFrameEnd::has_new_parameters`] returns true, and
-    /// [`super::VideoDepacketizer::parameters`] returns the new parameters.
-    ///
-    /// The override stays in effect until the stream's in-band parameters
-    /// change; repeats of the parameters it replaced don't undo it.
-    ///
-    /// Returns an error if this isn't an H.265 stream or the parameters are invalid.
-    #[cfg(feature = "h265")]
-    pub fn set_h265_parameters(
-        &mut self,
-        vps: &[u8],
-        sps: &[u8],
-        pps: &[u8],
-    ) -> Result<(), crate::Error> {
-        match &mut self.body {
-            FrameBody::H265(b) => {
-                b.set_parameters(vps, sps, pps)
-                    .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))?;
-                self.has_new_parameters = true;
-                Ok(())
-            }
-            _ => Err(wrap!(crate::error::ErrorInt::InvalidArgument(
-                "not an H.265 stream".to_owned()
-            ))),
         }
     }
 
@@ -721,7 +728,7 @@ pub(crate) mod testutil {
     }
 
     impl<Ctx> VideoHandler<Ctx> for Recorder {
-        fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+        fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
             self.events.push(Event::FrameStart {
                 is_random_access_point: frame_start.is_random_access_point(),
                 is_disposable: frame_start.is_disposable(),

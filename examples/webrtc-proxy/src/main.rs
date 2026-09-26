@@ -112,7 +112,7 @@ struct UpstreamHandler {
 }
 
 impl VideoHandler<PacketContext> for UpstreamHandler {
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         self.buf.clear();
 
         // Browsers need parameter sets in-band before each key frame.

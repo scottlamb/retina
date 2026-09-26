@@ -684,15 +684,12 @@ impl<H> DecodabilityTracker<'_, H> {
 }
 
 impl<Ctx, H: VideoHandler<Ctx>> VideoHandler<Ctx> for DecodabilityTracker<'_, H> {
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
-        let is_decodable = self.update(
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
+        frame_start.is_decodable = self.update(
             frame_start.is_random_access_point,
             frame_start.missing_prefix,
         );
-        self.inner.frame_start(&VideoFrameStart {
-            is_decodable,
-            ..*frame_start
-        })
+        self.inner.frame_start(frame_start)
     }
 
     #[inline]
@@ -1221,7 +1218,7 @@ mod tests {
         impl VideoHandler<crate::PacketContext> for H {
             fn frame_start(
                 &mut self,
-                fs: &VideoFrameStart<'_, crate::PacketContext>,
+                fs: &mut VideoFrameStart<'_, crate::PacketContext>,
             ) -> Accumulate {
                 self.1 = Some(fs.is_decodable());
                 Accumulate::No
@@ -1285,7 +1282,7 @@ mod tests {
         impl VideoHandler<crate::PacketContext> for H {
             fn frame_start(
                 &mut self,
-                fs: &VideoFrameStart<'_, crate::PacketContext>,
+                fs: &mut VideoFrameStart<'_, crate::PacketContext>,
             ) -> Accumulate {
                 self.1 = Some(fs.is_decodable());
                 Accumulate::No

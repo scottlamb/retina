@@ -145,7 +145,7 @@ impl<'a> Collector<'a> {
 }
 
 impl VideoHandler<PacketContext> for Collector<'_> {
-    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, _frame_start: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         Accumulate::Yes
     }
 
