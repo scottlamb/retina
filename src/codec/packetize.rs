@@ -149,6 +149,16 @@ pub trait PayloadSink {
     /// The sink should make this visible to receivers, e.g. by skipping an RTP
     /// sequence number.
     fn discontinuity(&mut self) {}
+
+    /// Returns true if the sink is short of space, so the packetizer should
+    /// shed load.
+    ///
+    /// This is a soft limit: the packetizer may deliver a couple more payloads
+    /// to end the current frame cleanly. See "Throttling" on
+    /// [`VideoPacketizer`].
+    fn congested(&self) -> bool {
+        false
+    }
 }
 
 impl<S: PayloadSink + ?Sized> PayloadSink for &mut S {
@@ -160,6 +170,11 @@ impl<S: PayloadSink + ?Sized> PayloadSink for &mut S {
     #[inline]
     fn discontinuity(&mut self) {
         (**self).discontinuity()
+    }
+
+    #[inline]
+    fn congested(&self) -> bool {
+        (**self).congested()
     }
 }
 
@@ -286,6 +301,28 @@ impl<'a> Payload<'a> {
 /// To fix up parameters (see [`VideoFrameStart::set_h264_parameters`] and
 /// [`VideoFrameStart::set_h265_parameters`]), do so before calling
 /// [`VideoFrameStart::parameters`].
+///
+/// # Throttling
+///
+/// When [`PayloadSink::congested`] returns true, the packetizer drops data
+/// in a way receivers can interpret precisely, rather than leaving the sink
+/// to drop arbitrary packets:
+///
+/// *   At the start of a frame, it drops the whole frame. This leaves no gap
+///     in sequence numbers; receivers see a gap in timestamps.
+/// *   At the start of a codec unit within a frame, or before delivering a
+///     fragment of one, it truncates the unit: the next payload is the
+///     unit's last, with the NAL header's F bit set to mark it damaged, as
+///     RFC 6184 section 5.8 and RFC 7798 section 1.1.4 allow. That payload
+///     ends the frame, and the rest of the frame is dropped. (A unit whose data
+///     has all been supplied is completed rather than truncated.)
+/// *   After dropping all or part of a frame which isn't disposable, it drops
+///     every frame until the next random access point, since they'd be
+///     undecodable anyway.
+///
+/// Receivers thus see at most one damaged frame per congestion episode, and
+/// no sequence number gaps. Retina's own depacketizer reports the damaged
+/// frame as [`crate::codec::LossReason::Corrupt`].
 #[derive(Debug)]
 pub struct VideoPacketizer(VideoPacketizerInner);
 
@@ -429,7 +466,9 @@ impl VideoPacketizer {
     /// Notes that the input lost data.
     ///
     /// Abandons any frame in progress (payloads already delivered stay
-    /// delivered) and calls [`PayloadSink::discontinuity`].
+    /// delivered) and calls [`PayloadSink::discontinuity`]. As the lost data
+    /// may have been depended on, drops frames until the next random access
+    /// point.
     pub fn discontinuity(&mut self, sink: &mut impl PayloadSink) {
         match self.0 {
             #[cfg(feature = "h264")]

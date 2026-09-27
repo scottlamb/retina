@@ -110,6 +110,13 @@ pub(crate) struct Packetizer<C: Codec> {
     /// True if the caller has misused `push_unit` or `end_frame`, so as to
     /// log only once.
     seen_misuse: bool,
+
+    /// True if the rest of the current frame is being dropped due to congestion.
+    dropping_frame: bool,
+
+    /// True if frames are being dropped until the next random access point,
+    /// because a frame others may depend on was dropped or data was lost.
+    awaiting_rap: bool,
 }
 
 #[derive(Debug)]
@@ -135,6 +142,9 @@ enum HeldKind {
 
     /// The final fragment of a fragmented NAL.
     FuEnd,
+
+    /// The final payload of a NAL truncated due to congestion.
+    Truncated,
 }
 
 impl<C: Codec> Packetizer<C> {
@@ -173,6 +183,8 @@ impl<C: Codec> Packetizer<C> {
             discarding_unit: false,
             seen_invalid_nal: false,
             seen_misuse: false,
+            dropping_frame: false,
+            awaiting_rap: false,
         })
     }
 
@@ -214,6 +226,12 @@ impl<C: Codec> Packetizer<C> {
         }
         self.frame = Some(frame);
         self.frame_start_pending = true;
+        if (self.awaiting_rap && !frame.is_random_access_point) || sink.congested() {
+            log::trace!("dropping frame {frame:?}");
+            self.drop_rest_of_frame();
+            return;
+        }
+        self.awaiting_rap = false;
         let insert = match self.parameter_set_insertion {
             ParameterSetInsertion::EachKeyFrame => {
                 frame.is_random_access_point || self.parameters_changed
@@ -245,6 +263,9 @@ impl<C: Codec> Packetizer<C> {
     ) {
         if self.frame.is_none() {
             self.misuse("codec unit data supplied outside a frame; discarding");
+            return;
+        }
+        if self.dropping_frame {
             return;
         }
         let mut data = data.iter().copied().filter(|d| !d.is_empty());
@@ -287,6 +308,15 @@ impl<C: Codec> Packetizer<C> {
                 self.discarding_unit = !position.is_last();
                 return;
             }
+            if sink.congested() {
+                // Truncate this NAL to just its header.
+                self.flush_held(false, sink);
+                self.held.clear();
+                self.held.extend_from_slice(damaged(hdr).as_ref());
+                self.held_kind = HeldKind::Truncated;
+                self.drop_rest_of_frame();
+                return;
+            }
             self.nal = Some(PacketizerNal {
                 hdr,
                 buffered: std::mem::take(&mut self.spare),
@@ -301,7 +331,13 @@ impl<C: Codec> Packetizer<C> {
             return;
         }
         for d in data {
+            if self.dropping_frame {
+                return;
+            }
             self.feed(d, sink);
+        }
+        if self.dropping_frame {
+            return;
         }
         if position.is_last() {
             self.end_nal(sink);
@@ -330,6 +366,12 @@ impl<C: Codec> Packetizer<C> {
                 return;
             }
 
+            if sink.congested() {
+                self.truncate(input, sink);
+                return;
+            }
+            let nal = self.nal.as_mut().expect("feed with NAL in progress");
+
             // This NAL must be fragmented, and there's more than a fragment's worth
             // of data, so the next fragment isn't the last.
             let header = C::fu_header(nal.hdr, !nal.fragmenting, false);
@@ -352,6 +394,48 @@ impl<C: Codec> Packetizer<C> {
             input = &input[from_input..];
             self.nal.as_mut().unwrap().buffered = buffered;
         }
+    }
+
+    /// Truncates the current NAL, of which `nal.buffered` and `input` are the
+    /// next body bytes, then drops the rest of the frame.
+    ///
+    /// The NAL's final payload is the one which would otherwise have been
+    /// delivered next, but with the F bit set (and, if fragmenting, the end
+    /// bit). It's held so that `end_frame` delivers it with the marker bit.
+    fn truncate(&mut self, input: &[u8], sink: &mut impl PayloadSink) {
+        let mut nal = self.nal.take().expect("truncate with NAL in progress");
+        log::trace!("truncating NAL {:02x?}", nal.hdr);
+        self.flush_held(false, sink);
+        self.held.clear();
+        let hdr = damaged(nal.hdr);
+        if nal.fragmenting {
+            self.held
+                .extend_from_slice(C::fu_header(hdr, false, true).as_ref());
+        } else {
+            self.held.extend_from_slice(hdr.as_ref());
+        }
+        let body_limit = self.max_payload_size - self.held.len();
+        let from_buffered = nal.buffered.len().min(body_limit);
+        let from_input = input.len().min(body_limit - from_buffered);
+        self.held.extend_from_slice(&nal.buffered[..from_buffered]);
+        self.held.extend_from_slice(&input[..from_input]);
+        self.held_kind = HeldKind::Truncated;
+        nal.buffered.clear();
+        self.spare = nal.buffered;
+        self.drop_rest_of_frame();
+    }
+
+    /// Drops the rest of the current frame, and (unless it's disposable)
+    /// following frames until the next random access point.
+    fn drop_rest_of_frame(&mut self) {
+        let frame = self
+            .frame
+            .as_ref()
+            .expect("drop_rest_of_frame within frame");
+        self.dropping_frame = true;
+        self.awaiting_rap |= !frame.is_disposable;
+        self.nal = None;
+        self.discarding_unit = false;
     }
 
     /// Ends the current NAL.
@@ -457,6 +541,7 @@ impl<C: Codec> Packetizer<C> {
             self.end_nal(sink);
         }
         self.discarding_unit = false;
+        self.dropping_frame = false;
         self.flush_held(true, sink);
         self.frame = None;
     }
@@ -524,8 +609,24 @@ impl<C: Codec> Packetizer<C> {
         self.frame = None;
         self.nal = None;
         self.discarding_unit = false;
+        self.dropping_frame = false;
+
+        // The lost data may have been depended on, so frames before the next
+        // random access point may be undecodable.
+        self.awaiting_rap = true;
         self.held.clear();
         self.held_kind = HeldKind::None;
         sink.discontinuity();
     }
+}
+
+/// Returns `hdr` with its F bit set, marking the NAL as damaged.
+///
+/// This is the H.264 `forbidden_zero_bit`, which RFC 6184 section 5.8 allows
+/// setting on a NAL with bit errors or syntax violations; and the H.265
+/// `forbidden_zero_bit`, which RFC 7798 section 1.1.4 allows setting on a NAL
+/// missing its last fragment.
+fn damaged<H: AsMut<[u8]>>(mut hdr: H) -> H {
+    hdr.as_mut()[0] |= 0b1000_0000;
+    hdr
 }

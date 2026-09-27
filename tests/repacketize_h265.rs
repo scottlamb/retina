@@ -320,3 +320,111 @@ fn parameter_fixup() {
     }
     assert!(raps > 1);
 }
+
+/// A sink which is congested as the test says.
+struct Throttled {
+    sender: Sender,
+    out: Vec<Pkt>,
+    congested: bool,
+}
+
+impl retina::codec::PayloadSink for Throttled {
+    fn payload(&mut self, payload: &retina::codec::Payload<'_>) {
+        let pkt = self
+            .sender
+            .packet(payload.timestamp(), payload.mark(), payload.data());
+        self.out.push(Pkt::new(payload, &pkt));
+    }
+
+    fn discontinuity(&mut self) {
+        self.sender.skip();
+    }
+
+    fn congested(&self) -> bool {
+        self.congested
+    }
+}
+
+/// Throttling a congested sink damages at most one frame, marked so the
+/// receiver knows which, without sequence number gaps; the receiver resumes at
+/// the next random access point with frames identical to the originals.
+#[test]
+fn throttle() {
+    let reference = generated_frames();
+    let upstream = upstream_packets(&reference);
+
+    // Congestion must end before the last random access point, so the
+    // receiver has somewhere to resume.
+    let last_rap = upstream
+        .iter()
+        .rposition(|p| p.frame_start && p.random_access_point)
+        .unwrap();
+    let mut saw_truncation = false;
+    let mut saw_clean_drop = false;
+    for start in 0..last_rap - 3 {
+        let ctx = format!("congested from upstream packet {start}");
+        let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+        let options = PacketizeOptions::default().max_payload_size(500);
+        let mut p = VideoPacketizer::new(d.parameters().unwrap(), options).unwrap();
+        let mut sink = Throttled {
+            sender: Sender::new(96, 1, 0, 0),
+            out: Vec::new(),
+            congested: false,
+        };
+        let mut f = Feeder::new();
+        for (i, pkt) in upstream.iter().enumerate() {
+            sink.congested = (start..start + 3).contains(&i);
+            f.push(
+                &pkt.raw,
+                &mut d,
+                &mut Repacketize {
+                    packetizer: &mut p,
+                    sink: &mut sink,
+                },
+            );
+        }
+        let truncated = sink.out.iter().filter(|p| p.raw[12] & 0x80 != 0).count();
+        assert!(truncated <= 1, "{ctx}");
+
+        let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+        let mut c = Collector::default();
+        let mut f = Feeder::new();
+        for (i, pkt) in sink.out.iter().enumerate() {
+            assert_eq!(pkt.sequence_number, i as u16, "{ctx}");
+            f.push(&pkt.raw, &mut d, &mut c);
+        }
+        assert_eq!(c.corrupt, truncated, "{ctx}");
+        assert_eq!(c.losses, c.corrupt, "{ctx}: no packet loss");
+
+        // Every frame received matches the original, and they're a prefix
+        // and a suffix starting at a random access point.
+        let mut ref_iter = reference.iter().peekable();
+        let mut skipped = false;
+        for frame in &c.frames {
+            let mut this_skipped = false;
+            while ref_iter
+                .peek()
+                .is_some_and(|r| r.rtp_timestamp != frame.rtp_timestamp)
+            {
+                ref_iter.next();
+                this_skipped = true;
+            }
+            if this_skipped {
+                assert!(!skipped, "{ctx}: one gap only");
+                assert!(frame.is_random_access_point, "{ctx}: resumes at a RAP");
+                skipped = true;
+            }
+            assert_eq!(Some(frame), ref_iter.next(), "{ctx}");
+        }
+        assert!(
+            skipped,
+            "{ctx}: something was dropped; {} packets, {} frames, first ts {:?}",
+            sink.out.len(),
+            c.frames.len(),
+            c.frames.first().map(|f| f.rtp_timestamp)
+        );
+        saw_truncation |= truncated == 1;
+        saw_clean_drop |= truncated == 0;
+    }
+    assert!(saw_truncation && saw_clean_drop);
+}

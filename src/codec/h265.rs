@@ -2103,6 +2103,7 @@ mod packetizer_tests {
     #[derive(Default)]
     struct Recorder {
         payloads: Vec<Recorded>,
+        congested: bool,
     }
 
     impl Recorder {
@@ -2118,6 +2119,10 @@ mod packetizer_tests {
                 p.position().is_first(),
                 HexDebug(p.data().concat()),
             ));
+        }
+
+        fn congested(&self) -> bool {
+            self.congested
         }
     }
 
@@ -2329,5 +2334,62 @@ mod packetizer_tests {
         )
         .unwrap();
         assert_eq!(r.take(), [rec(true, true, b"\x26\x01idr")]);
+    }
+
+    /// As in the H.264 `throttle_fu_a`: congestion mid-fragment truncates the
+    /// NAL, setting the F bit in the final fragment's payload header, and
+    /// frames are then dropped until a random access point.
+    #[test]
+    fn throttle_fu() {
+        let mut p = packetizer(7, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Start, &[b"\x02\x01abc"], &mut r);
+        p.push_unit(Position::Middle, &[b"defghij"], &mut r);
+        assert_eq!(
+            r.take(),
+            [
+                rec(false, true, b"\x62\x01\x81abcd"),
+                rec(false, false, b"\x62\x01\x01efgh")
+            ]
+        );
+        r.congested = true;
+        p.push_unit(Position::Middle, &[b"klmn"], &mut r);
+        p.push_unit(Position::End, &[b"op"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01q"], &mut r);
+        assert_eq!(r.take(), []);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, false, b"\xe2\x01\x41ijkl")]);
+
+        // Uncongested, but awaiting a random access point.
+        r.congested = false;
+        p.start_frame(frame(1, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01r"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), []);
+        p.start_frame(frame(2, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x26\x01s"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x26\x01s")]);
+    }
+
+    /// Congestion at a NAL boundary truncates the next NAL to its header.
+    #[test]
+    fn throttle_nal_boundary() {
+        let mut p = packetizer(1400, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x02\x01a"], &mut r);
+        r.congested = true;
+        p.push_unit(Position::Start, &[b"\x02\x01b"], &mut r);
+        p.push_unit(Position::End, &[b"c"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(
+            r.take(),
+            [
+                rec(false, true, b"\x02\x01a"),
+                rec(true, false, b"\x82\x01")
+            ]
+        );
     }
 }

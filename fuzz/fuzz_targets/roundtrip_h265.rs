@@ -87,7 +87,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         retina::codec::FrameInfo::new(timestamp),
         retina::codec::h26x::Framing::FourByteLength,
         input.data,
-        &mut sender.sink(|pkt| pkts.push(pkt)),
+        &mut sender.sink(|pkt| pkts.push(pkt.to_vec())),
     );
     if expect_err {
         assert!(r.is_err(), "packetizer should reject invalid NALs");
@@ -100,11 +100,11 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         let Some(pkt) = pkts.next() else {
             panic!("packetizer ran out of packets before depacketizer produced frame");
         };
-        assert!(pkt.raw.len() <= 12 + usize::from(input.max_payload_size));
+        assert!(pkt.len() <= 12 + usize::from(input.max_payload_size));
 
         // Recover the metadata from the header, which also checks header
         // parsing in the round trip.
-        let (header, payload) = retina::rtp::PacketHeader::validate(&pkt.raw[..])
+        let (header, payload) = retina::rtp::PacketHeader::validate(&pkt[..])
             .expect("packetizer should produce valid RTP packets");
         let mark = header.mark();
         let meta = retina::rtp::PacketMeta {
@@ -120,7 +120,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
             mark,
             loss: 0,
         };
-        let payload = &pkt.raw[usize::from(payload.start)..usize::from(payload.end)];
+        let payload = &pkt[usize::from(payload.start)..usize::from(payload.end)];
         retina_fuzz::push(&mut buf, meta, payload, &mut [(&mut d, &mut h)]);
         if h.events
             .iter()

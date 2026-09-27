@@ -258,9 +258,43 @@ pub struct StatusCode(u16);
 
 impl StatusCode {
     pub const OK: StatusCode = StatusCode(200);
+    pub const BAD_REQUEST: StatusCode = StatusCode(400);
     pub const UNAUTHORIZED: StatusCode = StatusCode(401);
+    pub const NOT_FOUND: StatusCode = StatusCode(404);
     pub const SESSION_NOT_FOUND: StatusCode = StatusCode(454);
+    pub const METHOD_NOT_VALID_IN_THIS_STATE: StatusCode = StatusCode(455);
+    pub const AGGREGATE_OPERATION_NOT_ALLOWED: StatusCode = StatusCode(459);
+    pub const UNSUPPORTED_TRANSPORT: StatusCode = StatusCode(461);
     pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
+    pub const NOT_IMPLEMENTED: StatusCode = StatusCode(501);
+    pub const SERVICE_UNAVAILABLE: StatusCode = StatusCode(503);
+    pub const OPTION_NOT_SUPPORTED: StatusCode = StatusCode(551);
+
+    /// Returns the reason phrase RFC 2326 suggests for this status code, or
+    /// a generic one based on its class.
+    pub fn canonical_reason(self) -> &'static str {
+        match self.0 {
+            200 => "OK",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            454 => "Session Not Found",
+            455 => "Method Not Valid in This State",
+            459 => "Aggregate Operation Not Allowed",
+            461 => "Unsupported Transport",
+            500 => "Internal Server Error",
+            501 => "Not Implemented",
+            503 => "Service Unavailable",
+            551 => "Option not supported",
+            _ => match self.0 / 100 {
+                1 => "Informational",
+                2 => "Success",
+                3 => "Redirection",
+                4 => "Client Error",
+                _ => "Server Error",
+            },
+        }
+    }
 
     #[inline]
     pub fn as_u16(self) -> u16 {
@@ -384,13 +418,18 @@ impl HeaderName {
     static_const_tokens! {
         ACCEPT => "Accept",
         AUTHORIZATION => "Authorization",
+        CONTENT_BASE => "Content-Base",
+        CONTENT_LENGTH => "Content-Length",
         CONTENT_TYPE => "Content-Type",
         CSEQ => "CSeq",
         PUBLIC => "Public",
         RANGE => "Range",
+        REQUIRE => "Require",
         RTP_INFO => "RTP-Info",
+        SERVER => "Server",
         SESSION => "Session",
         TRANSPORT => "Transport",
+        UNSUPPORTED => "Unsupported",
         USER_AGENT => "User-Agent",
         WWW_AUTHENTICATE => "WWW-Authenticate",
     }

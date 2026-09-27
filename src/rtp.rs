@@ -88,6 +88,12 @@ impl PacketHeader {
         Ok((header, payload_start..payload_end))
     }
 
+    /// Returns the raw 12-byte header.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; Self::LEN as usize] {
+        &self.0
+    }
+
     #[inline]
     pub fn mark(&self) -> bool {
         (self.0[1] & 0b1000_0000) != 0
@@ -184,38 +190,70 @@ pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
 
 /// The RTP session state of an outgoing stream.
 ///
-/// Turns payloads (such as [`crate::codec::Payload`]s) into complete RTP packets, assigning
-/// sequence numbers and mapping timestamps. The counterpart on the receive
-/// side is the validation a [`crate::client`] session does before handing
-/// packets to a depacketizer.
+/// Assigns sequence numbers to payloads (such as [`crate::codec::Payload`]s)
+/// and maps their timestamps, yielding [`OutgoingPacket`]s. Like the receive
+/// side, it owns no packet storage: the caller copies each packet wherever
+/// it's going, e.g. into a connection's send buffer. The counterpart on the
+/// receive side is the validation a [`crate::client`] session does before
+/// handing packets to a depacketizer.
 ///
-/// Every packet built by one `Sender` has the same SSRC and one sequence of
-/// sequence numbers, so identical packets can be sent to any number of
-/// receivers.
+/// Use one `Sender` per receiver, so that each receiver sees an ordinary RTP
+/// session with its own SSRC and sequence numbers, and so that data dropped
+/// for one receiver (see [`crate::codec::PayloadSink::congested`]) doesn't
+/// affect the others.
 #[derive(Debug)]
 pub struct Sender {
     ssrc: u32,
     payload_type: u8,
     next_sequence_number: u16,
     timestamp_offset: u32,
-
-    /// Space for packets, split off as they're built, to amortize allocation.
-    arena: bytes::BytesMut,
+    packet_count: u32,
+    octet_count: u32,
 }
 
-/// A complete outgoing RTP packet, as built by [`Sender`].
-#[derive(Clone, Debug)]
-pub struct OutgoingPacket {
-    /// The packet, including its RTP header.
-    pub raw: bytes::Bytes,
+/// An outgoing RTP packet, as returned by [`Sender::packet`].
+///
+/// This borrows its payload, so the caller must copy it (e.g. via
+/// [`OutgoingPacket::write_to`]) to keep it.
+#[derive(Copy, Clone, Debug)]
+pub struct OutgoingPacket<'a> {
+    /// The packet's RTP header.
+    pub header: PacketHeader,
 
-    /// The packet's sequence number.
-    pub sequence_number: u16,
+    /// The packet's payload, as a sequence of slices to be concatenated.
+    pub data: &'a [&'a [u8]],
+}
+
+impl OutgoingPacket<'_> {
+    /// Returns the packet's total length in bytes, including its RTP header.
+    #[inline]
+    pub fn len(&self) -> usize {
+        usize::from(PacketHeader::LEN) + self.data.iter().map(|d| d.len()).sum::<usize>()
+    }
+
+    /// Returns false; an RTP packet always has a header.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Writes the complete packet to `out`.
+    pub fn write_to(&self, out: &mut impl bytes::BufMut) {
+        out.put_slice(&self.header.0);
+        for d in self.data {
+            out.put_slice(d);
+        }
+    }
+
+    /// Returns the complete packet as a new `Vec`.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.len());
+        self.write_to(&mut v);
+        v
+    }
 }
 
 impl Sender {
-    const ARENA_SIZE: usize = 64 * 1024;
-
     /// Creates a new sender.
     ///
     /// RFC 3550 recommends choosing `ssrc`, `initial_sequence_number`, and
@@ -236,7 +274,8 @@ impl Sender {
             payload_type,
             next_sequence_number: initial_sequence_number,
             timestamp_offset,
-            arena: bytes::BytesMut::new(),
+            packet_count: 0,
+            octet_count: 0,
         }
     }
 
@@ -259,8 +298,22 @@ impl Sender {
         (timestamp.timestamp as u32).wrapping_add(self.timestamp_offset)
     }
 
-    /// Builds a packet with the given timestamp, marker bit, and payload
-    /// (as a sequence of slices to be concatenated).
+    /// Returns the number of packets sent so far, for RTCP sender reports.
+    #[inline]
+    pub fn packet_count(&self) -> u32 {
+        self.packet_count
+    }
+
+    /// Returns the number of payload octets sent so far, for RTCP sender
+    /// reports.
+    #[inline]
+    pub fn octet_count(&self) -> u32 {
+        self.octet_count
+    }
+
+    /// Assigns the next sequence number to a payload with the given
+    /// timestamp, marker bit, and data (as a sequence of slices to be
+    /// concatenated), returning the packet.
     ///
     /// For a [`crate::codec::Payload`] `p`, pass `p.timestamp()`, `p.mark()`,
     /// and `p.data()`; or use [`Sender::sink`].
@@ -268,37 +321,31 @@ impl Sender {
     /// # Panics
     ///
     /// If the packet exceeds 65,535 bytes.
-    pub fn packet(
+    pub fn packet<'a>(
         &mut self,
         timestamp: crate::Timestamp,
         mark: bool,
-        payload: &[&[u8]],
-    ) -> OutgoingPacket {
-        let payload_len: usize = payload.iter().map(|d| d.len()).sum();
+        data: &'a [&'a [u8]],
+    ) -> OutgoingPacket<'a> {
+        let payload_len: usize = data.iter().map(|d| d.len()).sum();
         let len = usize::from(PacketHeader::LEN) + payload_len;
         assert!(
             len <= usize::from(u16::MAX),
             "RTP packet of {len} bytes is too long"
         );
-        if self.arena.capacity() < len {
-            self.arena.reserve(len.max(Self::ARENA_SIZE));
-        }
         let sequence_number = self.next_sequence_number;
         self.next_sequence_number = sequence_number.wrapping_add(1);
-        self.arena.extend_from_slice(&[
-            2 << 6, // version=2, no padding, no extensions, no CSRCs.
-            if mark { 0b1000_0000 } else { 0 } | self.payload_type,
-        ]);
-        self.arena.extend_from_slice(&sequence_number.to_be_bytes());
-        self.arena
-            .extend_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
-        self.arena.extend_from_slice(&self.ssrc.to_be_bytes());
-        for d in payload {
-            self.arena.extend_from_slice(d);
-        }
+        self.packet_count = self.packet_count.wrapping_add(1);
+        self.octet_count = self.octet_count.wrapping_add(payload_len as u32);
+        let mut header = [0; PacketHeader::LEN as usize];
+        header[0] = 2 << 6; // version=2, no padding, no extensions, no CSRCs.
+        header[1] = if mark { 0b1000_0000 } else { 0 } | self.payload_type;
+        header[2..4].copy_from_slice(&sequence_number.to_be_bytes());
+        header[4..8].copy_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
+        header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
         OutgoingPacket {
-            raw: self.arena.split().freeze(),
-            sequence_number,
+            header: PacketHeader(header),
+            data,
         }
     }
 
@@ -307,9 +354,31 @@ impl Sender {
         self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
     }
 
-    /// Returns a [`crate::codec::PayloadSink`] which builds packets and passes
-    /// them to `f`, skipping a sequence number on each discontinuity.
-    pub fn sink<F: FnMut(OutgoingPacket)>(&mut self, f: F) -> SenderSink<'_, F> {
+    /// Returns an RTCP sender report stating that `timestamp` corresponds to
+    /// wall time `ntp`.
+    ///
+    /// This is a compound packet's first (and only mandatory) part; see
+    /// [RFC 3550 section 6.4.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1).
+    /// It has no reception report blocks.
+    pub fn sender_report(&self, ntp: crate::NtpTimestamp, timestamp: crate::Timestamp) -> [u8; 28] {
+        let mut sr = [0; 28];
+        sr[0] = 2 << 6; // version=2, no padding, no reception reports.
+        sr[1] = 200; // SR
+        sr[2..4].copy_from_slice(&6u16.to_be_bytes()); // length in 32-bit words, minus one.
+        sr[4..8].copy_from_slice(&self.ssrc.to_be_bytes());
+        sr[8..16].copy_from_slice(&ntp.0.to_be_bytes());
+        sr[16..20].copy_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
+        sr[20..24].copy_from_slice(&self.packet_count.to_be_bytes());
+        sr[24..28].copy_from_slice(&self.octet_count.to_be_bytes());
+        sr
+    }
+
+    /// Returns a [`crate::codec::PayloadSink`] which passes each packet to
+    /// `f`, and skips a sequence number on each discontinuity.
+    ///
+    /// The sink is never congested; to throttle, wrap `Sender` in a sink of
+    /// your own.
+    pub fn sink<F: FnMut(&OutgoingPacket<'_>)>(&mut self, f: F) -> SenderSink<'_, F> {
         SenderSink { sender: self, f }
     }
 }
@@ -320,10 +389,11 @@ pub struct SenderSink<'a, F> {
     f: F,
 }
 
-impl<F: FnMut(OutgoingPacket)> crate::codec::PayloadSink for SenderSink<'_, F> {
+impl<F: FnMut(&OutgoingPacket<'_>)> crate::codec::PayloadSink for SenderSink<'_, F> {
     fn payload(&mut self, payload: &crate::codec::Payload<'_>) {
         (self.f)(
-            self.sender
+            &self
+                .sender
                 .packet(payload.timestamp(), payload.mark(), payload.data()),
         );
     }
@@ -349,5 +419,33 @@ mod tests {
         assert_eq!(payload_range, 28..55);
         assert_eq!(data[payload_range.start as usize], 0x67);
         assert!(!header.mark());
+    }
+
+    #[test]
+    fn sender() {
+        let mut s = Sender::new(96, 0x1234_5678, 0xffff, 10);
+        let ts = crate::Timestamp::new(100, std::num::NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+        let pkt = s.packet(ts, true, &[b"ab", b"cde"]);
+        let raw = pkt.to_vec();
+        assert_eq!(raw.len(), pkt.len());
+        let (header, range) = PacketHeader::validate(&raw[..]).unwrap();
+        assert_eq!(header, pkt.header);
+        assert_eq!(&raw[usize::from(range.start)..], b"abcde");
+        assert!(header.mark());
+        assert_eq!(header.payload_type(), 96);
+        assert_eq!(header.sequence_number(), 0xffff);
+        assert_eq!(header.timestamp(), 110);
+        assert_eq!(header.ssrc(), 0x1234_5678);
+        assert_eq!(s.next_sequence_number(), 0);
+        s.skip();
+        assert_eq!(s.next_sequence_number(), 1);
+
+        let sr = s.sender_report(crate::NtpTimestamp(0x0102_0304_0506_0708), ts);
+        let (pkt, rest) = crate::rtcp::PacketRef::parse(&sr[..]).unwrap();
+        assert!(rest.is_empty());
+        let sr = pkt.as_sender_report().unwrap().unwrap();
+        assert_eq!(sr.ssrc(), 0x1234_5678);
+        assert_eq!(sr.ntp_timestamp().0, 0x0102_0304_0506_0708);
+        assert_eq!(sr.rtp_timestamp(), 110);
     }
 }

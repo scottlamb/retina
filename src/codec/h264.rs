@@ -3651,6 +3651,7 @@ mod packetizer_tests {
     struct Recorder {
         payloads: Vec<Recorded>,
         discontinuities: usize,
+        congested: bool,
     }
 
     impl Recorder {
@@ -3670,6 +3671,10 @@ mod packetizer_tests {
 
         fn discontinuity(&mut self) {
             self.discontinuities += 1;
+        }
+
+        fn congested(&self) -> bool {
+            self.congested
         }
     }
 
@@ -3794,7 +3799,114 @@ mod packetizer_tests {
         assert_eq!(r.take(), []);
     }
 
-    /// A discontinuity abandons the frame, dropping held data.
+    fn disposable(mut f: FrameInfo) -> FrameInfo {
+        f.is_disposable = true;
+        f
+    }
+
+    /// Congestion mid-fragment truncates the NAL: the fragment which would
+    /// have been delivered next becomes its last, with the F bit set, and
+    /// ends the frame. Frames are then dropped until a random access point.
+    #[test]
+    fn throttle_fu_a() {
+        let mut p = packetizer(6, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Start, &[b"\x41abc"], &mut r);
+        p.push_unit(Position::Middle, &[b"defghij"], &mut r);
+        assert_eq!(
+            r.take(),
+            [
+                rec(false, true, b"\x5c\x81abcd"),
+                rec(false, false, b"\x5c\x01efgh")
+            ]
+        );
+        r.congested = true;
+        p.push_unit(Position::Middle, &[b"klmn"], &mut r);
+        p.push_unit(Position::End, &[b"op"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x41q"], &mut r);
+        assert_eq!(r.take(), []);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, false, b"\xdc\x41ijkl")]);
+
+        // Uncongested, but awaiting a random access point.
+        r.congested = false;
+        p.start_frame(frame(1, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x41r"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), []);
+        p.start_frame(frame(2, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x65s"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x65s")]);
+        assert_eq!(r.discontinuities, 0);
+    }
+
+    /// Congestion before a NAL that isn't yet fragmenting truncates it to a
+    /// single NAL unit packet.
+    #[test]
+    fn throttle_before_first_fragment() {
+        let mut p = packetizer(4, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Start, &[b"\x41ab"], &mut r);
+        r.congested = true;
+        p.push_unit(Position::End, &[b"cdef"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\xc1abc")]);
+    }
+
+    /// Congestion at a NAL boundary truncates the next NAL to its header. A
+    /// disposable frame's loss doesn't affect later frames.
+    #[test]
+    fn throttle_nal_boundary() {
+        let mut p = packetizer(1400, ParameterSetInsertion::Never);
+        let mut r = Recorder::default();
+        p.start_frame(disposable(frame(0, false)), &mut r);
+        p.push_unit(Position::Complete, &[b"\x01a"], &mut r);
+        r.congested = true;
+        p.push_unit(Position::Start, &[b"\x01b"], &mut r);
+        p.push_unit(Position::End, &[b"c"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(
+            r.take(),
+            [rec(false, true, b"\x01a"), rec(true, false, b"\x81")]
+        );
+        r.congested = false;
+        p.start_frame(frame(1, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x41d"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x41d")]);
+    }
+
+    /// Congestion at a frame's start drops it entirely, and parameter sets
+    /// are still inserted at the next frame sent.
+    #[test]
+    fn throttle_frame_start() {
+        let mut p = packetizer(1400, ParameterSetInsertion::OnChange);
+        let mut r = Recorder::default();
+        p.set_parameters(&parameters_from_sps_and_pps(SPS, b"\x68\xee\x3c\x81").unwrap())
+            .unwrap();
+        r.congested = true;
+        p.start_frame(frame(0, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x65a"], &mut r);
+        p.end_frame(&mut r);
+        p.start_frame(disposable(frame(1, false)), &mut r);
+        p.push_unit(Position::Complete, &[b"\x01b"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), []);
+        r.congested = false;
+        p.start_frame(frame(2, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x65c"], &mut r);
+        p.end_frame(&mut r);
+        let r = r.take();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].0 && r[0].1);
+        assert_eq!(r[0].2.0[0] & 0x1f, 24, "STAP-A with parameter sets");
+    }
+
+    /// A discontinuity abandons the frame, dropping held data, then drops
+    /// frames until the next random access point.
     #[test]
     fn discontinuity() {
         let mut p = packetizer(1400, ParameterSetInsertion::Never);
@@ -3808,7 +3920,11 @@ mod packetizer_tests {
         p.start_frame(frame(1, false), &mut r);
         p.push_unit(Position::Complete, &[b"\x41q"], &mut r);
         p.end_frame(&mut r);
-        assert_eq!(r.take(), [rec(true, true, b"\x41q")]);
+        assert_eq!(r.take(), []); // may depend on the lost data.
+        p.start_frame(frame(2, true), &mut r);
+        p.push_unit(Position::Complete, &[b"\x65r"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x65r")]);
     }
 
     /// Misuse of `push_unit` and `end_frame` is tolerated rather than panicking.

@@ -31,7 +31,7 @@ use crate::{
 };
 
 mod channel_mapping;
-mod parse;
+pub(crate) mod parse;
 mod playing;
 mod receiver_report;
 

@@ -9,10 +9,10 @@ use std::num::NonZeroU32;
 
 use retina::buf::{MarkBuf, PacketRef};
 use retina::codec::{
-    Accumulate, FrameInfo, Loss, Payload, PayloadSink, VideoData, VideoDepacketizer, VideoFrameEnd,
-    VideoFrameStart, VideoHandler, VideoPacketizer,
+    Accumulate, FrameInfo, Loss, LossReason, Payload, PayloadSink, VideoData, VideoDepacketizer,
+    VideoFrameEnd, VideoFrameStart, VideoHandler, VideoPacketizer,
 };
-use retina::rtp::{PacketHeader, PacketMeta, Sender};
+use retina::rtp::{OutgoingPacket, PacketHeader, PacketMeta, Sender};
 
 /// Pushes raw RTP packets into a depacketizer, computing loss from sequence
 /// numbers. (No timestamp wraparound handling; the capture is short.)
@@ -76,11 +76,15 @@ pub struct Frame {
     pub nals: Vec<Vec<u8>>,
 }
 
-/// Collects frames as NAL units, from streamed `data` events.
+/// Collects complete frames as NAL units, from streamed `data` events.
 #[derive(Default)]
 pub struct Collector {
     pub frames: Vec<Frame>,
     pub losses: usize,
+    pub corrupt: usize,
+
+    /// True if the last of `frames` has started but not ended.
+    in_frame: bool,
 }
 
 impl VideoHandler<()> for Collector {
@@ -90,6 +94,7 @@ impl VideoHandler<()> for Collector {
             is_random_access_point: fs.is_random_access_point(),
             nals: Vec::new(),
         });
+        self.in_frame = true;
         Accumulate::No
     }
 
@@ -104,10 +109,18 @@ impl VideoHandler<()> for Collector {
         }
     }
 
-    fn frame_end(&mut self, _: &mut VideoFrameEnd<'_, ()>) {}
+    fn frame_end(&mut self, _: &mut VideoFrameEnd<'_, ()>) {
+        self.in_frame = false;
+    }
 
-    fn loss(&mut self, _: &Loss<'_, ()>) {
+    fn loss(&mut self, loss: &Loss<'_, ()>) {
+        if std::mem::take(&mut self.in_frame) {
+            self.frames.pop(); // abandoned.
+        }
         self.losses += 1;
+        if matches!(loss.reason(), LossReason::Corrupt { .. }) {
+            self.corrupt += 1;
+        }
     }
 }
 
@@ -152,13 +165,24 @@ impl<Ctx, S: PayloadSink> VideoHandler<Ctx> for Repacketize<'_, S> {
     }
 }
 
-/// A sent packet, with information from its payload.
+/// An owned copy of a sent packet, with information from its payload.
 #[derive(Debug)]
 pub struct Pkt {
     pub raw: Vec<u8>,
     pub sequence_number: u16,
     pub frame_start: bool,
     pub random_access_point: bool,
+}
+
+impl Pkt {
+    pub fn new(payload: &Payload<'_>, pkt: &OutgoingPacket<'_>) -> Self {
+        Self {
+            raw: pkt.to_vec(),
+            sequence_number: pkt.header.sequence_number(),
+            frame_start: payload.position().is_first(),
+            random_access_point: payload.is_random_access_point(),
+        }
+    }
 }
 
 /// A sink which builds packets with a [`Sender`] and records them.
@@ -176,12 +200,7 @@ impl<'a> Recorder<'a> {
 impl PayloadSink for Recorder<'_> {
     fn payload(&mut self, p: &Payload<'_>) {
         let pkt = self.sender.packet(p.timestamp(), p.mark(), p.data());
-        self.out.push(Pkt {
-            raw: pkt.raw.to_vec(),
-            sequence_number: pkt.sequence_number,
-            frame_start: p.position().is_first(),
-            random_access_point: p.is_random_access_point(),
-        });
+        self.out.push(Pkt::new(p, &pkt));
     }
 
     fn discontinuity(&mut self) {

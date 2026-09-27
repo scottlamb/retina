@@ -1,0 +1,17 @@
+[package]
+name = "proxy"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1.0.41"
+futures = "0.3.14"
+clap = { version = "4.1.4", features = ["derive"] }
+log = "0.4.8"
+mylog = { git = "https://github.com/scottlamb/mylog" }
+rand = "0.8.3"
+retina = { path = "../../" }
+tokio = { version = "1.13.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2.2.1"

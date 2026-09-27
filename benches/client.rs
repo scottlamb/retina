@@ -109,10 +109,8 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
                 &mut sender.sink(|pkt| {
                     data.push(b'$'); // interleaved data
                     data.push(0); // channel 0
-                    data.extend_from_slice(
-                        &u16::try_from(pkt.raw.len()).unwrap().to_be_bytes()[..],
-                    );
-                    data.extend_from_slice(&pkt.raw);
+                    data.extend_from_slice(&u16::try_from(pkt.len()).unwrap().to_be_bytes()[..]);
+                    pkt.write_to(&mut data);
                 }),
             )
             .unwrap();

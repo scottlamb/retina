@@ -52,6 +52,7 @@ pub mod codec;
 //mod error;
 #[doc(hidden)]
 pub mod rtsp;
+pub mod server;
 mod tokio;
 
 use error::ErrorInt;
