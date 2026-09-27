@@ -144,7 +144,7 @@ macro_rules! assert_eq_hex {
     }};
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "h264"))]
 macro_rules! assert_eq_hexes {
     ($left:expr, $right:expr) => {{
         let left = $left
@@ -160,7 +160,10 @@ macro_rules! assert_eq_hexes {
 }
 
 #[cfg(test)]
-pub(crate) use {assert_eq_hex, assert_eq_hexes};
+pub(crate) use assert_eq_hex;
+
+#[cfg(all(test, feature = "h264"))]
+pub(crate) use assert_eq_hexes;
 
 #[cfg(test)]
 pub(crate) fn init_logging() {

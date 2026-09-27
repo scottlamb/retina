@@ -3,6 +3,9 @@
 
 //! Common logic between H.264 and H.265.
 
+// Some helpers are used by only one codec, so are dead when the other is disabled.
+#![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
+
 use crate::buf::{BufRange, MarkBuf};
 use crate::inputs::{Input as _, Split};
 
