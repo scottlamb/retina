@@ -3,6 +3,9 @@
 
 //! Common logic between H.264 and H.265.
 
+// Some helpers are used by only one codec, so are dead when the other is disabled.
+#![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
+
 use crate::buf::BufRange;
 use crate::inputs::{Input as _, Split};
 
@@ -28,12 +31,14 @@ pub enum Framing {
 ///
 /// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most
 /// other RTSP implementations in tolerating this.
+#[cfg(any(feature = "h264", feature = "h265"))]
 #[derive(Debug)]
 pub(super) struct TolerantBitReader<'a, R> {
     pub(super) inner: R,
     pub(super) has_extra_trailing_data: &'a mut bool,
 }
 
+#[cfg(any(feature = "h264", feature = "h265"))]
 impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'_, R> {
     fn read_ue(&mut self, name: &'static str) -> Result<u32, h264_reader::rbsp::BitReaderError> {
         self.inner.read_ue(name)

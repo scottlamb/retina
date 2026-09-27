@@ -106,6 +106,7 @@ pub(crate) mod g723;
 pub mod h26x;
 pub(crate) mod jpeg;
 
+#[cfg(feature = "h264")]
 pub mod h264;
 
 #[cfg(feature = "h265")]
@@ -340,6 +341,7 @@ impl std::fmt::Debug for VideoParameters {
 #[derive(Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VideoParametersCodec {
+    #[cfg(feature = "h264")]
     H264 {
         sps: Bytes,
         pps: Bytes,
@@ -356,6 +358,7 @@ pub enum VideoParametersCodec {
 impl std::fmt::Debug for VideoParametersCodec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "h264")]
             Self::H264 { sps, pps } => f
                 .debug_struct("H264")
                 .field("sps", &crate::hex::LimitedHex::new(sps, 256))
@@ -376,6 +379,7 @@ impl std::fmt::Debug for VideoParametersCodec {
 impl VideoParametersCodec {
     fn visual_sample_entry_box_type(&self) -> [u8; 4] {
         match self {
+            #[cfg(feature = "h264")]
             VideoParametersCodec::H264 { .. } => *b"avc1",
             #[cfg(feature = "h265")]
             VideoParametersCodec::H265 { .. } => *b"hvc1",
@@ -436,6 +440,7 @@ impl VideoSampleEntryBuilder<'_> {
 
                 // Codec-specific portion.
                 match self.params.codec {
+                    #[cfg(feature = "h264")]
                     VideoParametersCodec::H264 { .. } => {
                         write_mp4_box!(&mut buf, *b"avcC", {
                             buf.extend_from_slice(&self.params.extra_data);
@@ -806,6 +811,7 @@ enum DepacketizerInner {
     Aac(Box<aac::Depacketizer>),
     SimpleAudio(Box<simple_audio::Depacketizer>),
     G723(Box<g723::Depacketizer>),
+    #[cfg(feature = "h264")]
     H264(Box<h264::Depacketizer>),
     #[cfg(feature = "h265")]
     H265(Box<h265::Depacketizer>),
@@ -839,6 +845,7 @@ impl Depacketizer {
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
         Ok(Depacketizer(match (media, encoding_name) {
+            #[cfg(feature = "h264")]
             ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
                 clock_rate,
                 format_specific_params,
@@ -909,6 +916,7 @@ impl Depacketizer {
         match &self.0 {
             DepacketizerInner::Aac(_) => {}
             DepacketizerInner::G723(_) => {}
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.check_invariants(),
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.check_invariants(),
@@ -926,6 +934,7 @@ impl Depacketizer {
     pub fn set_frame_format(&mut self, format: FrameFormat) {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.set_frame_format(format),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.set_frame_format(format),
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.set_frame_format(format),
@@ -944,6 +953,7 @@ impl Depacketizer {
         match &self.0 {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.parameters(),
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.parameters(),
@@ -962,6 +972,7 @@ impl Depacketizer {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.push(pkt),
             DepacketizerInner::G723(d) => d.push(pkt),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.push(pkt),
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.push(pkt),
@@ -979,6 +990,7 @@ impl Depacketizer {
         match &mut self.0 {
             DepacketizerInner::Aac(d) => d.pull(),
             DepacketizerInner::G723(d) => d.pull(),
+            #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.pull(),
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.pull(),
@@ -1007,6 +1019,7 @@ mod tests {
                 "g723::Depacketizer",
                 std::mem::size_of::<g723::Depacketizer>(),
             ),
+            #[cfg(feature = "h264")]
             (
                 "h264::Depacketizer",
                 std::mem::size_of::<h264::Depacketizer>(),

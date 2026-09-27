@@ -16,8 +16,9 @@ include = ["src/**/*", "benches", "Cargo.toml"]
 rust-version = "1.88"
 
 [features]
-default = ["h265"]
-h265 = []
+default = ["h264", "h265"]
+h264 = ["dep:h264-reader"]
+h265 = ["dep:h264-reader"]
 
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
@@ -31,7 +32,7 @@ bitstream-io = "2.6"
 bytes = "1.10"
 derive_more = { version = "2", features = ["debug", "display", "error", "from"] }
 futures = "0.3.14"
-h264-reader = "0.8.0"
+h264-reader = { version = "0.8.0", optional = true }
 hex = "0.4.3"
 http-auth = "0.1.2"
 jiff = "0.2.0"
@@ -58,7 +59,9 @@ debug = true
 [[bench]]
 name = "client"
 harness = false
+required-features = ["h264"]
 
 [[bench]]
 name = "depacketize"
 harness = false
+required-features = ["h264"]
