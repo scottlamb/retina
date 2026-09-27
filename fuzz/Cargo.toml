@@ -21,7 +21,7 @@ mylog = { git = "https://github.com/scottlamb/mylog" }
 
 [dependencies.retina]
 path = ".."
-features = ["h265"]
+features = ["h264", "h265"]
 
 [[bin]]
 name = "depacketize_h264"

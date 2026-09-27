@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 /// A reference to a byte range within a [`MarkBuf`].
 ///
 /// 10 bytes of data (16 with padding).
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BufRange {
     pub pos: u64,
@@ -490,6 +491,7 @@ pub(crate) struct PacketRef<'a> {
     payload_len: u16,
 }
 
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 impl<'a> PacketRef<'a> {
     /// Creates a `PacketRef`.
     pub fn new(

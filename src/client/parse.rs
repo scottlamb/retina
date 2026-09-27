@@ -788,8 +788,6 @@ pub(crate) fn parse_options(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
-
     use bytes::Bytes;
     use url::Url;
 
@@ -914,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn dahua_h264_aac_onvif() {
         init_logging();
         // DESCRIBE.
@@ -1040,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn hikvision() {
         init_logging();
         // DESCRIBE.
@@ -1120,6 +1120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn reolink() {
         init_logging();
         // DESCRIBE.
@@ -1217,6 +1218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn bunny() {
         init_logging();
         // This is a public test server for Wowza Streaming Engine.
@@ -1345,6 +1347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn foscam() {
         init_logging();
         // DESCRIBE.
@@ -1394,6 +1397,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h264")]
     fn vstarcam() {
         init_logging();
         // DESCRIBE.
@@ -1444,6 +1448,7 @@ mod tests {
     /// [GW Security GW4089IP](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-GW-Security#gw4089ip),
     /// main stream (high-res, audio).
     #[test]
+    #[cfg(feature = "h264")]
     fn gw_main() {
         init_logging();
         // DESCRIBE.
@@ -1535,6 +1540,7 @@ mod tests {
     /// [GW Security GW4089IP](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-GW-Security#gw4089ip),
     /// sub stream (low-res, no audio).
     #[test]
+    #[cfg(feature = "h264")]
     fn gw_sub() {
         init_logging();
         // DESCRIBE.
