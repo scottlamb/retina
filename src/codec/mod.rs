@@ -697,6 +697,9 @@ pub struct VideoFrame {
     is_random_access_point: bool,
     is_disposable: bool,
     data: Vec<u8>,
+
+    /// Ranges of `data` that were lost in transport and are zero-filled.
+    lost_ranges: Vec<std::ops::Range<usize>>,
 }
 
 impl VideoFrame {
@@ -721,6 +724,14 @@ impl VideoFrame {
     #[inline]
     pub fn loss(&self) -> u16 {
         self.loss
+    }
+
+    /// Returns the ranges of [`Self::data`] that were lost in transport and are zero-filled, as
+    /// far as the depacketizer can place them. Only RTP/JPEG reports them, from fragment offsets;
+    /// other codecs discard pictures with interior loss.
+    #[inline]
+    pub fn lost_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.lost_ranges
     }
 
     /// Returns this picture's timestamp in the time base associated with the stream.
@@ -789,6 +800,7 @@ impl std::fmt::Debug for VideoFrame {
             .field("has_new_parameters", &self.has_new_parameters)
             .field("is_random_access_point", &self.is_random_access_point)
             .field("is_disposable", &self.is_disposable)
+            .field("lost_ranges", &self.lost_ranges)
             .field("data", &crate::hex::LimitedHex::new(&self.data, 64))
             .finish()
     }
