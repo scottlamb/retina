@@ -294,6 +294,13 @@ pub struct Depacketizer {
     /// Backing storage to the assembled frame.
     data: Vec<u8>,
 
+    /// Where the entropy-coded data starts in `data`, after the generated headers. Fragment
+    /// offsets count from here.
+    scan_start: usize,
+
+    /// Ranges of `data` whose fragments were lost, zero-filled.
+    lost: Vec<std::ops::Range<usize>>,
+
     /// Cached quantization tables.
     qtables: Vec<Option<Bytes>>,
 
@@ -308,6 +315,8 @@ impl Depacketizer {
         Depacketizer {
             metadata: None,
             data: Vec::new(),
+            scan_start: 0,
+            lost: Vec::new(),
             pending: None,
             qtables: vec![None; 255],
             parameters: None,
@@ -447,6 +456,8 @@ impl Depacketizer {
                         precision,
                         dri,
                     )?;
+                    self.scan_start = self.data.len();
+                    self.lost.clear();
 
                     self.metadata.replace(JpegFrameMetadata {
                         start_ctx: ctx,
@@ -481,6 +492,27 @@ impl Depacketizer {
             return Ok(());
         }
 
+        // Fragments say where their data belongs: keep that layout when some were lost, so that
+        // the lost data is zero-filled at the right place and reported, instead of the following
+        // data moving into its place.
+        let expected = self.data.len() - self.scan_start;
+        let offset = frag_offset as usize;
+        if offset < expected {
+            // A repeated fragment; its data is in place already.
+            return Ok(());
+        }
+        if offset > expected {
+            if self.scan_start + offset > MAX_FRAME_LEN {
+                self.metadata = None;
+                self.data.clear();
+                return Err(format!(
+                    "RTP/JPEG fragment offset {offset} past the largest frame"
+                ));
+            }
+            let start = self.data.len();
+            self.data.resize(self.scan_start + offset, 0);
+            self.lost.push(start..self.data.len());
+        }
         self.data.extend_from_slice(&payload);
 
         if last_packet_in_frame {
@@ -506,6 +538,7 @@ impl Depacketizer {
                 is_random_access_point: true,
                 is_disposable: true,
                 data: std::mem::take(&mut self.data),
+                lost_ranges: std::mem::take(&mut self.lost),
             });
 
             let metadata = self.metadata.take();
@@ -912,6 +945,59 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
-        assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)
+        assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE);
+        assert!(frame.lost_ranges().is_empty());
+    }
+
+    #[test]
+    fn lost_fragment_is_zero_filled_and_reported() {
+        init_logging();
+        const LOST: u32 = 100;
+        let mut d = super::Depacketizer::new();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let mut buf = MarkBuf::new(65536);
+        let mut push = |payload: Vec<u8>, sequence_number: u16, loss: u16, mark: bool| {
+            let pkt = ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number,
+                loss,
+                mark,
+                payload_type: 0,
+            }
+            .build(payload)
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+            .unwrap();
+        };
+        push(START_PACKET.to_vec(), 0, 0, false);
+        // The end packet with its fragment offset moved on, as if a fragment before it was lost.
+        let mut end = END_PACKET.to_vec();
+        let offset = u32::from_be_bytes([0, end[1], end[2], end[3]]) + LOST;
+        end[1..4].copy_from_slice(&offset.to_be_bytes()[1..]);
+        push(end, 2, 1, true);
+
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            _ => panic!(),
+        };
+        let gap = VALID_JPEG_IMAGE.len() - (END_PACKET.len() - 8);
+        let mut expected = VALID_JPEG_IMAGE[..gap].to_vec();
+        expected.extend(std::iter::repeat_n(0, LOST as usize));
+        expected.extend_from_slice(&VALID_JPEG_IMAGE[gap..]);
+        assert_eq_hex!(frame.data(), expected.as_slice());
+        let lost = gap..gap + LOST as usize;
+        assert_eq!(frame.lost_ranges(), &[lost]);
     }
 }

@@ -1,3 +1,10 @@
+## unreleased
+
+*   RTP/JPEG: when fragments are lost inside a frame, the gap is zero-filled at
+    its fragment offset instead of the following data moving into its place, and
+    reported by the new `VideoFrame::lost_ranges`. Before, such a frame decoded
+    without an error but with the rest of its entropy-coded data misplaced.
+
 ## `v0.4.20` (2026-08-14)
 
 *   Retina now internally reads into and depacketizes from a ring buffer,

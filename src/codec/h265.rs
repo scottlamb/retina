@@ -717,6 +717,7 @@ impl Depacketizer {
             is_random_access_point,
             is_disposable,
             data,
+            lost_ranges: Vec::new(),
         })
     }
 }
