@@ -27,7 +27,7 @@ impl Depacketizer {
                 rfc6381_codec: None,
                 frame_length: None, // variable
                 clock_rate,
-                channels: channels.map_or(const { NonZeroU16::new(1).unwrap() }, |c| c),
+                channels: channels.unwrap_or(const { NonZeroU16::new(1).unwrap() }),
                 extra_data: Vec::new(),
                 codec: super::AudioParametersCodec::Other,
             },

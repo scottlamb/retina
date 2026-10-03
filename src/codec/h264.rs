@@ -1428,16 +1428,15 @@ impl Packetizer {
                 }
 
                 // Send a plain NAL packet. (TODO: consider using STAP-A.)
-                let mark;
-                if data.len() == usize_len {
-                    mark = true;
+                let mark = if data.len() == usize_len {
+                    true
                 } else {
                     self.state = PacketizerState::HaveData {
                         timestamp,
                         data: data.split_off(usize_len),
                     };
-                    mark = false;
-                }
+                    false
+                };
                 Ok(Some(
                     ReceivedPacketBuilder {
                         ctx: crate::PacketContext::dummy(),
