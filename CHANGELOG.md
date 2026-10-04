@@ -1,4 +1,4 @@
-## unreleased
+## `v0.4.21` (2026-10-04)
 
 *   prefer `GET_PARAMETER` keepalives over `SET_PARAMETER`, as ffmpeg does,
     fixing TP-Link Tapo cameras (including the C100, C110, C120, C200, C210,
@@ -12,6 +12,18 @@
     [moonfire-nvr#342](https://github.com/scottlamb/moonfire-nvr/issues/342), and
     by [@audryhome](https://github.com/audryhome) in
     [moonfire-nvr#361](https://github.com/scottlamb/moonfire-nvr/issues/361).
+*   ignore the `ssrc` parameter in the `PLAY` response's `RTP-Info` header,
+    fixing some Dahua NVRs, which write it in decimal there but in hex in the
+    `SETUP` response's `Transport` header. RTSP/1.0 doesn't define this
+    parameter, and servers disagree on its radix; the SSRC now comes from
+    `Transport` or the first RTP packet. Thanks to [@mnaza](https://github.com/mnaza) in
+    [#137](https://github.com/scottlamb/retina/pull/137).
+*   ignore unparseable and 16-bit `ssrc` values in the `SETUP` response's
+    `Transport` header, learning the SSRC from the first RTP packet instead.
+    This fixes Rubetek cameras, which send values such as `ssrc=0x6f7c`, and
+    another camera which sends `ssrc=A046` but uses a different 32-bit SSRC in
+    its RTP packets. Thanks to [@C-Format](https://github.com/C-Format) in
+    [#138](https://github.com/scottlamb/retina/pull/138).
 
 ## `v0.4.20` (2026-08-14)
 
