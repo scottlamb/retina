@@ -2158,12 +2158,19 @@ impl Session<Playing> {
         // and some servers (e.g. rtsp-simple-server as of 2021-08-07) behave badly
         // on receiving unsupported methods. See discussion at
         // <https://github.com/aler9/rtsp-simple-server/issues/1066>. Initially
-        // send `OPTIONS`, then follow recommendations to use (bodyless)
-        // `SET_PARAMETER` or `GET_PARAMETER` if available.
-        let method = if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
-            KeepaliveMethod::SetParameter
-        } else if *inner.flags & (SessionFlag::GetParameterSupported as u8) != 0 {
+        // send `OPTIONS`, then use (bodyless) `GET_PARAMETER` or `SET_PARAMETER`
+        // if available.
+        //
+        // Prefer `GET_PARAMETER` over `SET_PARAMETER`, contrary to the ONVIF
+        // recommendation. Tapo cameras advertise `SET_PARAMETER` but reply to it
+        // with `400 Bad Request` with the previous request's `CSeq`, while handling
+        // `GET_PARAMETER` correctly. ffmpeg also prefers `GET_PARAMETER` (and never
+        // uses `SET_PARAMETER` for keepalives), so this is likely the more
+        // well-tested choice in general.
+        let method = if *inner.flags & (SessionFlag::GetParameterSupported as u8) != 0 {
             KeepaliveMethod::GetParameter
+        } else if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
+            KeepaliveMethod::SetParameter
         } else {
             KeepaliveMethod::Options
         };

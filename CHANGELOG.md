@@ -1,3 +1,14 @@
+## unreleased
+
+*   prefer `GET_PARAMETER` keepalives over `SET_PARAMETER`, as ffmpeg does.
+    Tapo cameras advertise `SET_PARAMETER` but reply to it with
+    `400 Bad Request` and the previous request's `CSeq`, causing Retina to
+    fail the session with an RTSP framing error on the first `SET_PARAMETER`
+    keepalive, 15 seconds into each session.
+    See [#133](https://github.com/scottlamb/retina/issues/133),
+    [moonfire-nvr#342](https://github.com/scottlamb/moonfire-nvr/issues/342), and
+    [moonfire-nvr#361](https://github.com/scottlamb/moonfire-nvr/issues/361).
+
 ## `v0.4.20` (2026-08-14)
 
 *   Retina now internally reads into and depacketizes from a ring buffer,
