@@ -3380,6 +3380,101 @@ mod tests {
         );
     }
 
+    /// Tests that a keepalive response with an unexpected `CSeq` is a fatal error.
+    ///
+    /// Tapo cameras reply to `SET_PARAMETER` with the previous request's
+    /// `CSeq`. Retina avoids this by preferring `GET_PARAMETER`, but a mismatched
+    /// response is still an error rather than being guessed to belong to the
+    /// outstanding keepalive.
+    #[tokio::test]
+    async fn keepalive_unexpected_cseq() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default(), url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // Pretend a previous `OPTIONS` advertised both parameter methods, and
+        // make the keepalive fire almost immediately.
+        session.0.flags |=
+            SessionFlag::SetParameterSupported as u8 | SessionFlag::GetParameterSupported as u8;
+        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+
+        tokio::join!(
+            async {
+                match session.next().await {
+                    Some(Err(e)) => {
+                        assert!(
+                            matches!(*e.0, ErrorInt::RtspFramingError { .. }),
+                            "unexpected error: {e}"
+                        );
+                    }
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                let msg = server.next().await.unwrap().unwrap();
+                let req = match msg.msg {
+                    msg::Message::Request(r) => r,
+                    o => panic!("expected keepalive request, got {o:#?}"),
+                };
+                assert_eq!(req.method, msg::Method::GET_PARAMETER);
+                let cseq: u32 = req.headers.get("CSeq").unwrap().parse().unwrap();
+                let mut headers = msg::Headers::default();
+                headers.insert(
+                    msg::HeaderName::CSEQ,
+                    msg::HeaderValue::try_from((cseq - 1).to_string()).unwrap(),
+                );
+                server
+                    .send(OwnedMessage::Response {
+                        head: msg::Response {
+                            status_code: StatusCode::try_from(400u16).unwrap(),
+                            reason_phrase: "Bad Request".to_owned(),
+                            headers,
+                        },
+                        body: Bytes::new(),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+    }
+
     /// Tests ignoring bogus RTP and RTCP messages while waiting for PLAY response.
     #[tokio::test]
     async fn ignore_early_rtp_rtcp() {
