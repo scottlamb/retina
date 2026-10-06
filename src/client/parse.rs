@@ -842,6 +842,24 @@ mod tests {
         assert_eq!(p.streams.len(), 2);
     }
 
+    /// Malformed SDP should be an error, not a panic. `sdp-types` 0.1 hit an
+    /// `assert_eq!` when a malformed line was followed by a non-`m=` line.
+    #[test]
+    fn malformed_sdp() {
+        init_logging();
+        for body in [
+            &b"v=0\n \na=x\n"[..],
+            &b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=cam\r\nc=IN IP4 127.=rtpmap:96 \
+               H264/90000\r\n\x9a\xc2\x99\x92\x8b\x8f\xc5\xc66 packetizaon-mo-id=42cindexlength=3\
+               \r\na=control\r\n"[..],
+        ] {
+            let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+            let (response, body) = sdp_response(body);
+            let e = super::parse_describe(url, &response, &body).unwrap_err();
+            assert!(e.starts_with("Unable to parse SDP"), "{e}");
+        }
+    }
+
     #[test]
     fn dahua_h264_aac_onvif() {
         init_logging();
