@@ -479,6 +479,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    max_message_size: Option<usize>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -660,6 +661,26 @@ impl SessionOptions {
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
         self
+    }
+
+    /// Limits the size in bytes (head and body combined) of each RTSP
+    /// response (or request) read from the server.
+    ///
+    /// A larger message fails the session with an RTSP framing error rather
+    /// than being buffered in full. The limit is checked as the head arrives
+    /// and against its `Content-Length` before the body is read. It doesn't
+    /// apply to interleaved data messages, which are inherently limited to
+    /// 64 KiB.
+    ///
+    /// There's no limit by default. Real servers' responses are small; a
+    /// `DESCRIBE` response is typically a few KiB.
+    pub fn max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = Some(max_message_size);
+        self
+    }
+
+    fn get_max_message_size(&self) -> usize {
+        self.max_message_size.unwrap_or(usize::MAX)
     }
 }
 
@@ -1163,13 +1184,14 @@ enum SessionFlag {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url) -> Result<Self, Error> {
+    async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port)
+        let mut inner = crate::tokio::Connection::connect(host, port)
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        inner.set_max_message_size(options.get_max_message_size());
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -1458,7 +1480,7 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url).await?;
+        let conn = RtspConnection::connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
     }
 
@@ -3606,6 +3628,131 @@ mod tests {
                 response(include_bytes!("testdata/h264dvr_setup_audio.txt"))
             ),
         );
+    }
+
+    /// Sends `DESCRIBE` to a server which answers with the raw bytes `resp`,
+    /// then holds the connection open.
+    async fn describe_raw(
+        options: SessionOptions,
+        resp: Vec<u8>,
+    ) -> Result<Session<Described>, Error> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, mut server) = socketpair().await;
+        let mut inner = crate::tokio::Connection::from_stream(client).unwrap();
+        inner.set_max_message_size(options.get_max_message_size()); // as in `RtspConnection::connect`.
+        let conn = RtspConnection {
+            inner,
+            channels: ChannelMappings::default(),
+            next_cseq: 1,
+            seen_unassigned: false,
+        };
+        let url = Url::parse("rtsp://127.0.0.1:554/camera").unwrap();
+        let serve = async move {
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                let mut buf = [0u8; 1024];
+                let n = server.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "client hung up before sending its request");
+                req.extend_from_slice(&buf[..n]);
+            }
+            // The client may hang up partway through; that's fine.
+            let _ = server.write_all(&resp).await;
+            server
+        };
+        let (session, _server) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Session::describe_with_conn(conn, options, url),
+            ),
+            serve,
+        );
+        session.expect("DESCRIBE should finish rather than buffer forever")
+    }
+
+    fn assert_too_large(r: Result<Session<Described>, Error>) {
+        let e = r.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(*e.0, ErrorInt::RtspFramingError { .. }),
+            "expected framing error, got {e}"
+        );
+        assert!(e.to_string().contains("message-too-large"), "{e}");
+    }
+
+    /// Appends header lines to `resp` until it's at least 2 MiB.
+    fn push_junk_headers(resp: &mut Vec<u8>) {
+        let mut i = 0;
+        while resp.len() < 2 << 20 {
+            resp.extend_from_slice(format!("X-Junk-{i}: {:0>64}\r\n", 0).as_bytes());
+            i += 1;
+        }
+    }
+
+    /// The limit rejects a declared body length up front, without waiting for
+    /// the body.
+    #[tokio::test]
+    async fn describe_rejects_huge_content_length() {
+        init_logging();
+        let resp = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 1000000000\r\n\r\n";
+        let options = SessionOptions::default().max_message_size(64 << 10);
+        assert_too_large(describe_raw(options, resp.to_vec()).await);
+    }
+
+    /// The limit rejects a header block that never ends.
+    #[tokio::test]
+    async fn describe_rejects_endless_headers() {
+        init_logging();
+        let mut resp = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n".to_vec();
+        push_junk_headers(&mut resp);
+        let options = SessionOptions::default().max_message_size(64 << 10);
+        assert_too_large(describe_raw(options, resp).await);
+    }
+
+    /// A response exactly at the limit passes; one byte over fails.
+    #[tokio::test]
+    async fn describe_max_message_size() {
+        init_logging();
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        head.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from("1").unwrap(),
+        );
+        let mut resp = Vec::new();
+        OwnedMessage::Response { head, body }
+            .write(&mut resp)
+            .unwrap();
+        let len = resp.len();
+        let session = describe_raw(
+            SessionOptions::default().max_message_size(len),
+            resp.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.streams().len(), 2);
+        assert_too_large(
+            describe_raw(SessionOptions::default().max_message_size(len - 1), resp).await,
+        );
+    }
+
+    /// By default there's no limit: a 2 MiB response is accepted.
+    #[tokio::test]
+    async fn describe_no_max_message_size_by_default() {
+        init_logging();
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        head.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from("1").unwrap(),
+        );
+        let mut wire = Vec::new();
+        OwnedMessage::Response { head, body }
+            .write(&mut wire)
+            .unwrap();
+        let status_line_len = wire.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        let (status_line, rest) = wire.split_at(status_line_len);
+        let mut resp = status_line.to_vec();
+        push_junk_headers(&mut resp);
+        resp.extend_from_slice(rest);
+        let session = describe_raw(SessionOptions::default(), resp).await.unwrap();
+        assert_eq!(session.streams().len(), 2);
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes
