@@ -246,7 +246,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         .fmt
         .split_ascii_whitespace()
         .next()
-        .unwrap();
+        .ok_or_else(|| "media description has no format".to_string())?;
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
         .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
     if (rtp_payload_type & 0x80) != 0 {
@@ -1231,6 +1231,19 @@ mod tests {
             include_bytes!("testdata/missing_content_type_describe.txt"),
         )
         .unwrap();
+    }
+
+    /// An RTP media description with an empty format list should be skipped, not panic.
+    #[test]
+    fn media_without_format() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let (response, body) = sdp_response(
+            b"v=0\nm=video 0 RTP/AVP \nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
+        );
+        let p = super::parse_describe(url, &response, &body).unwrap();
+        assert_eq!(p.streams.len(), 1);
+        assert_eq!(p.streams[0].encoding_name(), "h264");
     }
 
     /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
