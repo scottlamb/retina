@@ -341,6 +341,197 @@ impl InorderParser {
     }
 }
 
+/// Minimum interval between RTCP sender reports for a send stream.
+///
+/// [RFC 3550 section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
+/// recommends a minimum of 5 seconds, randomized by a factor in `[0.5, 1.5]`
+/// (section 6.3.1).
+const SENDER_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// RTP/RTCP marshaller for a stream that Retina sends, such as an ONVIF
+/// audio backchannel.
+///
+/// Assigns the SSRC, sequence numbers, and a random timestamp offset as
+/// described in [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1)
+/// and generates RTCP sender reports (RFC 3550 section 6.4.1) with an SDES
+/// `CNAME` (section 6.5.1), as required for every compound RTCP packet
+/// (section 6.1).
+#[derive(Debug)]
+pub(crate) struct Sender {
+    pub(super) ssrc: u32,
+    pub(super) next_seq: u16,
+
+    /// Added to the caller-supplied timestamps.
+    pub(super) timestamp_offset: u32,
+
+    /// The payload type to use when the caller doesn't specify one: the first
+    /// one offered in the SDP.
+    default_payload_type: u8,
+
+    /// The RTP clock rate from the SDP, used to extrapolate the sender
+    /// report's RTP timestamp.
+    clock_rate_hz: u32,
+
+    /// The time the first RTP packet was sent and its RTP timestamp (offset
+    /// included), or `None` before then.
+    ///
+    /// Sender reports extrapolate the RTP timestamp from this anchor and the
+    /// clock rate.
+    anchor: Option<(tokio::time::Instant, u32)>,
+
+    /// RTP packets sent so far, for the sender report.
+    packet_count: u32,
+
+    /// RTP payload octets sent so far, for the sender report.
+    octet_count: u32,
+
+    /// When to send the next sender report, or `None` to send one after the
+    /// next RTP packet.
+    ///
+    /// The first report follows the first RTP packet without delay: [RFC 3550
+    /// section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
+    /// says that for unicast sessions "the delay before sending the initial
+    /// compound RTCP packet MAY be zero".
+    pub(super) next_report: Option<tokio::time::Instant>,
+
+    pub(super) cname: Box<str>,
+}
+
+impl Sender {
+    pub(crate) fn new(default_payload_type: u8, clock_rate_hz: u32) -> Self {
+        use base64::Engine as _;
+        use rand::Rng as _;
+        let mut rng = rand::thread_rng();
+        let cname_bytes: [u8; 12] = rng.r#gen();
+        Self {
+            ssrc: rng.r#gen(),
+            next_seq: rng.r#gen(),
+            timestamp_offset: rng.r#gen(),
+            default_payload_type,
+            clock_rate_hz,
+            anchor: None,
+            packet_count: 0,
+            octet_count: 0,
+            next_report: None,
+
+            // RFC 7022 section 4.2 recommends a random 96-bit CNAME, base64-encoded.
+            cname: base64::engine::general_purpose::STANDARD
+                .encode(cname_bytes)
+                .into_boxed_str(),
+        }
+    }
+
+    /// Returns the RTP payload type to use for `pkt`.
+    pub(crate) fn payload_type(&self, pkt: &crate::rtp::SendingPacket) -> u8 {
+        pkt.payload_type.unwrap_or(self.default_payload_type)
+    }
+
+    /// Appends the RTP packet for `pkt`, sent at `now`, to `out` and updates
+    /// counters.
+    ///
+    /// The caller has validated the payload type and length.
+    pub(crate) fn write_rtp(
+        &mut self,
+        now: tokio::time::Instant,
+        pkt: &crate::rtp::SendingPacket,
+        out: &mut Vec<u8>,
+    ) {
+        let payload_type = self.payload_type(pkt);
+        let timestamp = pkt.timestamp.wrapping_add(self.timestamp_offset);
+        self.anchor.get_or_insert((now, timestamp));
+        out.extend_from_slice(&[
+            2 << 6, // version=2, no padding, no extension, no CSRCs.
+            (u8::from(pkt.mark) << 7) | payload_type,
+        ]);
+        out.extend_from_slice(&self.next_seq.to_be_bytes());
+        out.extend_from_slice(&timestamp.to_be_bytes());
+        out.extend_from_slice(&self.ssrc.to_be_bytes());
+        out.extend_from_slice(&pkt.payload);
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.packet_count = self.packet_count.wrapping_add(1);
+
+        // RFC 3550 section 6.4.1: the octet count wraps around.
+        self.octet_count = self.octet_count.wrapping_add(pkt.payload.len() as u32);
+    }
+
+    /// Returns true if a sender report is due at `now`, after an RTP packet has been sent.
+    pub(crate) fn report_due(&self, now: tokio::time::Instant) -> bool {
+        self.next_report.is_none_or(|t| now >= t)
+    }
+
+    /// Returns the RTP timestamp corresponding to `now`.
+    ///
+    /// This extrapolates from the first packet sent, at the clock rate, as
+    /// [RFC 3550 section 6.4.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1)
+    /// describes: the result need not match any packet's timestamp. It wraps
+    /// like any RTP timestamp. Before the first packet, it's the timestamp
+    /// offset.
+    fn rtp_timestamp_at(&self, now: tokio::time::Instant) -> u32 {
+        let Some((first_sent, first_timestamp)) = self.anchor else {
+            return self.timestamp_offset;
+        };
+        let elapsed = now.saturating_duration_since(first_sent);
+
+        // Can't overflow: the nanoseconds fit in 94 bits and the clock rate in
+        // 32. Truncating to 32 bits is the RTP timestamp's wraparound.
+        let ticks = elapsed.as_nanos() * u128::from(self.clock_rate_hz) / 1_000_000_000;
+        first_timestamp.wrapping_add(ticks as u32)
+    }
+
+    /// Appends a compound RTCP packet (sender report and SDES `CNAME`) to `out`
+    /// and schedules the next one.
+    ///
+    /// `now` and `ntp` are the current monotonic and wall times. RFC 3550
+    /// section 6.4.1 says the report's NTP and RTP timestamps describe the same
+    /// instant, which need not be when any packet was sampled. The RTP
+    /// timestamp is extrapolated from the first packet sent; see
+    /// [`Sender::rtp_timestamp_at`].
+    pub(crate) fn write_sender_report(
+        &mut self,
+        now: tokio::time::Instant,
+        ntp: crate::NtpTimestamp,
+        out: &mut Vec<u8>,
+    ) {
+        use rand::Rng as _;
+
+        // Sender report, RFC 3550 section 6.4.1, with no report blocks: Retina
+        // receives nothing in this RTP session.
+        out.extend_from_slice(&[
+            2 << 6, // version=2, no padding, reception report count=0.
+            200,    // packet type = SR.
+            0,
+            6, // length in 32-bit words minus one.
+        ]);
+        out.extend_from_slice(&self.ssrc.to_be_bytes());
+        out.extend_from_slice(&ntp.0.to_be_bytes());
+        out.extend_from_slice(&self.rtp_timestamp_at(now).to_be_bytes());
+        out.extend_from_slice(&self.packet_count.to_be_bytes());
+        out.extend_from_slice(&self.octet_count.to_be_bytes());
+
+        // SDES with a single chunk holding a CNAME item, RFC 3550 section 6.5.
+        // The item list ends with at least one null octet and is padded to a
+        // 32-bit boundary. An item holds at most 255 octets.
+        let cname = self.cname.as_bytes();
+        let cname = &cname[..cname.len().min(255)];
+        let items_len = 2 + cname.len();
+        let padding = 4 - (items_len % 4); // 1..=4 null octets.
+        let chunk_len = 4 + items_len + padding; // SSRC, items, padding: at most 264.
+
+        // The length field is the packet's length in 32-bit words, minus one:
+        // the header word.
+        let length_words = (chunk_len / 4) as u16;
+        out.extend_from_slice(&[(2 << 6) | 1, 202]); // version=2, source count=1, packet type=SDES.
+        out.extend_from_slice(&length_words.to_be_bytes());
+        out.extend_from_slice(&self.ssrc.to_be_bytes());
+        out.extend_from_slice(&[1, cname.len() as u8]); // item type=CNAME, length.
+        out.extend_from_slice(cname);
+        out.extend_from_slice(&[0; 4][..padding]);
+
+        let interval = SENDER_REPORT_INTERVAL.mul_f64(rand::thread_rng().gen_range(0.5..1.5));
+        self.next_report = Some(now + interval);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -392,6 +583,63 @@ mod tests {
             Ok(None) => {}
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    /// Sender reports follow the first RTP packet, then come every 2.5–7.5
+    /// seconds (RFC 3550 sections 6.2 and 6.3.1) while packets are sent.
+    #[test]
+    fn sender_report_schedule() {
+        let mut sender = Sender::new(0, 8_000);
+        let start = tokio::time::Instant::now();
+        let pkt = crate::rtp::SendingPacket::new(0, 0, Bytes::from_static(b"x"));
+        let mut out = Vec::new();
+        sender.write_rtp(start, &pkt, &mut out);
+        assert!(sender.report_due(start));
+        sender.write_sender_report(start, crate::NtpTimestamp(0), &mut out);
+        assert_eq!(out.len(), 13 + 28 + 28);
+        assert!(!sender.report_due(start));
+        assert!(!sender.report_due(start + std::time::Duration::from_millis(2_499)));
+        assert!(sender.report_due(start + std::time::Duration::from_millis(7_500)));
+    }
+
+    /// The sender report's RTP timestamp describes the instant the report is
+    /// built, extrapolated from the first packet at the clock rate (RFC 3550
+    /// section 6.4.1), regardless of later packets' timestamps. It wraps.
+    #[test]
+    fn sender_report_rtp_timestamp() {
+        let mut sender = Sender::new(0, 8_000);
+        sender.timestamp_offset = 0xffff_f000;
+        let start = tokio::time::Instant::now();
+        assert_eq!(sender.rtp_timestamp_at(start), 0xffff_f000);
+        let mut out = Vec::new();
+        sender.write_rtp(
+            start,
+            &crate::rtp::SendingPacket::new(0, 0x100, Bytes::from_static(b"x")),
+            &mut out,
+        );
+        assert_eq!(sender.anchor, Some((start, 0xffff_f100)));
+
+        // A later packet with an unrelated timestamp doesn't move the anchor.
+        let later = start + std::time::Duration::from_millis(500);
+        sender.write_rtp(
+            later,
+            &crate::rtp::SendingPacket::new(0, 0x9999, Bytes::from_static(b"x")),
+            &mut out,
+        );
+        assert_eq!(sender.anchor, Some((start, 0xffff_f100)));
+
+        // 500 ms at 8 kHz is 4,000 ticks, which wraps past 2^32.
+        out.clear();
+        sender.write_sender_report(later, crate::NtpTimestamp(0x1234), &mut out);
+        assert_eq!(
+            &out[8..20],
+            b"\x00\x00\x00\x00\x00\x00\x12\x34\x00\x00\x00\xa0"
+        );
+        assert_eq!(
+            sender.rtp_timestamp_at(start + std::time::Duration::from_micros(125)),
+            0xffff_f101
+        );
+        assert_eq!(sender.rtp_timestamp_at(start), 0xffff_f100);
     }
 
     #[test]

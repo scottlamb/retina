@@ -21,14 +21,52 @@ use super::{ConnectionContext, ReceivedMessage, WallTime};
 /// Default initial capacity for the read ring buffer (64 KiB).
 const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 
+/// Buffered outgoing bytes at or above which [`Connection::poll_write_ready`]
+/// applies backpressure.
+///
+/// This bounds how much caller-supplied media (see
+/// [`Connection::queue_data`]) can pile up when the peer reads slowly, and so
+/// how far behind real time it plays out: 4 KiB is about half a second of
+/// G.711 (8,000 bytes per second plus headers). Below the mark, one item of
+/// any size is accepted, so a single large frame (up to the 64 KiB
+/// interleaved data limit) never waits forever. RTSP requests are always
+/// accepted, so the buffer may exceed this briefly.
+const WRITE_HIGH_WATER: usize = 4 * 1024;
+
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
     stream: TcpStream,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
-    /// Write buffer for outgoing messages (appended then flushed).
+
+    /// Write buffer for outgoing messages, appended to by `start_send` and
+    /// [`Connection::queue_data`] and drained by `poll_flush`.
     write_buf: Vec<u8>,
+
+    /// Total bytes written to `stream` since the connection was established.
+    ///
+    /// Together with `write_buf.len()`, this tells whether a particular
+    /// message (such as a keepalive request) has been written, even while
+    /// later messages remain buffered. See [`Connection::queued_end`].
+    written: u64,
+
+    /// Set once a write fails, to the kind of the error.
+    ///
+    /// `write_buf` is then cleared and all later writes fail: the remainder of
+    /// a partly written message would corrupt the framing of anything sent
+    /// after it.
+    write_failed: Option<std::io::ErrorKind>,
+
+    /// Tasks waiting for `write_buf` to drain, other than the one tokio will
+    /// wake on writability.
+    ///
+    /// The session's `Stream` impl (flushing keepalives) and its `Sink` impl
+    /// (flushing backchannel media) may be polled from different tasks, e.g.
+    /// after `StreamExt::split`. The `TcpStream` remembers only the most
+    /// recent task to see `Poll::Pending` on write, so whichever task finally
+    /// drains the buffer wakes the others.
+    write_waiters: Vec<std::task::Waker>,
 }
 
 impl Connection {
@@ -64,6 +102,9 @@ impl Connection {
                 .build(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
             write_buf: Vec::new(),
+            written: 0,
+            write_failed: None,
+            write_waiters: Vec::new(),
         })
     }
 
@@ -98,6 +139,111 @@ impl Connection {
             pos: self.parser.stream_pos() + self.read_buf.unparsed_len() as u64,
             received_wall: WallTime::now(),
             received: Instant::now(),
+        }
+    }
+
+    /// Returns the total bytes written so far.
+    ///
+    /// A message has been written once this reaches the value
+    /// [`Connection::queued_end`] returned right after it was queued.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Returns the value [`Connection::written`] will have once everything
+    /// queued so far has been written.
+    pub(crate) fn queued_end(&self) -> u64 {
+        self.written + self.write_buf.len() as u64
+    }
+
+    /// Returns an error to report if an earlier write failed.
+    fn write_failed_error(&self) -> Option<ErrorInt> {
+        self.write_failed.map(|kind| ErrorInt::WriteError {
+            conn_ctx: self.ctx,
+            source: std::io::Error::new(kind, "connection unusable after an earlier write error"),
+        })
+    }
+
+    /// Records that a write failed with `source`, returning the error.
+    ///
+    /// Discards the write buffer, so nothing left over from a partly written
+    /// message is sent later, and makes later writes fail.
+    fn fail_write(&mut self, source: std::io::Error) -> ErrorInt {
+        self.write_failed = Some(source.kind());
+        self.write_buf = Vec::new();
+        self.wake_write_waiters();
+        ErrorInt::WriteError {
+            conn_ctx: self.ctx,
+            source,
+        }
+    }
+
+    /// Appends an RTSP interleaved data message to the write buffer.
+    ///
+    /// `write_body` appends the message body to the supplied buffer. If the
+    /// resulting body exceeds the 16-bit length field ([RFC 2326 section
+    /// 10.12](https://datatracker.ietf.org/doc/html/rfc2326#section-10.12)),
+    /// nothing is queued and this returns an error. If an earlier write
+    /// failed, `write_body` isn't called and this returns an error. The caller
+    /// must eventually call `poll_flush`.
+    pub(crate) fn queue_data(
+        &mut self,
+        channel_id: u8,
+        write_body: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Error> {
+        if let Some(e) = self.write_failed_error() {
+            return Err(wrap!(e));
+        }
+        let start = self.write_buf.len();
+        self.write_buf.extend_from_slice(&[b'$', channel_id, 0, 0]);
+        write_body(&mut self.write_buf);
+        let body_len = self.write_buf.len() - start - 4;
+        let Ok(body_len) = u16::try_from(body_len) else {
+            self.write_buf.truncate(start);
+            return Err(wrap!(ErrorInt::Internal(
+                format!(
+                    "interleaved data body of {body_len} bytes exceeds the maximum of {}",
+                    u16::MAX
+                )
+                .into(),
+            )));
+        };
+        self.write_buf[start + 2..start + 4].copy_from_slice(&body_len.to_be_bytes());
+        Ok(())
+    }
+
+    /// Returns `Poll::Ready` when the write buffer is below the high-water
+    /// mark, flushing as necessary.
+    pub(crate) fn poll_write_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ErrorInt>> {
+        if let Some(e) = self.write_failed_error() {
+            return std::task::Poll::Ready(Err(e));
+        }
+        if self.write_buf.len() < WRITE_HIGH_WATER {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match std::pin::Pin::new(&mut *self).poll_flush(cx) {
+            std::task::Poll::Pending if self.write_buf.len() >= WRITE_HIGH_WATER => {
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            _ => std::task::Poll::Ready(Ok(())),
+        }
+    }
+
+    /// Notes that the current task is waiting for the write buffer to drain.
+    fn add_write_waiter(&mut self, cx: &std::task::Context<'_>) {
+        if !self.write_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            self.write_waiters.push(cx.waker().clone());
+        }
+    }
+
+    /// Wakes all tasks waiting for the write buffer to drain.
+    fn wake_write_waiters(&mut self) {
+        for w in self.write_waiters.drain(..) {
+            w.wake();
         }
     }
 }
@@ -292,6 +438,15 @@ fn codec_err_to_error(
     })
 }
 
+/// `Sink` impl for RTSP messages.
+///
+/// `poll_ready` is always ready: `start_send` appends to an unbounded write
+/// buffer, after anything queued earlier, so internal callers may send a small
+/// RTSP request without waiting for readiness. Bulk data goes through
+/// [`Connection::queue_data`] and [`Connection::poll_write_ready`] instead.
+///
+/// Once a write fails, the connection is unusable for writing: `start_send`,
+/// `poll_flush`, and `poll_close` return errors without writing anything more.
 impl Sink<OwnedMessage> for Connection {
     type Error = ErrorInt;
 
@@ -311,6 +466,9 @@ impl Sink<OwnedMessage> for Connection {
         mut self: std::pin::Pin<&mut Self>,
         item: OwnedMessage,
     ) -> Result<(), Self::Error> {
+        if let Some(e) = self.write_failed_error() {
+            return Err(e);
+        }
         item.write(&mut self.write_buf)
             .expect("Vec Writer is infallible");
         Ok(())
@@ -321,26 +479,40 @@ impl Sink<OwnedMessage> for Connection {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
         let this = &mut *self;
-        while !this.write_buf.is_empty() {
-            match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf) {
+        if let Some(e) = this.write_failed_error() {
+            return std::task::Poll::Ready(Err(e));
+        }
+
+        // Bytes written by this call. They're removed from the front of
+        // `write_buf` once, on return, rather than after each partial write,
+        // which would move the rest of a large buffer every time.
+        let mut written = 0;
+        while written < this.write_buf.len() {
+            match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf[written..]) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(
+                        this.fail_write(std::io::ErrorKind::WriteZero.into())
+                    ));
+                }
                 std::task::Poll::Ready(Ok(n)) => {
-                    this.write_buf.drain(..n);
+                    written += n;
+                    this.written += n as u64;
                 }
                 std::task::Poll::Ready(Err(e)) => {
-                    return std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                        conn_ctx: this.ctx,
-                        source: e,
-                    }));
+                    return std::task::Poll::Ready(Err(this.fail_write(e)));
                 }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Pending => {
+                    this.write_buf.drain(..written);
+                    this.add_write_waiter(cx);
+                    return std::task::Poll::Pending;
+                }
             }
         }
+        this.write_buf.clear();
+        this.wake_write_waiters();
         match std::pin::Pin::new(&mut this.stream).poll_flush(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                conn_ctx: this.ctx,
-                source: e,
-            })),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(this.fail_write(e))),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -356,10 +528,7 @@ impl Sink<OwnedMessage> for Connection {
         let this = &mut *self;
         match std::pin::Pin::new(&mut this.stream).poll_shutdown(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                conn_ctx: this.ctx,
-                source: e,
-            })),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(this.fail_write(e))),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -464,6 +633,116 @@ mod tests {
             }
             o => panic!("expected data, got {o:#?}"),
         }
+    }
+
+    /// `queue_data` frames interleaved data and rejects bodies that don't fit
+    /// the 16-bit length without queueing anything.
+    #[tokio::test]
+    async fn queue_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut conn = Connection::from_stream(client, usize::MAX).unwrap();
+        conn.queue_data(3, |out| out.extend_from_slice(b"abc"))
+            .unwrap();
+        let e = conn
+            .queue_data(4, |out| out.resize(out.len() + 65_536, 0))
+            .unwrap_err();
+        assert!(e.to_string().contains("65536 bytes"), "{e}");
+        conn.queue_data(5, |out| out.resize(out.len() + 65_535, 1))
+            .unwrap();
+        assert_eq!(&conn.write_buf[..11], b"$\x03\x00\x03abc$\x05\xff\xff");
+        assert_eq!(conn.write_buf.len(), 7 + 4 + 65_535);
+    }
+
+    /// `written` counts bytes as they go out, and `queued_end` marks where
+    /// the messages queued so far end.
+    #[tokio::test]
+    async fn written_and_queued_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut conn = Connection::from_stream(client, usize::MAX).unwrap();
+        assert_eq!((conn.written(), conn.queued_end()), (0, 0));
+        conn.queue_data(0, |out| out.extend_from_slice(b"abc"))
+            .unwrap();
+        assert_eq!((conn.written(), conn.queued_end()), (0, 7));
+        futures::SinkExt::<OwnedMessage>::flush(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!((conn.written(), conn.queued_end()), (7, 7));
+        conn.queue_data(1, |out| out.extend_from_slice(b"de"))
+            .unwrap();
+        assert_eq!((conn.written(), conn.queued_end()), (7, 13));
+    }
+
+    /// Once a write fails, the rest of the buffer is discarded and later
+    /// writes fail without sending anything, so the remainder of a partly
+    /// written message can't corrupt a later request's framing (such as the
+    /// `TEARDOWN` attempted when the session is dropped).
+    #[tokio::test]
+    async fn write_error_discards_buffer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        drop(server);
+        let mut conn = Connection::from_stream(client, usize::MAX).unwrap();
+
+        // Writes to the closed peer fail once its reset arrives.
+        let kind = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                conn.queue_data(0, |out| out.resize(out.len() + 1024, 0))
+                    .unwrap();
+                match futures::SinkExt::<OwnedMessage>::flush(&mut conn).await {
+                    Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                    Err(ErrorInt::WriteError { source, .. }) => break source.kind(),
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(conn.write_buf.is_empty());
+        let written = conn.written();
+
+        let check = |r: Result<(), Error>| match r.as_ref().map_err(|e| &*e.0) {
+            Err(ErrorInt::WriteError { source, .. }) => {
+                assert_eq!(source.kind(), kind);
+                assert!(
+                    source.to_string().contains("earlier write error"),
+                    "{source}"
+                );
+            }
+            o => panic!("expected write error, got {o:?}"),
+        };
+        check(conn.queue_data(0, |_| panic!("body shouldn't be written")));
+        check(
+            futures::SinkExt::<OwnedMessage>::send(
+                &mut conn,
+                OwnedMessage::Data {
+                    channel_id: 0,
+                    body: bytes::Bytes::from_static(b"x"),
+                },
+            )
+            .await
+            .map_err(|e| wrap!(e)),
+        );
+        check(
+            futures::SinkExt::<OwnedMessage>::flush(&mut conn)
+                .await
+                .map_err(|e| wrap!(e)),
+        );
+        check(
+            std::future::poll_fn(|cx| conn.poll_write_ready(cx))
+                .await
+                .map_err(|e| wrap!(e)),
+        );
+        assert!(conn.write_buf.is_empty());
+        assert_eq!(conn.written(), written);
     }
 
     #[test]
