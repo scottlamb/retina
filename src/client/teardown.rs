@@ -90,7 +90,7 @@ pub(super) async fn teardown_loop_forever(
             request_uri: Some(url.clone()),
             headers: [(
                 msg::HeaderName::SESSION,
-                msg::HeaderValue::try_from(session_id.to_string()).unwrap(),
+                msg::HeaderValue::try_from(session_id).expect("invalid session id"),
             )]
             .into(),
         },

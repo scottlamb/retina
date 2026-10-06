@@ -488,6 +488,8 @@ pub(crate) fn parse_describe(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionHeader {
+    /// The session id, trimmed and valid as a header value; see
+    /// [`parse_session_id`].
     pub(crate) id: Box<str>,
     pub(crate) timeout_sec: u32,
 }
@@ -519,6 +521,21 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
     Err(())
 }
 
+/// Parses the id part of a `Session` header, which later requests send back.
+///
+/// RFC 2326 section 12.37 has `session-id = 1*( ALPHA | DIGIT | safe )`.
+/// Tolerate surrounding whitespace (`Session: 1 ;timeout=60`), but reject an
+/// id that can't be sent back as a header value, such as an empty one.
+fn parse_session_id(id: &str, session_str: &str) -> Result<Box<str>, String> {
+    let id = id.trim();
+    if crate::rtsp::msg::HeaderValue::try_from(id).is_err() {
+        return Err(format!(
+            "Empty or invalid session id in Session header {session_str:?}"
+        ));
+    }
+    Ok(id.into())
+}
+
 /// Parses a `SETUP` response.
 /// `session_id` is checked for assignment or reassignment.
 /// Returns an assigned interleaved channel id (implying the next channel id
@@ -532,7 +549,7 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let session_str: &str = session;
     let session = match session_str.split_once(';') {
         None => SessionHeader {
-            id: session_str.into(),
+            id: parse_session_id(session_str, session_str)?,
             timeout_sec: 60, // default
         },
         Some((id, timeout_str)) => {
@@ -548,7 +565,7 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
                     ));
                 }
                 SessionHeader {
-                    id: id.into(),
+                    id: parse_session_id(id, session_str)?,
                     timeout_sec,
                 }
             } else {
@@ -1732,6 +1749,50 @@ mod tests {
                 server_port: Some(49152),
             }
         );
+    }
+
+    /// A `Session` header with a space before the `;`. Trim it, so the id can
+    /// be sent back as a header value. Sending `"1 "` used to panic at `PLAY`.
+    #[test]
+    fn setup_session_id_trailing_space() {
+        init_logging();
+        let setup_response = response(
+            b"RTSP/1.0 200 OK\r\n\
+              CSeq: 2\r\n\
+              Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+              Session: 1 ;timeout=60\r\n\r\n",
+        );
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r.session,
+            SessionHeader {
+                id: "1".into(),
+                timeout_sec: 60,
+            }
+        );
+    }
+
+    /// An empty session id can't be sent back as a header value; reject it.
+    #[test]
+    fn setup_empty_session_id() {
+        init_logging();
+        let setup_response = response(
+            b"RTSP/1.0 200 OK\r\n\
+              CSeq: 2\r\n\
+              Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+              Session: ;timeout=60\r\n\r\n",
+        );
+        let e = parse_setup(&setup_response.0).unwrap_err();
+        assert!(e.contains("invalid session id"), "{e}");
+    }
+
+    /// The RTSP parser already rejects control bytes in header values, but
+    /// check that a session id holding one is refused rather than stored.
+    #[test]
+    fn session_id_control_byte() {
+        let e = parse_session_id("1\x012", "1\x012;timeout=60").unwrap_err();
+        assert!(e.contains("invalid session id"), "{e}");
+        assert_eq!(&*parse_session_id(" a b\t", " a b\t").unwrap(), "a b");
     }
 
     /// Tests parsing a DESCRIBE response from an Anjvision camera whose

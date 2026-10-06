@@ -1608,7 +1608,7 @@ impl Session<Described> {
         if let &mut Some(ref s) = inner.session {
             headers.insert(
                 msg::HeaderName::SESSION,
-                msg::HeaderValue::try_from(s.id.to_string()).unwrap(),
+                msg::HeaderValue::try_from(&*s.id).expect("invalid session id"),
             );
         }
         let mut req = OwnedMessage::Request {
@@ -1798,7 +1798,8 @@ impl Session<Described> {
                         headers: [
                             (
                                 msg::HeaderName::SESSION,
-                                msg::HeaderValue::try_from(&*session.id).unwrap(),
+                                msg::HeaderValue::try_from(&*session.id)
+                                    .expect("invalid session id"),
                             ),
                             (
                                 msg::HeaderName::RANGE,
@@ -2180,7 +2181,7 @@ impl Session<Playing> {
                 request_uri: Some(inner.presentation.base_url.clone()),
                 headers: [(
                     msg::HeaderName::SESSION,
-                    msg::HeaderValue::try_from(session.id.to_string()).unwrap(),
+                    msg::HeaderValue::try_from(&*session.id).expect("invalid session id"),
                 )]
                 .into(),
             },
@@ -3529,6 +3530,63 @@ mod tests {
             .await
         },);
         let _session = session.unwrap();
+    }
+
+    /// A camera that sends `Session: 1 ;timeout=60`. The id is trimmed and
+    /// sent back in `PLAY`, which used to panic on the invalid header value.
+    #[tokio::test]
+    async fn session_id_trailing_space() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default(), url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(
+                    b"RTSP/1.0 200 OK\r\n\
+                      CSeq: 2\r\n\
+                      Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+                      Session: 1 ;timeout=60\r\n\r\n"
+                )
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(session.play(PlayOptions::default()), async {
+            let msg = server.next().await.unwrap().unwrap();
+            let msg::Message::Request(r) = msg.msg else {
+                panic!()
+            };
+            assert_eq!(r.method, msg::Method::PLAY);
+            assert_eq!(r.headers.get("Session").map(|v| &**v), Some("1"));
+            let (mut resp, body) = response(b"RTSP/1.0 200 OK\r\nSession: 1\r\n\r\n");
+            resp.headers.insert(
+                msg::HeaderName::CSEQ,
+                r.headers.get("CSeq").unwrap().clone(),
+            );
+            server
+                .send(OwnedMessage::Response { head: resp, body })
+                .await
+                .unwrap();
+        });
+        session.unwrap();
     }
 
     #[tokio::test]
