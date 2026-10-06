@@ -58,6 +58,15 @@ impl Connection {
         })
     }
 
+    /// Limits the size of RTSP requests and responses read from this
+    /// connection. Must be called before reading.
+    pub(crate) fn set_max_message_size(&mut self, max_message_size: usize) {
+        debug_assert_eq!(self.parser.stream_pos(), 0);
+        self.parser = crate::rtsp::parse::Parser::builder()
+            .max_message_size(max_message_size)
+            .build();
+    }
+
     pub(crate) fn ctx(&self) -> &ConnectionContext {
         &self.ctx
     }

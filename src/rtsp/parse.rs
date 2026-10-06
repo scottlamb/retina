@@ -142,6 +142,17 @@ fn invalid_err<E: std::error::Error + Send + Sync + 'static>(
     })
 }
 
+fn too_large(size: u64, max_message_size: usize) -> FeedError {
+    FeedError::Invalid(Invalid {
+        pos: 0,
+        context: vec!["message-too-large"],
+        source: Some(
+            format!("message of at least {size} bytes exceeds max_message_size {max_message_size}")
+                .into(),
+        ),
+    })
+}
+
 fn incomplete() -> FeedError {
     FeedError::Incomplete(Incomplete::default())
 }
@@ -154,8 +165,12 @@ pub struct ParserBuilder {
 impl ParserBuilder {
     /// Sets the maximum total message size in bytes (head + body combined).
     ///
-    /// Messages exceeding this limit are rejected with [`FeedError::Invalid`].
-    /// Defaults to [`usize::MAX`] (no limit).
+    /// Requests and responses exceeding this limit are rejected with
+    /// [`FeedError::Invalid`]: as soon as their head exceeds it (so a head
+    /// which never ends doesn't make the caller buffer without bound), or as
+    /// soon as the head is complete if its `Content-Length` would exceed it.
+    /// Interleaved data messages are exempt; their 16-bit length already
+    /// bounds them. Defaults to [`usize::MAX`] (no limit).
     pub fn max_message_size(mut self, n: usize) -> Self {
         self.max_message_size = n;
         self
@@ -206,6 +221,20 @@ impl Parser {
         self.stream_pos
     }
 
+    /// Returns an error if a request or response of at least `size` bytes
+    /// exceeds the configured maximum.
+    fn check_size(&self, msg: &Message, size: u64) -> Result<(), FeedError> {
+        if size <= self.max_message_size as u64 {
+            return Ok(());
+        }
+        let context = match msg {
+            Message::Request(_) => "request",
+            Message::Response(_) => "response",
+            Message::Data(_) => unreachable!(),
+        };
+        Err(too_large(size, self.max_message_size).context(context))
+    }
+
     /// Parses the next message from `input`.
     ///
     /// Returns `Ok(Some(...))` when a complete message has been parsed.
@@ -244,13 +273,17 @@ impl Parser {
                             self.state = ParserState::Body(Message::Data(data), body_len);
                         }
                         Ok(Some(msg)) => {
-                            self.state = ParserState::Head {
-                                msg,
-                                head_bytes: before - input.len(),
-                            };
+                            let head_bytes = before - input.len();
+                            self.check_size(&msg, head_bytes as u64)?;
+                            self.state = ParserState::Head { msg, head_bytes };
                         }
-                        Err(FeedError::Incomplete(_)) => {
+                        Err(FeedError::Incomplete(inc)) => {
                             *input = checkpoint;
+                            if before > self.max_message_size {
+                                // The first line alone is already too long.
+                                let e = too_large(before as u64, self.max_message_size);
+                                return Err(inc.context.into_iter().fold(e, FeedError::context));
+                            }
                             return Err(incomplete());
                         }
                         Err(e) => return Err(e),
@@ -270,6 +303,7 @@ impl Parser {
                     match parse_header_line(input) {
                         Ok(Some((name, value))) => {
                             head_bytes += before - input.len();
+                            self.check_size(&msg, head_bytes as u64)?;
                             match &mut msg {
                                 Message::Request(req) => req.headers.append(name, value),
                                 Message::Response(resp) => resp.headers.append(name, value),
@@ -286,14 +320,13 @@ impl Parser {
                             };
                             let body_len =
                                 content_length(headers).map_err(|e| e.context(context))?;
-                            let total = (head_bytes as u64).saturating_add(body_len);
-                            if total > self.max_message_size as u64 {
-                                return Err(invalid("message-too-large").context(context));
-                            }
+                            self.check_size(&msg, (head_bytes as u64).saturating_add(body_len))?;
                             self.state = ParserState::Body(msg, body_len as usize);
                         }
                         Err(FeedError::Incomplete(_)) => {
                             *input = checkpoint;
+                            // A header line which never ends.
+                            self.check_size(&msg, (head_bytes + before) as u64)?;
                             self.state = ParserState::Head { msg, head_bytes };
                             return Err(incomplete());
                         }
@@ -818,6 +851,91 @@ pub(crate) mod tests {
             panic!("expected Invalid, got {err:?}");
         };
         assert_eq!(inv.context, ["message-too-large", "request"]);
+    }
+
+    /// Feeds `data` to a parser limited to 1 KiB and expects `message-too-large`.
+    fn expect_too_large(data: &[u8]) -> Invalid {
+        let mut input = Split::new(data, &[]);
+        let err = Parser::builder()
+            .max_message_size(1024)
+            .build()
+            .feed(&mut input)
+            .unwrap_err();
+        let FeedError::Invalid(inv) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert_eq!(inv.context, ["message-too-large", "response"]);
+        inv
+    }
+
+    #[test]
+    fn max_message_size_unterminated_header_line() {
+        // A header line that never ends must not be buffered without bound
+        // while waiting for its CRLF.
+        let mut data = b"RTSP/1.0 200 OK\r\nX-Junk: ".to_vec();
+        data.resize(2048, b'a');
+        let inv = expect_too_large(&data);
+        assert_eq!(inv.pos, 17, "should point at the unfinished header line");
+    }
+
+    #[test]
+    fn max_message_size_unterminated_status_line() {
+        let mut data = b"RTSP/1.0 200 ".to_vec();
+        data.resize(2048, b'a');
+        let mut input = Split::new(&data, &[]);
+        let err = Parser::builder()
+            .max_message_size(1024)
+            .build()
+            .feed(&mut input)
+            .unwrap_err();
+        let FeedError::Invalid(ref inv) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert_eq!(inv.pos, 0);
+        assert_eq!(inv.context.first(), Some(&"message-too-large"));
+        assert_eq!(inv.context.last(), Some(&"status-line"));
+        assert!(
+            err.to_string()
+                .ends_with("message of at least 2048 bytes exceeds max_message_size 1024"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn max_message_size_endless_headers() {
+        // Complete header lines that never reach the blank line must not
+        // accumulate without bound either.
+        let mut data = b"RTSP/1.0 200 OK\r\n".to_vec();
+        for i in 0..100 {
+            data.extend_from_slice(format!("X-Junk-{i}: aaaaaaaaaaaaaaaa\r\n").as_bytes());
+        }
+        expect_too_large(&data);
+    }
+
+    #[test]
+    fn max_message_size_checks_content_length_up_front() {
+        // The body's declared length is rejected as soon as the head is
+        // parsed, before any of the body is received.
+        let data = b"RTSP/1.0 200 OK\r\nContent-Length: 1000000\r\n\r\n";
+        let inv = expect_too_large(data);
+        assert_eq!(inv.pos, data.len() as u64);
+    }
+
+    #[test]
+    fn max_message_size_ignores_interleaved_data() {
+        // Interleaved data is bounded by its 16-bit length, so the limit
+        // doesn't apply to it.
+        let mut data = vec![b'$', 0, 0xff, 0xff];
+        data.resize(4 + 0xffff, 0);
+        let mut input = Split::new(&data, &[]);
+        let (msg, body) = Parser::builder()
+            .max_message_size(1024)
+            .build()
+            .feed(&mut input)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, Message::Data(_)));
+        assert_eq!(body.len(), 0xffff);
     }
 
     #[test]
