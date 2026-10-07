@@ -32,16 +32,23 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) async fn connect(host: Host<&str>, port: u16) -> Result<Self, std::io::Error> {
+    pub(crate) async fn connect(
+        host: Host<&str>,
+        port: u16,
+        max_message_size: usize,
+    ) -> Result<Self, std::io::Error> {
         let stream = match host {
             Host::Domain(h) => TcpStream::connect((h, port)).await,
             Host::Ipv4(h) => TcpStream::connect((h, port)).await,
             Host::Ipv6(h) => TcpStream::connect((h, port)).await,
         }?;
-        Self::from_stream(stream)
+        Self::from_stream(stream, max_message_size)
     }
 
-    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
+    pub(crate) fn from_stream(
+        stream: TcpStream,
+        max_message_size: usize,
+    ) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
@@ -52,19 +59,12 @@ impl Connection {
                 peer_addr,
                 established_wall,
             },
-            parser: crate::rtsp::parse::Parser::default(),
+            parser: crate::rtsp::parse::Parser::builder()
+                .max_message_size(max_message_size)
+                .build(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
             write_buf: Vec::new(),
         })
-    }
-
-    /// Limits the size of RTSP requests and responses read from this
-    /// connection. Must be called before reading.
-    pub(crate) fn set_max_message_size(&mut self, max_message_size: usize) {
-        debug_assert_eq!(self.parser.stream_pos(), 0);
-        self.parser = crate::rtsp::parse::Parser::builder()
-            .max_message_size(max_message_size)
-            .build();
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {

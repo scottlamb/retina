@@ -145,7 +145,7 @@ fn invalid_err<E: std::error::Error + Send + Sync + 'static>(
 fn too_large(size: u64, max_message_size: usize) -> FeedError {
     FeedError::Invalid(Invalid {
         pos: 0,
-        context: vec!["message-too-large"],
+        context: Vec::new(),
         source: Some(
             format!("message of at least {size} bytes exceeds max_message_size {max_message_size}")
                 .into(),
@@ -850,10 +850,10 @@ pub(crate) mod tests {
         let FeedError::Invalid(ref inv) = err else {
             panic!("expected Invalid, got {err:?}");
         };
-        assert_eq!(inv.context, ["message-too-large", "request"]);
+        assert_eq!(inv.context, ["request"]);
     }
 
-    /// Feeds `data` to a parser limited to 1 KiB and expects `message-too-large`.
+    /// Feeds `data` to a parser limited to 1 KiB and expects it to be too large.
     fn expect_too_large(data: &[u8]) -> Invalid {
         let mut input = Split::new(data, &[]);
         let err = Parser::builder()
@@ -864,7 +864,7 @@ pub(crate) mod tests {
         let FeedError::Invalid(inv) = err else {
             panic!("expected Invalid, got {err:?}");
         };
-        assert_eq!(inv.context, ["message-too-large", "response"]);
+        assert_eq!(inv.context, ["response"]);
         inv
     }
 
@@ -892,7 +892,6 @@ pub(crate) mod tests {
             panic!("expected Invalid, got {err:?}");
         };
         assert_eq!(inv.pos, 0);
-        assert_eq!(inv.context.first(), Some(&"message-too-large"));
         assert_eq!(inv.context.last(), Some(&"status-line"));
         assert!(
             err.to_string()

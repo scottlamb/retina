@@ -669,8 +669,8 @@ impl SessionOptions {
     /// A larger message fails the session with an RTSP framing error rather
     /// than being buffered in full. The limit is checked as the head arrives
     /// and against its `Content-Length` before the body is read. It doesn't
-    /// apply to interleaved data messages, which are inherently limited to
-    /// 64 KiB.
+    /// apply to interleaved data messages, which are inherently limited to a
+    /// 4-byte head and a body under 64 KiB.
     ///
     /// There's no limit by default. Real servers' responses are small; a
     /// `DESCRIBE` response is typically a few KiB.
@@ -1188,10 +1188,9 @@ impl RtspConnection {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let mut inner = crate::tokio::Connection::connect(host, port)
+        let inner = crate::tokio::Connection::connect(host, port, options.get_max_message_size())
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-        inner.set_max_message_size(options.get_max_message_size());
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -3106,8 +3105,8 @@ mod tests {
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
         let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client).unwrap();
-        let server = crate::tokio::Connection::from_stream(server).unwrap();
+        let client = crate::tokio::Connection::from_stream(client, usize::MAX).unwrap();
+        let server = crate::tokio::Connection::from_stream(server, usize::MAX).unwrap();
         let client = RtspConnection {
             inner: client,
             channels: ChannelMappings::default(),
@@ -3638,8 +3637,8 @@ mod tests {
     ) -> Result<Session<Described>, Error> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let (client, mut server) = socketpair().await;
-        let mut inner = crate::tokio::Connection::from_stream(client).unwrap();
-        inner.set_max_message_size(options.get_max_message_size()); // as in `RtspConnection::connect`.
+        let inner =
+            crate::tokio::Connection::from_stream(client, options.get_max_message_size()).unwrap();
         let conn = RtspConnection {
             inner,
             channels: ChannelMappings::default(),
@@ -3675,7 +3674,7 @@ mod tests {
             matches!(*e.0, ErrorInt::RtspFramingError { .. }),
             "expected framing error, got {e}"
         );
-        assert!(e.to_string().contains("message-too-large"), "{e}");
+        assert!(e.to_string().contains("exceeds max_message_size"), "{e}");
     }
 
     /// Appends header lines to `resp` until it's at least 2 MiB.
