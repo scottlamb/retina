@@ -20,7 +20,7 @@ pub(super) async fn background_teardown(
     seqnum: Option<u64>,
     base_url: Url,
     tool: Option<Tool>,
-    session_id: Box<str>,
+    session_id: msg::HeaderValue,
     just_try_once: bool,
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
@@ -77,7 +77,7 @@ pub(super) async fn background_teardown(
 pub(super) async fn teardown_loop_forever(
     url: Url,
     tool: Option<Tool>,
-    session_id: &str,
+    session_id: &msg::HeaderValue,
     just_try_once: bool,
     options: &SessionOptions,
     mut requested_auth: Option<http_auth::PasswordClient>,
@@ -88,11 +88,7 @@ pub(super) async fn teardown_loop_forever(
         head: msg::Request {
             method: msg::Method::TEARDOWN,
             request_uri: Some(url.clone()),
-            headers: [(
-                msg::HeaderName::SESSION,
-                msg::HeaderValue::try_from(session_id).expect("invalid session id"),
-            )]
-            .into(),
+            headers: [(msg::HeaderName::SESSION, session_id.clone())].into(),
         },
         body: Bytes::new(),
     };
