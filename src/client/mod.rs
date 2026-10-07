@@ -1606,10 +1606,7 @@ impl Session<Described> {
             }
         };
         if let &mut Some(ref s) = inner.session {
-            headers.insert(
-                msg::HeaderName::SESSION,
-                msg::HeaderValue::try_from(&*s.id).expect("invalid session id"),
-            );
+            headers.insert(msg::HeaderName::SESSION, s.id.clone());
         }
         let mut req = OwnedMessage::Request {
             head: msg::Request {
@@ -1642,7 +1639,7 @@ impl Session<Described> {
             })
         })?;
         match inner.session.as_ref() {
-            Some(SessionHeader { id, .. }) if id.as_ref() != &*response.session.id => {
+            Some(SessionHeader { id, .. }) if *id != response.session.id => {
                 match inner.options.session_id {
                     SessionIdPolicy::UseFirst => (),
                     _ => {
@@ -1796,11 +1793,7 @@ impl Session<Described> {
                         method: msg::Method::PLAY,
                         request_uri: Some(inner.presentation.control.clone()),
                         headers: [
-                            (
-                                msg::HeaderName::SESSION,
-                                msg::HeaderValue::try_from(&*session.id)
-                                    .expect("invalid session id"),
-                            ),
+                            (msg::HeaderName::SESSION, session.id.clone()),
                             (
                                 msg::HeaderName::RANGE,
                                 msg::HeaderValue::try_from("npt=0.000-").unwrap(),
@@ -2179,11 +2172,7 @@ impl Session<Playing> {
             head: msg::Request {
                 method: method.into(),
                 request_uri: Some(inner.presentation.base_url.clone()),
-                headers: [(
-                    msg::HeaderName::SESSION,
-                    msg::HeaderValue::try_from(&*session.id).expect("invalid session id"),
-                )]
-                .into(),
+                headers: [(msg::HeaderName::SESSION, session.id.clone())].into(),
             },
             body: Bytes::new(),
         };

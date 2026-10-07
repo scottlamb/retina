@@ -488,9 +488,9 @@ pub(crate) fn parse_describe(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionHeader {
-    /// The session id, trimmed and valid as a header value; see
-    /// [`parse_session_id`].
-    pub(crate) id: Box<str>,
+    /// The session id, trimmed; see [`parse_session_id`]. Kept as a header
+    /// value so later requests can send it back without revalidating.
+    pub(crate) id: crate::rtsp::msg::HeaderValue,
     pub(crate) timeout_sec: u32,
 }
 
@@ -526,14 +526,9 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
 /// RFC 2326 section 12.37 has `session-id = 1*( ALPHA | DIGIT | safe )`.
 /// Tolerate surrounding whitespace (`Session: 1 ;timeout=60`), but reject an
 /// id that can't be sent back as a header value, such as an empty one.
-fn parse_session_id(id: &str, session_str: &str) -> Result<Box<str>, String> {
-    let id = id.trim();
-    if crate::rtsp::msg::HeaderValue::try_from(id).is_err() {
-        return Err(format!(
-            "Empty or invalid session id in Session header {session_str:?}"
-        ));
-    }
-    Ok(id.into())
+fn parse_session_id(id: &str, session_str: &str) -> Result<crate::rtsp::msg::HeaderValue, String> {
+    crate::rtsp::msg::HeaderValue::try_from(id.trim())
+        .map_err(|_| format!("Empty or invalid session id in Session header {session_str:?}"))
 }
 
 /// Parses a `SETUP` response.
@@ -945,7 +940,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "634214675641".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("634214675641").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1059,7 +1054,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "708345999".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("708345999").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1147,7 +1142,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "F8F8E425".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("F8F8E425").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1233,7 +1228,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "1642021126".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("1642021126").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1452,7 +1447,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9a90de54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9a90de54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1465,7 +1460,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9a90de54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9a90de54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1530,7 +1525,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9b0d0e54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9b0d0e54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1655,7 +1650,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "708886412".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("708886412").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
@@ -1677,7 +1672,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "5657612475258969210".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("5657612475258969210").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
@@ -1701,7 +1696,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "1066441024".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("1066441024").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
@@ -1721,7 +1716,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "12345678".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("12345678").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
@@ -1741,7 +1736,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "12345678".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("12345678").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: None,
@@ -1766,7 +1761,7 @@ mod tests {
         assert_eq!(
             r.session,
             SessionHeader {
-                id: "1".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("1").unwrap(),
                 timeout_sec: 60,
             }
         );
