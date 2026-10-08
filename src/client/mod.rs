@@ -479,6 +479,7 @@ pub struct SessionOptions {
     teardown: TeardownPolicy,
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
+    max_message_size: Option<usize>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -660,6 +661,26 @@ impl SessionOptions {
     pub fn session_id(mut self, policy: SessionIdPolicy) -> Self {
         self.session_id = policy;
         self
+    }
+
+    /// Limits the size in bytes (head and body combined) of each RTSP
+    /// response (or request) read from the server.
+    ///
+    /// A larger message fails the session with an RTSP framing error rather
+    /// than being buffered in full. The limit is checked as the head arrives
+    /// and against its `Content-Length` before the body is read. It doesn't
+    /// apply to interleaved data messages, which are inherently limited to a
+    /// 4-byte head and a body under 64 KiB.
+    ///
+    /// There's no limit by default. Real servers' responses are small; a
+    /// `DESCRIBE` response is typically a few KiB.
+    pub fn max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = Some(max_message_size);
+        self
+    }
+
+    fn get_max_message_size(&self) -> usize {
+        self.max_message_size.unwrap_or(usize::MAX)
     }
 }
 
@@ -976,8 +997,10 @@ enum StreamState {
 struct StreamStateInit {
     /// The RTP synchronization source (SSRC), as defined in
     /// [RFC 3550](https://tools.ietf.org/html/rfc3550). This is normally
-    /// supplied in the `SETUP` response's `Transport` header. Reolink cameras
-    /// instead supply it in the `PLAY` response's `RTP-Info` header.
+    /// supplied in the `SETUP` response's `Transport` header; when it is not,
+    /// it is learned from the first packet. Reolink cameras, and some Dahua
+    /// firmware, also write an `ssrc` in the `PLAY` response's `RTP-Info`
+    /// header, which RTSP/1.0 does not define; that one is ignored.
     ssrc: Option<u32>,
 
     /// The initial RTP sequence number, as specified in the `PLAY` response's
@@ -1161,11 +1184,11 @@ enum SessionFlag {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url) -> Result<Self, Error> {
+    async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port)
+        let inner = crate::tokio::Connection::connect(host, port, options.get_max_message_size())
             .await
             .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
@@ -1456,7 +1479,7 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url).await?;
+        let conn = RtspConnection::connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
     }
 
@@ -1604,10 +1627,7 @@ impl Session<Described> {
             }
         };
         if let &mut Some(ref s) = inner.session {
-            headers.insert(
-                msg::HeaderName::SESSION,
-                msg::HeaderValue::try_from(s.id.to_string()).unwrap(),
-            );
+            headers.insert(msg::HeaderName::SESSION, s.id.clone());
         }
         let mut req = OwnedMessage::Request {
             head: msg::Request {
@@ -1640,7 +1660,7 @@ impl Session<Described> {
             })
         })?;
         match inner.session.as_ref() {
-            Some(SessionHeader { id, .. }) if id.as_ref() != &*response.session.id => {
+            Some(SessionHeader { id, .. }) if *id != response.session.id => {
                 match inner.options.session_id {
                     SessionIdPolicy::UseFirst => (),
                     _ => {
@@ -1794,10 +1814,7 @@ impl Session<Described> {
                         method: msg::Method::PLAY,
                         request_uri: Some(inner.presentation.control.clone()),
                         headers: [
-                            (
-                                msg::HeaderName::SESSION,
-                                msg::HeaderValue::try_from(&*session.id).unwrap(),
-                            ),
+                            (msg::HeaderName::SESSION, session.id.clone()),
                             (
                                 msg::HeaderName::RANGE,
                                 msg::HeaderValue::try_from("npt=0.000-").unwrap(),
@@ -2156,12 +2173,19 @@ impl Session<Playing> {
         // and some servers (e.g. rtsp-simple-server as of 2021-08-07) behave badly
         // on receiving unsupported methods. See discussion at
         // <https://github.com/aler9/rtsp-simple-server/issues/1066>. Initially
-        // send `OPTIONS`, then follow recommendations to use (bodyless)
-        // `SET_PARAMETER` or `GET_PARAMETER` if available.
-        let method = if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
-            KeepaliveMethod::SetParameter
-        } else if *inner.flags & (SessionFlag::GetParameterSupported as u8) != 0 {
+        // send `OPTIONS`, then use (bodyless) `GET_PARAMETER` or `SET_PARAMETER`
+        // if available.
+        //
+        // Prefer `GET_PARAMETER` over `SET_PARAMETER`, contrary to the ONVIF
+        // recommendation. Tapo cameras advertise `SET_PARAMETER` but reply to it
+        // with `400 Bad Request` with the previous request's `CSeq`, while handling
+        // `GET_PARAMETER` correctly. ffmpeg also prefers `GET_PARAMETER` (and never
+        // uses `SET_PARAMETER` for keepalives), so this is likely the more
+        // well-tested choice in general.
+        let method = if *inner.flags & (SessionFlag::GetParameterSupported as u8) != 0 {
             KeepaliveMethod::GetParameter
+        } else if *inner.flags & (SessionFlag::SetParameterSupported as u8) != 0 {
+            KeepaliveMethod::SetParameter
         } else {
             KeepaliveMethod::Options
         };
@@ -2169,11 +2193,7 @@ impl Session<Playing> {
             head: msg::Request {
                 method: method.into(),
                 request_uri: Some(inner.presentation.base_url.clone()),
-                headers: [(
-                    msg::HeaderName::SESSION,
-                    msg::HeaderValue::try_from(session.id.to_string()).unwrap(),
-                )]
-                .into(),
+                headers: [(msg::HeaderName::SESSION, session.id.clone())].into(),
             },
             body: Bytes::new(),
         };
@@ -3075,8 +3095,8 @@ mod tests {
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
         let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client).unwrap();
-        let server = crate::tokio::Connection::from_stream(server).unwrap();
+        let client = crate::tokio::Connection::from_stream(client, usize::MAX).unwrap();
+        let server = crate::tokio::Connection::from_stream(server, usize::MAX).unwrap();
         let client = RtspConnection {
             inner: client,
             channels: ChannelMappings::default(),
@@ -3371,6 +3391,101 @@ mod tests {
         );
     }
 
+    /// Tests that a keepalive response with an unexpected `CSeq` is a fatal error.
+    ///
+    /// Tapo cameras reply to `SET_PARAMETER` with the previous request's
+    /// `CSeq`. Retina avoids this by preferring `GET_PARAMETER`, but a mismatched
+    /// response is still an error rather than being guessed to belong to the
+    /// outstanding keepalive.
+    #[tokio::test]
+    async fn keepalive_unexpected_cseq() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default(), url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // Pretend a previous `OPTIONS` advertised both parameter methods, and
+        // make the keepalive fire almost immediately.
+        session.0.flags |=
+            SessionFlag::SetParameterSupported as u8 | SessionFlag::GetParameterSupported as u8;
+        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+
+        tokio::join!(
+            async {
+                match session.next().await {
+                    Some(Err(e)) => {
+                        assert!(
+                            matches!(*e.0, ErrorInt::RtspFramingError { .. }),
+                            "unexpected error: {e}"
+                        );
+                    }
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                let msg = server.next().await.unwrap().unwrap();
+                let req = match msg.msg {
+                    msg::Message::Request(r) => r,
+                    o => panic!("expected keepalive request, got {o:#?}"),
+                };
+                assert_eq!(req.method, msg::Method::GET_PARAMETER);
+                let cseq: u32 = req.headers.get("CSeq").unwrap().parse().unwrap();
+                let mut headers = msg::Headers::default();
+                headers.insert(
+                    msg::HeaderName::CSEQ,
+                    msg::HeaderValue::try_from((cseq - 1).to_string()).unwrap(),
+                );
+                server
+                    .send(OwnedMessage::Response {
+                        head: msg::Response {
+                            status_code: StatusCode::try_from(400u16).unwrap(),
+                            reason_phrase: "Bad Request".to_owned(),
+                            headers,
+                        },
+                        body: Bytes::new(),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+    }
+
     /// Tests ignoring bogus RTP and RTCP messages while waiting for PLAY response.
     #[tokio::test]
     async fn ignore_early_rtp_rtcp() {
@@ -3425,6 +3540,63 @@ mod tests {
             .await
         },);
         let _session = session.unwrap();
+    }
+
+    /// A camera that sends `Session: 1 ;timeout=60`. The id is trimmed and
+    /// sent back in `PLAY`, which used to panic on the invalid header value.
+    #[tokio::test]
+    async fn session_id_trailing_space() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, SessionOptions::default(), url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(
+                    b"RTSP/1.0 200 OK\r\n\
+                      CSeq: 2\r\n\
+                      Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+                      Session: 1 ;timeout=60\r\n\r\n"
+                )
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(session.play(PlayOptions::default()), async {
+            let msg = server.next().await.unwrap().unwrap();
+            let msg::Message::Request(r) = msg.msg else {
+                panic!()
+            };
+            assert_eq!(r.method, msg::Method::PLAY);
+            assert_eq!(r.headers.get("Session").map(|v| &**v), Some("1"));
+            let (mut resp, body) = response(b"RTSP/1.0 200 OK\r\nSession: 1\r\n\r\n");
+            resp.headers.insert(
+                msg::HeaderName::CSEQ,
+                r.headers.get("CSeq").unwrap().clone(),
+            );
+            server
+                .send(OwnedMessage::Response { head: resp, body })
+                .await
+                .unwrap();
+        });
+        session.unwrap();
     }
 
     #[tokio::test]
@@ -3502,6 +3674,131 @@ mod tests {
                 response(include_bytes!("testdata/h264dvr_setup_audio.txt"))
             ),
         );
+    }
+
+    /// Sends `DESCRIBE` to a server which answers with the raw bytes `resp`,
+    /// then holds the connection open.
+    async fn describe_raw(
+        options: SessionOptions,
+        resp: Vec<u8>,
+    ) -> Result<Session<Described>, Error> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (client, mut server) = socketpair().await;
+        let inner =
+            crate::tokio::Connection::from_stream(client, options.get_max_message_size()).unwrap();
+        let conn = RtspConnection {
+            inner,
+            channels: ChannelMappings::default(),
+            next_cseq: 1,
+            seen_unassigned: false,
+        };
+        let url = Url::parse("rtsp://127.0.0.1:554/camera").unwrap();
+        let serve = async move {
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                let mut buf = [0u8; 1024];
+                let n = server.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "client hung up before sending its request");
+                req.extend_from_slice(&buf[..n]);
+            }
+            // The client may hang up partway through; that's fine.
+            let _ = server.write_all(&resp).await;
+            server
+        };
+        let (session, _server) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Session::describe_with_conn(conn, options, url),
+            ),
+            serve,
+        );
+        session.expect("DESCRIBE should finish rather than buffer forever")
+    }
+
+    fn assert_too_large(r: Result<Session<Described>, Error>) {
+        let e = r.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(*e.0, ErrorInt::RtspFramingError { .. }),
+            "expected framing error, got {e}"
+        );
+        assert!(e.to_string().contains("exceeds max_message_size"), "{e}");
+    }
+
+    /// Appends header lines to `resp` until it's at least 2 MiB.
+    fn push_junk_headers(resp: &mut Vec<u8>) {
+        let mut i = 0;
+        while resp.len() < 2 << 20 {
+            resp.extend_from_slice(format!("X-Junk-{i}: {:0>64}\r\n", 0).as_bytes());
+            i += 1;
+        }
+    }
+
+    /// The limit rejects a declared body length up front, without waiting for
+    /// the body.
+    #[tokio::test]
+    async fn describe_rejects_huge_content_length() {
+        init_logging();
+        let resp = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 1000000000\r\n\r\n";
+        let options = SessionOptions::default().max_message_size(64 << 10);
+        assert_too_large(describe_raw(options, resp.to_vec()).await);
+    }
+
+    /// The limit rejects a header block that never ends.
+    #[tokio::test]
+    async fn describe_rejects_endless_headers() {
+        init_logging();
+        let mut resp = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n".to_vec();
+        push_junk_headers(&mut resp);
+        let options = SessionOptions::default().max_message_size(64 << 10);
+        assert_too_large(describe_raw(options, resp).await);
+    }
+
+    /// A response exactly at the limit passes; one byte over fails.
+    #[tokio::test]
+    async fn describe_max_message_size() {
+        init_logging();
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        head.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from("1").unwrap(),
+        );
+        let mut resp = Vec::new();
+        OwnedMessage::Response { head, body }
+            .write(&mut resp)
+            .unwrap();
+        let len = resp.len();
+        let session = describe_raw(
+            SessionOptions::default().max_message_size(len),
+            resp.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.streams().len(), 2);
+        assert_too_large(
+            describe_raw(SessionOptions::default().max_message_size(len - 1), resp).await,
+        );
+    }
+
+    /// By default there's no limit: a 2 MiB response is accepted.
+    #[tokio::test]
+    async fn describe_no_max_message_size_by_default() {
+        init_logging();
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        head.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from("1").unwrap(),
+        );
+        let mut wire = Vec::new();
+        OwnedMessage::Response { head, body }
+            .write(&mut wire)
+            .unwrap();
+        let status_line_len = wire.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        let (status_line, rest) = wire.split_at(status_line_len);
+        let mut resp = status_line.to_vec();
+        push_junk_headers(&mut resp);
+        resp.extend_from_slice(rest);
+        let session = describe_raw(SessionOptions::default(), resp).await.unwrap();
+        assert_eq!(session.streams().len(), 2);
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes

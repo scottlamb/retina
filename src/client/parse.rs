@@ -246,7 +246,7 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         .fmt
         .split_ascii_whitespace()
         .next()
-        .unwrap();
+        .ok_or_else(|| "media description has no format".to_string())?;
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
         .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
     if (rtp_payload_type & 0x80) != 0 {
@@ -488,7 +488,9 @@ pub(crate) fn parse_describe(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionHeader {
-    pub(crate) id: Box<str>,
+    /// The session id, trimmed; see [`parse_session_id`]. Kept as a header
+    /// value so later requests can send it back without revalidating.
+    pub(crate) id: crate::rtsp::msg::HeaderValue,
     pub(crate) timeout_sec: u32,
 }
 
@@ -519,6 +521,16 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
     Err(())
 }
 
+/// Parses the id part of a `Session` header, which later requests send back.
+///
+/// RFC 2326 section 12.37 has `session-id = 1*( ALPHA | DIGIT | safe )`.
+/// Tolerate surrounding whitespace (`Session: 1 ;timeout=60`), but reject an
+/// id that can't be sent back as a header value, such as an empty one.
+fn parse_session_id(id: &str, session_str: &str) -> Result<crate::rtsp::msg::HeaderValue, String> {
+    crate::rtsp::msg::HeaderValue::try_from(id.trim())
+        .map_err(|_| format!("Empty or invalid session id in Session header {session_str:?}"))
+}
+
 /// Parses a `SETUP` response.
 /// `session_id` is checked for assignment or reassignment.
 /// Returns an assigned interleaved channel id (implying the next channel id
@@ -532,7 +544,7 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let session_str: &str = session;
     let session = match session_str.split_once(';') {
         None => SessionHeader {
-            id: session_str.into(),
+            id: parse_session_id(session_str, session_str)?,
             timeout_sec: 60, // default
         },
         Some((id, timeout_str)) => {
@@ -548,7 +560,7 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
                     ));
                 }
                 SessionHeader {
-                    id: id.into(),
+                    id: parse_session_id(id, session_str)?,
                     timeout_sec,
                 }
             } else {
@@ -567,9 +579,20 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let transport_str: &str = transport;
     for part in transport_str.split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
+            // RFC 2326 section 12.39 asks for eight hex digits without a
+            // prefix. Some cameras send a 16-bit value instead: Rubetek sends
+            // `ssrc=0x6f7c`, and another camera sends `ssrc=A046` while its
+            // RTP packets carry a different, full 32-bit SSRC, so every packet
+            // would be rejected as a stale session's. The value is advisory:
+            // when absent, the SSRC is learned from the first RTP packet. So
+            // warn and ignore one that does not parse or has four digits or
+            // fewer. Fewer than eight is fine otherwise: Hikvision drops a
+            // leading zero (`ssrc= d6d6627`), and its value is real.
             let v = v.trim();
-            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
-            ssrc = Some(v);
+            match u32::from_str_radix(v, 16) {
+                Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
+                _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
+            }
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
@@ -675,12 +698,17 @@ pub(crate) fn parse_play(
                     Ok(v) => state.initial_rtptime = Some(v),
                     Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
                 },
-                "ssrc" => {
-                    let value = value.trim();
-                    let ssrc = u32::from_str_radix(value, 16)
-                        .map_err(|_| format!("Unparseable ssrc {value}"))?;
-                    state.ssrc = Some(ssrc);
-                }
+                // `ssrc` is deliberately not read here. RTSP/1.0 defines no
+                // `ssrc` parameter for `RTP-Info` (RFC 2326 section 12.33);
+                // it is RTSP/2.0 that adds one. Servers that send it anyway
+                // disagree about the radix: Reolink writes hex, while some
+                // Dahua firmware writes decimal here and the same value in
+                // hex in `Transport`. Guessing is worse than ignoring. About
+                // 2.3% of 32-bit values written in decimal also parse as hex,
+                // to a different number, and the session would then reject
+                // every packet for carrying the wrong SSRC. The SSRC comes
+                // from the `Transport` header at SETUP when the server
+                // supplies one there, and from the first packet otherwise.
                 _ => {}
             }
         }
@@ -826,6 +854,24 @@ mod tests {
         assert_eq!(p.streams.len(), 2);
     }
 
+    /// Malformed SDP should be an error, not a panic. `sdp-types` 0.1 hit an
+    /// `assert_eq!` when a malformed line was followed by a non-`m=` line.
+    #[test]
+    fn malformed_sdp() {
+        init_logging();
+        for body in [
+            &b"v=0\n \na=x\n"[..],
+            &b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=cam\r\nc=IN IP4 127.=rtpmap:96 \
+               H264/90000\r\n\x9a\xc2\x99\x92\x8b\x8f\xc5\xc66 packetizaon-mo-id=42cindexlength=3\
+               \r\na=control\r\n"[..],
+        ] {
+            let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+            let (response, body) = sdp_response(body);
+            let e = super::parse_describe(url, &response, &body).unwrap_err();
+            assert!(e.starts_with("Unable to parse SDP"), "{e}");
+        }
+    }
+
     #[test]
     fn dahua_h264_aac_onvif() {
         init_logging();
@@ -894,7 +940,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "634214675641".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("634214675641").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1008,7 +1054,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "708345999".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("708345999").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1096,7 +1142,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "F8F8E425".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("F8F8E425").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1121,7 +1167,9 @@ mod tests {
         match &p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(3075976528));
-                assert_eq!(state.ssrc, Some(0x9fc9fff8));
+                // The `ssrc=9fc9fff8` in `RTP-Info` is not read; with none in
+                // `Transport` either, it is learned from the first packet.
+                assert_eq!(state.ssrc, None);
             }
             _ => panic!(),
         };
@@ -1180,7 +1228,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "1642021126".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("1642021126").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1213,6 +1261,19 @@ mod tests {
             include_bytes!("testdata/missing_content_type_describe.txt"),
         )
         .unwrap();
+    }
+
+    /// An RTP media description with an empty format list should be skipped, not panic.
+    #[test]
+    fn media_without_format() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let (response, body) = sdp_response(
+            b"v=0\nm=video 0 RTP/AVP \nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
+        );
+        let p = super::parse_describe(url, &response, &body).unwrap();
+        assert_eq!(p.streams.len(), 1);
+        assert_eq!(p.streams[0].encoding_name(), "h264");
     }
 
     /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
@@ -1386,7 +1447,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9a90de54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9a90de54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1399,7 +1460,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9a90de54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9a90de54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1464,7 +1525,7 @@ mod tests {
         assert_eq!(
             setup_response.session,
             SessionHeader {
-                id: "9b0d0e54".into(),
+                id: crate::rtsp::msg::HeaderValue::try_from("9b0d0e54").unwrap(),
                 timeout_sec: 60
             }
         );
@@ -1541,6 +1602,41 @@ mod tests {
         };
     }
 
+    /// Some Dahua firmware writes the SSRC in decimal in the `RTP-Info` header
+    /// while writing the same value in hex in `Transport`. One device sent
+    /// `ssrc=FFFFEF2D` at SETUP and `ssrc=4294962989` at PLAY, which are the
+    /// same number.
+    ///
+    /// RTSP/1.0 does not define `ssrc` in `RTP-Info` at all, so the parameter
+    /// is ignored whatever it says: PLAY succeeds, and the SSRC stays the one
+    /// the `Transport` header gave. Parsing it as hex used to turn a session
+    /// that had set up cleanly into a hard failure here.
+    #[test]
+    fn dahua_rtp_info_decimal_ssrc() {
+        init_logging();
+        let prefix =
+            "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
+        let mut p = parse_describe(
+            prefix,
+            include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
+        )
+        .unwrap();
+        p.streams[0].state = dummy_stream_state_init(Some(0xffff_ef2d));
+        super::parse_play(
+            &response(include_bytes!("testdata/dahua_play_decimal_ssrc.txt")).0,
+            &mut p,
+        )
+        .unwrap();
+        match &p.streams[0].state {
+            StreamState::Init(s) => {
+                assert_eq!(s.initial_seq, Some(13210));
+                assert_eq!(s.initial_rtptime, Some(1_067_824_145));
+                assert_eq!(s.ssrc, Some(0xffff_ef2d));
+            }
+            _ => panic!(),
+        };
+    }
+
     /// Some Hikvision cameras send SSRC with a leading space in the
     /// Transport header (e.g. `ssrc= d6d6627`). Ensure we trim whitespace
     /// before parsing.
@@ -1554,11 +1650,57 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "708886412".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("708886412").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
                 ssrc: Some(0x0d6d6627),
+                server_port: None,
+            }
+        );
+    }
+
+    /// Rubetek cameras send the SSRC with a `0x` prefix in the Transport
+    /// header (e.g. `ssrc=0x6f7c`). Ignore it rather than fail SETUP.
+    #[test]
+    fn rubetek_ssrc_with_0x_prefix() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/rubetek_setup_ssrc_0x.txt"));
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: crate::rtsp::msg::HeaderValue::try_from("5657612475258969210").unwrap(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: None,
+                server_port: None,
+            }
+        );
+    }
+
+    /// A camera that sends a four-digit SSRC (`ssrc=A046`) in the Transport
+    /// header and a different one in its RTP packets. The Transport header is
+    /// as the camera sent it; the rest of the response is minimal. Ignore the
+    /// value, so the SSRC is learned from the first RTP packet.
+    #[test]
+    fn setup_ssrc_with_four_hex_digits() {
+        init_logging();
+        let setup_response = response(include_bytes!("testdata/setup_ssrc_4_hex_digits.txt"));
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r,
+            SetupResponse {
+                source: None,
+                session: SessionHeader {
+                    id: crate::rtsp::msg::HeaderValue::try_from("1066441024").unwrap(),
+                    timeout_sec: 60,
+                },
+                channel_id: Some(0),
+                ssrc: None,
                 server_port: None,
             }
         );
@@ -1574,7 +1716,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "12345678".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("12345678").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: Some(0),
@@ -1594,7 +1736,7 @@ mod tests {
             SetupResponse {
                 source: None,
                 session: SessionHeader {
-                    id: "12345678".into(),
+                    id: crate::rtsp::msg::HeaderValue::try_from("12345678").unwrap(),
                     timeout_sec: 60,
                 },
                 channel_id: None,
@@ -1602,6 +1744,50 @@ mod tests {
                 server_port: Some(49152),
             }
         );
+    }
+
+    /// A `Session` header with a space before the `;`. Trim it, so the id can
+    /// be sent back as a header value. Sending `"1 "` used to panic at `PLAY`.
+    #[test]
+    fn setup_session_id_trailing_space() {
+        init_logging();
+        let setup_response = response(
+            b"RTSP/1.0 200 OK\r\n\
+              CSeq: 2\r\n\
+              Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+              Session: 1 ;timeout=60\r\n\r\n",
+        );
+        let r = parse_setup(&setup_response.0).unwrap();
+        assert_eq!(
+            r.session,
+            SessionHeader {
+                id: crate::rtsp::msg::HeaderValue::try_from("1").unwrap(),
+                timeout_sec: 60,
+            }
+        );
+    }
+
+    /// An empty session id can't be sent back as a header value; reject it.
+    #[test]
+    fn setup_empty_session_id() {
+        init_logging();
+        let setup_response = response(
+            b"RTSP/1.0 200 OK\r\n\
+              CSeq: 2\r\n\
+              Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\
+              Session: ;timeout=60\r\n\r\n",
+        );
+        let e = parse_setup(&setup_response.0).unwrap_err();
+        assert!(e.contains("invalid session id"), "{e}");
+    }
+
+    /// The RTSP parser already rejects control bytes in header values, but
+    /// check that a session id holding one is refused rather than stored.
+    #[test]
+    fn session_id_control_byte() {
+        let e = parse_session_id("1\x012", "1\x012;timeout=60").unwrap_err();
+        assert!(e.contains("invalid session id"), "{e}");
+        assert_eq!(&*parse_session_id(" a b\t", " a b\t").unwrap(), "a b");
     }
 
     /// Tests parsing a DESCRIBE response from an Anjvision camera whose
