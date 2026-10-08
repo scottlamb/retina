@@ -3174,7 +3174,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(addr);
         let server = listener.accept();
-        (client.await.unwrap(), server.await.unwrap().0)
+        let (client, server) = (client.await.unwrap(), server.await.unwrap().0);
+
+        // Without this, Nagle's algorithm holds back a small write until the
+        // peer ACKs the last one, which on Linux it may delay ~40 ms. Tests
+        // that pause time would auto-advance far past their deadlines meanwhile.
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        (client, server)
     }
 
     /// UDP equivalent of [`socketpair`]: two mutually connected localhost
