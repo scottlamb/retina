@@ -595,11 +595,7 @@ impl Depacketizer {
                 {
                     new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
                 }
-                u if matches!(
-                    u.unit_type_class(),
-                    nal::UnitTypeClass::Vcl { irap: false }
-                ) =>
-                {
+                u if matches!(u.unit_type_class(), nal::UnitTypeClass::Vcl { irap: false }) => {
                     is_random_access_point = false;
                 }
                 _ => {}
