@@ -27,7 +27,7 @@ pub(crate) struct Connection {
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
-    /// Write buffer for outgoing messages (written then flushed).
+    /// Write buffer for outgoing messages (appended then flushed).
     write_buf: Vec<u8>,
 }
 
@@ -297,11 +297,15 @@ impl Sink<OwnedMessage> for Connection {
         std::task::Poll::Ready(Ok(()))
     }
 
+    /// Queues `item` after any messages not yet fully flushed.
+    ///
+    /// Appending rather than replacing keeps messages whole and in order when
+    /// one is queued while another is still being flushed, as a receiver report
+    /// may be while a keepalive request is.
     fn start_send(
         mut self: std::pin::Pin<&mut Self>,
         item: OwnedMessage,
     ) -> Result<(), Self::Error> {
-        self.write_buf.clear();
         item.write(&mut self.write_buf)
             .expect("Vec Writer is infallible");
         Ok(())
@@ -397,6 +401,64 @@ mod tests {
         assert_eq!(s1, b"asdf");
         assert!(s2.is_empty());
         assert_eq!(read_buf.unparsed_len(), 4); // "rest" remains
+    }
+
+    /// Messages queued back to back before a flush, e.g. a receiver report
+    /// queued while a keepalive request is still being flushed, all reach the
+    /// peer whole and in order.
+    #[tokio::test]
+    async fn start_send_appends() {
+        use crate::rtsp::msg::{self, Message};
+        use futures::{SinkExt as _, StreamExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut client = Connection::from_stream(client.unwrap(), usize::MAX).unwrap();
+        let mut server = Connection::from_stream(server.unwrap().0, usize::MAX).unwrap();
+
+        client
+            .start_send_unpin(OwnedMessage::Request {
+                head: msg::Request {
+                    method: msg::Method::GET_PARAMETER,
+                    request_uri: None,
+                    headers: [(
+                        msg::HeaderName::CSEQ,
+                        msg::HeaderValue::try_from("7").unwrap(),
+                    )]
+                    .into(),
+                },
+                body: bytes::Bytes::new(),
+            })
+            .unwrap();
+        assert!(!client.write_buf.is_empty());
+        client
+            .start_send_unpin(OwnedMessage::Data {
+                channel_id: 1,
+                body: bytes::Bytes::from_static(b"report"),
+            })
+            .unwrap();
+        client.flush().await.unwrap();
+        assert!(client.write_buf.is_empty());
+
+        let m = server.next().await.unwrap().unwrap();
+        match m.msg {
+            Message::Request(r) => {
+                assert_eq!(r.method, msg::Method::GET_PARAMETER);
+                assert_eq!(r.headers.get("CSeq").unwrap().to_string(), "7");
+            }
+            o => panic!("expected request, got {o:#?}"),
+        }
+        let m = server.next().await.unwrap().unwrap();
+        match m.msg {
+            Message::Data(d) => {
+                assert_eq!(d.channel_id, 1);
+                assert_eq!(&server.body_bytes(m.body_pos, m.body_len)[..], b"report");
+            }
+            o => panic!("expected data, got {o:#?}"),
+        }
     }
 
     #[test]
