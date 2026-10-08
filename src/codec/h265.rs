@@ -597,7 +597,7 @@ impl Depacketizer {
                 }
                 u if matches!(
                     u.unit_type_class(),
-                    nal::UnitTypeClass::Vcl { intra_coded: false }
+                    nal::UnitTypeClass::Vcl { irap: false }
                 ) =>
                 {
                     is_random_access_point = false;

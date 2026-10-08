@@ -26,7 +26,7 @@ pub enum UnitTypeClass {
     Vcl {
         /// True iff this is part of an intra random access point (IRAP)
         /// picture: `nal_unit_type` in `BLA_W_LP..=RSV_IRAP_VCL23`.
-        intra_coded: bool,
+        irap: bool,
     },
     NonVcl,
 }
@@ -133,7 +133,7 @@ impl UnitType {
             | UnitType::RsvVcl28
             | UnitType::RsvVcl29
             | UnitType::RsvVcl30
-            | UnitType::RsvVcl31 => UnitTypeClass::Vcl { intra_coded: false },
+            | UnitType::RsvVcl31 => UnitTypeClass::Vcl { irap: false },
             // H.265 section 7.4.2.2 / Table 7-1: nal_unit_type values in the
             // range BLA_W_LP..=RSV_IRAP_VCL23 are intra random access point
             // (IRAP) pictures. This includes CRA and BLA, not just IDR.
@@ -144,7 +144,7 @@ impl UnitType {
             | UnitType::IdrNLp
             | UnitType::CraNut
             | UnitType::RsvIrapVcl22
-            | UnitType::RsvIrapVcl23 => UnitTypeClass::Vcl { intra_coded: true },
+            | UnitType::RsvIrapVcl23 => UnitTypeClass::Vcl { irap: true },
             _ => UnitTypeClass::NonVcl,
         }
     }
