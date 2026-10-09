@@ -1,3 +1,12 @@
+## unreleased
+
+*   H.265: treat all intra random access point (IRAP) pictures as random
+    access points, not just IDR pictures. Previously CRA and BLA pictures
+    were reported with `is_random_access_point() == false`, so e.g.
+    `ParameterSetInsertion::EachKeyFrame` never prepended parameter sets on
+    streams using CRA pictures (such as `libx265` defaults).
+    Fixes [#132](https://github.com/scottlamb/retina/issues/132).
+
 ## `v0.4.21` (2026-10-04)
 
 *   prefer `GET_PARAMETER` keepalives over `SET_PARAMETER`, as ffmpeg does,

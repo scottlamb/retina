@@ -739,12 +739,20 @@ impl VideoFrame {
         &self.end_ctx
     }
 
-    /// Returns if this is a "random access point (RAP)" aka "instantaneous
-    /// decoding refresh (IDR)" picture.
+    /// Returns if this is a "random access point (RAP)" picture: one where
+    /// decoding can start, as it can be decoded without any other.
     ///
-    /// The former is defined in ISO/IEC 14496-12; the latter in H.264. Both
-    /// mean that this picture can be decoded without any other AND no pictures
-    /// following this one depend on any pictures before this one.
+    /// In H.264, this is an "instantaneous decoding refresh (IDR)" picture, and
+    /// no pictures following this one depend on any pictures before this one.
+    ///
+    /// In H.265, this is any "intra random access point (IRAP)" picture: IDR,
+    /// clean random access (CRA), or broken link access (BLA). After a CRA or
+    /// BLA picture, "random access skipped leading (RASL)" pictures (those that
+    /// follow it in decoding order but precede it in output order) may depend
+    /// on pictures before it, so they can't be decoded correctly when decoding
+    /// starts at this picture. Retina currently passes RASL pictures through
+    /// unmarked; a decoder starting here should discard them. All other
+    /// pictures following this one don't depend on any pictures before it.
     #[inline]
     pub fn is_random_access_point(&self) -> bool {
         self.is_random_access_point
