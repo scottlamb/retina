@@ -34,6 +34,7 @@ use crate::{
 
 mod channel_mapping;
 mod parse;
+mod receiver_report;
 
 /// Internal API, public for a benchmark only.
 #[doc(hidden)]
@@ -468,6 +469,14 @@ fn keepalive_interval(session: &SessionHeader) -> std::time::Duration {
     std::time::Duration::from_secs(std::cmp::min(u64::from(session.timeout_sec), 60)) / 2
 }
 
+/// Returns the current time for RTCP receiver reports' statistics and schedule.
+///
+/// This reads tokio's clock, as the report timer does, so the two agree even
+/// when tests pause time. Otherwise it's the same as `Instant::now()`.
+fn report_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
 /// Options which must be known right as a session is created.
 ///
 /// Decisions which can be deferred are in [`SetupOptions`] or [`PlayOptions`] instead.
@@ -480,6 +489,7 @@ pub struct SessionOptions {
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
+    receiver_reports: ReceiverReportPolicy,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -573,6 +583,56 @@ impl std::str::FromStr for SessionIdPolicy {
     }
 }
 
+/// Policy for sending RTCP receiver reports to the server.
+///
+/// Receiver reports, as described in [RFC 3550 section
+/// 6.4.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.2), tell
+/// the server about packet loss and jitter. RFC 3550 section 6 says this
+/// feedback "SHOULD be used in all environments".
+///
+/// Specify via [`SessionOptions::receiver_reports`].
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
+pub enum ReceiverReportPolicy {
+    /// Default policy: currently `Never`.
+    #[default]
+    #[display("default")]
+    Default,
+
+    /// Never send receiver reports.
+    #[display("never")]
+    Never,
+
+    /// Send receiver reports while playing, for each stream on its RTCP
+    /// interleaved channel or UDP port, about every 5 seconds.
+    #[display("always")]
+    Always,
+}
+
+impl ReceiverReportPolicy {
+    fn enabled(self) -> bool {
+        match self {
+            ReceiverReportPolicy::Default | ReceiverReportPolicy::Never => false,
+            ReceiverReportPolicy::Always => true,
+        }
+    }
+}
+
+impl std::str::FromStr for ReceiverReportPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "default" => ReceiverReportPolicy::Default,
+            "never" => ReceiverReportPolicy::Never,
+            "always" => ReceiverReportPolicy::Always,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad ReceiverReportPolicy {s}; expected default, never, or always"
+            ))),
+        })
+    }
+}
+
 /// The RTP packet transport to request.
 ///
 /// Defaults to `Transport::Tcp`.
@@ -587,9 +647,9 @@ pub enum Transport {
     ///
     /// This support is currently only suitable for a LAN for a couple reasons:
     /// *   There's no reorder buffer, so out-of-order packets are all dropped.
-    /// *   There's no support for sending RTCP RRs (receiver reports), so
-    ///     servers won't have the correct information to measure packet loss
-    ///     and pace packets appropriately.
+    /// *   RTCP RRs (receiver reports) aren't sent by default, so servers won't
+    ///     have the correct information to measure packet loss and pace packets
+    ///     appropriately. See [`SessionOptions::receiver_reports`].
     #[display("udp")]
     Udp(UdpTransportOptions),
 }
@@ -676,6 +736,14 @@ impl SessionOptions {
     /// `DESCRIBE` response is typically a few KiB.
     pub fn max_message_size(mut self, max_message_size: usize) -> Self {
         self.max_message_size = Some(max_message_size);
+        self
+    }
+
+    /// Sets the policy for sending RTCP receiver reports.
+    ///
+    /// See [`ReceiverReportPolicy`].
+    pub fn receiver_reports(mut self, policy: ReceiverReportPolicy) -> Self {
+        self.receiver_reports = policy;
         self
     }
 
@@ -990,6 +1058,9 @@ enum StreamState {
         rtp_handler: rtp::InorderParser,
         ctx: StreamContext,
         udp_sockets: Option<UdpSockets>,
+
+        /// Reception statistics for RTCP receiver reports, iff they're enabled.
+        reception: Option<receiver_report::ReceptionStats>,
     },
 }
 
@@ -1063,6 +1134,16 @@ impl From<KeepaliveMethod> for msg::Method {
             KeepaliveMethod::GetParameter => msg::Method::GET_PARAMETER,
         }
     }
+}
+
+/// The state of RTCP receiver reports; only used in state `Playing` when
+/// they're enabled via [`SessionOptions::receiver_reports`].
+struct ReportState {
+    writer: receiver_report::ReportWriter,
+    schedule: receiver_report::ReportSchedule,
+
+    /// Fires at `schedule.next_due()`.
+    timer: Pin<Box<tokio::time::Sleep>>,
 }
 
 /// State after a `PLAY`; use via `Session<Playing>`.
@@ -1151,6 +1232,10 @@ struct SessionInner {
     keepalive_state: KeepaliveState,
 
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// The state of RTCP receiver reports, iff they're enabled; only used in
+    /// state `Playing`.
+    reports: Option<ReportState>,
 
     /// Bitmask of [`SessionFlag`]s.
     flags: u8,
@@ -1535,6 +1620,7 @@ impl Session<Described> {
                 describe_status,
                 keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: None,
+                reports: None,
                 flags: 0,
                 udp_next_poll_i: 0,
             }),
@@ -1939,6 +2025,11 @@ impl Session<Described> {
                         ),
                         ctx,
                         udp_sockets,
+                        reception: inner
+                            .options
+                            .receiver_reports
+                            .enabled()
+                            .then(|| receiver_report::ReceptionStats::new(s.clock_rate_hz)),
                     };
                 }
                 StreamState::Uninit => {}
@@ -1946,6 +2037,15 @@ impl Session<Described> {
             };
         }
         *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep(keepalive_interval(session))));
+        if inner.options.receiver_reports.enabled() {
+            let mut rng = rand::thread_rng();
+            let schedule = receiver_report::ReportSchedule::new(report_now(), &mut rng);
+            *inner.reports = Some(ReportState {
+                writer: receiver_report::ReportWriter::random(&mut rng),
+                timer: Box::pin(tokio::time::sleep_until(schedule.next_due().into())),
+                schedule,
+            });
+        }
         Ok(Session(self.0, Playing(())))
     }
 }
@@ -2155,8 +2255,8 @@ impl Session<Playing> {
             KeepaliveState::Idle => {}
         }
 
-        // Currently the only outbound data should be keepalives, and the previous one
-        // has already been flushed, so there's no reason the Sink shouldn't be ready.
+        // The only outbound data are keepalives and receiver reports, and the
+        // Sink queues them without limit, so there's no reason it shouldn't be ready.
         if matches!(conn.inner.poll_ready_unpin(cx), Poll::Pending) {
             bail!(ErrorInt::Internal(
                 "Unexpectedly not ready to send keepalive".into()
@@ -2214,6 +2314,70 @@ impl Session<Playing> {
             .expect("keepalive timer set in state Playing")
             .as_mut()
             .reset(tokio::time::Instant::now() + keepalive_interval);
+        Ok(())
+    }
+
+    /// Writes a receiver report for each stream and schedules the next.
+    ///
+    /// Each stream is its own RTP session, so each gets its own report on its
+    /// own RTCP channel or socket. Over TCP, the report is queued on the RTSP
+    /// connection, and the poll loop flushes it (along with any keepalive). Over
+    /// UDP, it's sent right away if the socket has room; otherwise this report
+    /// is skipped, as later reports carry cumulative statistics anyway.
+    fn handle_report_timer(mut self: Pin<&mut Self>) -> Result<(), Error> {
+        let inner = self.0.as_mut().project();
+        let reports = inner
+            .reports
+            .as_mut()
+            .expect("report timer can't fire without reports");
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+        let now = report_now();
+        for (i, s) in inner.presentation.streams.iter_mut().enumerate() {
+            let StreamState::Playing {
+                ctx,
+                udp_sockets,
+                reception: Some(reception),
+                ..
+            } = &mut s.state
+            else {
+                continue;
+            };
+            let block = reception.report_block(now);
+            trace!("sending RTCP receiver report for stream {i}: {block:?}");
+            let pkt = reports.writer.write(block.as_ref());
+            match (udp_sockets, &ctx.0) {
+                (Some(sockets), _) => {
+                    if let Err(e) = sockets.rtcp.try_send(&pkt) {
+                        // `ConnectionRefused` can follow an ICMP error, as with
+                        // `punch_firewall_hole`. Neither it nor a full socket
+                        // buffer is a reason to end the session.
+                        match e.kind() {
+                            io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused => {
+                                debug!("Unable to send RTCP receiver report for stream {i}: {e}")
+                            }
+                            _ => warn!("Unable to send RTCP receiver report for stream {i}: {e}"),
+                        }
+                    }
+                }
+                (None, StreamContextInner::Tcp(tcp)) => {
+                    conn.inner
+                        .start_send_unpin(OwnedMessage::Data {
+                            channel_id: tcp.rtp_channel_id + 1,
+                            body: Bytes::from(pkt),
+                        })
+                        .expect("encoding is infallible");
+                }
+                (None, _) => unreachable!("stream {i} has neither TCP nor UDP context"),
+            }
+        }
+        reports.schedule.sent(now, &mut rand::thread_rng());
+        reports
+            .timer
+            .as_mut()
+            .reset(reports.schedule.next_due().into());
         Ok(())
     }
 
@@ -2505,7 +2669,7 @@ impl Session<Playing> {
             rtp_handler,
             ctx: stream_ctx,
             udp_sockets,
-            ..
+            reception,
         } = &mut stream.state
         else {
             unreachable!("stream {} not in Playing state", item.stream_i);
@@ -2527,6 +2691,21 @@ impl Session<Playing> {
                             description: rtp_handler.validate_error(reason, split),
                         })
                     })?;
+
+                // Count the packet for receiver reports as it arrives, before
+                // `rtp_handler` skips or rejects it for being out of order: RFC
+                // 3550 appendix A.1 counts reordered and duplicate packets as
+                // received. Like `rtp_handler`, ignore pt=50 packets.
+                if let Some(reception) = reception
+                    && header.payload_type() != 50
+                {
+                    reception.rtp(
+                        header.ssrc(),
+                        header.sequence_number(),
+                        header.timestamp(),
+                        report_now(),
+                    );
+                }
                 let Some(meta) = rtp_handler.rtp(
                     inner.options,
                     stream_ctx,
@@ -2568,7 +2747,21 @@ impl Session<Playing> {
                     item.stream_i,
                     body,
                 ) {
-                    Ok(p) => Ok(p.map(ValidatedItem::Rtcp)),
+                    Ok(p) => {
+                        // Note sender reports for the LSR and DLSR fields of
+                        // receiver reports. `rtp_handler` has already checked
+                        // the SSRC (per `UnknownRtcpSsrcPolicy`) and set
+                        // `rtp_timestamp` iff the packet begins with a valid
+                        // sender report.
+                        if let (Some(reception), Some(PacketItem::Rtcp(pkt))) = (reception, &p)
+                            && pkt.rtp_timestamp().is_some()
+                            && let Some(Ok(Some(sr))) =
+                                pkt.pkts().next().map(|p| p.as_sender_report())
+                        {
+                            reception.sender_report(sr.ssrc(), sr.ntp_timestamp(), report_now());
+                        }
+                        Ok(p.map(ValidatedItem::Rtcp))
+                    }
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
                         conn_ctx: *conn.inner.ctx(),
                         stream_ctx: stream_ctx.to_owned(),
@@ -2649,11 +2842,24 @@ impl Session<Playing> {
                 self.as_mut().handle_keepalive_timer(cx)?;
             }
 
-            // Then finish flushing the current keepalive if necessary.
-            if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
-                match self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx) {
+            // Then check if it's time for receiver reports.
+            if let Some(r) = self.0.reports.as_mut()
+                && matches!(r.timer.as_mut().poll(cx), Poll::Ready(()))
+            {
+                self.as_mut().handle_report_timer()?;
+            }
+
+            // Then finish flushing the current keepalive and/or receiver
+            // reports if necessary.
+            let keepalive_flushing =
+                matches!(self.0.keepalive_state, KeepaliveState::Flushing { .. });
+            let conn = &mut self.0.conn.as_mut().unwrap().inner;
+            if keepalive_flushing || conn.has_unflushed() {
+                match conn.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => {
-                        self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
+                        if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
+                            self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
+                        }
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
                     Poll::Pending => {}
@@ -2968,7 +3174,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(addr);
         let server = listener.accept();
-        (client.await.unwrap(), server.await.unwrap().0)
+        let (client, server) = (client.await.unwrap(), server.await.unwrap().0);
+
+        // Without this, Nagle's algorithm holds back a small write until the
+        // peer ACKs the last one, which on Linux it may delay ~40 ms. Tests
+        // that pause time would auto-advance far past their deadlines meanwhile.
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        (client, server)
     }
 
     /// UDP equivalent of [`socketpair`]: two mutually connected localhost
@@ -3799,6 +4012,436 @@ mod tests {
         resp.extend_from_slice(rest);
         let session = describe_raw(SessionOptions::default(), resp).await.unwrap();
         assert_eq!(session.streams().len(), 2);
+    }
+
+    /// Describes, sets up stream 0 via TCP, and plays a session against the
+    /// mock server, using the Reolink test data.
+    async fn play_tcp(options: SessionOptions) -> (Session<Playing>, crate::tokio::Connection) {
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, options, url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        (session.unwrap(), server)
+    }
+
+    /// The SSRC in the Reolink test data's RTP packets.
+    const REOLINK_SSRC: u32 = 0xdcc4a0d8;
+
+    fn rtp_pkt(seq: u16, timestamp: u32) -> Bytes {
+        let mut pkt = vec![0x80, 0x60];
+        pkt.extend_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&timestamp.to_be_bytes());
+        pkt.extend_from_slice(&REOLINK_SSRC.to_be_bytes());
+        pkt.extend_from_slice(b"hello world");
+        Bytes::from(pkt)
+    }
+
+    fn sender_report_pkt(ntp: u64, timestamp: u32) -> Bytes {
+        let mut pkt = vec![0x80, 200, 0, 6];
+        pkt.extend_from_slice(&REOLINK_SSRC.to_be_bytes());
+        pkt.extend_from_slice(&ntp.to_be_bytes());
+        pkt.extend_from_slice(&timestamp.to_be_bytes());
+        pkt.extend_from_slice(&[0; 8]); // packet and octet counts.
+        Bytes::from(pkt)
+    }
+
+    /// Polls `session` (which must yield nothing) until `server` receives a
+    /// message, and returns it with its body.
+    async fn recv_while_polling(
+        session: &mut Pin<&mut Session<Playing>>,
+        server: &mut crate::tokio::Connection,
+    ) -> (msg::Message, Bytes) {
+        tokio::select! {
+            item = session.next() => panic!("unexpected item: {item:#?}"),
+            msg = server.next() => {
+                let msg = msg.unwrap().unwrap();
+                let body = server.body_bytes(msg.body_pos, msg.body_len);
+                (msg.msg, body)
+            }
+        }
+    }
+
+    /// Like [`recv_while_polling`], expecting interleaved data on `channel_id`.
+    async fn recv_data_while_polling(
+        session: &mut Pin<&mut Session<Playing>>,
+        server: &mut crate::tokio::Connection,
+        channel_id: u8,
+    ) -> Bytes {
+        match recv_while_polling(session, server).await {
+            (msg::Message::Data(d), body) => {
+                assert_eq!(d.channel_id, channel_id);
+                body
+            }
+            (o, _) => panic!("expected data, got {o:#?}"),
+        }
+    }
+
+    /// Reports are sent on the stream's RTCP channel when due: an empty RR
+    /// before any RTP has arrived, then one describing what has.
+    #[tokio::test(start_paused = true)]
+    async fn receiver_reports_tcp() {
+        init_logging();
+        let (session, mut server) = play_tcp(
+            SessionOptions::default()
+                .unassigned_channel_data(UnassignedChannelDataPolicy::Ignore)
+                .receiver_reports(ReceiverReportPolicy::Always),
+        )
+        .await;
+        tokio::pin!(session);
+
+        // Keep only the report timer, so paused time auto-advances to it. See
+        // the comment in `simple`.
+        session.0.keepalive_timer = None;
+        let reports = session.0.reports.as_ref().unwrap();
+        let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
+        let due = tokio::time::Instant::from_std(reports.schedule.next_due());
+
+        // RFC 3550 section 6.2: the first report may come after half the 5 s
+        // minimum, randomized and compensated as in section 6.3.1.
+        let played = tokio::time::Instant::now();
+        assert!(due - played >= std::time::Duration::from_millis(1026));
+        assert!(due - played < std::time::Duration::from_millis(3079));
+
+        // Nothing has arrived yet, so the first report is an empty RR.
+        let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+        assert!(tokio::time::Instant::now() >= due);
+        receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
+
+        // Hold off reports while packets arrive, so paused time can't
+        // auto-advance into the next one meanwhile.
+        let mut reports = session.0.reports.take().unwrap();
+        let ntp = 0xe436_2f99_cccc_cccc;
+        tokio::join!(
+            async {
+                for _ in 0..4 {
+                    match session.next().await {
+                        Some(Ok(_)) => {}
+                        o => panic!("unexpected item: {o:#?}"),
+                    }
+                }
+            },
+            async {
+                // seq 0x41d6 is lost; 0x41d7 is 6000 ticks late relative to
+                // 0x41d5 (all arrive at the same paused instant).
+                for (channel_id, body) in [
+                    (0, rtp_pkt(0x41d4, 1_000)),
+                    (0, rtp_pkt(0x41d5, 4_000)),
+                    (0, rtp_pkt(0x41d7, 10_000)),
+                    (1, sender_report_pkt(ntp, 10_000)),
+                ] {
+                    server
+                        .send(OwnedMessage::Data { channel_id, body })
+                        .await
+                        .unwrap();
+                }
+            },
+        );
+        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+        reports.timer.as_mut().reset(tokio::time::Instant::now());
+        session.0.reports = Some(reports);
+
+        // A report may have slipped out before the packets arrived; skip any
+        // empty one.
+        let block = loop {
+            let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+            if report[0] & 0x1f == 0 {
+                continue;
+            }
+            let rr = receiver_report::tests::parse_report(&report, ssrc, 1, &cname);
+            break receiver_report::tests::parse_block(rr);
+        };
+        assert_eq!(
+            block,
+            receiver_report::ReportBlock {
+                ssrc: REOLINK_SSRC,
+                fraction_lost: 85, // 1 of 3 expected since 0x41d5, the first valid packet.
+                cumulative_lost: 1,
+                extended_highest_seq: 0x41d7,
+                jitter: 375, // 6000 / 16
+                lsr: 0x2f99_cccc,
+                dlsr: 98_304, // 1.5 s in units of 1/65536 s
+            }
+        );
+    }
+
+    /// Reports keep coming on schedule while nothing else wakes the session.
+    #[tokio::test(start_paused = true)]
+    async fn receiver_reports_tcp_quiet() {
+        init_logging();
+        let (mut session, mut server) =
+            play_tcp(SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always))
+                .await;
+        session.0.keepalive_timer = None;
+        let reports = session.0.reports.as_ref().unwrap();
+        let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
+        let due = tokio::time::Instant::from_std(reports.schedule.next_due());
+
+        // Poll the session from its own task, so only its own wakers wake it.
+        let session = tokio::spawn(async move {
+            let item = session.next().await;
+            panic!("unexpected item: {item:#?}");
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            for i in 0..3 {
+                let msg = server.next().await.unwrap().unwrap();
+                let msg::Message::Data(d) = msg.msg else {
+                    panic!("expected data, got {:#?}", msg.msg);
+                };
+                assert_eq!(d.channel_id, 1);
+                let report = server.body_bytes(msg.body_pos, msg.body_len);
+                receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
+
+                // Each report is at least 5 s × 0.5 / (e - 3/2) after the last.
+                assert!(
+                    tokio::time::Instant::now() >= due + i * std::time::Duration::from_millis(2052)
+                );
+            }
+        })
+        .await
+        .unwrap();
+        session.abort();
+    }
+
+    /// A keepalive and a report due at once both reach the server intact, in
+    /// that order.
+    #[tokio::test]
+    async fn receiver_report_and_keepalive_back_to_back() {
+        init_logging();
+        let (session, mut server) =
+            play_tcp(SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always))
+                .await;
+        tokio::pin!(session);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        let reports = session.0.reports.as_mut().unwrap();
+        reports.timer.as_mut().reset(deadline);
+        let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
+
+        match recv_while_polling(&mut session, &mut server).await {
+            (msg::Message::Request(r), body) => {
+                assert_eq!(r.method, msg::Method::OPTIONS);
+                assert!(r.headers.get("CSeq").is_some());
+                assert!(body.is_empty());
+            }
+            (o, _) => panic!("expected keepalive request, got {o:#?}"),
+        }
+        let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+        receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
+    }
+
+    /// Without `SessionOptions::receiver_reports`, no RTCP is written.
+    #[tokio::test(start_paused = true)]
+    async fn receiver_reports_off_by_default() {
+        init_logging();
+        let (session, mut server) = play_tcp(SessionOptions::default()).await;
+        tokio::pin!(session);
+        session.0.keepalive_timer = None;
+        assert!(session.0.reports.is_none());
+        assert!(session.0.presentation.streams.iter().all(|s| !matches!(
+            s.state,
+            StreamState::Playing {
+                reception: Some(_),
+                ..
+            }
+        )));
+        tokio::join!(
+            async {
+                match session.next().await {
+                    Some(Ok(PacketItem::Rtp(_))) => {}
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                server
+                    .send(OwnedMessage::Data {
+                        channel_id: 0,
+                        body: rtp_pkt(0x41d4, 0),
+                    })
+                    .await
+                    .unwrap();
+            },
+        );
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            recv_while_polling(&mut session, &mut server),
+        )
+        .await;
+        assert!(r.is_err(), "unexpected message: {:#?}", r.map(|(m, _)| m));
+    }
+
+    /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
+    /// port.
+    #[tokio::test]
+    async fn receiver_reports_udp() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always),
+                url
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+
+        // SETUP, with server sockets for the stream.
+        let server_udp = crate::tokio::UdpPair::for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        let ((), client_rtp_port) = tokio::join!(
+            async {
+                session
+                    .setup(
+                        0,
+                        SetupOptions::default().transport(Transport::Udp(Default::default())),
+                    )
+                    .await
+                    .unwrap();
+            },
+            async {
+                let msg = server.next().await.unwrap().unwrap();
+                let msg::Message::Request(req) = msg.msg else {
+                    panic!("expected SETUP request");
+                };
+                assert_eq!(req.method, msg::Method::SETUP);
+                let transport: &str = req.headers.get("Transport").unwrap();
+                let client_port = transport
+                    .split(';')
+                    .find_map(|p| p.strip_prefix("client_port="))
+                    .unwrap()
+                    .to_owned();
+                let client_rtp_port: u16 = client_port.split('-').next().unwrap().parse().unwrap();
+                let mut headers = msg::Headers::default();
+                for (name, value) in [
+                    ("CSeq", req.headers.get("CSeq").unwrap().to_string()),
+                    ("Session", "F8F8E425".to_owned()),
+                    (
+                        "Transport",
+                        format!(
+                            "RTP/AVP/UDP;unicast;client_port={client_port};server_port={}-{}",
+                            server_udp.rtp_port,
+                            server_udp.rtp_port + 1
+                        ),
+                    ),
+                ] {
+                    headers.insert(
+                        msg::HeaderName::try_from(name).unwrap(),
+                        msg::HeaderValue::try_from(value).unwrap(),
+                    );
+                }
+                server
+                    .send(OwnedMessage::Response {
+                        head: msg::Response {
+                            status_code: StatusCode::OK,
+                            reason_phrase: "OK".to_owned(),
+                            headers,
+                        },
+                        body: Bytes::new(),
+                    })
+                    .await
+                    .unwrap();
+                client_rtp_port
+            },
+        );
+        let client_rtcp_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_rtp_port + 1);
+
+        // The firewall hole-punching packet arrives first.
+        let mut buf = [0u8; 1500];
+        let (n, from) = server_udp.rtcp_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..n], from), (&HOLE_PUNCH_RTCP[..], client_rtcp_addr));
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+        session.0.keepalive_timer = None;
+        let mut reports = session.0.reports.take().unwrap();
+        let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
+
+        // RTP.
+        let client_rtp_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_rtp_port);
+        for seq in [0x41d4, 0x41d5] {
+            server_udp
+                .rtp_socket
+                .send_to(&rtp_pkt(seq, 0), client_rtp_addr)
+                .await
+                .unwrap();
+            match session.next().await {
+                Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.sequence_number(), seq),
+                o => panic!("unexpected item: {o:#?}"),
+            }
+        }
+
+        // The report.
+        reports.timer.as_mut().reset(tokio::time::Instant::now());
+        session.0.reports = Some(reports);
+        let (n, from) = tokio::select! {
+            item = session.next() => panic!("unexpected item: {item:#?}"),
+            r = server_udp.rtcp_socket.recv_from(&mut buf) => r.unwrap(),
+        };
+        assert_eq!(from, client_rtcp_addr);
+        let rr = receiver_report::tests::parse_report(&buf[..n], ssrc, 1, &cname);
+        let block = receiver_report::tests::parse_block(rr);
+        assert_eq!(
+            (
+                block.ssrc,
+                block.extended_highest_seq,
+                block.cumulative_lost
+            ),
+            (REOLINK_SSRC, 0x41d5, 0)
+        );
+    }
+
+    #[test]
+    fn receiver_report_policy_from_str() {
+        for policy in [
+            ReceiverReportPolicy::Default,
+            ReceiverReportPolicy::Never,
+            ReceiverReportPolicy::Always,
+        ] {
+            let parsed: ReceiverReportPolicy = policy.to_string().parse().unwrap();
+            assert_eq!(parsed.enabled(), policy.enabled());
+        }
+        assert!(!ReceiverReportPolicy::default().enabled());
+        assert!("sometimes".parse::<ReceiverReportPolicy>().is_err());
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes
