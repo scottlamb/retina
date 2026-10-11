@@ -88,6 +88,11 @@ impl Connection {
         bytes::Bytes::from(buf)
     }
 
+    /// Returns true iff messages are queued that haven't been fully written.
+    pub(crate) fn has_unflushed(&self) -> bool {
+        !self.write_buf.is_empty()
+    }
+
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
         RtspMessageContext {
             pos: self.parser.stream_pos() + self.read_buf.unparsed_len() as u64,
