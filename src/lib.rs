@@ -210,6 +210,25 @@ pub const UNIX_EPOCH: NtpTimestamp = NtpTimestamp((2_208_988_800) << 32);
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct NtpTimestamp(pub u64);
 
+impl NtpTimestamp {
+    /// Returns the local machine's realtime clock as an NTP timestamp.
+    pub(crate) fn now() -> Self {
+        let since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+
+        // The seconds wrap every 136 years, as NTP era 0 ends in 2036.
+        // Nanoseconds are below 2^30, so the shift can't overflow.
+        let frac = (u64::from(since_epoch.subsec_nanos()) << 32) / 1_000_000_000;
+        NtpTimestamp(
+            UNIX_EPOCH
+                .0
+                .wrapping_add(since_epoch.as_secs() << 32)
+                .wrapping_add(frac),
+        )
+    }
+}
+
 impl std::fmt::Display for NtpTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let since_epoch = self.0.wrapping_sub(UNIX_EPOCH.0);
