@@ -1,3 +1,12 @@
+## unreleased
+
+*   add `retina::codec::StreamDepacketizer`, which depacketizes an RTP stream
+    received outside `retina::client`: it checks each packet's header, follows
+    the SSRC and sequence numbers, places the 32-bit timestamps on a
+    non-wrapping timeline, and yields `CodecItem`s as the client does. This is
+    the receiving half of an RTSP server accepting `ANNOUNCE`/`RECORD`
+    ([#89](https://github.com/scottlamb/retina/issues/89)).
+
 ## `v0.4.21` (2026-10-04)
 
 *   prefer `GET_PARAMETER` keepalives over `SET_PARAMETER`, as ffmpeg does,
