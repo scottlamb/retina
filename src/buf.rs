@@ -471,6 +471,25 @@ impl MarkBuf {
         self.ring.advance_to(floor);
     }
 
+    /// Appends a packet's payload received by other means (not read into this
+    /// buffer) and marks it parsed, so it can go straight to a depacketizer.
+    /// Returns its stream position.
+    pub fn append(&mut self, payload: &[u8]) -> u64 {
+        let pos = self.end();
+        let len = payload.len();
+        let (s1, s2) = self.spare_capacity(len);
+        if len <= s1.len() {
+            s1[..len].copy_from_slice(payload);
+        } else {
+            let (first, second) = payload.split_at(s1.len());
+            s1.copy_from_slice(first);
+            s2[..second.len()].copy_from_slice(second);
+        }
+        self.advance_end(len);
+        self.advance_unparsed(self.end());
+        pos
+    }
+
     /// Appends data directly to the buffer.
     #[cfg(test)]
     pub fn extend(&mut self, data: &[u8]) {
