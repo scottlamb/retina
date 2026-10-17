@@ -490,6 +490,7 @@ pub struct SessionOptions {
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
     receiver_reports: ReceiverReportPolicy,
+    bind_addr: Option<std::net::IpAddr>,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -690,6 +691,15 @@ impl SessionOptions {
     #[inline]
     pub fn creds(mut self, creds: Option<Credentials>) -> Self {
         self.creds = creds;
+        self
+    }
+
+    /// Binds outgoing connections (the RTSP TCP connection, and UDP data sockets when using UDP
+    /// transport) to this local address. Useful when the host has several local addresses and the
+    /// OS would otherwise pick a source address the server has no route back to (e.g. a link-local
+    /// address beside a routable one). The port is chosen by the OS.
+    pub fn bind(mut self, bind_addr: Option<std::net::IpAddr>) -> Self {
+        self.bind_addr = bind_addr;
         self
     }
 
@@ -1273,9 +1283,14 @@ impl RtspConnection {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port, options.get_max_message_size())
-            .await
-            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        let inner = crate::tokio::Connection::connect(
+            host,
+            port,
+            options.get_max_message_size(),
+            options.bind_addr,
+        )
+        .await
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
