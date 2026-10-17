@@ -6,27 +6,27 @@
 //! In theory there could be a similar async-std-based implementation.
 
 use futures::{Sink, Stream};
+use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
 use crate::buf::MarkBuf;
-use crate::inputs::Split;
 use crate::rtsp::msg::OwnedMessage;
+use crate::rtsp::reader::Reader;
 use crate::{Error, ErrorInt, RtspMessageContext};
 
 use super::{ConnectionContext, ReceivedMessage, WallTime};
-
-/// Default initial capacity for the read ring buffer (64 KiB).
-const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
     stream: TcpStream,
     ctx: ConnectionContext,
-    parser: crate::rtsp::parse::Parser,
-    read_buf: MarkBuf,
+
+    /// The reader, which is lent out while playing; see [`Connection::take_reader`].
+    reader: Option<Reader>,
+
     /// Write buffer for outgoing messages (appended then flushed).
     write_buf: Vec<u8>,
 }
@@ -95,10 +95,7 @@ impl Connection {
                 peer_addr,
                 established_wall,
             },
-            parser: crate::rtsp::parse::Parser::builder()
-                .max_message_size(max_message_size)
-                .build(),
-            read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
+            reader: Some(Reader::new(max_message_size)),
             write_buf: Vec::new(),
         })
     }
@@ -107,21 +104,30 @@ impl Connection {
         &self.ctx
     }
 
-    pub(crate) fn read_buf(&self) -> &MarkBuf {
-        &self.read_buf
+    fn reader(&self) -> &Reader {
+        self.reader
+            .as_ref()
+            .expect("reader should be present except while playing")
     }
 
-    /// Reads body data from the ring buffer as `Bytes`.
-    ///
-    /// This copies the data out, so it's for cold paths: RTSP message bodies
-    /// and RTCP packets. RTP packets are lent out directly from the ring
-    /// buffer; see [`crate::client::RtpPacket`].
+    /// Takes the reader, so that a [`crate::client::playing::PlayingCore`]
+    /// can parse messages without going through this connection's `Stream`
+    /// impl. Put it back with [`Connection::restore_reader`] before polling
+    /// the `Stream` impl again.
+    pub(crate) fn take_reader(&mut self) -> Reader {
+        self.reader
+            .take()
+            .expect("reader should be present except while playing")
+    }
+
+    pub(crate) fn restore_reader(&mut self, reader: Reader) {
+        assert!(self.reader.is_none());
+        self.reader = Some(reader);
+    }
+
+    /// Reads body data from the ring buffer as `Bytes`; see [`Reader::body_bytes`].
     pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
-        let (s1, s2) = self.read_buf.split(body_pos, body_len as usize).slices();
-        let mut buf = Vec::with_capacity(body_len as usize);
-        buf.extend_from_slice(s1);
-        buf.extend_from_slice(s2);
-        bytes::Bytes::from(buf)
+        self.reader().body_bytes(body_pos, body_len)
     }
 
     /// Returns true iff messages are queued that haven't been fully written.
@@ -130,89 +136,51 @@ impl Connection {
     }
 
     pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
-        RtspMessageContext {
-            pos: self.parser.stream_pos() + self.read_buf.unparsed_len() as u64,
-            received_wall: WallTime::now(),
-            received: Instant::now(),
-        }
+        self.reader().eof_ctx(Instant::now())
+    }
+
+    /// Reads available bytes from the connection into `buf`, returning the
+    /// number read. `Ready(Ok(0))` means the peer closed the connection.
+    pub(crate) fn poll_read(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut MarkBuf,
+    ) -> Poll<std::io::Result<usize>> {
+        poll_read(&self.stream, cx, buf)
+    }
+
+    /// Queues `data` to be written by [`Sink::poll_flush`].
+    pub(crate) fn queue_write(&mut self, data: &[u8]) {
+        self.write_buf.extend_from_slice(data);
     }
 }
 
-/// Tries to decode a message from the read buffer without I/O.
-///
-/// Separated from `Connection` methods to avoid self-borrow issues.
-///
-/// When `eof` is true, the TCP stream has closed. `Incomplete` and empty
-/// `Ok(None)` with leftover data are promoted to errors.
-fn try_decode(
-    parser: &mut crate::rtsp::parse::Parser,
-    read_buf: &mut MarkBuf,
-    eof: bool,
-) -> Result<Option<ReceivedMessage>, CodecError> {
-    use crate::rtsp::parse::FeedError;
-
-    let pos = parser.stream_pos();
-    let unparsed = read_buf.unparsed();
-    let mut input = {
-        let split = read_buf.unparsed_split();
-        let (first, second) = split.slices();
-        Split::new(first, second)
-    };
-    let initial_len = input.len();
-
-    match parser.feed(&mut input) {
-        Ok(None) => Ok(None), // idle, no data; caller distinguishes EOF from "need more"
-        Ok(Some((msg, body_slice))) => {
-            let consumed = initial_len - input.len();
-            let body_len = body_slice.len();
-            let body_pos = unparsed + (consumed - body_len) as u64;
-            read_buf.advance_unparsed(unparsed + consumed as u64);
-            Ok(Some(ReceivedMessage {
-                msg,
-                body_pos,
-                body_len: body_len as u32,
-                ctx: RtspMessageContext {
-                    pos,
-                    received_wall: WallTime::now(),
-                    received: Instant::now(),
-                },
-            }))
-        }
-        Err(FeedError::Incomplete(_)) if !eof => {
-            // On Incomplete, the parser may have stably consumed some bytes
-            // (e.g. header lines). Advance past them.
-            let consumed = initial_len - input.len();
-            if consumed > 0 {
-                read_buf.advance_unparsed(unparsed + consumed as u64);
+/// Reads available bytes from `stream` into `buf`'s spare capacity via
+/// vectored I/O, filling both halves of the ring.
+fn poll_read(
+    stream: &TcpStream,
+    cx: &mut Context<'_>,
+    buf: &mut MarkBuf,
+) -> Poll<std::io::Result<usize>> {
+    loop {
+        std::task::ready!(stream.poll_read_ready(cx))?;
+        let (first, second) = buf.spare_capacity(4096);
+        let mut bufs = [
+            std::io::IoSliceMut::new(first),
+            std::io::IoSliceMut::new(second),
+        ];
+        match stream.try_read_vectored(&mut bufs) {
+            Ok(n) => {
+                buf.advance_end(n);
+                return Poll::Ready(Ok(n));
             }
-            Ok(None)
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Spurious readiness; re-register and wait.
+                continue;
+            }
+            Err(e) => return Poll::Ready(Err(e)),
         }
-        Err(FeedError::Incomplete(inc)) => {
-            // EOF with incomplete data: the message is truncated.
-            Err(CodecError::ParseError {
-                description: format!(
-                    "Incomplete RTSP message at EOF ({inc}); buffered:\n{:#?}",
-                    crate::hex::LimitedHex::from_split(read_buf.unparsed_split(), 128),
-                ),
-                pos,
-            })
-        }
-        Err(FeedError::Invalid(inv)) => Err(CodecError::ParseError {
-            description: format!(
-                "Invalid RTSP message: {inv}; buffered:\n{:#?}",
-                crate::hex::LimitedHex::from_split(read_buf.unparsed_split(), 128),
-            ),
-            pos: inv.pos,
-        }),
     }
-}
-
-/// An intermediate error type used internally.
-#[derive(Debug)]
-#[allow(dead_code)] // IoError reserved for future use
-enum CodecError {
-    IoError(std::io::Error),
-    ParseError { description: String, pos: u64 },
 }
 
 impl Stream for Connection {
@@ -220,112 +188,34 @@ impl Stream for Connection {
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
+        let reader = this
+            .reader
+            .as_mut()
+            .expect("reader should be present except while playing");
         loop {
             // Try decoding from existing buffered data.
-            match try_decode(&mut this.parser, &mut this.read_buf, false) {
-                Ok(Some(msg)) => return std::task::Poll::Ready(Some(Ok(msg))),
+            match reader.decode(&this.ctx, false, Instant::now()) {
+                Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
                 Ok(None) => {}
-                Err(e) => {
-                    return std::task::Poll::Ready(Some(Err(codec_err_to_error(
-                        &this.ctx,
-                        &this.parser,
-                        &this.read_buf,
-                        e,
-                    ))));
-                }
+                Err(e) => return Poll::Ready(Some(Err(e))),
             }
 
-            // Need more data. Read from the stream into the ring buffer
-            // using vectored I/O to fill both halves of the ring.
-            match this.stream.poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(error)) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-                    return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: this.ctx,
-                        msg_ctx: RtspMessageContext {
-                            pos,
-                            received_wall: WallTime::now(),
-                            received: Instant::now(),
-                        },
-                        source: error,
-                    }))));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-            let (first, second) = this.read_buf.spare_capacity(4096);
-            let mut bufs = [
-                std::io::IoSliceMut::new(first),
-                std::io::IoSliceMut::new(second),
-            ];
-            match this.stream.try_read_vectored(&mut bufs) {
+            // Need more data.
+            match std::task::ready!(poll_read(&this.stream, cx, reader.buf_mut())) {
                 Ok(0) => {
                     // EOF. Try decode with eof=true.
-                    return match try_decode(&mut this.parser, &mut this.read_buf, true) {
-                        Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
-                        Ok(None) => std::task::Poll::Ready(None),
-                        Err(e) => std::task::Poll::Ready(Some(Err(codec_err_to_error(
-                            &this.ctx,
-                            &this.parser,
-                            &this.read_buf,
-                            e,
-                        )))),
-                    };
+                    return Poll::Ready(reader.decode(&this.ctx, true, Instant::now()).transpose());
                 }
-                Ok(n) => {
-                    this.read_buf.advance_end(n);
-                    // Loop to try decoding again.
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Spurious readiness; re-register and wait.
-                    continue;
-                }
-                Err(error) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-                    return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: this.ctx,
-                        msg_ctx: RtspMessageContext {
-                            pos,
-                            received_wall: WallTime::now(),
-                            received: Instant::now(),
-                        },
-                        source: error,
-                    }))));
+                Ok(_) => {} // Loop to try decoding again.
+                Err(e) => {
+                    return Poll::Ready(Some(Err(reader.read_error(&this.ctx, e, Instant::now()))));
                 }
             }
         }
     }
-}
-
-fn codec_err_to_error(
-    ctx: &ConnectionContext,
-    parser: &crate::rtsp::parse::Parser,
-    read_buf: &MarkBuf,
-    e: CodecError,
-) -> Error {
-    wrap!(match e {
-        CodecError::IoError(error) => ErrorInt::RtspReadError {
-            conn_ctx: *ctx,
-            msg_ctx: RtspMessageContext {
-                pos: parser.stream_pos() + read_buf.unparsed_len() as u64,
-                received_wall: WallTime::now(),
-                received: Instant::now(),
-            },
-            source: error,
-        },
-        CodecError::ParseError { description, pos } => ErrorInt::RtspFramingError {
-            conn_ctx: *ctx,
-            msg_ctx: RtspMessageContext {
-                pos,
-                received_wall: WallTime::now(),
-                received: Instant::now(),
-            },
-            description,
-        },
-    })
 }
 
 impl Sink<OwnedMessage> for Connection {
@@ -446,25 +336,6 @@ mod tests {
         assert_eq!(accepted.unwrap().1.ip(), local);
     }
 
-    #[test]
-    fn crlf_data() {
-        let mut read_buf = MarkBuf::new(64);
-        let data = b"\r\n$\x00\x00\x04asdfrest";
-        let (first, _) = read_buf.spare_capacity(data.len());
-        first[..data.len()].copy_from_slice(data);
-        read_buf.advance_end(data.len());
-
-        let mut parser = crate::rtsp::parse::Parser::default();
-        let msg = try_decode(&mut parser, &mut read_buf, false)
-            .unwrap()
-            .unwrap();
-        // Read body from ring buffer.
-        let (s1, s2) = read_buf.split(msg.body_pos, msg.body_len as usize).slices();
-        assert_eq!(s1, b"asdf");
-        assert!(s2.is_empty());
-        assert_eq!(read_buf.unparsed_len(), 4); // "rest" remains
-    }
-
     /// Messages queued back to back before a flush, e.g. a receiver report
     /// queued while a keepalive request is still being flushed, all reach the
     /// peer whole and in order.
@@ -521,22 +392,5 @@ mod tests {
             }
             o => panic!("expected data, got {o:#?}"),
         }
-    }
-
-    #[test]
-    fn response_decode() {
-        let mut read_buf = MarkBuf::new(64);
-        let data = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n";
-        let (first, _) = read_buf.spare_capacity(data.len());
-        first[..data.len()].copy_from_slice(data);
-        read_buf.advance_end(data.len());
-
-        let mut parser = crate::rtsp::parse::Parser::default();
-        let msg = try_decode(&mut parser, &mut read_buf, false)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(msg.msg, crate::rtsp::msg::Message::Response(_)));
-        assert_eq!(msg.body_len, 0);
-        assert_eq!(read_buf.unparsed_len(), 0);
     }
 }
