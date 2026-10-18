@@ -464,14 +464,23 @@ impl Display for PacketContext {
 /// A pair of local UDP sockets used for RTP and RTCP transmission.
 ///
 /// The RTP port is always even, and the RTCP port is always the following (odd) integer.
-struct UdpPair {
-    rtp_port: u16,
-    rtp_socket: UdpSocket,
-    rtcp_socket: UdpSocket,
+///
+/// [`client::Session`] binds these itself; callers of
+/// [`client::SessionCore`] may use this for
+/// [`client::SetupTransport::Udp`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct UdpPair {
+    pub rtp_port: u16,
+    pub rtp_socket: UdpSocket,
+    pub rtcp_socket: UdpSocket,
 }
 
 impl UdpPair {
-    fn for_ip(ip_addr: IpAddr) -> Result<Self, std::io::Error> {
+    /// Binds a pair of sockets on `ip_addr`, at random ports.
+    ///
+    /// `ip_addr` should be the RTSP connection's local address.
+    pub fn for_ip(ip_addr: IpAddr) -> Result<Self, std::io::Error> {
         const MAX_TRIES: usize = 10;
         const ALLOWED_RTP_RANGE: Range<u16> = 5000..65000; // stolen from ffmpeg's defaults.
         let mut rng = rand::thread_rng();

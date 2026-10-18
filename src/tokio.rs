@@ -5,9 +5,8 @@
 //!
 //! In theory there could be a similar async-std-based implementation.
 
-use futures::{Sink, Stream};
+use futures::Sink;
 use std::task::{Context, Poll};
-use std::time::Instant;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
@@ -15,16 +14,25 @@ use url::Host;
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::OwnedMessage;
 use crate::rtsp::reader::Reader;
-use crate::{Error, ErrorInt, RtspMessageContext};
+use crate::{ConnectionContext, ErrorInt, WallTime};
+#[cfg(test)]
+use crate::{Error, ReceivedMessage};
+#[cfg(test)]
+use futures::Stream;
+#[cfg(test)]
+use std::time::Instant;
 
-use super::{ConnectionContext, ReceivedMessage, WallTime};
-
-/// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
+/// A RTSP connection which implements `Sink`, `Unpin`, and (in tests, for
+/// mock servers) `Stream`.
+///
+/// The client reads into a sans-I/O core's buffer via
+/// [`Connection::poll_read`] instead of using the `Stream` impl.
 pub(crate) struct Connection {
     stream: TcpStream,
     ctx: ConnectionContext,
 
-    /// The reader, which is lent out while playing; see [`Connection::take_reader`].
+    /// The reader for the `Stream` impl; see [`Connection::with_reader`].
+    #[cfg_attr(not(test), allow(dead_code))]
     reader: Option<Reader>,
 
     /// Write buffer for outgoing messages (appended then flushed).
@@ -32,10 +40,13 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    /// Connects to `host:port`, from `bind_addr` if specified.
+    ///
+    /// The connection has no reader; the caller parses what it reads via a
+    /// sans-I/O core.
     pub(crate) async fn connect(
         host: Host<&str>,
         port: u16,
-        max_message_size: usize,
         bind_addr: Option<std::net::IpAddr>,
     ) -> Result<Self, std::io::Error> {
         let stream = match bind_addr {
@@ -46,7 +57,7 @@ impl Connection {
             }?,
             Some(local) => Self::connect_bound(host, port, local).await?,
         };
-        Self::from_stream(stream, max_message_size)
+        Self::from_stream(stream)
     }
 
     /// Connects to `host:port` from the local address `local` (port chosen by the OS).
@@ -81,10 +92,8 @@ impl Connection {
         }))
     }
 
-    pub(crate) fn from_stream(
-        stream: TcpStream,
-        max_message_size: usize,
-    ) -> Result<Self, std::io::Error> {
+    /// Wraps `stream`, without a reader; see [`Connection::with_reader`].
+    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
@@ -95,48 +104,34 @@ impl Connection {
                 peer_addr,
                 established_wall,
             },
-            reader: Some(Reader::new(max_message_size)),
+            reader: None,
             write_buf: Vec::new(),
         })
+    }
+
+    /// Adds a reader, so this connection can be used via its `Stream` impl.
+    #[cfg(test)]
+    pub(crate) fn with_reader(mut self, max_message_size: usize) -> Self {
+        self.reader = Some(Reader::new(max_message_size));
+        self
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
         &self.ctx
     }
 
-    fn reader(&self) -> &Reader {
+    /// Reads body data from the ring buffer as `Bytes`; see [`Reader::body_bytes`].
+    #[cfg(test)]
+    pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
         self.reader
             .as_ref()
-            .expect("reader should be present except while playing")
-    }
-
-    /// Takes the reader, so that a [`crate::client::playing::PlayingCore`]
-    /// can parse messages without going through this connection's `Stream`
-    /// impl. Put it back with [`Connection::restore_reader`] before polling
-    /// the `Stream` impl again.
-    pub(crate) fn take_reader(&mut self) -> Reader {
-        self.reader
-            .take()
-            .expect("reader should be present except while playing")
-    }
-
-    pub(crate) fn restore_reader(&mut self, reader: Reader) {
-        assert!(self.reader.is_none());
-        self.reader = Some(reader);
-    }
-
-    /// Reads body data from the ring buffer as `Bytes`; see [`Reader::body_bytes`].
-    pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
-        self.reader().body_bytes(body_pos, body_len)
+            .expect("with_reader")
+            .body_bytes(body_pos, body_len)
     }
 
     /// Returns true iff messages are queued that haven't been fully written.
     pub(crate) fn has_unflushed(&self) -> bool {
         !self.write_buf.is_empty()
-    }
-
-    pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
-        self.reader().eof_ctx(Instant::now())
     }
 
     /// Reads available bytes from the connection into `buf`, returning the
@@ -183,6 +178,7 @@ fn poll_read(
     }
 }
 
+#[cfg(test)]
 impl Stream for Connection {
     type Item = Result<ReceivedMessage, Error>;
 
@@ -191,10 +187,7 @@ impl Stream for Connection {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
-        let reader = this
-            .reader
-            .as_mut()
-            .expect("reader should be present except while playing");
+        let reader = this.reader.as_mut().expect("with_reader");
         loop {
             // Try decoding from existing buffered data.
             match reader.decode(&this.ctx, false, Instant::now()) {
@@ -323,12 +316,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let (client, accepted) = tokio::join!(
-            Connection::connect(
-                Host::Ipv4(std::net::Ipv4Addr::LOCALHOST),
-                port,
-                usize::MAX,
-                Some(local)
-            ),
+            Connection::connect(Host::Ipv4(std::net::Ipv4Addr::LOCALHOST), port, Some(local)),
             listener.accept()
         );
         client.unwrap();
@@ -349,8 +337,10 @@ mod tests {
             TcpStream::connect(listener.local_addr().unwrap()),
             listener.accept()
         );
-        let mut client = Connection::from_stream(client.unwrap(), usize::MAX).unwrap();
-        let mut server = Connection::from_stream(server.unwrap().0, usize::MAX).unwrap();
+        let mut client = Connection::from_stream(client.unwrap()).unwrap();
+        let mut server = Connection::from_stream(server.unwrap().0)
+            .unwrap()
+            .with_reader(usize::MAX);
 
         client
             .start_send_unpin(OwnedMessage::Request {

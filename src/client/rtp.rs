@@ -343,7 +343,7 @@ impl InorderParser {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::client::UdpStreamContext;
+    use crate::UdpStreamContext;
 
     use super::*;
 

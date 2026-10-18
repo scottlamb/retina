@@ -2,35 +2,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RTSP client: connect to a server via [`Session`].
+//!
+//! [`Session`] does its I/O via tokio. Its protocol logic is also available
+//! without any I/O or runtime, for callers who do their own, as
+//! [`SessionCore`]. The `polling-client` example drives it with plain
+//! non-blocking sockets and a `poll(2)`-style loop.
 
 use std::convert::TryFrom;
 use std::io;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
-use self::channel_mapping::*;
+pub use self::channel_mapping::ChannelType;
+use self::playing::PlayingCore;
+pub use self::session_core::{SessionCore, SessionEvent, SetupTransport, UdpTransmit};
 pub use self::timeline::Timeline;
-use crate::inputs::Input;
-use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
+use crate::inputs::Input as _;
+use crate::rtsp::msg::{self as msg, OwnedMessage};
 use bytes::Bytes;
-use futures::{Future, SinkExt, StreamExt, ready};
-use log::{debug, trace, warn};
-use pin_project::pin_project;
+use futures::{Future, SinkExt, ready};
+use log::{debug, warn};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use url::Url;
 
-use crate::client::parse::SessionHeader;
-use crate::{
-    Error, ErrorInt, RtspMessageContext, StreamContext, StreamContextInner, TcpStreamContext,
-    UdpStreamContext,
-};
+use crate::{Error, ErrorInt, RtspMessageContext, StreamContext};
 
 mod channel_mapping;
+mod conn;
 pub(crate) mod parse;
 mod playing;
 mod receiver_report;
@@ -39,6 +42,7 @@ mod receiver_report;
 #[doc(hidden)]
 pub mod rtp;
 
+mod session_core;
 mod teardown;
 mod timeline;
 
@@ -973,10 +977,12 @@ struct UdpSockets {
     rtcp: UdpSocket,
 }
 
-/// Placeholder `Debug` impl to allow `UdpSockets` to be a field within a `#[derive(Debug)]` struct.
-impl std::fmt::Debug for UdpSockets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UdpSockets").finish()
+impl UdpSockets {
+    fn socket(&self, channel_type: ChannelType) -> &UdpSocket {
+        match channel_type {
+            ChannelType::Rtp => &self.rtp,
+            ChannelType::Rtcp => &self.rtcp,
+        }
     }
 }
 
@@ -1056,7 +1062,7 @@ impl Stream {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum StreamState {
     /// Uninitialized; no `SETUP` has yet been sent.
     Uninit,
@@ -1065,14 +1071,11 @@ enum StreamState {
     Init(StreamStateInit),
 
     /// `PLAY` response has been received. Further state is in the session's
-    /// [`playing::PlayingCore`].
-    Playing {
-        ctx: StreamContext,
-        udp_sockets: Option<UdpSockets>,
-    },
+    /// [`PlayingCore`].
+    Playing { ctx: StreamContext },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StreamStateInit {
     /// The RTP synchronization source (SSRC), as defined in
     /// [RFC 3550](https://tools.ietf.org/html/rfc3550). This is normally
@@ -1093,7 +1096,6 @@ struct StreamStateInit {
     initial_rtptime: Option<u32>,
 
     ctx: StreamContext,
-    udp_sockets: Option<UdpSockets>,
 }
 
 /// Username and password authentication credentials.
@@ -1115,45 +1117,13 @@ pub trait State {}
 
 /// Initial state after a `DESCRIBE`; use via `Session<Described>`.
 #[doc(hidden)]
-pub struct Described {
-    sdp: Bytes,
-}
+pub struct Described(());
 impl State for Described {}
 
 /// State after a `PLAY`; use via `Session<Playing>`.
 #[doc(hidden)]
 pub struct Playing(());
 impl State for Playing {}
-
-/// The raw connection, without tracking session state.
-struct RtspConnection {
-    inner: crate::tokio::Connection,
-    channels: ChannelMappings,
-
-    /// The next `CSeq` header value to use when sending an RTSP request.
-    next_cseq: u32,
-
-    /// If Retina has received data on an unassigned RTSP interleaved data channel.
-    seen_unassigned: bool,
-}
-
-/// Mode to use in `RtspConnection::send` when looking for a response.
-enum ResponseMode {
-    /// Anything but the response to this request is an error.
-    Normal,
-
-    /// Silently discard data messages on assigned channels.
-    ///
-    /// This is a workaround for recent Reolink cameras which appear to send
-    /// RTCP sender reports immediately *before* the `PLAY` response when
-    /// using interleaved data. It's simplest to discard them rather than
-    /// attempt to interpret them before having `RTP-Info`.
-    Play,
-
-    /// Discard data messages and unrelated responses while awaiting the
-    /// response to this request.
-    Teardown,
-}
 
 /// An RTSP session.
 ///
@@ -1170,52 +1140,48 @@ enum ResponseMode {
 /// 6. Possibly wait for `TEARDOWN` to complete; see
 ///    [`SessionOptions::session_group`] and [`SessionGroup::await_teardown`].
 ///
+/// This does I/O for a [`SessionCore`], which holds the protocol logic.
+///
 /// ## tokio runtime
 ///
 /// All `Session` operations are currently expected to be performed from
 /// "within" a tokio runtime with both time and I/O resource drivers enabled.
 /// Operations may panic or fail otherwise.
-pub struct Session<S: State>(Pin<Box<SessionInner>>, S);
+pub struct Session<S: State>(Box<SessionInner>, S);
 
-#[pin_project(PinnedDrop)]
 struct SessionInner {
-    /// The connection. Currently there's expected to always be a RTSP
-    /// connection, even while playing a RTP/AVP/UDP session. The only
+    /// The RTSP connection, used only for I/O. Currently there's expected to
+    /// always be one, even while playing a RTP/AVP/UDP session. The only
     /// exception is during drop.
-    conn: Option<RtspConnection>,
+    conn: Option<crate::tokio::Connection>,
 
-    options: SessionOptions,
-    requested_auth: Option<http_auth::PasswordClient>,
-    presentation: Presentation,
+    /// The protocol state.
+    core: SessionCore,
 
-    /// This will be set iff one or more `SETUP` calls have been issued.
-    /// This is sometimes true in state `Described` and always true in state
-    /// `Playing`.
-    session: Option<parse::SessionHeader>,
+    /// Sockets for each stream in the presentation which is set up via UDP.
+    udp: Box<[Option<UdpSockets>]>,
 
-    /// The sans-I/O state of a playing session. Set iff in state `Playing`,
-    /// except during drop.
-    ///
-    /// While this is set, it holds `conn`'s reader, `options`, and
-    /// `requested_auth`, and has taken over sending requests on `conn`.
-    playing: Option<playing::PlayingCore>,
-
-    /// Fires at the core's [`playing::PlayingCore::poll_timeout`]; only used
-    /// in state `Playing`. Tests may disable it.
+    /// Fires at the core's [`SessionCore::poll_timeout`]; only used in state
+    /// `Playing`. Tests may disable it.
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
-    /// Bitmask of [`SessionFlag`]s.
-    flags: u8,
-
-    /// The index within `presentation.streams` to start the next poll at.
-    /// Round-robining between them rather than always starting at 0 should
-    /// prevent one stream from starving the others.
+    /// The index within `udp` to start the next poll at. Round-robining
+    /// between them rather than always starting at 0 should prevent one stream
+    /// from starving the others.
     udp_next_poll_i: usize,
+}
+
+impl SessionInner {
+    fn playing_core(&mut self) -> &mut PlayingCore {
+        self.core
+            .playing_mut()
+            .expect("core is playing in state Playing")
+    }
 }
 
 #[derive(Copy, Clone)]
 #[repr(u8)]
-enum SessionFlag {
+pub(crate) enum SessionFlag {
     /// Set if the server may be in state Playing: we have sent a `PLAY`
     /// request, regardless of if the response has been received.
     MaybePlaying = 0x1,
@@ -1227,204 +1193,110 @@ enum SessionFlag {
     UdpStreams = 0x4,
 }
 
-impl RtspConnection {
-    async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
-        let host =
-            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
-        let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(
-            host,
-            port,
-            options.get_max_message_size(),
-            options.bind_addr,
-        )
+/// Checks that `url` is suitable for `DESCRIBE`, returning its host.
+fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
+    if url.scheme() != "rtsp" {
+        return Err(format!(
+            "Bad URL {}; only scheme rtsp supported",
+            url.as_str()
+        ));
+    }
+    if url.username() != "" || url.password().is_some() {
+        // Url apparently doesn't even have a way to clear the credentials,
+        // so this has to be an error.
+        // TODO: that's not true; revisit this.
+        return Err("URL must not contain credentials".to_owned());
+    }
+    url.host()
+        .ok_or_else(|| format!("Must specify host in rtsp url {}", url))
+}
+
+/// Connects to the server named in `url`.
+async fn connect(url: &Url, options: &SessionOptions) -> Result<crate::tokio::Connection, Error> {
+    let host = validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+    let port = url.port().unwrap_or(554);
+    crate::tokio::Connection::connect(host, port, options.bind_addr)
         .await
-        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-        Ok(Self {
-            inner,
-            channels: ChannelMappings::default(),
-            next_cseq: 1,
-            seen_unassigned: false,
-        })
-    }
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))
+}
 
-    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
-            return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
-                url.as_str()
-            ));
+/// A sans-I/O core which completes one request at a time; see [`poll_request`].
+trait RequestCore {
+    type Output;
+    fn poll_transmit(&mut self) -> Option<Vec<u8>>;
+    fn read_buf(&mut self) -> &mut crate::buf::MarkBuf;
+    fn handle_eof(&mut self);
+    fn read_error(&self, source: io::Error, now: std::time::Instant) -> Error;
+    fn poll_done(&mut self, now: std::time::Instant) -> Option<Result<Self::Output, Error>>;
+}
+
+impl RequestCore for SessionCore {
+    type Output = SessionEvent;
+    fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+        SessionCore::poll_transmit(self)
+    }
+    fn read_buf(&mut self) -> &mut crate::buf::MarkBuf {
+        SessionCore::read_buf(self)
+    }
+    fn handle_eof(&mut self) {
+        SessionCore::handle_eof(self)
+    }
+    fn read_error(&self, source: io::Error, now: std::time::Instant) -> Error {
+        SessionCore::read_error(self, source, now)
+    }
+    fn poll_done(&mut self, now: std::time::Instant) -> Option<Result<SessionEvent, Error>> {
+        self.poll_event(now)
+    }
+}
+
+impl RequestCore for conn::ConnCore {
+    type Output = conn::Response;
+    fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+        conn::ConnCore::poll_transmit(self)
+    }
+    fn read_buf(&mut self) -> &mut crate::buf::MarkBuf {
+        conn::ConnCore::read_buf(self)
+    }
+    fn handle_eof(&mut self) {
+        self.eof = true;
+    }
+    fn read_error(&self, source: io::Error, now: std::time::Instant) -> Error {
+        conn::ConnCore::read_error(self, source, now)
+    }
+    fn poll_done(&mut self, now: std::time::Instant) -> Option<Result<conn::Response, Error>> {
+        self.poll_response(now)
+    }
+}
+
+/// Does I/O on `conn` until `core`'s outstanding request completes.
+///
+/// The caller must have started a request, so that EOF ends it.
+fn poll_request<C: RequestCore>(
+    cx: &mut std::task::Context<'_>,
+    conn: &mut crate::tokio::Connection,
+    core: &mut C,
+) -> Poll<Result<C::Output, Error>> {
+    loop {
+        // Use tokio's clock, to match the timer. Outside tests that pause
+        // time, it's the same as `std::time::Instant::now()`.
+        let now = tokio::time::Instant::now().into_std();
+        if let Some(data) = core.poll_transmit() {
+            conn.queue_write(&data);
         }
-        if url.username() != "" || url.password().is_some() {
-            // Url apparently doesn't even have a way to clear the credentials,
-            // so this has to be an error.
-            // TODO: that's not true; revisit this.
-            return Err("URL must not contain credentials".to_owned());
+        if conn.has_unflushed()
+            && let Poll::Ready(Err(e)) = conn.poll_flush_unpin(cx)
+        {
+            return Poll::Ready(Err(wrap!(e)));
         }
-        url.host()
-            .ok_or_else(|| format!("Must specify host in rtsp url {}", url))
-    }
-
-    /// Sends a request and expects an upcoming message from the peer to be its response.
-    /// Takes care of authorization and `CSeq`. Returns `Error` if not successful.
-    async fn send(
-        &mut self,
-        mode: ResponseMode,
-        options: &SessionOptions,
-        tool: Option<&Tool>,
-        requested_auth: &mut Option<http_auth::PasswordClient>,
-        req: &mut OwnedMessage,
-    ) -> Result<(RtspMessageContext, u32, msg::Response, Bytes), Error> {
-        loop {
-            let cseq = self.fill_req(options, requested_auth, req)?;
-            self.inner.send(req.clone()).await.map_err(|e| wrap!(e))?;
-            let method: &str = req.method_str();
-            let (resp, resp_body, msg_ctx) = loop {
-                let msg = self.inner.next().await.unwrap_or_else(|| {
-                    bail!(ErrorInt::RtspReadError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx: self.inner.eof_ctx(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("EOF while expecting response to {method} CSeq {cseq}"),
-                        ),
-                    })
-                })?;
-                let msg_ctx = msg.ctx;
-                let description = match msg.msg {
-                    msg::Message::Response(r) => {
-                        if let Some(response_cseq) = parse::get_cseq(&r) {
-                            if response_cseq == cseq {
-                                let body = self.inner.body_bytes(msg.body_pos, msg.body_len);
-                                break (r, body, msg_ctx);
-                            }
-                            if matches!(mode, ResponseMode::Teardown) {
-                                debug!("ignoring unrelated response during TEARDOWN");
-                                continue;
-                            }
-                            format!("{} response with CSeq {}", r.reason_phrase, response_cseq)
-                        } else {
-                            format!("{} response with no/unparseable cseq", r.reason_phrase)
-                        }
-                    }
-                    msg::Message::Data(d) => {
-                        if matches!(mode, ResponseMode::Teardown) {
-                            debug!("ignoring RTSP interleaved data during TEARDOWN");
-                            continue;
-                        } else if let (ResponseMode::Play, Some(m)) =
-                            (&mode, self.channels.lookup(d.channel_id))
-                        {
-                            debug!(
-                                "ignoring interleaved data message on {:?} channel {} while \
-                                     waiting for response to {} CSeq {}",
-                                m.channel_type, d.channel_id, method, cseq
-                            );
-                            continue;
-                        }
-                        let body = self.inner.body_bytes(msg.body_pos, msg.body_len);
-                        self.handle_unassigned_data(msg_ctx, options, tool, d.channel_id, body)?;
-                        continue;
-                    }
-                    msg::Message::Request(r) => format!("{:?} request", r.method),
-                };
-                bail!(ErrorInt::RtspFramingError {
-                    conn_ctx: *self.inner.ctx(),
-                    msg_ctx,
-                    description: format!(
-                        "Expected response to {method} CSeq {cseq}, got {description}",
-                    ),
-                });
-            };
-            if resp.status_code == StatusCode::UNAUTHORIZED {
-                if requested_auth.is_some() {
-                    // TODO: the WWW-Authenticate might indicate a new domain or nonce.
-                    // In that case, we should retry rather than returning error.
-                    bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status_code,
-                        description: "Received Unauthorized after trying digest auth".into(),
-                    })
-                }
-                let www_authenticate = match resp.headers.get("WWW-Authenticate") {
-                    None => bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status_code,
-                        description: "Unauthorized without WWW-Authenticate header".into(),
-                    }),
-                    Some(h) => h,
-                };
-                if options.creds.is_none() {
-                    bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status_code,
-                        description: "Authentication requested and no credentials supplied"
-                            .to_owned(),
-                    })
-                }
-                let www_authenticate: &str = www_authenticate;
-                *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
-                    Ok(c) => Some(c),
-                    Err(e) => bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *self.inner.ctx(),
-                        msg_ctx,
-                        method: req.method().clone(),
-                        cseq,
-                        status: resp.status_code,
-                        description: format!("Can't understand WWW-Authenticate header: {e}"),
-                    }),
-                };
-                continue;
-            } else if !resp.status_code.is_success() {
-                bail!(ErrorInt::RtspResponseError {
-                    conn_ctx: *self.inner.ctx(),
-                    msg_ctx,
-                    method: req.method().clone(),
-                    cseq,
-                    status: resp.status_code,
-                    description: "Unexpected RTSP response status".into(),
-                });
-            }
-            return Ok((msg_ctx, cseq, resp, resp_body));
+        if let Some(r) = core.poll_done(now) {
+            return Poll::Ready(r);
         }
-    }
-
-    /// Handles data on an unassigned RTSP channel.
-    fn handle_unassigned_data(
-        &mut self,
-        msg_ctx: RtspMessageContext,
-        options: &SessionOptions,
-        tool: Option<&Tool>,
-        channel_id: u8,
-        data: Bytes,
-    ) -> Result<(), Error> {
-        handle_unassigned_data(
-            self.inner.ctx(),
-            &mut self.seen_unassigned,
-            msg_ctx,
-            options,
-            tool,
-            channel_id,
-            data,
-        )
-    }
-
-    /// Fills out `req` with authorization and `CSeq` headers.
-    fn fill_req(
-        &mut self,
-        options: &SessionOptions,
-        requested_auth: &mut Option<http_auth::PasswordClient>,
-        req: &mut OwnedMessage,
-    ) -> Result<u32, Error> {
-        fill_req(&mut self.next_cseq, options, requested_auth, req)
+        match conn.poll_read(cx, core.read_buf()) {
+            Poll::Ready(Ok(0)) => core.handle_eof(),
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(core.read_error(e, now))),
+            Poll::Pending => return Poll::Pending,
+        }
     }
 }
 
@@ -1540,13 +1412,13 @@ const DEFAULT_USER_AGENT: &str = concat!("retina_", env!("CARGO_PKG_VERSION"));
 impl<S: State> Session<S> {
     /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
-        &self.0.presentation.streams
+        self.0.core.streams()
     }
 
     /// Returns the server's version as declared in the `DESCRIBE` response's `a:tool` SDP
     /// attribute.
     pub fn tool(&self) -> Option<&Tool> {
-        self.0.presentation.tool.as_ref()
+        self.0.core.tool()
     }
 
     /// Returns a context for the RTSP connection, e.g. for error messages.
@@ -1555,7 +1427,6 @@ impl<S: State> Session<S> {
             .conn
             .as_ref()
             .expect("conn is present until drop")
-            .inner
             .ctx()
     }
 }
@@ -1570,63 +1441,28 @@ impl Session<Described> {
     ///
     /// Expects to be called from a tokio runtime.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = RtspConnection::connect(&url, &options).await?;
+        let conn = connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
     }
 
     async fn describe_with_conn(
-        mut conn: RtspConnection,
+        conn: crate::tokio::Connection,
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
-        let mut req = OwnedMessage::Request {
-            head: msg::Request {
-                method: msg::Method::DESCRIBE,
-                request_uri: Some(url.clone()),
-                headers: [(
-                    msg::HeaderName::ACCEPT,
-                    msg::HeaderValue::try_from("application/sdp").unwrap(),
-                )]
-                .into(),
-            },
-            body: Bytes::new(),
-        };
-        let mut requested_auth = None;
-        let (msg_ctx, cseq, response, resp_body) = conn
-            .send(
-                ResponseMode::Normal,
-                &options,
-                None, // tool isn't known until after the DESCRIBE response is parsed below.
-                &mut requested_auth,
-                &mut req,
-            )
-            .await?;
-        let presentation =
-            parse::parse_describe(url, &response, &resp_body).map_err(|description| {
-                wrap!(ErrorInt::RtspResponseError {
-                    conn_ctx: *conn.inner.ctx(),
-                    msg_ctx,
-                    method: msg::Method::DESCRIBE,
-                    cseq,
-                    status: response.status_code,
-                    description,
-                })
-            })?;
-        let sdp = resp_body;
-        Ok(Session(
-            Box::pin(SessionInner {
-                conn: Some(conn),
-                options,
-                requested_auth,
-                presentation,
-                session: None,
-                playing: None,
-                keepalive_timer: None,
-                flags: 0,
-                udp_next_poll_i: 0,
-            }),
-            Described { sdp },
-        ))
+        let core = SessionCore::from_conn(conn::ConnCore::new(*conn.ctx(), options));
+        let mut inner = Box::new(SessionInner {
+            conn: Some(conn),
+            core,
+            udp: Box::new([]),
+            keepalive_timer: None,
+            udp_next_poll_i: 0,
+        });
+        inner.core.describe(url)?;
+        let event = inner.drive().await?;
+        debug_assert!(matches!(event, SessionEvent::Described), "{event:?}");
+        inner.udp = inner.core.streams().iter().map(|_| None).collect();
+        Ok(Session(inner, Described(())))
     }
 
     /// Returns the raw SDP (Session Description Protocol) session description of this URL.
@@ -1635,7 +1471,7 @@ impl Session<Described> {
     /// They're accessibled in the `Session<Described>` state. Currently, they're discarded on
     /// `play` to reduce memory usage.
     pub fn sdp(&self) -> &[u8] {
-        &self.1.sdp
+        self.0.core.sdp()
     }
 
     /// Sends a `SETUP` request for a stream.
@@ -1648,210 +1484,54 @@ impl Session<Described> {
     ///
     /// Panics if `stream_i >= self.streams().len()`.
     pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
-        let inner = &mut self.0.as_mut().project();
-        let conn = inner
-            .conn
-            .as_mut()
-            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        let stream = &mut inner.presentation.streams[stream_i];
-        if !matches!(stream.state, StreamState::Uninit) {
-            bail!(ErrorInt::FailedPrecondition("stream already set up".into()));
-        }
-        let url = stream
-            .control
-            .as_ref()
-            .unwrap_or(&inner.presentation.control)
-            .clone();
-        let mut headers = msg::Headers::default();
-        let udp = match options.transport {
-            Transport::Tcp(_) => {
-                let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
-                    wrap!(ErrorInt::FailedPrecondition(
-                        "no unassigned channels".into()
-                    ))
-                })?;
-                headers.insert(
-                    msg::HeaderName::TRANSPORT,
-                    msg::HeaderValue::try_from(format!(
-                        "RTP/AVP/TCP;unicast;interleaved={}-{}",
-                        proposed_channel_id,
-                        proposed_channel_id + 1
-                    ))
-                    .unwrap(),
-                );
-                *inner.flags |= SessionFlag::TcpStreams as u8;
-                None
-            }
+        let inner = &mut *self.0;
+        let (transport, pair) = match options.transport {
+            Transport::Tcp(_) => (SetupTransport::Tcp, None),
             Transport::Udp(_) => {
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
-                let local_ip = conn.inner.ctx().local_addr.ip();
+                let local_ip = inner.core.conn_ctx().local_addr.ip();
                 let pair = crate::tokio::UdpPair::for_ip(local_ip)
                     .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
-                headers.insert(
-                    msg::HeaderName::TRANSPORT,
-                    msg::HeaderValue::try_from(format!(
-                        "RTP/AVP/UDP;unicast;client_port={}-{}",
-                        pair.rtp_port,
-                        pair.rtp_port + 1,
-                    ))
-                    .unwrap(),
-                );
-                *inner.flags |= SessionFlag::UdpStreams as u8;
-                Some((
-                    UdpStreamContext {
-                        local_ip,
-                        peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        local_rtp_port: pair.rtp_port,
-                        peer_rtp_port: 0,
+                (
+                    SetupTransport::Udp {
+                        client_rtp_port: pair.rtp_port,
                     },
-                    UdpSockets {
-                        rtp: pair.rtp_socket,
-                        rtcp: pair.rtcp_socket,
-                    },
-                ))
+                    Some(pair),
+                )
             }
         };
-        if let &mut Some(ref s) = inner.session {
-            headers.insert(msg::HeaderName::SESSION, s.id.clone());
+        inner.core.setup(stream_i, transport)?;
+        let SessionEvent::SetUp { udp_peer, .. } = inner.drive().await? else {
+            unreachable!("SETUP completes with SetUp");
+        };
+        if let (Some(pair), Some(peer)) = (pair, udp_peer) {
+            let sockets = UdpSockets {
+                rtp: pair.rtp_socket,
+                rtcp: pair.rtcp_socket,
+            };
+            sockets
+                .rtp
+                .connect(peer)
+                .await
+                .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+            sockets
+                .rtcp
+                .connect(SocketAddr::new(peer.ip(), peer.port() + 1))
+                .await
+                .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+
+            // Punch a hole in connection-tracking firewalls, as described at
+            // `SessionCore::poll_transmit_udp`.
+            while let Some(t) = inner.core.poll_transmit_udp() {
+                sockets
+                    .socket(t.channel_type)
+                    .send(&t.data)
+                    .await
+                    .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+            }
+            inner.udp[stream_i] = Some(sockets);
         }
-        let mut req = OwnedMessage::Request {
-            head: msg::Request {
-                method: msg::Method::SETUP,
-                request_uri: Some(url),
-                headers,
-            },
-            body: Bytes::new(),
-        };
-        let (msg_ctx, cseq, response, _resp_body) = conn
-            .send(
-                ResponseMode::Normal,
-                inner.options,
-                inner.presentation.tool.as_ref(),
-                inner.requested_auth,
-                &mut req,
-            )
-            .await?;
-        debug!("SETUP response: {:#?}", response);
-        let conn_ctx = conn.inner.ctx();
-        let status = response.status_code;
-        let response = parse::parse_setup(&response).map_err(|description| {
-            wrap!(ErrorInt::RtspResponseError {
-                conn_ctx: *conn_ctx,
-                msg_ctx,
-                method: msg::Method::SETUP,
-                cseq,
-                status,
-                description,
-            })
-        })?;
-        match inner.session.as_ref() {
-            Some(SessionHeader { id, .. }) if *id != response.session.id => {
-                match inner.options.session_id {
-                    SessionIdPolicy::UseFirst => (),
-                    _ => {
-                        bail!(ErrorInt::RtspResponseError {
-                            conn_ctx: *conn.inner.ctx(),
-                            msg_ctx,
-                            method: msg::Method::SETUP,
-                            cseq,
-                            status,
-                            description: format!(
-                                "session id changed from {:?} to {:?}",
-                                id, response.session.id,
-                            ),
-                        });
-                    }
-                }
-            }
-            Some(_) => {}
-            None => {
-                debug!(
-                    "established session {:?}, timeout={}s",
-                    response.session.id, response.session.timeout_sec
-                );
-                *inner.session = Some(response.session)
-            }
-        };
-        let conn_ctx = conn.inner.ctx();
-        let (stream_ctx, udp_sockets);
-        match udp {
-            None => {
-                let channel_id = match response.channel_id {
-                    Some(id) => id,
-                    None => bail!(ErrorInt::RtspResponseError {
-                        conn_ctx: *conn.inner.ctx(),
-                        msg_ctx,
-                        method: msg::Method::SETUP,
-                        cseq,
-                        status,
-                        description: "Transport header is missing interleaved parameter".to_owned(),
-                    }),
-                };
-                conn.channels
-                    .assign(channel_id, stream_i)
-                    .map_err(|description| {
-                        wrap!(ErrorInt::RtspResponseError {
-                            conn_ctx: *conn_ctx,
-                            msg_ctx,
-                            method: msg::Method::SETUP,
-                            cseq,
-                            status,
-                            description,
-                        })
-                    })?;
-                stream_ctx = StreamContext(StreamContextInner::Tcp(TcpStreamContext {
-                    rtp_channel_id: channel_id,
-                }));
-                udp_sockets = None;
-            }
-            Some((mut ctx, sockets)) => {
-                // TODO: RFC 2326 section 12.39 says "If the source address for
-                // the stream is different than can be derived from the RTSP
-                // endpoint address (the server in playback or the client in
-                // recording), the source MAY be specified." Not MUST,
-                // unfortunately. But let's see if we can get away with this
-                // for now.
-                let source = match response.source {
-                    Some(s) => s,
-                    None => conn.inner.ctx().peer_addr.ip(),
-                };
-                let server_port = response.server_port.ok_or_else(|| {
-                    wrap!(ErrorInt::RtspResponseError {
-                        conn_ctx: *conn_ctx,
-                        msg_ctx,
-                        method: msg::Method::SETUP,
-                        cseq,
-                        status,
-                        description: "Transport header is missing server_port parameter".to_owned(),
-                    })
-                })?;
-                ctx.peer_ip = source;
-                ctx.peer_rtp_port = server_port;
-                sockets
-                    .rtp
-                    .connect(SocketAddr::new(source, server_port))
-                    .await
-                    .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-                sockets
-                    .rtcp
-                    .connect(SocketAddr::new(source, server_port + 1))
-                    .await
-                    .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-                punch_firewall_hole(&sockets)
-                    .await
-                    .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
-                stream_ctx = StreamContext(StreamContextInner::Udp(ctx));
-                udp_sockets = Some(sockets);
-            }
-        };
-        stream.state = StreamState::Init(StreamStateInit {
-            ssrc: response.ssrc,
-            initial_seq: None,
-            initial_rtptime: None,
-            ctx: stream_ctx,
-            udp_sockets,
-        });
         Ok(())
     }
 
@@ -1860,209 +1540,27 @@ impl Session<Described> {
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
     pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
-        let inner = self.0.as_mut().project();
-        let conn = inner
-            .conn
-            .as_mut()
-            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        let session = inner.session.as_ref().ok_or_else(|| {
-            wrap!(ErrorInt::FailedPrecondition(
-                "must SETUP before PLAY".into()
-            ))
-        })?;
-        if let Some(ref t) = inner.presentation.tool
-            && (*inner.flags & (SessionFlag::TcpStreams as u8)) != 0
-            && t.has_live555_tcp_bug()
-        {
-            warn!(
-                "Connecting via TCP to known-broken RTSP server {:?}. \
-                        See <https://github.com/scottlamb/retina/issues/17>. \
-                        Consider using UDP instead!",
-                t
-            );
-        }
-
-        trace!("PLAY with channel mappings: {:#?}", conn.channels);
-        *inner.flags |= SessionFlag::MaybePlaying as u8;
-        let (msg_ctx, cseq, response, _resp_body) = conn
-            .send(
-                ResponseMode::Play,
-                inner.options,
-                inner.presentation.tool.as_ref(),
-                inner.requested_auth,
-                &mut OwnedMessage::Request {
-                    head: msg::Request {
-                        method: msg::Method::PLAY,
-                        request_uri: Some(inner.presentation.control.clone()),
-                        headers: [
-                            (msg::HeaderName::SESSION, session.id.clone()),
-                            (
-                                msg::HeaderName::RANGE,
-                                msg::HeaderValue::try_from("npt=0.000-").unwrap(),
-                            ),
-                        ]
-                        .into(),
-                    },
-                    body: Bytes::new(),
-                },
-            )
-            .await?;
-        parse::parse_play(&response, inner.presentation).map_err(|description| {
-            wrap!(ErrorInt::RtspResponseError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx,
-                method: msg::Method::PLAY,
-                cseq,
-                status: response.status_code,
-                description,
-            })
-        })?;
-
-        // Count how many streams have been setup (not how many are in the presentation).
-        let setup_streams = inner
-            .presentation
-            .streams
-            .iter()
-            .filter(|s| matches!(s.state, StreamState::Init(_)))
-            .count();
-
-        let all_have_time = inner.presentation.streams.iter().all(|s| match s.state {
-            StreamState::Init(StreamStateInit {
-                initial_rtptime, ..
-            }) => initial_rtptime.is_some(),
-            _ => true,
-        });
-
-        // Move all streams that have been set up from Init to Playing state. Check that required
-        // parameters are present while doing so.
-        let mut core_streams: Box<[Option<playing::PlayingStream>]> =
-            inner.presentation.streams.iter().map(|_| None).collect();
-        for (i, s) in inner.presentation.streams.iter_mut().enumerate() {
-            match std::mem::replace(&mut s.state, StreamState::Uninit) {
-                StreamState::Init(StreamStateInit {
-                    initial_rtptime,
-                    initial_seq,
-                    ssrc,
-                    ctx,
-                    udp_sockets,
-                }) => {
-                    let initial_rtptime = match policy.initial_timestamp {
-                        InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
-                            if setup_streams > 1 =>
-                        {
-                            if initial_rtptime.is_none() {
-                                bail!(ErrorInt::RtspResponseError {
-                                    conn_ctx: *conn.inner.ctx(),
-                                    msg_ctx,
-                                    method: msg::Method::PLAY,
-                                    cseq,
-                                    status: response.status_code,
-                                    description: format!(
-                                        "Expected rtptime on PLAY with mode {:?}, missing on \
-                                             stream {} ({:?}). Consider setting initial timestamp \
-                                             mode permissive.",
-                                        policy.initial_timestamp, i, s.control
-                                    ),
-                                });
-                            }
-                            initial_rtptime
-                        }
-                        InitialTimestampPolicy::Permissive
-                            if setup_streams > 1 && all_have_time =>
-                        {
-                            initial_rtptime
-                        }
-                        _ => None,
-                    };
-                    let initial_seq = match (initial_seq, policy.initial_seq) {
-                        (Some(seq), InitialSequenceNumberPolicy::Ignore)
-                        | (
-                            Some(seq @ 0 | seq @ 1),
-                            InitialSequenceNumberPolicy::Default
-                            | InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
-                        ) => {
-                            log::info!(
-                                "ignoring PLAY seq={} on stream {} due to policy {:?}",
-                                seq,
-                                i,
-                                policy.initial_seq
-                            );
-                            None
-                        }
-                        (Some(seq), _) => {
-                            log::debug!("setting PLAY seq={} on stream {}", seq, i);
-                            Some(seq)
-                        }
-                        (None, _) => {
-                            log::debug!("no PLAY seq on stream {}", i);
-                            None
-                        }
-                    };
-                    let conn_ctx = conn.inner.ctx();
-                    let timeline = Timeline::new(
-                        initial_rtptime,
-                        s.clock_rate_hz,
-                        policy.enforce_timestamps_with_max_jump_secs,
-                    )
-                    .map_err(|description| {
-                        wrap!(ErrorInt::RtspResponseError {
-                            conn_ctx: *conn_ctx,
-                            msg_ctx,
-                            method: msg::Method::PLAY,
-                            cseq,
-                            status: response.status_code,
-                            description,
-                        })
-                    })?;
-                    core_streams[i] = Some(playing::PlayingStream {
-                        timeline,
-                        rtp_handler: rtp::InorderParser::new(
-                            ssrc,
-                            initial_seq,
-                            policy.unknown_rtcp_ssrc,
-                        ),
-                        ctx,
-                        udp_buf: udp_sockets
-                            .as_ref()
-                            .map(|_| crate::buf::MarkBuf::new(65536)),
-                        reception: inner
-                            .options
-                            .receiver_reports
-                            .enabled()
-                            .then(|| receiver_report::ReceptionStats::new(s.clock_rate_hz)),
-                    });
-                    s.state = StreamState::Playing { ctx, udp_sockets };
-                }
-                StreamState::Uninit => {}
-                StreamState::Playing { .. } => unreachable!(),
-            };
-        }
-
-        // Hand the connection's reader and request state to the core.
-        let now = tokio::time::Instant::now();
-        let core = playing::PlayingCore::new(
-            playing::Parts {
-                reader: conn.inner.take_reader(),
-                options: std::mem::take(inner.options),
-                requested_auth: inner.requested_auth.take(),
-                next_cseq: conn.next_cseq,
-            },
-            playing::Init {
-                conn_ctx: *conn.inner.ctx(),
-                channels: conn.channels.clone(),
-                seen_unassigned: conn.seen_unassigned,
-                streams: core_streams,
-                tool: inner.presentation.tool.clone(),
-                session,
-                keepalive_url: inner.presentation.base_url.clone(),
-            },
-            now.into_std(),
-        );
-        *inner.keepalive_timer = Some(Box::pin(tokio::time::sleep_until(
-            tokio::time::Instant::from_std(core.poll_timeout()),
+        let inner = &mut *self.0;
+        inner.core.play(policy)?;
+        let event = inner.drive().await?;
+        debug_assert!(matches!(event, SessionEvent::Playing), "{event:?}");
+        let deadline = inner
+            .core
+            .poll_timeout()
+            .expect("playing core has a timeout");
+        inner.keepalive_timer = Some(Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline),
         )));
-        *inner.playing = Some(core);
         Ok(Session(self.0, Playing(())))
+    }
+}
+
+impl SessionInner {
+    /// Does I/O until the session core's request completes.
+    async fn drive(&mut self) -> Result<SessionEvent, Error> {
+        let conn = self.conn.as_mut().expect("conn is present until drop");
+        let core = &mut self.core;
+        std::future::poll_fn(|cx| poll_request(cx, conn, core)).await
     }
 }
 
@@ -2163,38 +1661,6 @@ fn note_stale_live555_data(
             );
         }
     });
-}
-
-#[rustfmt::skip]
-const HOLE_PUNCH_RTP: [u8; 12] = [
-    2 << 6,     // version=2 + p=0 + x=0 + cc=0
-    0,          // m=0 + pt=0
-    0, 0,       // sequence number=0
-    0, 0, 0, 0, // timestamp=0 0,
-    0, 0, 0, 0, // ssrc=0
-];
-#[rustfmt::skip]
-const HOLE_PUNCH_RTCP: [u8; 8] = [
-    2 << 6,     // version=2 + p=0 + rc=0
-    201,        // pt=200 (reception report)
-    0, 1,       // length=1 (in 4-byte words minus 1)
-    0, 0, 0, 0, // ssrc=0 (bogus but we don't know the ssrc reliably yet)
-];
-
-/// Sends dummy RTP and RTCP packets to punch a hole in connection-tracking
-/// firewalls.
-///
-/// This is useful when the client is on the protected side of the firewall and
-/// the server isn't. The server should discard these dummy packets, but they
-/// prompt the firewall to add the appropriate connection tracking state for
-/// server->client packets to make it through.
-///
-/// Note this is insufficient for NAT traversal; the NAT firewall must be
-/// RTSP-aware to rewrite the Transport header's client_ports.
-async fn punch_firewall_hole(sockets: &UdpSockets) -> Result<(), std::io::Error> {
-    sockets.rtp.send(&HOLE_PUNCH_RTP[..]).await?;
-    sockets.rtcp.send(&HOLE_PUNCH_RTCP[..]).await?;
-    Ok(())
 }
 
 /// An item returned by [`Session<Playing>::next_item`].
@@ -2301,7 +1767,7 @@ impl Session<Playing> {
             Some(Err(e)) => return Poll::Ready(Some(Err(e))),
             Some(Ok(v)) => v,
         };
-        Poll::Ready(Some(Ok(self.item(v))))
+        Poll::Ready(Some(Ok(self.0.playing_core().item(v))))
     }
 
     /// Returns the next RTP or RTCP packet.
@@ -2312,20 +1778,8 @@ impl Session<Playing> {
         match std::future::poll_fn(|cx| self.poll_validated(cx)).await {
             None => None,
             Some(Err(e)) => Some(Err(e)),
-            Some(Ok(v)) => Some(Ok(self.item(v))),
+            Some(Ok(v)) => Some(Ok(self.0.playing_core().item(v))),
         }
-    }
-
-    fn core(&self) -> &playing::PlayingCore {
-        self.0
-            .playing
-            .as_ref()
-            .expect("core is present while playing")
-    }
-
-    /// Builds a [`PlayingItem`] which borrows the session's buffers.
-    fn item(&self, v: playing::ValidatedItem) -> PlayingItem<'_> {
-        self.core().item(self.streams(), v)
     }
 
     /// Does I/O until the core has a validated item or the session ends.
@@ -2335,15 +1789,15 @@ impl Session<Playing> {
     ) -> Poll<Option<Result<playing::ValidatedItem, Error>>> {
         let SessionInner {
             conn,
-            playing,
-            presentation,
+            core,
+            udp,
             keepalive_timer,
-            flags,
             udp_next_poll_i,
-            ..
         } = &mut *self.0;
-        let conn = &mut conn.as_mut().expect("conn is present until drop").inner;
-        let core = playing.as_mut().expect("core is present while playing");
+        let conn = conn.as_mut().expect("conn is present until drop");
+        let core = core
+            .playing_mut()
+            .expect("core is playing in state Playing");
         loop {
             // Use tokio's clock, to match the timer. Outside tests that pause
             // time, it's the same as `std::time::Instant::now()`.
@@ -2361,9 +1815,9 @@ impl Session<Playing> {
             // Then try receiving data on the RTSP connection. Let this starve
             // sending keepalives; if we can't keep up, the server should
             // probably drop us.
-            match conn.poll_read(cx, core.tcp_buf()) {
+            match conn.poll_read(cx, core.read_buf()) {
                 Poll::Ready(Ok(0)) => {
-                    core.handle_tcp_eof();
+                    core.handle_eof();
                     continue;
                 }
                 Poll::Ready(Ok(_)) => continue,
@@ -2376,12 +1830,10 @@ impl Session<Playing> {
             }
 
             // Next try receiving data on the UDP sockets, if any.
-            if *flags & (SessionFlag::UdpStreams as u8) != 0 {
-                match Self::poll_udp(cx, core, &presentation.streams, udp_next_poll_i, now) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                    Poll::Pending => {}
-                }
+            match Self::poll_udp(cx, core, udp, udp_next_poll_i, now) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Pending => {}
             }
 
             // Then check if it's time for a new keepalive. Loop afterward to
@@ -2394,9 +1846,9 @@ impl Session<Playing> {
                 t.as_mut()
                     .reset(tokio::time::Instant::from_std(core.poll_timeout()));
                 if let Some(data) = core.poll_transmit() {
-                    conn.queue_write(data);
+                    conn.queue_write(&data);
                 }
-                Self::send_udp_reports(core, &presentation.streams);
+                Self::send_udp_reports(core, udp);
                 continue;
             }
 
@@ -2419,19 +1871,14 @@ impl Session<Playing> {
     ///
     /// Each is sent right away if the socket has room; otherwise it's
     /// skipped, as later reports carry cumulative statistics anyway.
-    fn send_udp_reports(core: &mut playing::PlayingCore, streams: &[Stream]) {
-        while let Some((i, pkt)) = core.poll_transmit_udp() {
-            let StreamState::Playing {
-                udp_sockets: Some(sockets),
-                ..
-            } = &streams[i].state
-            else {
-                unreachable!("stream {i} is a playing UDP stream");
-            };
-            if let Err(e) = sockets.rtcp.try_send(&pkt) {
-                // `ConnectionRefused` can follow an ICMP error, as with
-                // `punch_firewall_hole`. Neither it nor a full socket buffer is
-                // a reason to end the session.
+    fn send_udp_reports(core: &mut PlayingCore, udp: &[Option<UdpSockets>]) {
+        while let Some(t) = core.poll_transmit_udp() {
+            let i = t.stream_i;
+            let sockets = udp[i].as_ref().expect("stream is a UDP stream");
+            if let Err(e) = sockets.socket(t.channel_type).try_send(&t.data) {
+                // `ConnectionRefused` can follow an ICMP error, as with the
+                // hole-punching packets sent in `setup`. Neither it nor a full
+                // socket buffer is a reason to end the session.
                 match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused => {
                         debug!("Unable to send RTCP receiver report for stream {i}: {e}")
@@ -2456,7 +1903,7 @@ impl Session<Playing> {
     /// `recvmsg` on a datagram socket never coalesces queued packets.
     ///
     /// TODO: drain several packets per syscall via `recvmmsg` and/or `UDP_GRO`.
-    /// [`playing::PlayingCore::udp_received`] already accepts several
+    /// [`PlayingCore::udp_received`] already accepts several
     /// datagrams before they're parsed; each datagram's length is still
     /// `u16`-bounded.
     fn poll_udp_recv(
@@ -2516,7 +1963,7 @@ impl Session<Playing> {
                     continue;
                 }
                 Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    // The packets sent by `punch_firewall_hole` can elicit a
+                    // The hole-punching packets sent in `setup` can elicit a
                     // 'destination unreachable' ICMP response from the server,
                     // which gets turned into a 'connection refused' error.
                     debug!("Ignoring UDP connection refused error");
@@ -2541,27 +1988,18 @@ impl Session<Playing> {
     /// returned `Poll::Pending`.
     fn poll_udp_stream(
         cx: &mut std::task::Context,
-        core: &mut playing::PlayingCore,
-        stream: &Stream,
+        core: &mut PlayingCore,
+        udp_sockets: &UdpSockets,
         i: usize,
         now: std::time::Instant,
     ) -> Poll<Result<(), Error>> {
-        let StreamState::Playing {
-            ctx: stream_ctx,
-            udp_sockets: Some(udp_sockets),
-        } = &stream.state
-        else {
-            return Poll::Pending;
-        };
         let conn_ctx = *core.conn_ctx();
+        let stream_ctx = *core.streams()[i].ctx().expect("UDP stream is set up");
 
         // Prioritize RTCP over RTP within a stream.
         for channel_type in [ChannelType::Rtcp, ChannelType::Rtp] {
-            let socket = match channel_type {
-                ChannelType::Rtcp => &udp_sockets.rtcp,
-                ChannelType::Rtp => &udp_sockets.rtp,
-            };
-            match Self::poll_udp_recv(socket, cx, core.udp_buf(i), &conn_ctx, stream_ctx) {
+            let socket = udp_sockets.socket(channel_type);
+            match Self::poll_udp_recv(socket, cx, core.udp_buf(i), &conn_ctx, &stream_ctx) {
                 Poll::Ready(Ok(n)) => {
                     core.udp_received(i, channel_type, n, now);
                     return Poll::Ready(Ok(()));
@@ -2576,18 +2014,21 @@ impl Session<Playing> {
     /// Polls all UDP streams, round-robining between them to avoid starvation.
     fn poll_udp(
         cx: &mut std::task::Context,
-        core: &mut playing::PlayingCore,
-        streams: &[Stream],
+        core: &mut PlayingCore,
+        udp: &[Option<UdpSockets>],
         next_poll_i: &mut usize,
         now: std::time::Instant,
     ) -> Poll<Result<(), Error>> {
-        // Assume 0 <= next_poll_i < streams.len().
-        // play() would have failed if there were no (setup) streams.
+        if udp.is_empty() {
+            return Poll::Pending;
+        }
         let starting_i = *next_poll_i;
         loop {
             let i = *next_poll_i;
-            *next_poll_i = (i + 1) % streams.len();
-            if let Poll::Ready(r) = Self::poll_udp_stream(cx, core, &streams[i], i, now) {
+            *next_poll_i = (i + 1) % udp.len();
+            if let Some(sockets) = &udp[i]
+                && let Poll::Ready(r) = Self::poll_udp_stream(cx, core, sockets, i, now)
+            {
                 return Poll::Ready(r);
             }
             if *next_poll_i == starting_i {
@@ -2597,44 +2038,31 @@ impl Session<Playing> {
     }
 }
 
-#[pin_project::pinned_drop]
-impl PinnedDrop for SessionInner {
-    fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        let Some(core) = self.core.take_setup() else {
+            return;
+        };
 
-        // Take back what the playing core borrowed, to send a `TEARDOWN`.
-        if let Some(core) = this.playing.take() {
-            let parts = core.into_parts();
-            if let Some(conn) = this.conn.as_mut() {
-                conn.inner.restore_reader(parts.reader);
-                conn.next_cseq = parts.next_cseq;
-            }
-            *this.options = parts.options;
-            *this.requested_auth = parts.requested_auth;
-        }
-
-        let has_tcp = (*this.flags & (SessionFlag::TcpStreams as u8)) != 0;
-        let just_try_once = match this.options.teardown {
+        let flags = core.flags();
+        let has_tcp = (flags & (SessionFlag::TcpStreams as u8)) != 0;
+        let just_try_once = match core.options().teardown {
             TeardownPolicy::Auto if has_tcp => {
                 // If the server is known to have the live555 bug, try really hard to send a
                 // TEARDOWN before considering the session cleaned up. Otherwise, try once on
                 // the existing connection, primarily in case the server has
                 // this bug but doesn't advertise a buggy version.
-                !this
-                    .presentation
-                    .tool
-                    .as_ref()
-                    .map(Tool::has_live555_tcp_bug)
-                    .unwrap_or(false)
+                !core.tool().map(Tool::has_live555_tcp_bug).unwrap_or(false)
             }
             TeardownPolicy::Auto | TeardownPolicy::Always => false,
             TeardownPolicy::Never => return,
         };
 
-        let session = match this.session.take() {
-            Some(s) => s,
-            None => return,
+        let (Some(session), Some(base_url)) = (core.session(), core.base_url()) else {
+            return;
         };
+        let session_id = session.id.clone();
+        let base_url = base_url.clone();
 
         // For now, assume the whole timeout is left.
         let expires = tokio::time::Instant::now()
@@ -2642,7 +2070,7 @@ impl PinnedDrop for SessionInner {
 
         // Track the session, if there is a group.
         let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
-        let seqnum = if let Some(session_group) = this.options.session_group.as_ref() {
+        let seqnum = if let Some(session_group) = core.options().session_group.as_ref() {
             let mut lock = session_group.sessions.lock().unwrap();
             let seqnum = lock.next_seqnum;
             lock.next_seqnum += 1;
@@ -2651,28 +2079,27 @@ impl PinnedDrop for SessionInner {
                 expires,
                 teardown_rx: Some(teardown_rx),
                 has_tcp,
-                maybe_playing: *this.flags & (SessionFlag::MaybePlaying as u8) != 0,
+                maybe_playing: flags & (SessionFlag::MaybePlaying as u8) != 0,
             });
             log::debug!(
                 "{:?}/{} tracking TEARDOWN of session id {}",
                 session_group.debug_id(),
                 seqnum,
-                session.id
+                session_id
             );
             Some(seqnum)
         } else {
             None
         };
 
+        let (conn_core, ..) = core.into_parts();
         tokio::spawn(teardown::background_teardown(
             seqnum,
-            this.presentation.base_url.clone(),
-            this.presentation.tool.take(),
-            session.id,
+            base_url,
+            session_id,
             just_try_once,
-            std::mem::take(this.options),
-            this.requested_auth.take(),
-            this.conn.take(),
+            conn_core,
+            self.conn.take(),
             teardown_tx,
             expires,
         ));
@@ -2682,7 +2109,11 @@ impl PinnedDrop for SessionInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtsp::msg::StatusCode;
     use crate::testutil::{init_logging, response};
+    use futures::StreamExt as _;
+    use session_core::HOLE_PUNCH_RTCP;
+    use std::net::{IpAddr, Ipv4Addr};
 
     /// Cross-platform, tokio equivalent of `socketpair(2)`.
     async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
@@ -2824,16 +2255,12 @@ mod tests {
         );
     }
 
-    async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
+    async fn connect_to_mock() -> (crate::tokio::Connection, crate::tokio::Connection) {
         let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client, usize::MAX).unwrap();
-        let server = crate::tokio::Connection::from_stream(server, usize::MAX).unwrap();
-        let client = RtspConnection {
-            inner: client,
-            channels: ChannelMappings::default(),
-            next_cseq: 1,
-            seen_unassigned: false,
-        };
+        let client = crate::tokio::Connection::from_stream(client).unwrap();
+        let server = crate::tokio::Connection::from_stream(server)
+            .unwrap()
+            .with_reader(usize::MAX);
         (client, server)
     }
 
@@ -3511,14 +2938,7 @@ mod tests {
     ) -> Result<Session<Described>, Error> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let (client, mut server) = socketpair().await;
-        let inner =
-            crate::tokio::Connection::from_stream(client, options.get_max_message_size()).unwrap();
-        let conn = RtspConnection {
-            inner,
-            channels: ChannelMappings::default(),
-            next_cseq: 1,
-            seen_unassigned: false,
-        };
+        let conn = crate::tokio::Connection::from_stream(client).unwrap();
         let url = Url::parse("rtsp://127.0.0.1:554/camera").unwrap();
         let serve = async move {
             let mut req = Vec::new();
@@ -3629,8 +3049,8 @@ mod tests {
     }
 
     /// Returns `session`'s core. After moving its deadlines, call [`rearm`].
-    fn playing_core(session: &mut Session<Playing>) -> &mut playing::PlayingCore {
-        session.0.playing.as_mut().unwrap()
+    fn playing_core(session: &mut Session<Playing>) -> &mut PlayingCore {
+        session.0.playing_core()
     }
 
     /// Resets `session`'s timer to its core's next deadline.
@@ -4093,11 +3513,12 @@ mod tests {
         for (name, size) in &[
             ("PlayingItem", std::mem::size_of::<PlayingItem>()),
             ("Presentation", std::mem::size_of::<Presentation>()),
-            ("RtspConnection", std::mem::size_of::<RtspConnection>()),
+            ("PlayingCore", std::mem::size_of::<PlayingCore>()),
             (
                 "Session",
                 std::mem::size_of::<Session<Described>>(), // <Playing> is the same size.
             ),
+            ("SessionCore", std::mem::size_of::<SessionCore>()),
             ("SessionInner", std::mem::size_of::<SessionInner>()),
             ("SessionOptions", std::mem::size_of::<SessionOptions>()),
             ("Stream", std::mem::size_of::<Stream>()),
@@ -4123,20 +3544,5 @@ mod tests {
         let group = SessionGroup::default();
         let stale_sessions = group.stale_sessions();
         assert_send(group.await_stale_sessions(&stale_sessions));
-    }
-
-    #[test]
-    fn validate_hole_punch_rtp() {
-        let (header, _) = crate::rtp::PacketHeader::validate(&HOLE_PUNCH_RTP[..]).unwrap();
-        assert_eq!(header.payload_type(), 0);
-    }
-
-    #[test]
-    fn validate_hole_punch_rtcp() {
-        let (pkt_ref, _) = crate::rtcp::PacketRef::parse(&HOLE_PUNCH_RTCP[..]).unwrap();
-        assert!(matches!(
-            pkt_ref.as_typed().unwrap(),
-            Some(crate::rtcp::TypedPacketRef::ReceiverReport(_))
-        ));
     }
 }

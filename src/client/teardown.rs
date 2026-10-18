@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 
-use super::{ResponseMode, RtspConnection, SessionOptions, Tool};
+use super::conn::{ConnCore, Response, ResponseMode};
 use crate::{Error, error::ErrorInt};
 
 const EXISTING_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -15,16 +15,17 @@ const FRESH_CONN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Handles `TEARDOWN` loop in the background, removing the stale session entry on success or
 /// session expiry.
+///
+/// `core` is the session's connection state, used for the first attempt on
+/// `conn` (if any) and then for fresh connections.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn background_teardown(
     seqnum: Option<u64>,
     base_url: Url,
-    tool: Option<Tool>,
     session_id: msg::HeaderValue,
     just_try_once: bool,
-    options: SessionOptions,
-    requested_auth: Option<http_auth::PasswordClient>,
-    conn: Option<RtspConnection>,
+    mut core: ConnCore,
+    conn: Option<crate::tokio::Connection>,
     mut tx: tokio::sync::watch::Sender<Option<Result<(), Error>>>,
     expires: tokio::time::Instant,
 ) {
@@ -37,11 +38,9 @@ pub(super) async fn background_teardown(
         expires,
         teardown_loop_forever(
             base_url,
-            tool,
             &session_id,
             just_try_once,
-            &options,
-            requested_auth,
+            &mut core,
             conn,
             &mut tx,
         ),
@@ -51,7 +50,7 @@ pub(super) async fn background_teardown(
     {
         log::debug!("TEARDOWN {} aborted on session expiration", &*session_id);
     }
-    if let Some(ref session_group) = options.session_group {
+    if let Some(ref session_group) = core.options.session_group {
         let seqnum = seqnum.expect("seqnum specified when session_group exists");
         log::trace!(
             "Clearing session {:?}/{} for id {:?}",
@@ -73,18 +72,15 @@ pub(super) async fn background_teardown(
 }
 
 /// Attempts `TEARDOWN` in a loop until success; caller should bound by session expiry.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn teardown_loop_forever(
+async fn teardown_loop_forever(
     url: Url,
-    tool: Option<Tool>,
     session_id: &msg::HeaderValue,
     just_try_once: bool,
-    options: &SessionOptions,
-    mut requested_auth: Option<http_auth::PasswordClient>,
-    mut conn: Option<RtspConnection>,
+    core: &mut ConnCore,
+    mut conn: Option<crate::tokio::Connection>,
     tx: &mut tokio::sync::watch::Sender<Option<Result<(), Error>>>,
 ) {
-    let mut req = OwnedMessage::Request {
+    let req = OwnedMessage::Request {
         head: msg::Request {
             method: msg::Method::TEARDOWN,
             request_uri: Some(url.clone()),
@@ -100,9 +96,13 @@ pub(super) async fn teardown_loop_forever(
         // efficient approach, this is the best for old live555 servers' stale
         // TCP sessions. Tearing them down before closing the connection means
         // they don't have a chance to mess up any other sockets.
+        //
+        // A request may have been in progress when the session was dropped.
+        // Its response, if any, will be ignored as unrelated.
+        core.abandon_pending();
         tokio::select! {
             biased;
-            r = attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn) => {
+            r = attempt(&req, core, conn) => {
                 match r {
                     Ok(status) => {
                         log::debug!("TEARDOWN {} on existing conn succeeded (status {}).", session_id, u16::from(status));
@@ -153,8 +153,9 @@ pub(super) async fn teardown_loop_forever(
             .as_mut()
             .reset(tokio::time::Instant::now() + timeout);
         let attempt = async {
-            let conn = RtspConnection::connect(&url, options).await?;
-            attempt(&mut req, tool.as_ref(), options, &mut requested_auth, conn).await
+            let conn = super::connect(&url, &core.options).await?;
+            core.reconnect(*conn.ctx());
+            attempt(&req, core, conn).await
         };
         tokio::select! {
             biased;
@@ -185,17 +186,19 @@ pub(super) async fn teardown_loop_forever(
 
 /// Makes a single attempt on the supplied connection; caller is responsible for the timeout.
 async fn attempt(
-    req: &mut OwnedMessage,
-    tool: Option<&Tool>,
-    options: &SessionOptions,
-    requested_auth: &mut Option<http_auth::PasswordClient>,
-    mut conn: RtspConnection,
+    req: &OwnedMessage,
+    core: &mut ConnCore,
+    mut conn: crate::tokio::Connection,
 ) -> Result<StatusCode, Error> {
-    let e = match conn
-        .send(ResponseMode::Teardown, options, tool, requested_auth, req)
-        .await
-    {
-        Ok((_ctx, _cseq, resp, _body)) => return Ok(resp.status_code),
+    core.send(ResponseMode::Teardown, req.clone())?;
+    status(std::future::poll_fn(|cx| super::poll_request(cx, &mut conn, core)).await)
+}
+
+/// Interprets the result of a `TEARDOWN` request, returning the status if the
+/// session is gone.
+pub(super) fn status(r: Result<Response, Error>) -> Result<StatusCode, Error> {
+    let e = match r {
+        Ok(resp) => return Ok(resp.head.status_code),
         Err(e) => e,
     };
 

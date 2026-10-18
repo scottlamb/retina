@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/client", "examples/ffmpeg-decode", "examples/proxy", "examples/webrtc-proxy", "fuzz"]
+members = [".", "examples/client", "examples/ffmpeg-decode", "examples/polling-client", "examples/proxy", "examples/webrtc-proxy", "fuzz"]
 default-members = ["."]
 
 [package]
@@ -38,7 +38,6 @@ http-auth = "0.1.2"
 jiff = "0.2.0"
 log = "0.4.8"
 memchr = "2.7.4"
-pin-project = "1.0.7"
 pretty-hex = "0.4.0"
 rand = "0.8.3"
 sdp-types = "0.2.0"
