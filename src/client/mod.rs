@@ -3524,6 +3524,7 @@ mod tests {
         {
             let session = session.unwrap();
             tokio::pin!(session);
+            session.0.keepalive_timer = None; // see `simple`.
 
             // Packet.
             tokio::join!(
@@ -4148,8 +4149,12 @@ mod tests {
         receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
 
         // Hold off reports while packets arrive, so paused time can't
-        // auto-advance into the next one meanwhile.
+        // auto-advance into the next one meanwhile. Taking `reports` isn't
+        // enough: paused time auto-advances to any registered timer, polled or
+        // not. Replace the timer with one that isn't registered until polled
+        // or reset below; otherwise packets arrive at different instants.
         let mut reports = session.0.reports.take().unwrap();
+        reports.timer = Box::pin(tokio::time::sleep(std::time::Duration::ZERO));
         let ntp = 0xe436_2f99_cccc_cccc;
         tokio::join!(
             async {
