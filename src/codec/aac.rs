@@ -40,8 +40,8 @@ use std::{
     num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
-use crate::buf::PacketRef;
-use crate::{Error, error::ErrorInt, rtp::PacketMeta};
+use crate::rtp::ReceivedPacketRef;
+use crate::{Error, error::ErrorInt, rtp::ReceivedPacketMeta};
 
 use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
@@ -459,7 +459,7 @@ enum FrameData {
 /// beginning of a fragment.
 #[derive(Debug)]
 struct Aggregate<Ctx> {
-    meta: PacketMeta<Ctx>,
+    meta: ReceivedPacketMeta<Ctx>,
 
     /// True iff there was loss immediately before the packet that started this
     /// aggregate. The distinction between old and recent loss is relevant
@@ -565,7 +565,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
+    pub(super) fn push(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl AudioHandler<Ctx>,
+    ) {
         if let Err(description) = self.push_inner(pkt) {
             return super::report_corrupt(pkt, description, |l| handler.loss(l));
         }
@@ -589,7 +593,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
     }
 
-    fn push_inner(&mut self, pkt: &PacketRef<'_, Ctx>) -> Result<(), String> {
+    fn push_inner(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>) -> Result<(), String> {
         let meta = &pkt.meta;
         let (s1, s2) = pkt.payload().slices();
         self.payload.clear();
@@ -784,7 +788,7 @@ impl Depacketizer<crate::PacketContext> {
     ///
     /// Between any two calls to `push_collect`, the caller must call `pull`
     /// until it returns `None`.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
         pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;

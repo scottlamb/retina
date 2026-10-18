@@ -5,7 +5,7 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
 use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
@@ -54,7 +54,7 @@ impl Depacketizer {
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push<Ctx>(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
     ) {
         let (s1, s2) = pkt.payload().slices();

@@ -102,7 +102,7 @@ pub struct Reordered<T> {
     /// The packet's header.
     pub header: PacketHeader,
 
-    /// The position to pass to [`crate::buf::PacketRef::with_pin_pos`].
+    /// The position to pass to [`crate::rtp::ReceivedPacketRef::with_pin_pos`].
     ///
     /// This is at or before the packet's own position and that of every
     /// packet still held, all of which [`Reorderer::pop`] will return later.
@@ -153,7 +153,7 @@ struct Held<T> {
 ///     [`Reorderer::push`], which pins the packet's data in the buffer.
 /// 2.  calls [`Reorderer::pop`] until it returns `None`, and for each packet,
 ///     calls [`super::Receiver::rtp`] and builds a
-///     [`crate::buf::PacketRef`] using [`Reordered::pin_pos`].
+///     [`crate::rtp::ReceivedPacketRef`] using [`Reordered::pin_pos`].
 /// 3.  calls `pop` again by [`Reorderer::poll_timeout`], to give up on
 ///     missing packets.
 ///
@@ -195,7 +195,7 @@ pub struct Reorderer<T> {
     restart_pending: bool,
 
     /// The mark of the last packet returned by `pop`, held until the next
-    /// call so the caller can build a `PacketRef` to it.
+    /// call so the caller can build a `ReceivedPacketRef` to it.
     last: Option<Mark>,
 
     /// Arrival statistics, once a packet has arrived.
@@ -395,7 +395,7 @@ impl<T> Reorderer<T> {
     /// [`ReorderOptions::max_packets`] are held.
     ///
     /// The returned packet's data stays pinned until the next call to `push`
-    /// or `pop`, so the caller can build a [`crate::buf::PacketRef`] to it.
+    /// or `pop`, so the caller can build a [`crate::rtp::ReceivedPacketRef`] to it.
     pub fn pop(&mut self, now: Instant) -> Option<Reordered<T>> {
         self.last = None;
         let (h, restarted) = match self.ready.pop_front() {
@@ -678,11 +678,11 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn h264_access_unit() {
-        use crate::buf::PacketRef;
         use crate::codec::{
             Accumulate, FrameFormat, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart,
             VideoHandler,
         };
+        use crate::rtp::ReceivedPacketRef;
         use crate::rtp::{Receiver, ReceiverOptions};
 
         #[derive(Default)]
@@ -726,7 +726,8 @@ mod tests {
             while let Some(p) = r.pop(now) {
                 let meta = receiver.rtp((), &p.header).unwrap();
                 let len = u16::try_from(p.item.end - p.item.start).unwrap();
-                let pkt = PacketRef::new(meta, buf, p.item.start, len).with_pin_pos(p.pin_pos);
+                let pkt =
+                    ReceivedPacketRef::new(meta, buf, p.item.start, len).with_pin_pos(p.pin_pos);
                 d.push(&pkt, &mut frames);
             }
         };

@@ -108,7 +108,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         let (header, payload) = retina::rtp::PacketHeader::validate(&pkt[..])
             .expect("packetizer should produce valid RTP packets");
         let mark = header.mark();
-        let meta = retina::rtp::PacketMeta {
+        let meta = retina::rtp::ReceivedPacketMeta {
             ctx: 0,
             timestamp: retina::Timestamp::new(
                 i64::from(header.timestamp()),

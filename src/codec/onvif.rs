@@ -8,7 +8,7 @@
 //! version 19.12 section 5.2.1.1. The RTP layer muxing is simple: RTP packets with the MARK
 //! bit set end messages.
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
 use super::{MessageFrameRef, MessageHandler, MessageParameters};
 
@@ -52,7 +52,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl MessageHandler<Ctx>,
     ) {
         if !pkt.meta.continuity.is_contiguous()

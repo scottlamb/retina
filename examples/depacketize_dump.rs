@@ -22,11 +22,12 @@
 
 use std::io::{IoSliceMut, Read};
 
-use retina::buf::{MarkBuf, PacketRef};
+use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
     PayloadFormat, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+use retina::rtp::ReceivedPacketRef;
 use retina::rtp::{PacketHeader, Receiver, ReceiverOptions};
 
 /// The packet context: the packet's byte offset within the file.
@@ -160,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let meta = receiver
                 .rtp(offset, &header)
                 .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
-            let pkt = PacketRef::new(
+            let pkt = ReceivedPacketRef::new(
                 meta,
                 &buf,
                 pkt_pos + u64::from(payload.start),

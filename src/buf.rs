@@ -3,28 +3,29 @@
 
 //! Buffers for received RTP data.
 //!
-//! A [`PacketRef`] is how a packet reaches any depacketizer, such as
-//! [`crate::codec::VideoDepacketizer`]. It refers to the packet's payload in
-//! place within a [`MarkBuf`], which holds received bytes—for example, RTSP
-//! interleaved data read from a TCP connection, or UDP datagrams. The
-//! depacketizer refers to payload bytes in place rather than copying them, and
-//! the buffer keeps them available as long as a depacketizer needs them.
+//! A [`ReceivedPacketRef`](crate::rtp::ReceivedPacketRef) is how a packet
+//! reaches any depacketizer, such as [`crate::codec::VideoDepacketizer`]. It
+//! refers to the packet's payload in place within a [`MarkBuf`], which holds
+//! received bytes—for example, RTSP interleaved data read from a TCP
+//! connection, or UDP datagrams. The depacketizer refers to payload bytes in
+//! place rather than copying them, and the buffer keeps them available as long
+//! as a depacketizer needs them.
 //!
 //! A [`crate::client`] session fills its own buffers and lends out
-//! `PacketRef`s; see [`crate::client::Session::next_item`]. Callers doing
-//! their own I/O fill a `MarkBuf` themselves, as below.
+//! `ReceivedPacketRef`s; see [`crate::client::Session::next_item`]. Callers
+//! doing their own I/O fill a `MarkBuf` themselves, as below.
 //!
 //! # Supplying packets yourself
 //!
 //! The caller fills a `MarkBuf`, parses RTP packets out of it, and hands each
-//! packet's payload to a depacketizer as a `PacketRef`. This module does no
-//! I/O itself; see the `depacketize-dump` example for a caller that reads from
-//! a file.
+//! packet's payload to a depacketizer as a `ReceivedPacketRef`. This module
+//! does no I/O itself; see the `depacketize-dump` example for a caller that
+//! reads from a file.
 //!
 //! ```
-//! # use retina::buf::{MarkBuf, PacketRef};
+//! # use retina::buf::MarkBuf;
 //! # use retina::codec::{AudioDepacketizer, AudioFrameRef, AudioHandler};
-//! # use retina::rtp::PacketMeta;
+//! # use retina::rtp::{ReceivedPacketMeta, ReceivedPacketRef};
 //! struct MyHandler;
 //! impl AudioHandler<u64> for MyHandler {
 //!     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, u64>) {
@@ -45,7 +46,7 @@
 //! buf.advance_unparsed(buf.end());
 //!
 //! // Depacketize.
-//! let meta = PacketMeta {
+//! let meta = ReceivedPacketMeta {
 //!     ctx: 0, // e.g. a file offset.
 //!     timestamp: retina::Timestamp::new(0, std::num::NonZeroU32::new(8_000).unwrap(), 0)
 //!         .unwrap(),
@@ -54,7 +55,7 @@
 //!     mark: true,
 //!     continuity: retina::rtp::Continuity::Contiguous,
 //! };
-//! d.push(&PacketRef::new(meta, &buf, pos, received.len() as u16), &mut MyHandler);
+//! d.push(&ReceivedPacketRef::new(meta, &buf, pos, received.len() as u16), &mut MyHandler);
 //! ```
 
 pub use crate::inputs::Split;
@@ -422,7 +423,8 @@ impl std::fmt::Debug for Mark {
 /// are never beyond `unparsed()`. This guarantees reclaiming space never
 /// discards unparsed data. The caller upholds it simply by advancing
 /// `unparsed()` past a packet (as with [`MarkBuf::advance_unparsed`]) before
-/// constructing a [`PacketRef`] to it; [`PacketRef::new`] panics otherwise.
+/// constructing a [`crate::rtp::ReceivedPacketRef`] to it;
+/// [`crate::rtp::ReceivedPacketRef::new`] panics otherwise.
 #[derive(Debug)]
 pub struct MarkBuf {
     ring: RingBuf,
@@ -580,110 +582,6 @@ impl MarkBuf {
     pub fn extend(&mut self, data: &[u8]) {
         self.reclaim();
         self.ring.extend(data);
-    }
-}
-
-/// An RTP packet whose payload is in a [`MarkBuf`].
-///
-/// Passed to depacketizers such as [`crate::codec::VideoDepacketizer::push`],
-/// bundling packet metadata with buffer access.
-pub struct PacketRef<'a, Ctx> {
-    /// The packet's metadata.
-    pub meta: crate::rtp::PacketMeta<Ctx>,
-    buf: &'a MarkBuf,
-    payload_pos: u64,
-    payload_len: u16,
-
-    /// The position a depacketizer pins to retain this packet's payload and
-    /// that of every packet pushed after it; see [`PacketRef::with_pin_pos`].
-    pin_pos: u64,
-}
-
-#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
-impl<'a, Ctx> PacketRef<'a, Ctx> {
-    /// Creates a `PacketRef` for a payload at stream positions
-    /// `[payload_pos, payload_pos + payload_len)` in `buf`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the payload isn't within `buf`'s parsed bytes, `[start(),
-    /// unparsed())`. See the [`MarkBuf`] contract.
-    pub fn new(
-        meta: crate::rtp::PacketMeta<Ctx>,
-        buf: &'a MarkBuf,
-        payload_pos: u64,
-        payload_len: u16,
-    ) -> Self {
-        assert!(
-            payload_pos >= buf.start()
-                && payload_pos
-                    .checked_add(u64::from(payload_len))
-                    .is_some_and(|end| end <= buf.unparsed()),
-            "payload [{payload_pos}, +{payload_len}) must be within parsed bytes [{}, {})",
-            buf.start(),
-            buf.unparsed(),
-        );
-        Self {
-            meta,
-            buf,
-            payload_pos,
-            payload_len,
-            pin_pos: payload_pos,
-        }
-    }
-
-    /// Sets the position a depacketizer pins to retain this packet's data.
-    ///
-    /// A depacketizer holding data from several packets pins only the first
-    /// one's position, relying on a [`MarkBuf`] to retain everything after
-    /// it. That holds when packets are pushed in the order they were received.
-    /// When they aren't, as with [`crate::rtp::Reorderer`], each packet's pin
-    /// position must be at or before the payload of every packet pushed after
-    /// it. `Reorderer` supplies such a position.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless `pin_pos` is within `[start(), payload_pos]`, where
-    /// `start()` is the oldest position still in the buffer.
-    pub fn with_pin_pos(self, pin_pos: u64) -> Self {
-        assert!(
-            pin_pos >= self.buf.start() && pin_pos <= self.payload_pos,
-            "pin_pos {pin_pos} must be within [{}, {}]",
-            self.buf.start(),
-            self.payload_pos,
-        );
-        Self { pin_pos, ..self }
-    }
-
-    /// Pins this packet's data (and that of packets pushed after it) so it
-    /// stays accessible until the returned [`Mark`] is dropped.
-    pub(crate) fn mark(&self) -> Mark {
-        self.buf.add_mark_at(self.pin_pos)
-    }
-
-    /// Ring-buffer position of the first payload byte.
-    #[inline]
-    pub(crate) fn payload_pos(&self) -> u64 {
-        self.payload_pos
-    }
-
-    /// Payload length in bytes.
-    #[inline]
-    pub(crate) fn payload_len(&self) -> u16 {
-        self.payload_len
-    }
-
-    /// Returns the payload.
-    #[inline]
-    pub fn payload(&self) -> Split<'a> {
-        self.buf
-            .split(self.payload_pos, usize::from(self.payload_len))
-    }
-
-    /// Returns the buffer holding the payload.
-    #[inline]
-    pub(crate) fn buf(&self) -> &'a MarkBuf {
-        self.buf
     }
 }
 
@@ -981,43 +879,5 @@ mod tests {
             assert_eq!(got, model, "mark_round={mark_round}");
             drop(mark);
         }
-    }
-
-    fn meta() -> crate::rtp::PacketMeta<()> {
-        crate::rtp::PacketMeta {
-            ctx: (),
-            timestamp: crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0)
-                .unwrap(),
-            sequence_number: 0,
-            ssrc: 0,
-            mark: false,
-            continuity: crate::rtp::Continuity::Contiguous,
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "must be within parsed bytes")]
-    fn packet_ref_unparsed() {
-        let mut buf = MarkBuf::new(64);
-        buf.extend(b"hello");
-        let _ = PacketRef::new(meta(), &buf, 0, 5);
-    }
-
-    #[test]
-    #[should_panic(expected = "must be within parsed bytes")]
-    fn packet_ref_beyond_end() {
-        let mut buf = MarkBuf::new(64);
-        buf.extend(b"hello");
-        buf.advance_unparsed(5);
-        let _ = PacketRef::new(meta(), &buf, 1, 5);
-    }
-
-    #[test]
-    fn packet_ref_ok() {
-        let mut buf = MarkBuf::new(64);
-        buf.extend(b"hello");
-        buf.advance_unparsed(5);
-        let pkt = PacketRef::new(meta(), &buf, 1, 4);
-        assert_eq!(pkt.payload().to_vec(), b"ello");
     }
 }

@@ -24,11 +24,12 @@ pub fn init_logging() {
     })
 }
 
-use retina::buf::{MarkBuf, PacketRef};
+use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, FrameFormat, Loss, LossReason, Position, VideoData, VideoDepacketizer,
     VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+use retina::rtp::ReceivedPacketRef;
 
 /// An event recorded by [`CheckingHandler`].
 #[derive(Debug, PartialEq, Eq)]
@@ -146,7 +147,7 @@ impl VideoHandler<u64> for CheckingHandler {
 /// Appends `payload` to `buf`, then pushes it to each depacketizer.
 pub fn push(
     buf: &mut MarkBuf,
-    meta: retina::rtp::PacketMeta<u64>,
+    meta: retina::rtp::ReceivedPacketMeta<u64>,
     payload: &[u8],
     targets: &mut [(&mut VideoDepacketizer<u64>, &mut CheckingHandler)],
 ) {
@@ -154,7 +155,7 @@ pub fn push(
     buf.extend(payload);
     buf.advance_unparsed(buf.end());
     let len = u16::try_from(payload.len()).expect("payload fits in u16");
-    let pkt = PacketRef::new(meta, buf, pos, len);
+    let pkt = ReceivedPacketRef::new(meta, buf, pos, len);
     for (d, h) in targets {
         d.push(&pkt, *h);
         d.check_invariants();

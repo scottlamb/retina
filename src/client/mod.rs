@@ -1699,7 +1699,7 @@ pub enum PlayingItem<'a> {
 pub struct RtpPacket<'a> {
     stream_id: usize,
     stream: &'a Stream,
-    pkt: crate::buf::PacketRef<'a, crate::PacketContext>,
+    pkt: crate::rtp::ReceivedPacketRef<'a, crate::PacketContext>,
 
     /// The buffer position of the start of the RTP header.
     raw_pos: u64,
@@ -1724,7 +1724,7 @@ impl<'a> RtpPacket<'a> {
 
     /// Returns the payload and metadata, ready to push to a depacketizer.
     #[inline]
-    pub fn packet(&self) -> &crate::buf::PacketRef<'a, crate::PacketContext> {
+    pub fn packet(&self) -> &crate::rtp::ReceivedPacketRef<'a, crate::PacketContext> {
         &self.pkt
     }
 

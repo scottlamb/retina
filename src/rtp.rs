@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+use crate::buf::{Mark, MarkBuf, Split};
 use crate::inputs::Input;
 
 mod receiver;
@@ -43,7 +44,7 @@ impl PacketHeader {
     /// Validates an RTP packet, returning the fixed header and payload range.
     ///
     /// Accepts any [`Input`] implementation: a `&[u8]` or a
-    /// [`Split`](crate::inputs::Split) pair of ring-buffer slices.
+    /// [`Split`] pair of ring-buffer slices.
     pub fn validate<'i>(input: impl Input<'i>) -> Result<(Self, Range<u16>), &'static str> {
         let len = u16::try_from(input.len()).map_err(|_| "too long")?;
         if len < Self::LEN {
@@ -142,12 +143,12 @@ impl std::fmt::Debug for PacketHeader {
 
 /// Metadata about an RTP packet, as supplied to a depacketizer such as
 /// [`crate::codec::VideoDepacketizer`]
-/// within a [`crate::buf::PacketRef`].
+/// within a [`ReceivedPacketRef`].
 ///
 /// `Ctx` is a caller-chosen packet context type, returned with the events the
 /// packet contributes to. See [`crate::codec::VideoHandler`].
 #[derive(Clone, Copy, Debug)]
-pub struct PacketMeta<Ctx> {
+pub struct ReceivedPacketMeta<Ctx> {
     /// The caller's context for this packet.
     pub ctx: Ctx,
 
@@ -169,7 +170,7 @@ pub struct PacketMeta<Ctx> {
 }
 
 /// How an RTP packet relates to the previous one in its stream, as reported
-/// in [`PacketMeta::continuity`].
+/// in [`ReceivedPacketMeta::continuity`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum Continuity {
     /// The packet directly follows the previous one, or is the first.
@@ -211,6 +212,110 @@ impl Continuity {
             Continuity::Lost(n) => n.get(),
             Continuity::Discontinuity => 1,
         }
+    }
+}
+
+/// An RTP packet whose payload is in a [`MarkBuf`].
+///
+/// Passed to depacketizers such as [`crate::codec::VideoDepacketizer::push`],
+/// bundling packet metadata with buffer access.
+pub struct ReceivedPacketRef<'a, Ctx> {
+    /// The packet's metadata.
+    pub meta: ReceivedPacketMeta<Ctx>,
+    buf: &'a MarkBuf,
+    payload_pos: u64,
+    payload_len: u16,
+
+    /// The position a depacketizer pins to retain this packet's payload and
+    /// that of every packet pushed after it; see [`ReceivedPacketRef::with_pin_pos`].
+    pin_pos: u64,
+}
+
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
+impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
+    /// Creates a `ReceivedPacketRef` for a payload at stream positions
+    /// `[payload_pos, payload_pos + payload_len)` in `buf`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload isn't within `buf`'s parsed bytes, `[start(),
+    /// unparsed())`. See the [`MarkBuf`] contract.
+    pub fn new(
+        meta: ReceivedPacketMeta<Ctx>,
+        buf: &'a MarkBuf,
+        payload_pos: u64,
+        payload_len: u16,
+    ) -> Self {
+        assert!(
+            payload_pos >= buf.start()
+                && payload_pos
+                    .checked_add(u64::from(payload_len))
+                    .is_some_and(|end| end <= buf.unparsed()),
+            "payload [{payload_pos}, +{payload_len}) must be within parsed bytes [{}, {})",
+            buf.start(),
+            buf.unparsed(),
+        );
+        Self {
+            meta,
+            buf,
+            payload_pos,
+            payload_len,
+            pin_pos: payload_pos,
+        }
+    }
+
+    /// Sets the position a depacketizer pins to retain this packet's data.
+    ///
+    /// A depacketizer holding data from several packets pins only the first
+    /// one's position, relying on a [`MarkBuf`] to retain everything after
+    /// it. That holds when packets are pushed in the order they were received.
+    /// When they aren't, as with [`crate::rtp::Reorderer`], each packet's pin
+    /// position must be at or before the payload of every packet pushed after
+    /// it. `Reorderer` supplies such a position.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `pin_pos` is within `[start(), payload_pos]`, where
+    /// `start()` is the oldest position still in the buffer.
+    pub fn with_pin_pos(self, pin_pos: u64) -> Self {
+        assert!(
+            pin_pos >= self.buf.start() && pin_pos <= self.payload_pos,
+            "pin_pos {pin_pos} must be within [{}, {}]",
+            self.buf.start(),
+            self.payload_pos,
+        );
+        Self { pin_pos, ..self }
+    }
+
+    /// Pins this packet's data (and that of packets pushed after it) so it
+    /// stays accessible until the returned [`Mark`] is dropped.
+    pub(crate) fn mark(&self) -> Mark {
+        self.buf.add_mark_at(self.pin_pos)
+    }
+
+    /// Ring-buffer position of the first payload byte.
+    #[inline]
+    pub(crate) fn payload_pos(&self) -> u64 {
+        self.payload_pos
+    }
+
+    /// Payload length in bytes.
+    #[inline]
+    pub(crate) fn payload_len(&self) -> u16 {
+        self.payload_len
+    }
+
+    /// Returns the payload.
+    #[inline]
+    pub fn payload(&self) -> Split<'a> {
+        self.buf
+            .split(self.payload_pos, usize::from(self.payload_len))
+    }
+
+    /// Returns the buffer holding the payload.
+    #[inline]
+    pub(crate) fn buf(&self) -> &'a MarkBuf {
+        self.buf
     }
 }
 
@@ -500,5 +605,43 @@ mod tests {
         assert_eq!(sr.ssrc(), 0x1234_5678);
         assert_eq!(sr.ntp_timestamp().0, 0x0102_0304_0506_0708);
         assert_eq!(sr.rtp_timestamp(), 110);
+    }
+
+    fn meta() -> ReceivedPacketMeta<()> {
+        crate::rtp::ReceivedPacketMeta {
+            ctx: (),
+            timestamp: crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            sequence_number: 0,
+            ssrc: 0,
+            mark: false,
+            continuity: crate::rtp::Continuity::Contiguous,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_unparsed() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        let _ = ReceivedPacketRef::new(meta(), &buf, 0, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_beyond_end() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let _ = ReceivedPacketRef::new(meta(), &buf, 1, 5);
+    }
+
+    #[test]
+    fn packet_ref_ok() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let pkt = ReceivedPacketRef::new(meta(), &buf, 1, 4);
+        assert_eq!(pkt.payload().to_vec(), b"ello");
     }
 }

@@ -16,13 +16,14 @@ use base64::Engine as _;
 use bytes::Bytes;
 use log::{debug, log_enabled, trace};
 
-use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
+use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::TolerantBitReader;
 use crate::codec::{
     Accumulate, FrameBody, Loss, LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler,
     VideoParameters,
 };
 use crate::inputs::Input as _;
+use crate::rtp::ReceivedPacketRef;
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -422,7 +423,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    pub(super) fn push(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
         let r = self.push_inner(pkt, handler);
 
         // Several error paths within `push_inner` just use the `?` operator to bail out with
@@ -438,7 +443,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
     fn push_inner(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         let meta = &pkt.meta;
@@ -852,7 +857,7 @@ impl Depacketizer<crate::PacketContext> {
     ///
     /// Between any two calls to `push_collect`, the caller must call `pull`
     /// until it returns `None`.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
         pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
@@ -969,7 +974,7 @@ fn can_end_au(nal_unit_type: nal::UnitType) -> bool {
 
 impl<Ctx: Clone> AccessUnit<Ctx> {
     fn start(
-        meta: &crate::rtp::PacketMeta<Ctx>,
+        meta: &crate::rtp::ReceivedPacketMeta<Ctx>,
         additional_loss: u16,
         same_ts_as_prev: bool,
     ) -> Self {
@@ -1383,8 +1388,9 @@ mod tests {
 
     use crate::{
         PacketContext,
-        buf::{MarkBuf, PacketRef},
+        buf::MarkBuf,
         codec::testutil::Item,
+        rtp::ReceivedPacketRef,
         testutil::TestPacket,
         testutil::{assert_eq_hex, init_logging},
     };
@@ -1895,7 +1901,7 @@ mod tests {
                         mark: bool,
                         payload: &[u8],
                         h: &mut Recorder| {
-                let meta = crate::rtp::PacketMeta {
+                let meta = crate::rtp::ReceivedPacketMeta {
                     ctx: PacketContext::dummy(),
                     timestamp: crate::Timestamp {
                         timestamp: ts,
@@ -1910,7 +1916,10 @@ mod tests {
                 let pos = buf.end();
                 buf.extend(payload);
                 buf.advance_unparsed(buf.end());
-                d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16), h);
+                d.push(
+                    &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
+                    h,
+                );
             };
 
             // IDR_W_RADL, fragmented.
@@ -2025,7 +2034,7 @@ mod tests {
         };
         let mut push =
             |d: &mut super::Depacketizer<_>, seq: u16, ts: i64, mark: bool, payload: &[u8]| {
-                let meta = crate::rtp::PacketMeta {
+                let meta = crate::rtp::ReceivedPacketMeta {
                     ctx: PacketContext::dummy(),
                     timestamp: crate::Timestamp {
                         timestamp: ts,
@@ -2041,7 +2050,7 @@ mod tests {
                 buf.extend(payload);
                 buf.advance_unparsed(buf.end());
                 d.push(
-                    &PacketRef::new(meta, &buf, pos, payload.len() as u16),
+                    &ReceivedPacketRef::new(meta, &buf, pos, payload.len() as u16),
                     &mut h,
                 );
             };

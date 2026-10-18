@@ -179,7 +179,7 @@ pub(crate) enum ValidatedItem {
 /// Metadata for a validated RTP packet whose body is in a ring buffer.
 pub(crate) struct ValidatedRtp {
     stream_id: usize,
-    meta: crate::rtp::PacketMeta<PacketContext>,
+    meta: crate::rtp::ReceivedPacketMeta<PacketContext>,
     body_pos: u64,
     body_len: u16,
     payload_range: std::ops::Range<u16>,
@@ -459,7 +459,7 @@ impl PlayingCore {
             .as_ref()
             .and_then(|s| s.udp_buf.as_ref())
             .unwrap_or(self.conn.reader.buf());
-        let pkt = crate::buf::PacketRef::new(
+        let pkt = crate::rtp::ReceivedPacketRef::new(
             rtp.meta,
             buf,
             rtp.body_pos + u64::from(rtp.payload_range.start),

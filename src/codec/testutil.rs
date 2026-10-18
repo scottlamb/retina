@@ -12,7 +12,7 @@ use super::{
     MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 use crate::PacketContext;
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
 /// Frames and errors from a depacketizer, in order.
 #[derive(Debug, Default)]
@@ -30,7 +30,7 @@ impl Pending {
     /// Panics if items from a previous packet haven't been pulled.
     pub(crate) fn push(
         &mut self,
-        pkt: &PacketRef<'_, PacketContext>,
+        pkt: &ReceivedPacketRef<'_, PacketContext>,
         format: FrameFormat,
         push: impl FnOnce(&mut Collector<'_>),
     ) {

@@ -26,8 +26,8 @@ use std::num::{NonZeroU16, NonZeroU32};
 use bytes::Bytes;
 
 use crate::Error;
-use crate::buf::PacketRef;
 use crate::error::ErrorInt;
+use crate::rtp::ReceivedPacketRef;
 
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
 ///
@@ -655,7 +655,7 @@ impl AudioSampleEntryBuilder<'_> {
 pub struct MessageParameters(onvif::CompressionType);
 
 /// Reports packet loss before a packet is pushed, as all depacketizers do.
-fn report_packet_loss<Ctx>(pkt: &PacketRef<'_, Ctx>, loss: impl FnOnce(&Loss<'_, Ctx>)) {
+fn report_packet_loss<Ctx>(pkt: &ReceivedPacketRef<'_, Ctx>, loss: impl FnOnce(&Loss<'_, Ctx>)) {
     let reason = match pkt.meta.continuity {
         crate::rtp::Continuity::Contiguous => return,
         crate::rtp::Continuity::Lost(n) => LossReason::PacketLoss { packets: n.get() },
@@ -669,7 +669,7 @@ fn report_packet_loss<Ctx>(pkt: &PacketRef<'_, Ctx>, loss: impl FnOnce(&Loss<'_,
 
 /// Reports corrupt data found in a packet.
 fn report_corrupt<Ctx>(
-    pkt: &PacketRef<'_, Ctx>,
+    pkt: &ReceivedPacketRef<'_, Ctx>,
     description: String,
     loss: impl FnOnce(&Loss<'_, Ctx>),
 ) {
@@ -834,7 +834,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     ///
     /// Panics if a depacketizer which has retained data from one
     /// [`crate::buf::MarkBuf`] is supplied a packet from another.
-    pub fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
         let mut tainted = self.tainted;
         let handler = &mut DecodabilityTracker {
             tainted: &mut tainted,
@@ -844,7 +844,11 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         self.tainted = tainted;
     }
 
-    fn push_tracked(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    fn push_tracked(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
         report_packet_loss(pkt, |l| handler.loss(l));
         match &mut self.inner {
             #[cfg(feature = "h264")]
@@ -936,7 +940,7 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
     ///
     /// This never fails: lost packets and corrupt data are reported via
     /// [`AudioHandler::loss`].
-    pub fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
+    pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
         report_packet_loss(pkt, |l| handler.loss(l));
         match &mut self.0 {
             AudioInner::Aac(d) => d.push(pkt, handler),
@@ -983,7 +987,11 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     ///
     /// This never fails: lost packets and corrupt data are reported via
     /// [`MessageHandler::loss`].
-    pub fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl MessageHandler<Ctx>) {
+    pub fn push(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl MessageHandler<Ctx>,
+    ) {
         report_packet_loss(pkt, |l| handler.loss(l));
         self.0.push(pkt, handler);
     }
@@ -1147,7 +1155,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     #[cfg(test)]
     pub(crate) fn push(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut (impl VideoHandler<Ctx> + AudioHandler<Ctx> + MessageHandler<Ctx>),
     ) {
         match self {
@@ -1163,7 +1171,7 @@ mod tests {
     use super::*;
     use crate::buf::MarkBuf;
     #[cfg(feature = "h264")]
-    use crate::rtp::PacketMeta;
+    use crate::rtp::ReceivedPacketMeta;
     use events::testutil::{Event, Recorder, hex};
 
     /// Pushes a packet via the infallible `push`.
@@ -1174,7 +1182,7 @@ mod tests {
         payload: &[u8],
         h: &mut Recorder,
     ) {
-        let meta = crate::rtp::PacketMeta {
+        let meta = crate::rtp::ReceivedPacketMeta {
             ctx: crate::PacketContext::dummy(),
             timestamp: crate::Timestamp::new(timestamp, NonZeroU32::new(90_000).unwrap(), 0)
                 .unwrap(),
@@ -1186,7 +1194,10 @@ mod tests {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16), h);
+        d.push(
+            &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
+            h,
+        );
         d.check_invariants();
     }
 
@@ -1268,7 +1279,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut h = H::default();
         let mut push = |seq: u16, ts: i64, loss: u16, payload: &[u8], h: &mut H| {
-            let meta = crate::rtp::PacketMeta {
+            let meta = crate::rtp::ReceivedPacketMeta {
                 ctx: crate::PacketContext::dummy(),
                 timestamp: crate::Timestamp::new(ts, NonZeroU32::new(90_000).unwrap(), 0).unwrap(),
                 ssrc: 0,
@@ -1279,7 +1290,10 @@ mod tests {
             let pos = buf.end();
             buf.extend(payload);
             buf.advance_unparsed(buf.end());
-            d.push(&PacketRef::new(meta, &buf, pos, payload.len() as u16), h);
+            d.push(
+                &ReceivedPacketRef::new(meta, &buf, pos, payload.len() as u16),
+                h,
+            );
         };
         push(0, 0, 0, b"\x41p", &mut h); // before the first IDR.
         push(1, 1, 0, b"\x65idr", &mut h);
@@ -1332,7 +1346,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut h = H::default();
         let mut push = |seq: u16, ts: i64, loss: u16, payload: &[u8], h: &mut H| {
-            let meta = crate::rtp::PacketMeta {
+            let meta = crate::rtp::ReceivedPacketMeta {
                 ctx: crate::PacketContext::dummy(),
                 timestamp: crate::Timestamp::new(ts, NonZeroU32::new(90_000).unwrap(), 0).unwrap(),
                 ssrc: 0,
@@ -1343,7 +1357,10 @@ mod tests {
             let pos = buf.end();
             buf.extend(payload);
             buf.advance_unparsed(buf.end());
-            d.push(&PacketRef::new(meta, &buf, pos, payload.len() as u16), h);
+            d.push(
+                &ReceivedPacketRef::new(meta, &buf, pos, payload.len() as u16),
+                h,
+            );
         };
 
         // Slice bodies starting with bit 1 have `first_mb_in_slice == 0`.
@@ -1585,7 +1602,7 @@ mod tests {
         dump: &[u8],
         channel: u8,
         clock_rate: u32,
-        mut f: impl FnMut(&MarkBuf, PacketMeta<crate::PacketContext>, u64, u16),
+        mut f: impl FnMut(&MarkBuf, ReceivedPacketMeta<crate::PacketContext>, u64, u16),
     ) {
         let mut buf = MarkBuf::new(4096);
         let mut prev: Option<(u16, u32, i64)> = None;
@@ -1614,7 +1631,7 @@ mod tests {
                 header.sequence_number().wrapping_sub(s).wrapping_sub(1)
             });
             prev = Some((header.sequence_number(), raw, extended));
-            let meta = PacketMeta {
+            let meta = ReceivedPacketMeta {
                 ctx: crate::PacketContext::dummy(),
                 timestamp: crate::Timestamp::new(extended, NonZeroU32::new(clock_rate).unwrap(), 0)
                     .unwrap(),
@@ -1666,7 +1683,7 @@ mod tests {
             let mut pending = testutil::Pending::default();
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
                 d.push(
-                    &PacketRef::new(meta, buf, pos, len),
+                    &ReceivedPacketRef::new(meta, buf, pos, len),
                     &mut testutil::Collector::new(&mut pending, FrameFormat::default()),
                 );
                 while let Some(item) = pending.pull() {
@@ -1686,7 +1703,7 @@ mod tests {
                 let mut h = Recorder::new(Accumulate::Yes);
                 h.format = format;
                 replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
-                    d.push(&PacketRef::new(meta, buf, pos, len), &mut h);
+                    d.push(&ReceivedPacketRef::new(meta, buf, pos, len), &mut h);
                 });
                 let frames: Vec<Vec<u8>> = h
                     .take()
@@ -1710,7 +1727,7 @@ mod tests {
             let mut d = new();
             let mut h = Recorder::new(Accumulate::No);
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
-                d.push(&PacketRef::new(meta, buf, pos, len), &mut h);
+                d.push(&ReceivedPacketRef::new(meta, buf, pos, len), &mut h);
             });
             let ends = h
                 .take()

@@ -7,12 +7,13 @@
 
 use std::num::NonZeroU32;
 
-use retina::buf::{MarkBuf, PacketRef};
+use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, FrameInfo, Loss, LossReason, Payload, PayloadSink, VideoData, VideoDepacketizer,
     VideoFrameEnd, VideoFrameStart, VideoHandler, VideoPacketizer,
 };
-use retina::rtp::{OutgoingPacket, PacketHeader, PacketMeta, Sender};
+use retina::rtp::ReceivedPacketRef;
+use retina::rtp::{OutgoingPacket, PacketHeader, ReceivedPacketMeta, Sender};
 
 /// Pushes raw RTP packets into a depacketizer, computing loss from sequence
 /// numbers. (No timestamp wraparound handling; the capture is short.)
@@ -40,7 +41,7 @@ impl Feeder {
             .next_seq
             .map_or(0, |s| header.sequence_number().wrapping_sub(s));
         self.next_seq = Some(header.sequence_number().wrapping_add(1));
-        let meta = PacketMeta {
+        let meta = ReceivedPacketMeta {
             ctx: (),
             timestamp: retina::Timestamp::new(
                 i64::from(header.timestamp()),
@@ -57,7 +58,7 @@ impl Feeder {
         self.buf.extend(raw);
         self.buf.advance_unparsed(self.buf.end());
         d.push(
-            &PacketRef::new(
+            &ReceivedPacketRef::new(
                 meta,
                 &self.buf,
                 pos + u64::from(payload.start),

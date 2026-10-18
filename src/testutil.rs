@@ -177,7 +177,7 @@ impl TestPacket {
         self,
         buf: &'b mut crate::buf::MarkBuf,
         payload: impl IntoIterator<Item = u8>,
-    ) -> crate::buf::PacketRef<'b, crate::PacketContext> {
+    ) -> crate::rtp::ReceivedPacketRef<'b, crate::PacketContext> {
         let raw = crate::rtp::build_raw_rtp(
             self.sequence_number,
             self.timestamp.timestamp() as u32,
@@ -191,8 +191,8 @@ impl TestPacket {
         let pos = buf.end();
         buf.extend(&raw);
         buf.advance_unparsed(buf.end());
-        crate::buf::PacketRef::new(
-            crate::rtp::PacketMeta {
+        crate::rtp::ReceivedPacketRef::new(
+            crate::rtp::ReceivedPacketMeta {
                 ctx: self.ctx,
                 timestamp: self.timestamp,
                 sequence_number: self.sequence_number,

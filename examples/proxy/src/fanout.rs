@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex};
 
 use log::{debug, warn};
 use retina::PacketContext;
-use retina::buf::{MarkBuf, PacketRef};
+use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, FrameInfo, Loss, Payload, PayloadFormat, PayloadSink, VideoData, VideoDepacketizer,
     VideoFrameEnd, VideoFrameStart, VideoHandler, VideoPacketizer, VideoParameters,
 };
+use retina::rtp::ReceivedPacketRef;
 use retina::rtp::{OutgoingPacket, Sender};
 
 /// Above this many unsent bytes, a connection is congested: its packetizers
@@ -241,7 +242,7 @@ pub enum UpstreamKind {
 
 impl UpstreamTrack {
     /// Handles an upstream RTP packet.
-    pub fn push(&mut self, pkt: &PacketRef<'_, PacketContext>) {
+    pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, PacketContext>) {
         while let Ok(d) = self.joins.try_recv() {
             self.downstreams.push(d);
         }

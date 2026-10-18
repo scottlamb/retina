@@ -8,7 +8,7 @@ use bytes::Bytes;
 use log::{debug, warn};
 
 use crate::rtcp::ReceivedCompoundPacket;
-use crate::rtp::{PacketHeader, PacketMeta, ReceiveError, Receiver, SsrcMatch};
+use crate::rtp::{PacketHeader, ReceiveError, ReceivedPacketMeta, Receiver, SsrcMatch};
 use crate::{
     Error, ErrorInt, PacketContext, PacketContextInner, StreamContext, StreamContextInner,
 };
@@ -87,7 +87,7 @@ impl StreamReceiver {
         pkt_ctx: &PacketContext,
         stream_id: usize,
         header: &PacketHeader,
-    ) -> Result<PacketMeta<PacketContext>, Error> {
+    ) -> Result<ReceivedPacketMeta<PacketContext>, Error> {
         self.receiver.rtp(*pkt_ctx, header).map_err(|e| {
             if matches!(e, ReceiveError::WrongSsrc { .. }) {
                 note_stale_live555_data_if_tcp(conn, stream_ctx, pkt_ctx);

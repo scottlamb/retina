@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
 use crate::{Timestamp, codec::AllPixelDimensions};
 
@@ -322,7 +322,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    pub(super) fn push(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
         if let Err(description) = self.push_inner(pkt, handler) {
             super::report_corrupt(pkt, description, |l| handler.loss(l));
         }
@@ -330,7 +334,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
     fn push_inner(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         if (pkt.payload_len() as usize) < 8 {
@@ -643,7 +647,7 @@ impl Depacketizer<crate::PacketContext> {
     ///
     /// Between any two calls to `push_collect`, the caller must call `pull`
     /// until it returns `None`.
-    fn push_collect(&mut self, pkt: &PacketRef<'_, crate::PacketContext>) {
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
         pending.push(pkt, super::FrameFormat::default(), |c| self.push(pkt, c));
         self.pending = pending;

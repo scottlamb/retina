@@ -5,11 +5,12 @@ use std::num::NonZeroU16;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use retina::PacketContext;
-use retina::buf::{MarkBuf, PacketRef};
+use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, AudioDepacketizer, AudioFrameRef, AudioHandler, FrameFormat, VideoData,
     VideoDepacketizer, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+use retina::rtp::ReceivedPacketRef;
 use retina::rtp::{Receiver, ReceiverOptions};
 use std::convert::TryFrom;
 use std::io::Write;
@@ -102,7 +103,7 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
         let pos = buf.end();
         buf.extend(&data);
         buf.advance_unparsed(buf.end());
-        let pkt = PacketRef::new(
+        let pkt = ReceivedPacketRef::new(
             meta,
             buf,
             pos + u64::from(payload_range.start),

@@ -7,7 +7,7 @@
 use std::num::{NonZeroU16, NonZeroU32};
 
 use super::timeline::Timeline;
-use super::{Continuity, PacketHeader, PacketMeta};
+use super::{Continuity, PacketHeader, ReceivedPacketMeta};
 use crate::rtcp::SenderReportRef;
 use crate::{Error, ErrorInt, NtpTimestamp, Timestamp};
 
@@ -231,12 +231,12 @@ impl std::fmt::Debug for Seq {
 }
 
 /// Receives a single RTP stream (one SSRC): checks SSRC and sequence numbers
-/// and extends timestamps, producing the [`PacketMeta`] that depacketizers
+/// and extends timestamps, producing the [`ReceivedPacketMeta`] that depacketizers
 /// take. The counterpart of [`super::Sender`].
 ///
 /// This is sans-I/O and doesn't touch payloads: the caller validates the
 /// header via [`PacketHeader::validate`], calls [`Receiver::rtp`], and builds
-/// a [`crate::buf::PacketRef`] however it buffers data.
+/// a [`crate::rtp::ReceivedPacketRef`] however it buffers data.
 ///
 /// It expects packets in sequence order, as from a [`super::Reorderer`],
 /// returning [`ReceiveError::OutOfOrder`] otherwise.
@@ -336,7 +336,7 @@ impl Receiver {
     /// [`super::Reordered::restarted`].
     ///
     /// The next packet establishes the expected sequence number, and its
-    /// [`PacketMeta::continuity`] is [`Continuity::Discontinuity`]. The SSRC
+    /// [`ReceivedPacketMeta::continuity`] is [`Continuity::Discontinuity`]. The SSRC
     /// and timestamp checks are unchanged.
     pub fn restart_sequence(&mut self) {
         self.seq = None;
@@ -351,12 +351,12 @@ impl Receiver {
 
     /// Processes a validated RTP header, returning its metadata.
     ///
-    /// [`PacketMeta::continuity`] reports gaps in sequence numbers.
+    /// [`ReceivedPacketMeta::continuity`] reports gaps in sequence numbers.
     pub fn rtp<Ctx>(
         &mut self,
         ctx: Ctx,
         header: &PacketHeader,
-    ) -> Result<PacketMeta<Ctx>, ReceiveError> {
+    ) -> Result<ReceivedPacketMeta<Ctx>, ReceiveError> {
         let sequence_number = header.sequence_number();
         let ssrc = header.ssrc();
         if let Some(expected) = self.ssrc
@@ -408,7 +408,7 @@ impl Receiver {
                 }
             }
         };
-        Ok(PacketMeta {
+        Ok(ReceivedPacketMeta {
             ctx,
             timestamp,
             sequence_number,

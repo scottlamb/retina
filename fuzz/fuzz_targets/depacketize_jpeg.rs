@@ -41,7 +41,7 @@ fuzz_target!(|pkts: Vec<Pkt<'_>>| {
         if pkt.ts_change {
             timestamp = timestamp.try_add(1).unwrap();
         }
-        let meta = retina::rtp::PacketMeta {
+        let meta = retina::rtp::ReceivedPacketMeta {
             ctx: i as u64,
             timestamp,
             ssrc: 0,
