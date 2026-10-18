@@ -4,33 +4,12 @@
 //! [`Receiver`]: tracks a received RTP stream's SSRC, sequence numbers, and
 //! timestamps.
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use super::timeline::Timeline;
-use super::{PacketHeader, PacketMeta};
+use super::{Continuity, PacketHeader, PacketMeta};
 use crate::rtcp::SenderReportRef;
 use crate::{Error, ErrorInt, NtpTimestamp, Timestamp};
-
-/// What [`Receiver::rtp`] does with a packet whose sequence number is
-/// before the expected one.
-///
-/// Sequence numbers are compared as wrapping 16-bit values; a jump forward of
-/// more than `0x8000` is indistinguishable from a step backward, so it's
-/// treated as out-of-order rather than loss.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum OutOfOrder {
-    /// Return [`ReceiveError::OutOfOrder`].
-    ///
-    /// Appropriate for TCP, where reordering means a sender bug.
-    #[default]
-    Error,
-
-    /// Drop the packet, logging it and returning `Ok(None)`.
-    ///
-    /// Appropriate for UDP, absent a reordering buffer.
-    Drop,
-}
 
 /// Options for a [`Receiver`].
 #[derive(Clone, Debug)]
@@ -39,7 +18,6 @@ pub struct ReceiverOptions {
     pub(crate) initial_sequence_number: Option<u16>,
     pub(crate) initial_rtptime: Option<u32>,
     pub(crate) max_forward_jump_secs: Option<NonZeroU32>,
-    pub(crate) out_of_order: OutOfOrder,
     pub(crate) learn_ssrc_from_sender_report: bool,
 }
 
@@ -50,7 +28,6 @@ impl Default for ReceiverOptions {
             initial_sequence_number: None,
             initial_rtptime: None,
             max_forward_jump_secs: None,
-            out_of_order: OutOfOrder::default(),
             learn_ssrc_from_sender_report: true,
         }
     }
@@ -100,16 +77,6 @@ impl ReceiverOptions {
         }
     }
 
-    /// Sets the handling of out-of-order packets. Defaults to
-    /// [`OutOfOrder::Error`].
-    #[inline]
-    pub fn out_of_order(self, out_of_order: OutOfOrder) -> Self {
-        Self {
-            out_of_order,
-            ..self
-        }
-    }
-
     /// Sets whether a sender report can establish the SSRC when it isn't yet
     /// known. Defaults to true.
     #[inline]
@@ -136,8 +103,12 @@ pub enum ReceiveError {
         sequence_number: u16,
     },
 
-    /// An RTP packet's sequence number is before the expected one, with
-    /// [`OutOfOrder::Error`].
+    /// An RTP packet's sequence number is before the expected one.
+    ///
+    /// Sequence numbers are compared as wrapping 16-bit values; a jump forward
+    /// of more than `0x8000` is indistinguishable from a step backward. To
+    /// tolerate reordering, duplicates, or a sender restarting its sequence
+    /// numbers, pass packets through a [`super::Reorderer`] first.
     #[non_exhaustive]
     OutOfOrder {
         ssrc: u32,
@@ -267,7 +238,8 @@ impl std::fmt::Debug for Seq {
 /// header via [`PacketHeader::validate`], calls [`Receiver::rtp`], and builds
 /// a [`crate::buf::PacketRef`] however it buffers data.
 ///
-/// It expects packets in sequence order; see [`OutOfOrder`].
+/// It expects packets in sequence order, as from a [`super::Reorderer`],
+/// returning [`ReceiveError::OutOfOrder`] otherwise.
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2)
 /// allows the SSRC to change mid-session (after an RTCP BYE); this isn't
 /// supported, but the caller can replace the `Receiver`.
@@ -277,11 +249,16 @@ pub struct Receiver {
     timeline: Timeline,
     ssrc: Option<Ssrc>,
     seq: Option<Seq>,
-    out_of_order: OutOfOrder,
     learn_ssrc_from_sender_report: bool,
+
+    /// True if [`Receiver::restart_sequence`] was called since the last packet.
+    restarted: bool,
 
     /// RTP packets accepted by [`Receiver::rtp`].
     rtp_packets: u64,
+
+    /// Packets lost, as indicated by gaps in sequence numbers.
+    lost: u64,
 
     /// Sender reports seen by [`Receiver::sender_report`].
     sender_reports: u64,
@@ -293,6 +270,7 @@ impl std::fmt::Debug for Receiver {
             .field("ssrc", &self.ssrc)
             .field("next_seq", &self.seq)
             .field("rtp_packets", &self.rtp_packets)
+            .field("lost", &self.lost)
             .field("sender_reports", &self.sender_reports)
             .finish()
     }
@@ -320,9 +298,10 @@ impl Receiver {
                 source: Source::Options,
                 next,
             }),
-            out_of_order: options.out_of_order,
             learn_ssrc_from_sender_report: options.learn_ssrc_from_sender_report,
+            restarted: false,
             rtp_packets: 0,
+            lost: 0,
             sender_reports: 0,
         })
     }
@@ -345,21 +324,39 @@ impl Receiver {
         self.rtp_packets
     }
 
+    /// Returns the number of packets lost so far, as indicated by gaps in
+    /// sequence numbers. This excludes any lost at a
+    /// [`Continuity::Discontinuity`].
+    #[inline]
+    pub fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    /// Notes that the sender restarted its sequence numbers, as indicated by
+    /// [`super::Reordered::restarted`].
+    ///
+    /// The next packet establishes the expected sequence number, and its
+    /// [`PacketMeta::continuity`] is [`Continuity::Discontinuity`]. The SSRC
+    /// and timestamp checks are unchanged.
+    pub fn restart_sequence(&mut self) {
+        self.seq = None;
+        self.restarted = true;
+    }
+
     /// Returns the number of sender reports seen so far.
     #[inline]
     pub fn sender_reports(&self) -> u64 {
         self.sender_reports
     }
 
-    /// Processes a validated RTP header, returning its metadata or `None` if
-    /// it was dropped as out-of-order.
+    /// Processes a validated RTP header, returning its metadata.
     ///
-    /// [`PacketMeta::loss`] reports gaps in sequence numbers.
+    /// [`PacketMeta::continuity`] reports gaps in sequence numbers.
     pub fn rtp<Ctx>(
         &mut self,
         ctx: Ctx,
         header: &PacketHeader,
-    ) -> Result<Option<PacketMeta<Ctx>>, ReceiveError> {
+    ) -> Result<PacketMeta<Ctx>, ReceiveError> {
         let sequence_number = header.sequence_number();
         let ssrc = header.ssrc();
         if let Some(expected) = self.ssrc
@@ -376,23 +373,11 @@ impl Receiver {
             None => 0,
         };
         if loss > 0x80_00 {
-            let expected = self.seq.expect("loss > 0 implies seq").next;
-            match self.out_of_order {
-                OutOfOrder::Error => {
-                    return Err(ReceiveError::OutOfOrder {
-                        ssrc,
-                        expected,
-                        received: sequence_number,
-                    });
-                }
-                OutOfOrder::Drop => {
-                    log::info!(
-                        "dropping out-of-order ssrc {ssrc:08x} seq={sequence_number} \
-                         when expecting seq={expected}",
-                    );
-                    return Ok(None);
-                }
-            }
+            return Err(ReceiveError::OutOfOrder {
+                ssrc,
+                expected: self.seq.expect("loss > 0 implies seq").next,
+                received: sequence_number,
+            });
         }
         let timestamp = self
             .timeline
@@ -412,14 +397,25 @@ impl Receiver {
             next: sequence_number.wrapping_add(1),
         });
         self.rtp_packets += 1;
-        Ok(Some(PacketMeta {
+        let continuity = if std::mem::take(&mut self.restarted) {
+            Continuity::Discontinuity
+        } else {
+            match NonZeroU16::new(loss) {
+                None => Continuity::Contiguous,
+                Some(n) => {
+                    self.lost += u64::from(n.get());
+                    Continuity::Lost(n)
+                }
+            }
+        };
+        Ok(PacketMeta {
             ctx,
             timestamp,
             sequence_number,
             ssrc,
             mark: header.mark(),
-            loss,
-        }))
+            continuity,
+        })
     }
 
     /// Processes a sender report, placing its RTP timestamp on the timeline.
@@ -465,6 +461,10 @@ mod tests {
     use super::*;
     use crate::rtp::build_raw_rtp;
 
+    fn lost(n: u16) -> Continuity {
+        Continuity::Lost(NonZeroU16::new(n).unwrap())
+    }
+
     fn header(seq: u16, ts: u32, ssrc: u32) -> PacketHeader {
         let pkt = build_raw_rtp(seq, ts, 96, ssrc, true, *b"x").unwrap();
         PacketHeader::validate(&pkt[..]).unwrap().0
@@ -473,8 +473,11 @@ mod tests {
     #[test]
     fn learns_and_checks_ssrc() {
         let mut r = Receiver::new(90_000, ReceiverOptions::default()).unwrap();
-        let m = r.rtp((), &header(10, 1000, 0x1234)).unwrap().unwrap();
-        assert_eq!((m.loss, m.timestamp.elapsed()), (0, 0));
+        let m = r.rtp((), &header(10, 1000, 0x1234)).unwrap();
+        assert_eq!(
+            (m.continuity, m.timestamp.elapsed()),
+            (Continuity::Contiguous, 0)
+        );
         assert_eq!(r.ssrc(), Some(0x1234));
         assert!(matches!(
             r.rtp((), &header(11, 1000, 0x5678)),
@@ -487,16 +490,15 @@ mod tests {
 
         // The rejected packet didn't change the state.
         assert_eq!(r.next_sequence_number(), Some(11));
-        let m = r.rtp((), &header(13, 1090, 0x1234)).unwrap().unwrap();
-        assert_eq!((m.loss, m.timestamp.elapsed()), (2, 90));
+        let m = r.rtp((), &header(13, 1090, 0x1234)).unwrap();
+        assert_eq!((m.continuity, m.timestamp.elapsed()), (lost(2), 90));
         assert_eq!(r.rtp_packets(), 2);
     }
 
     #[test]
     fn out_of_order() {
-        let opts = ReceiverOptions::default().ssrc(0xd25614e);
-        let mut r = Receiver::new(90_000, opts.clone()).unwrap();
-        r.rtp((), &header(2, 2, 0xd25614e)).unwrap().unwrap();
+        let mut r = Receiver::new(90_000, ReceiverOptions::default().ssrc(0xd25614e)).unwrap();
+        r.rtp((), &header(2, 2, 0xd25614e)).unwrap();
         assert!(matches!(
             r.rtp((), &header(1, 1, 0xd25614e)),
             Err(ReceiveError::OutOfOrder {
@@ -506,20 +508,27 @@ mod tests {
             })
         ));
 
-        let mut r = Receiver::new(90_000, opts.out_of_order(OutOfOrder::Drop)).unwrap();
+        // The rejected packet shouldn't have adjusted time.
+        let m = r.rtp((), &header(3, 3, 0xd25614e)).unwrap();
         assert_eq!(
-            r.rtp((), &header(2, 2, 0xd25614e))
-                .unwrap()
-                .unwrap()
-                .timestamp
-                .elapsed(),
-            0
+            (m.continuity, m.timestamp.elapsed()),
+            (Continuity::Contiguous, 1)
         );
-        assert!(r.rtp((), &header(1, 1, 0xd25614e)).unwrap().is_none());
+    }
 
-        // The dropped packet shouldn't have adjusted time.
-        let m = r.rtp((), &header(3, 3, 0xd25614e)).unwrap().unwrap();
-        assert_eq!((m.loss, m.timestamp.elapsed()), (0, 1));
+    #[test]
+    fn restart_sequence() {
+        let mut r = Receiver::new(90_000, ReceiverOptions::default()).unwrap();
+        r.rtp((), &header(1000, 0, 1)).unwrap();
+        r.restart_sequence();
+        let m = r.rtp((), &header(10, 90, 1)).unwrap();
+        assert_eq!(
+            (m.continuity, m.timestamp.elapsed()),
+            (Continuity::Discontinuity, 90)
+        );
+        let m = r.rtp((), &header(12, 180, 1)).unwrap();
+        assert_eq!(m.continuity, lost(1));
+        assert_eq!((r.rtp_packets(), r.lost()), (3, 1));
     }
 
     #[test]
@@ -528,8 +537,8 @@ mod tests {
             .initial_sequence_number(5)
             .initial_rtptime(100);
         let mut r = Receiver::new(90_000, opts).unwrap();
-        let m = r.rtp((), &header(7, 190, 1)).unwrap().unwrap();
-        assert_eq!((m.loss, m.timestamp.elapsed()), (2, 90));
+        let m = r.rtp((), &header(7, 190, 1)).unwrap();
+        assert_eq!((m.continuity, m.timestamp.elapsed()), (lost(2), 90));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use log::{debug, trace, warn};
@@ -339,7 +339,7 @@ impl SetupCore {
                 client_rtp_port,
                 options,
             } => {
-                reorder = options.reorder;
+                reorder = Some(options.reorder);
                 headers.insert(
                     msg::HeaderName::TRANSPORT,
                     msg::HeaderValue::try_from(format!(
@@ -670,20 +670,20 @@ impl SetupCore {
             };
             let mut options = crate::rtp::ReceiverOptions::default()
                 .max_forward_jump_secs(policy.enforce_timestamps_with_max_jump_secs)
-                .out_of_order(if matches!(ctx.0, StreamContextInner::Udp(_)) {
-                    crate::rtp::OutOfOrder::Drop
-                } else {
-                    crate::rtp::OutOfOrder::Error
-                })
                 .learn_ssrc_from_sender_report(!matches!(
                     policy.unknown_rtcp_ssrc,
                     UnknownRtcpSsrcPolicy::ProcessPackets
                 ));
+            // TCP doesn't reorder packets, so it doesn't wait for them. Its
+            // reorderer still drops late packets and recognizes restarts.
+            let mut reorder = reorder
+                .unwrap_or_else(|| crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO));
             if let Some(ssrc) = ssrc {
                 options = options.ssrc(ssrc);
             }
             if let Some(seq) = initial_seq {
                 options = options.initial_sequence_number(seq);
+                reorder = reorder.initial_sequence_number(seq);
             }
             if let Some(rtptime) = initial_rtptime {
                 options = options.initial_rtptime(rtptime);
@@ -692,7 +692,7 @@ impl SetupCore {
                 .map_err(|e| r.error(&conn_ctx, e.to_string()))?;
             core_streams[i] = Some(PlayingStream {
                 rtp_handler: rtp::StreamReceiver::new(receiver, policy.unknown_rtcp_ssrc),
-                reorderer: reorder.map(crate::rtp::Reorderer::new),
+                reorderer: crate::rtp::Reorderer::new(reorder),
                 ctx,
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
                 reception: self

@@ -656,14 +656,15 @@ pub struct MessageParameters(onvif::CompressionType);
 
 /// Reports packet loss before a packet is pushed, as all depacketizers do.
 fn report_packet_loss<Ctx>(pkt: &PacketRef<'_, Ctx>, loss: impl FnOnce(&Loss<'_, Ctx>)) {
-    if pkt.meta.loss > 0 {
-        loss(&Loss {
-            ctx: &pkt.meta.ctx,
-            reason: LossReason::PacketLoss {
-                packets: pkt.meta.loss,
-            },
-        });
-    }
+    let reason = match pkt.meta.continuity {
+        crate::rtp::Continuity::Contiguous => return,
+        crate::rtp::Continuity::Lost(n) => LossReason::PacketLoss { packets: n.get() },
+        crate::rtp::Continuity::Discontinuity => LossReason::Discontinuity,
+    };
+    loss(&Loss {
+        ctx: &pkt.meta.ctx,
+        reason,
+    });
 }
 
 /// Reports corrupt data found in a packet.
@@ -1180,7 +1181,7 @@ mod tests {
             ssrc: 0,
             sequence_number,
             mark,
-            loss,
+            continuity: crate::rtp::Continuity::from_loss(loss),
         };
         let pos = buf.end();
         buf.extend(payload);
@@ -1273,7 +1274,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark: true,
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1337,7 +1338,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark: true,
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1620,7 +1621,7 @@ mod tests {
                 sequence_number: header.sequence_number(),
                 ssrc: header.ssrc(),
                 mark: header.mark(),
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             f(
                 &buf,

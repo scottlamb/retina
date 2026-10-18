@@ -52,7 +52,7 @@
 //!     sequence_number: 0,
 //!     ssrc: 0,
 //!     mark: true,
-//!     loss: 0,
+//!     continuity: retina::rtp::Continuity::Contiguous,
 //! };
 //! d.push(&PacketRef::new(meta, &buf, pos, received.len() as u16), &mut MyHandler);
 //! ```
@@ -991,7 +991,7 @@ mod tests {
             sequence_number: 0,
             ssrc: 0,
             mark: false,
-            loss: 0,
+            continuity: crate::rtp::Continuity::Contiguous,
         }
     }
 

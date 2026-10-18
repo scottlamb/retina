@@ -78,8 +78,8 @@ impl StreamReceiver {
         )
     }
 
-    /// Processes a pre-validated RTP header, returning packet metadata or
-    /// `None` if the packet should be skipped.
+    /// Processes a pre-validated RTP header from the stream's reorderer,
+    /// returning packet metadata.
     pub(crate) fn rtp(
         &mut self,
         conn: &ConnCore,
@@ -87,10 +87,7 @@ impl StreamReceiver {
         pkt_ctx: &PacketContext,
         stream_id: usize,
         header: &PacketHeader,
-    ) -> Result<Option<PacketMeta<PacketContext>>, Error> {
-        if skip(header) {
-            return Ok(None);
-        }
+    ) -> Result<PacketMeta<PacketContext>, Error> {
         self.receiver.rtp(*pkt_ctx, header).map_err(|e| {
             if matches!(e, ReceiveError::WrongSsrc { .. }) {
                 note_stale_live555_data_if_tcp(conn, stream_ctx, pkt_ctx);
@@ -160,36 +157,16 @@ impl StreamReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConnectionContext;
-    use crate::client::SessionOptions;
-    use crate::rtp::ReceiverOptions;
 
-    /// Checks dropping and logging Geovision's extra payload type 50 packets.
-    /// On a GV-EBD4701 running V1.02_2021_04_08, these seem to appear after
-    /// every IDR frame, with the same sequence number as the final packet in
-    /// that frame.
+    /// Checks skipping Geovision's extra payload type 50 packets. On a
+    /// GV-EBD4701 running V1.02_2021_04_08, these seem to appear after every
+    /// IDR frame, with the same sequence number as the final packet in that
+    /// frame.
     #[test]
     fn geovision_pt50_packet() {
-        let conn = ConnCore::new(ConnectionContext::dummy(), SessionOptions::default());
-        let receiver = Receiver::new(90_000, ReceiverOptions::default().ssrc(0xd25614e)).unwrap();
-        let mut r = StreamReceiver::new(receiver, UnknownRtcpSsrcPolicy::Default);
-        let stream_ctx = StreamContext::dummy();
-        let pkt_ctx = PacketContext::dummy();
-
-        // Normal packet.
         let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 105, 0xd25614e, true, *b"foo").unwrap();
-        let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
-        match r.rtp(&conn, &stream_ctx, &pkt_ctx, 0, &header) {
-            Ok(Some(_)) => {}
-            o => panic!("unexpected packet 1 result: {o:#?}"),
-        }
-
-        // Mystery pt=50 packet with same sequence number.
+        assert!(!skip(&PacketHeader::validate(&pkt[..]).unwrap().0));
         let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 50, 0xd25614e, true, *b"bar").unwrap();
-        let (header, _payload_range) = PacketHeader::validate(&pkt[..]).unwrap();
-        match r.rtp(&conn, &stream_ctx, &pkt_ctx, 0, &header) {
-            Ok(None) => {}
-            o => panic!("unexpected packet 2 result: {o:#?}"),
-        }
+        assert!(skip(&PacketHeader::validate(&pkt[..]).unwrap().0));
     }
 }

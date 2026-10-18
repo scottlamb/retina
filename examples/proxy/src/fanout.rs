@@ -261,7 +261,14 @@ impl UpstreamTrack {
                 let (a, b) = payload.slices();
                 let data = [a, b];
                 for d in &mut self.downstreams {
-                    for _ in 0..meta.loss {
+                    // Skip sequence numbers so downstream sees the loss. At
+                    // a discontinuity, the count is unknown; skip one.
+                    let skip = match meta.continuity {
+                        retina::rtp::Continuity::Lost(n) => n.get(),
+                        retina::rtp::Continuity::Discontinuity => 1,
+                        _ => 0,
+                    };
+                    for _ in 0..skip {
                         d.sender.skip();
                     }
                     if d.conn.congested() {

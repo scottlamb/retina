@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::PacketHeader;
+use super::seq::{Arrival, SeqState};
 use crate::buf::{Mark, MarkBuf};
 
 /// Options for a [`Reorderer`].
@@ -14,6 +15,7 @@ use crate::buf::{Mark, MarkBuf};
 pub struct ReorderOptions {
     pub(crate) max_delay: Duration,
     pub(crate) max_packets: u16,
+    pub(crate) initial_sequence_number: Option<u16>,
 }
 
 impl Default for ReorderOptions {
@@ -21,6 +23,7 @@ impl Default for ReorderOptions {
         Self {
             max_delay: Duration::from_millis(50),
             max_packets: 128,
+            initial_sequence_number: None,
         }
     }
 }
@@ -30,6 +33,8 @@ impl ReorderOptions {
     /// Defaults to 50 milliseconds.
     ///
     /// This is the most latency reordering adds, once a stream has started.
+    /// Zero returns each packet as soon as it arrives, dropping any which
+    /// arrive after a later one.
     #[inline]
     pub fn max_delay(self, max_delay: Duration) -> Self {
         Self { max_delay, ..self }
@@ -44,6 +49,21 @@ impl ReorderOptions {
     pub fn max_packets(self, max_packets: u16) -> Self {
         Self {
             max_packets,
+            ..self
+        }
+    }
+
+    /// Sets the first sequence number to return, e.g. from the `PLAY`
+    /// response's `RTP-Info` header.
+    ///
+    /// By default, the reorderer waits up to [`ReorderOptions::max_delay`]
+    /// before returning the first packet, in case packets with earlier
+    /// sequence numbers arrive. With a known first sequence number, it returns
+    /// that packet as soon as it arrives.
+    #[inline]
+    pub fn initial_sequence_number(self, seq: u16) -> Self {
+        Self {
+            initial_sequence_number: Some(seq),
             ..self
         }
     }
@@ -63,6 +83,13 @@ pub enum Pushed {
     /// returned a later packet: it was too late or a duplicate of one
     /// returned.
     Late,
+
+    /// The packet was discarded because its sequence number jumped too far
+    /// from the others', as described in [RFC 3550 appendix
+    /// A.1](https://datatracker.ietf.org/doc/html/rfc3550#appendix-A.1). If
+    /// the next packet follows it, the sender is assumed to have restarted;
+    /// see [`Reordered::restarted`].
+    Stray,
 }
 
 /// A packet returned by [`Reorderer::pop`].
@@ -80,6 +107,31 @@ pub struct Reordered<T> {
     /// This is at or before the packet's own position and that of every
     /// packet still held, all of which [`Reorderer::pop`] will return later.
     pub pin_pos: u64,
+
+    /// True if the sender restarted its sequence numbers before this packet,
+    /// so it's unrelated to the packet returned before it. The caller should
+    /// call [`super::Receiver::restart_sequence`] before passing it on.
+    pub restarted: bool,
+}
+
+/// Counts of packets a [`Reorderer`] discarded or gave up on.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ReorderCounters {
+    /// Packets discarded as [`Pushed::Late`].
+    pub late: u64,
+
+    /// Packets discarded as [`Pushed::Duplicate`].
+    pub duplicates: u64,
+
+    /// Packets discarded as [`Pushed::Stray`].
+    pub strays: u64,
+
+    /// Times the sender restarted its sequence numbers.
+    pub restarts: u64,
+
+    /// Missing packets given up on.
+    pub skipped: u64,
 }
 
 struct Held<T> {
@@ -90,8 +142,9 @@ struct Held<T> {
     item: T,
 }
 
-/// Puts RTP packets from a single stream (one SSRC), such as one received
-/// over UDP, back in sequence order.
+/// Puts RTP packets from a single stream (one SSRC) back in sequence order,
+/// and keeps the arrival statistics of [RFC 3550 appendix
+/// A.1](https://datatracker.ietf.org/doc/html/rfc3550#appendix-A.1).
 ///
 /// This is sans-I/O and works with packets in place within a [`MarkBuf`]. The
 /// caller parses each packet's header via [`PacketHeader::validate`], then:
@@ -104,16 +157,29 @@ struct Held<T> {
 /// 3.  calls `pop` again by [`Reorderer::poll_timeout`], to give up on
 ///     missing packets.
 ///
-/// Before the first packet is returned, the reorderer waits up to
-/// [`ReorderOptions::max_delay`] in case packets with earlier sequence
-/// numbers arrive. Afterward, it returns each packet as soon as those before
-/// it have been returned or given up on. A packet whose predecessor was given
-/// up on, or which arrives after a later packet was returned, is
-/// [`Pushed::Late`] and dropped.
+/// Unless [`ReorderOptions::initial_sequence_number`] is set, the reorderer
+/// waits up to [`ReorderOptions::max_delay`] before returning the first
+/// packet, in case packets with earlier sequence numbers arrive. Afterward,
+/// it returns each packet as soon as those before it have been returned or
+/// given up on. A packet whose predecessor was given up on, or which arrives
+/// after a later packet was returned, is [`Pushed::Late`] and dropped.
+///
+/// It also recognizes a sender restarting its sequence numbers, as RFC 3550
+/// appendix A.1 does: after a packet whose sequence number jumps far from the
+/// others ([`Pushed::Stray`]), a packet following it starts a new sequence.
+/// The reorderer returns the packets it holds from the old sequence, then
+/// continues with the new one, marking its first packet
+/// [`Reordered::restarted`].
+///
+/// With a [`ReorderOptions::max_delay`] of zero, it returns each packet
+/// immediately, so it only drops late packets and recognizes restarts.
 ///
 /// It doesn't check SSRCs; that's left to the [`super::Receiver`].
 pub struct Reorderer<T> {
     options: ReorderOptions,
+
+    /// Packets from before a restart, in order, to return before `held`.
+    ready: VecDeque<Held<T>>,
 
     /// Held packets, sorted by sequence number relative to `next`.
     held: VecDeque<Held<T>>,
@@ -121,29 +187,40 @@ pub struct Reorderer<T> {
     /// The next sequence number to return, once one is known.
     next: Option<u16>,
 
-    /// True once a packet has been returned. Before then, an earlier packet
-    /// can move `next` backward.
+    /// True once a packet has been returned or the first sequence number is
+    /// known. Before then, an earlier packet can move `next` backward.
     started: bool,
+
+    /// True if the next packet returned from `held` starts a new sequence.
+    restart_pending: bool,
 
     /// The mark of the last packet returned by `pop`, held until the next
     /// call so the caller can build a `PacketRef` to it.
     last: Option<Mark>,
+
+    /// Arrival statistics, once a packet has arrived.
+    seq: Option<SeqState>,
+
+    /// How the statistics classified the last packet pushed.
+    last_arrival: Option<Arrival>,
+
+    counters: ReorderCounters,
 }
 
 impl<T> std::fmt::Debug for Reorderer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seqs = |q: &VecDeque<Held<T>>| {
+            q.iter()
+                .map(|h| h.header.sequence_number())
+                .collect::<Vec<_>>()
+        };
         f.debug_struct("Reorderer")
             .field("options", &self.options)
             .field("next", &self.next)
             .field("started", &self.started)
-            .field(
-                "held",
-                &self
-                    .held
-                    .iter()
-                    .map(|h| h.header.sequence_number())
-                    .collect::<Vec<_>>(),
-            )
+            .field("ready", &seqs(&self.ready))
+            .field("held", &seqs(&self.held))
+            .field("counters", &self.counters)
             .finish()
     }
 }
@@ -152,26 +229,52 @@ impl<T> Reorderer<T> {
     pub fn new(options: ReorderOptions) -> Self {
         Self {
             options,
+            ready: VecDeque::new(),
             held: VecDeque::new(),
-            next: None,
-            started: false,
+            next: options.initial_sequence_number,
+            started: options.initial_sequence_number.is_some(),
+            restart_pending: false,
             last: None,
+            seq: None,
+            last_arrival: None,
+            counters: ReorderCounters::default(),
         }
     }
 
     /// Returns the number of packets held.
     #[inline]
     pub fn len(&self) -> usize {
-        self.held.len()
+        self.ready.len() + self.held.len()
     }
 
     /// Returns true if no packets are held.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.held.is_empty()
+        self.len() == 0
     }
 
-    /// Offset of `seq` from `next`, which must be known.
+    /// Returns counts of packets discarded or given up on so far.
+    #[inline]
+    pub fn counters(&self) -> ReorderCounters {
+        self.counters
+    }
+
+    /// Returns `(fraction_lost, cumulative_lost, extended_highest_seq)` for an
+    /// RTCP report block and starts a new reporting interval, or `None` if no
+    /// valid packet has arrived since the last report.
+    pub(crate) fn reception_report(&mut self) -> Option<(u8, i32, u32)> {
+        self.seq.as_mut()?.report()
+    }
+
+    /// Returns true if the last packet pushed was counted as received in the
+    /// arrival statistics. Per RFC 3550 appendix A.1, packets are counted
+    /// once the source is out of probation, including duplicates and late
+    /// packets but not strays. Receiver reports' jitter uses the same packets.
+    pub(crate) fn last_arrival_counted(&self) -> bool {
+        matches!(self.last_arrival, Some(Arrival::Valid | Arrival::Restart))
+    }
+
+    /// Offset of `seq` from `next`.
     #[inline]
     fn offset(next: u16, seq: u16) -> u16 {
         seq.wrapping_sub(next)
@@ -195,6 +298,26 @@ impl<T> Reorderer<T> {
     ) -> Pushed {
         self.last = None;
         let seq = header.sequence_number();
+        let arrival = self
+            .seq
+            .get_or_insert_with(|| SeqState::new(seq))
+            .update(seq);
+        self.last_arrival = Some(arrival);
+        match arrival {
+            Arrival::Stray => {
+                self.counters.strays += 1;
+                return Pushed::Stray;
+            }
+            Arrival::Restart => {
+                // Return what's held from the old sequence first, in order.
+                self.counters.restarts += 1;
+                self.ready.append(&mut self.held);
+                self.next = Some(seq);
+                self.started = true;
+                self.restart_pending = true;
+            }
+            Arrival::Probation | Arrival::Valid => {}
+        }
         let mut next = *self.next.get_or_insert(seq);
         let offset = Self::offset(next, seq);
         if offset >= 0x8000 {
@@ -207,6 +330,7 @@ impl<T> Reorderer<T> {
                 .map(|h| Self::offset(next, h.header.sequence_number()))
                 .unwrap_or(0);
             if self.started || u32::from(max_offset) + u32::from(back) >= 0x8000 {
+                self.counters.late += 1;
                 return Pushed::Late;
             }
             next = seq;
@@ -221,6 +345,7 @@ impl<T> Reorderer<T> {
             .get(i)
             .is_some_and(|h| h.header.sequence_number() == seq)
         {
+            self.counters.duplicates += 1;
             return Pushed::Duplicate;
         }
         self.held.insert(
@@ -236,14 +361,21 @@ impl<T> Reorderer<T> {
         Pushed::Held
     }
 
-    /// Returns true if the front packet should be returned at `now`.
+    /// Returns true if the front of `held` is next in sequence.
+    fn front_in_order(&self) -> bool {
+        self.started
+            && self
+                .held
+                .front()
+                .is_some_and(|f| Some(f.header.sequence_number()) == self.next)
+    }
+
+    /// Returns true if the front of `held` should be returned at `now`.
     fn front_due(&self, now: Instant) -> bool {
-        let Some(front) = self.held.front() else {
-            return false;
-        };
-        (self.started && Some(front.header.sequence_number()) == self.next)
-            || self.held.len() > usize::from(self.options.max_packets)
-            || self.give_up_at().is_some_and(|t| t <= now)
+        !self.held.is_empty()
+            && (self.front_in_order()
+                || self.held.len() > usize::from(self.options.max_packets)
+                || self.give_up_at().is_some_and(|t| t <= now))
     }
 
     /// Returns when the oldest held packet will have waited `max_delay`.
@@ -266,18 +398,36 @@ impl<T> Reorderer<T> {
     /// or `pop`, so the caller can build a [`crate::buf::PacketRef`] to it.
     pub fn pop(&mut self, now: Instant) -> Option<Reordered<T>> {
         self.last = None;
-        if !self.front_due(now) {
-            return None;
-        }
-        let h = self.held.pop_front().expect("front_due implies non-empty");
-        self.next = Some(h.header.sequence_number().wrapping_add(1));
-        self.started = true;
-        let pin_pos = self.held.iter().map(|h| h.pos).fold(h.pos, u64::min);
+        let (h, restarted) = match self.ready.pop_front() {
+            Some(h) => (h, false),
+            None => {
+                if !self.front_due(now) {
+                    return None;
+                }
+                let h = self.held.pop_front().expect("front_due implies non-empty");
+                let seq = h.header.sequence_number();
+                if self.started
+                    && let Some(next) = self.next
+                {
+                    self.counters.skipped += u64::from(Self::offset(next, seq));
+                }
+                self.next = Some(seq.wrapping_add(1));
+                self.started = true;
+                (h, std::mem::take(&mut self.restart_pending))
+            }
+        };
+        let pin_pos = self
+            .ready
+            .iter()
+            .chain(self.held.iter())
+            .map(|h| h.pos)
+            .fold(h.pos, u64::min);
         self.last = Some(h.mark);
         Some(Reordered {
             item: h.item,
             header: h.header,
             pin_pos,
+            restarted,
         })
     }
 
@@ -286,10 +436,11 @@ impl<T> Reorderer<T> {
     ///
     /// This may be in the past, if a packet is due now.
     pub fn poll_timeout(&self) -> Option<Instant> {
+        if let Some(r) = self.ready.front() {
+            return Some(r.arrival);
+        }
         let front = self.held.front()?;
-        if (self.started && Some(front.header.sequence_number()) == self.next)
-            || self.held.len() > usize::from(self.options.max_packets)
-        {
+        if self.front_in_order() || self.held.len() > usize::from(self.options.max_packets) {
             return Some(front.arrival);
         }
         self.give_up_at()
@@ -410,6 +561,86 @@ mod tests {
     }
 
     #[test]
+    fn initial_sequence_number() {
+        let mut f = Fixture::new(ReorderOptions::default().initial_sequence_number(10));
+        f.push(10, 0);
+        assert_eq!(f.pop(0), [10]);
+        assert_eq!(f.push(9, 0).0, Pushed::Late);
+
+        // A gap after the known start is a gap, not a startup wait.
+        let mut f = Fixture::new(ReorderOptions::default().initial_sequence_number(10));
+        f.push(11, 0);
+        assert_eq!(f.pop(49), []);
+        assert_eq!(f.pop(50), [11]);
+        assert_eq!(f.r.counters().skipped, 1);
+    }
+
+    #[test]
+    fn zero_delay() {
+        let mut f = Fixture::new(ReorderOptions::default().max_delay(Duration::ZERO));
+        f.push(5, 0);
+        assert_eq!(f.pop(0), [5]);
+        f.push(7, 0);
+        assert_eq!(f.pop(0), [7]);
+        assert_eq!(f.push(6, 0).0, Pushed::Late);
+        assert_eq!(
+            f.r.counters(),
+            ReorderCounters {
+                late: 1,
+                skipped: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn restart() {
+        let mut f = Fixture::new(ReorderOptions::default());
+        for seq in 1000..1003 {
+            f.push(seq, 0);
+        }
+        assert_eq!(f.pop(50), [1000, 1001, 1002]);
+        f.push(1004, 60); // held, waiting for 1003.
+
+        // A single stray packet is dropped...
+        assert_eq!(f.push(10, 60).0, Pushed::Stray);
+        assert_eq!(f.pop(60), Vec::<u16>::new());
+
+        // ...but a packet following it starts a new sequence. The old
+        // sequence's held packets are returned first.
+        assert_eq!(f.push(11, 61).0, Pushed::Held);
+        let t = f.t0 + Duration::from_millis(61);
+        let p = f.r.pop(t).unwrap();
+        assert_eq!((p.header.sequence_number(), p.restarted), (1004, false));
+        let p = f.r.pop(t).unwrap();
+        assert_eq!((p.header.sequence_number(), p.restarted), (11, true));
+        assert!(f.r.pop(t).is_none());
+
+        // Then the new sequence continues normally.
+        f.push(12, 62);
+        assert_eq!(f.pop(62), [12]);
+        assert_eq!(
+            f.r.counters(),
+            ReorderCounters {
+                strays: 1,
+                restarts: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn reception_report() {
+        let mut f = Fixture::new(ReorderOptions::default());
+        f.push(1, 0); // on probation, not counted.
+        assert_eq!(f.r.reception_report(), None);
+        f.push(2, 0);
+        f.push(4, 0);
+        f.push(4, 0); // duplicate, counted as received.
+        assert_eq!(f.r.reception_report(), Some((0, 0, 4)));
+    }
+
+    #[test]
     fn wraparound() {
         let mut f = Fixture::new(ReorderOptions::default());
         f.push(0, 0);
@@ -493,7 +724,7 @@ mod tests {
         };
         let mut drain = |buf: &MarkBuf, r: &mut Reorderer<std::ops::Range<u64>>, now| {
             while let Some(p) = r.pop(now) {
-                let meta = receiver.rtp((), &p.header).unwrap().unwrap();
+                let meta = receiver.rtp((), &p.header).unwrap();
                 let len = u16::try_from(p.item.end - p.item.start).unwrap();
                 let pkt = PacketRef::new(meta, buf, p.item.start, len).with_pin_pos(p.pin_pos);
                 d.push(&pkt, &mut frames);

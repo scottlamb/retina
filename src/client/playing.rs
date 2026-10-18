@@ -69,8 +69,10 @@ pub(crate) struct Reports {
 pub(crate) struct PlayingStream {
     pub(crate) rtp_handler: StreamReceiver,
 
-    /// For a UDP stream, the reorder buffer, if enabled.
-    pub(crate) reorderer: Option<Reorderer<ReorderItem>>,
+    /// The reorder buffer, which every RTP packet passes through. On TCP, it
+    /// has no delay; it just drops late packets and recognizes restarts. It
+    /// also keeps sequence number statistics for receiver reports.
+    pub(crate) reorderer: Reorderer<ReorderItem>,
 
     pub(crate) ctx: StreamContext,
 
@@ -137,6 +139,25 @@ struct StreamItem {
     body_len: u16,
 }
 
+/// Logs a packet the reorderer dropped: a warning the first time each kind of
+/// drop happens on a stream, then only at debug level.
+fn note_dropped(stream_i: usize, seq: u16, pushed: Pushed, c: crate::rtp::ReorderCounters) {
+    let first = match pushed {
+        Pushed::Late => c.late == 1,
+        Pushed::Duplicate => c.duplicates == 1,
+        Pushed::Stray => c.strays == 1,
+        _ => false,
+    };
+    if first {
+        warn!(
+            "stream {stream_i}: dropping {pushed:?} seq={seq}; further such drops \
+             are logged at debug level"
+        );
+    } else {
+        log::debug!("stream {stream_i}: dropping {pushed:?} seq={seq}; {c:?}");
+    }
+}
+
 /// An RTP packet held in a [`PlayingStream::reorderer`].
 pub(crate) struct ReorderItem {
     pkt_ctx: PacketContext,
@@ -163,8 +184,8 @@ pub(crate) struct ValidatedRtp {
     body_len: u16,
     payload_range: std::ops::Range<u16>,
 
-    /// The pin position from [`crate::rtp::Reordered::pin_pos`], if reordered.
-    pin_pos: Option<u64>,
+    /// The pin position from [`crate::rtp::Reordered::pin_pos`].
+    pin_pos: u64,
 }
 
 impl PlayingCore {
@@ -399,29 +420,31 @@ impl PlayingCore {
     fn pop_reordered(&mut self, now: Instant) -> Result<Option<ValidatedItem>, Error> {
         for (stream_i, stream) in self.streams.iter_mut().enumerate() {
             let Some(stream) = stream else { continue };
-            let Some(reorderer) = &mut stream.reorderer else {
+            let Some(p) = stream.reorderer.pop(now) else {
                 continue;
             };
-            while let Some(p) = reorderer.pop(now) {
-                let Some(meta) = stream.rtp_handler.rtp(
-                    &self.conn,
-                    &stream.ctx,
-                    &p.item.pkt_ctx,
-                    stream_i,
-                    &p.header,
-                )?
-                else {
-                    continue;
-                };
-                return Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
-                    stream_id: stream_i,
-                    meta,
-                    body_pos: p.item.body_pos,
-                    body_len: p.item.body_len,
-                    payload_range: p.item.payload_range,
-                    pin_pos: Some(p.pin_pos),
-                })));
+            if p.restarted {
+                log::warn!(
+                    "stream {stream_i}: sender restarted RTP sequence numbers at seq={}",
+                    p.header.sequence_number()
+                );
+                stream.rtp_handler.receiver.restart_sequence();
             }
+            let meta = stream.rtp_handler.rtp(
+                &self.conn,
+                &stream.ctx,
+                &p.item.pkt_ctx,
+                stream_i,
+                &p.header,
+            )?;
+            return Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
+                stream_id: stream_i,
+                meta,
+                body_pos: p.item.body_pos,
+                body_len: p.item.body_len,
+                payload_range: p.item.payload_range,
+                pin_pos: p.pin_pos,
+            })));
         }
         Ok(None)
     }
@@ -436,15 +459,13 @@ impl PlayingCore {
             .as_ref()
             .and_then(|s| s.udp_buf.as_ref())
             .unwrap_or(self.conn.reader.buf());
-        let mut pkt = crate::buf::PacketRef::new(
+        let pkt = crate::buf::PacketRef::new(
             rtp.meta,
             buf,
             rtp.body_pos + u64::from(rtp.payload_range.start),
             rtp.payload_range.end - rtp.payload_range.start,
-        );
-        if let Some(pin_pos) = rtp.pin_pos {
-            pkt = pkt.with_pin_pos(pin_pos);
-        }
+        )
+        .with_pin_pos(rtp.pin_pos);
         PlayingItem::Rtp(RtpPacket {
             stream_id: rtp.stream_id,
             stream: &self.presentation.streams[rtp.stream_id],
@@ -456,16 +477,15 @@ impl PlayingCore {
 
     /// Returns the next time [`PlayingCore::handle_timeout`] should be called.
     ///
-    /// This includes when a UDP stream's reorder buffer will give up on a
-    /// missing packet; [`PlayingCore::poll_item`] then returns the packets
-    /// after it.
+    /// This includes when a stream's reorder buffer will give up on a missing
+    /// packet; [`PlayingCore::poll_item`] then returns the packets after it.
     pub fn poll_timeout(&self) -> Instant {
         let mut t = match &self.reports {
             Some(r) => self.keepalive.deadline.min(r.due),
             None => self.keepalive.deadline,
         };
         for s in self.streams.iter().flatten() {
-            if let Some(r) = s.reorderer.as_ref().and_then(Reorderer::poll_timeout) {
+            if let Some(r) = s.reorderer.poll_timeout() {
                 t = t.min(r);
             }
         }
@@ -569,12 +589,17 @@ impl PlayingCore {
                 ctx,
                 udp_buf,
                 reception: Some(reception),
+                reorderer,
+                rtp_handler,
                 ..
             }) = s
             else {
                 continue;
             };
-            let block = reception.report_block(now);
+            let block = rtp_handler.receiver.ssrc().and_then(|ssrc| {
+                let seq = reorderer.reception_report()?;
+                Some(reception.report_block(now, ssrc, seq))
+            });
             trace!("sending RTCP receiver report for stream {i}: {block:?}");
             let pkt = reports.writer.write(block.as_ref());
             match (udp_buf, &ctx.0) {
@@ -749,60 +774,35 @@ impl PlayingCore {
                         })
                     })?;
 
-                // Count the packet for receiver reports as it arrives, before
-                // `rtp_handler` skips or rejects it for being out of order: RFC
-                // 3550 appendix A.1 counts reordered and duplicate packets as
-                // received. Like `rtp_handler`, ignore pt=50 packets.
-                if let Some(reception) = &mut stream.reception
-                    && header.payload_type() != 50
-                {
-                    reception.rtp(
-                        header.ssrc(),
-                        header.sequence_number(),
-                        header.timestamp(),
-                        now,
-                    );
-                }
-                if let Some(reorderer) = &mut stream.reorderer {
-                    if super::rtp::skip(&header) {
-                        return Ok(None);
-                    }
-                    let seq = header.sequence_number();
-                    match reorderer.push(
-                        buf,
-                        header,
-                        item.body_pos,
-                        now,
-                        ReorderItem {
-                            pkt_ctx: item.pkt_ctx,
-                            body_pos: item.body_pos,
-                            body_len: item.body_len,
-                            payload_range,
-                        },
-                    ) {
-                        Pushed::Held => {}
-                        o => log::info!("stream {}: dropping seq={seq}: {o:?}", item.stream_i),
-                    }
-                    return Ok(None); // returned later via `pop_reordered`.
-                }
-                let Some(meta) = stream.rtp_handler.rtp(
-                    &self.conn,
-                    &stream.ctx,
-                    &item.pkt_ctx,
-                    item.stream_i,
-                    &header,
-                )?
-                else {
+                if super::rtp::skip(&header) {
                     return Ok(None);
-                };
-                Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
-                    stream_id: item.stream_i,
-                    meta,
-                    body_pos: item.body_pos,
-                    body_len: item.body_len,
-                    payload_range,
-                    pin_pos: None,
-                })))
+                }
+                let seq = header.sequence_number();
+                let rtp_timestamp = header.timestamp();
+                let pushed = stream.reorderer.push(
+                    buf,
+                    header,
+                    item.body_pos,
+                    now,
+                    ReorderItem {
+                        pkt_ctx: item.pkt_ctx,
+                        body_pos: item.body_pos,
+                        body_len: item.body_len,
+                        payload_range,
+                    },
+                );
+
+                // Note the arrival for receiver reports' jitter, if the
+                // reorderer's statistics counted it.
+                if let Some(reception) = &mut stream.reception
+                    && stream.reorderer.last_arrival_counted()
+                {
+                    reception.rtp(rtp_timestamp, now);
+                }
+                if pushed != Pushed::Held {
+                    note_dropped(item.stream_i, seq, pushed, stream.reorderer.counters());
+                }
+                Ok(None) // returned later via `pop_reordered`.
             }
             ChannelType::Rtcp => {
                 let body = Bytes::from(
@@ -882,16 +882,14 @@ mod tests {
                 rtp_handler: StreamReceiver::new(
                     crate::rtp::Receiver::new(
                         s.clock_rate_hz(),
-                        crate::rtp::ReceiverOptions::default().out_of_order(if udp {
-                            crate::rtp::OutOfOrder::Drop
-                        } else {
-                            crate::rtp::OutOfOrder::Error
-                        }),
+                        crate::rtp::ReceiverOptions::default(),
                     )
                     .unwrap(),
                     UnknownRtcpSsrcPolicy::Default,
                 ),
-                reorderer: None,
+                reorderer: Reorderer::new(
+                    crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO),
+                ),
                 ctx: StreamContext::dummy(),
                 udp_buf: udp.then(|| MarkBuf::new(65536)),
                 reception: None,
@@ -1056,6 +1054,39 @@ mod tests {
         assert!(core.poll_item(t1).is_none());
     }
 
+    /// Over TCP, a late packet is dropped rather than failing the session, and
+    /// a sender restarting its sequence numbers shows up as a discontinuity.
+    #[test]
+    fn tcp_late_and_restart() {
+        use crate::rtp::Continuity;
+        let Fixture { mut core, t0 } = fixture();
+        for seq in [1000, 1001, 1003, 1002, 10, 11] {
+            core.read_buf().extend(&interleaved(0, seq, b"x"));
+        }
+        let items: Vec<_> = std::iter::from_fn(|| match core.poll_item(t0)? {
+            Ok(PlayingItem::Rtp(p)) => {
+                Some((p.packet().meta.sequence_number, p.packet().meta.continuity))
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        })
+        .collect();
+        assert_eq!(
+            items,
+            [
+                (1000, Continuity::Contiguous),
+                (1001, Continuity::Contiguous),
+                (1003, Continuity::from_loss(1)),
+                // 1002 is late; 10 is a stray.
+                (11, Continuity::Discontinuity),
+            ]
+        );
+        let counters = core.streams[0].as_ref().unwrap().reorderer.counters();
+        assert_eq!(
+            (counters.late, counters.strays, counters.restarts),
+            (1, 1, 1)
+        );
+    }
+
     #[test]
     fn udp_rtp_and_rtcp() {
         let Fixture { mut core, t0 } = fixture();
@@ -1095,7 +1126,7 @@ mod tests {
     fn udp_reorder() {
         let Fixture { mut core, t0 } = fixture();
         core.streams[1].as_mut().unwrap().reorderer =
-            Some(Reorderer::new(crate::rtp::ReorderOptions::default()));
+            Reorderer::new(crate::rtp::ReorderOptions::default());
         let receive = |core: &mut PlayingCore, seq: u16, now: Instant| {
             let payload = format!("pkt {seq}");
             let data = &interleaved(0, seq, payload.as_bytes())[4..];

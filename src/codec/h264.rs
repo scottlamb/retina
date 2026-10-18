@@ -612,7 +612,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     AccessUnit::start(meta, 0, false)
                 }
                 DepacketizerInputState::PreMark(mut access_unit) => {
-                    let loss = meta.loss;
+                    let loss = meta.continuity.loss_count();
                     if loss > 0 {
                         self.discard_au();
                         if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
@@ -689,7 +689,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     debug_assert!(self.nals.is_empty());
                     debug_assert!(self.pieces.is_empty());
                     if meta.timestamp.timestamp == timestamp.timestamp {
-                        pkts += meta.loss;
+                        pkts += meta.continuity.loss_count();
                         self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
                         return Ok(());
                     }
@@ -698,7 +698,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             };
 
         let mark = meta.mark;
-        let loss = meta.loss;
+        let loss = meta.continuity.loss_count();
         let timestamp = meta.timestamp;
 
         if payload_len == 0 {
@@ -1171,7 +1171,7 @@ impl<Ctx: Clone> AccessUnit<Ctx> {
             fu_a: None,
 
             // TODO: overflow?
-            loss: meta.loss + additional_loss,
+            loss: meta.continuity.loss_count() + additional_loss,
             same_ts_as_prev,
         }
     }
@@ -3108,7 +3108,7 @@ mod tests {
             ssrc: 0,
             sequence_number,
             mark,
-            loss,
+            continuity: crate::rtp::Continuity::from_loss(loss),
         };
         let pos = buf.end();
         buf.extend(payload);
@@ -3592,7 +3592,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark,
-                loss: 0,
+                continuity: crate::rtp::Continuity::Contiguous,
             };
             let pos = buf.end();
             buf.extend(payload);

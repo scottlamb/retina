@@ -663,27 +663,22 @@ impl std::str::FromStr for Transport {
 pub struct TcpTransportOptions;
 
 /// Per-stream UDP transport options.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct UdpTransportOptions {
-    pub(crate) reorder: Option<crate::rtp::ReorderOptions>,
-}
-
-impl Default for UdpTransportOptions {
-    fn default() -> Self {
-        Self {
-            reorder: Some(crate::rtp::ReorderOptions::default()),
-        }
-    }
+    pub(crate) reorder: crate::rtp::ReorderOptions,
 }
 
 impl UdpTransportOptions {
-    /// Sets how to reorder RTP packets, or `None` to drop out-of-order packets
-    /// instead. Defaults to [`crate::rtp::ReorderOptions::default`].
+    /// Sets how to reorder RTP packets. Defaults to
+    /// [`crate::rtp::ReorderOptions::default`].
     ///
-    /// Reordering briefly delays the first packet and any packet following a
-    /// gap in sequence numbers; see [`crate::rtp::Reorderer`].
-    pub fn reorder(self, reorder: Option<crate::rtp::ReorderOptions>) -> Self {
+    /// Reordering briefly delays any packet following a gap in sequence
+    /// numbers, and the first packet unless the `PLAY` response supplies its
+    /// sequence number; see [`crate::rtp::Reorderer`]. A
+    /// [`crate::rtp::ReorderOptions::max_delay`] of zero drops out-of-order
+    /// packets instead.
+    pub fn reorder(self, reorder: crate::rtp::ReorderOptions) -> Self {
         Self { reorder }
     }
 }
@@ -1113,7 +1108,7 @@ struct StreamStateInit {
 
     ctx: StreamContext,
 
-    /// For a UDP stream, how to reorder packets, if at all.
+    /// For a UDP stream, how to reorder packets.
     reorder: Option<crate::rtp::ReorderOptions>,
 }
 
@@ -1758,7 +1753,7 @@ impl std::fmt::Debug for RtpPacket<'_> {
             .field("ssrc", &format_args!("{:08x}", meta.ssrc))
             .field("sequence_number", &meta.sequence_number)
             .field("mark", &meta.mark)
-            .field("loss", &meta.loss)
+            .field("continuity", &meta.continuity)
             .field(
                 "payload",
                 &crate::hex::LimitedHex::from_split(self.pkt.payload(), 64),

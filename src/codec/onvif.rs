@@ -55,13 +55,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         pkt: &PacketRef<'_, Ctx>,
         handler: &mut impl MessageHandler<Ctx>,
     ) {
-        if pkt.meta.loss > 0
+        if !pkt.meta.continuity.is_contiguous()
             && let Some(in_progress) = &self.in_progress
         {
             log::debug!(
-                "Discarding {}-byte message prefix due to loss of {} RTP packets",
+                "Discarding {}-byte message prefix due to {:?}",
                 in_progress.data.len(),
-                pkt.meta.loss,
+                pkt.meta.continuity,
             );
             self.in_progress = None;
         }

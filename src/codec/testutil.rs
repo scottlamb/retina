@@ -134,6 +134,7 @@ impl<'a> Collector<'a> {
     fn on_loss(&mut self, loss: &Loss<'_, PacketContext>) {
         match loss.reason() {
             LossReason::PacketLoss { packets } => self.pending.loss += packets,
+            LossReason::Discontinuity => self.pending.loss += 1,
             LossReason::Corrupt(c) => self.pending.items.push_back(Err(c.to_string())),
         }
     }

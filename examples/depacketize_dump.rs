@@ -159,8 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
             let meta = receiver
                 .rtp(offset, &header)
-                .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?
-                .expect("OutOfOrder::Error never drops");
+                .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
             let pkt = PacketRef::new(
                 meta,
                 &buf,
