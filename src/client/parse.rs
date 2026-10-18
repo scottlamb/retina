@@ -788,6 +788,7 @@ mod tests {
             ctx: StreamContext(StreamContextInner::Tcp(TcpStreamContext {
                 rtp_channel_id: 0,
             })),
+            reorder: None,
         })
     }
 

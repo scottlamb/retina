@@ -533,6 +533,7 @@ fn run(opts: Opts) -> Result<(), Error> {
             Transport::Tcp => SetupTransport::Tcp,
             Transport::Udp => SetupTransport::Udp {
                 client_rtp_port: io.bind_udp(i)?,
+                options: Default::default(),
             },
         };
         core.setup(i, transport)?;

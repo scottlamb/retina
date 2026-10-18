@@ -37,7 +37,10 @@ pub enum SetupTransport {
     /// RTP/AVP/UDP: send RTP and RTCP to a pair of UDP sockets the caller has
     /// bound on the RTSP connection's local address, on ports `client_rtp_port`
     /// (even) and `client_rtp_port + 1`. See [`crate::UdpPair`].
-    Udp { client_rtp_port: u16 },
+    Udp {
+        client_rtp_port: u16,
+        options: super::UdpTransportOptions,
+    },
 }
 
 /// A packet to send on a UDP stream's socket, from
@@ -89,6 +92,7 @@ enum Op {
     Setup {
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
     },
     Play {
         options: PlayOptions,
@@ -311,6 +315,7 @@ impl SetupCore {
             .unwrap_or(&presentation.control)
             .clone();
         let mut headers = msg::Headers::default();
+        let mut reorder = None;
         let udp = match transport {
             SetupTransport::Tcp => {
                 let proposed_channel_id =
@@ -330,7 +335,11 @@ impl SetupCore {
                 );
                 None
             }
-            SetupTransport::Udp { client_rtp_port } => {
+            SetupTransport::Udp {
+                client_rtp_port,
+                options,
+            } => {
+                reorder = options.reorder;
                 headers.insert(
                     msg::HeaderName::TRANSPORT,
                     msg::HeaderValue::try_from(format!(
@@ -359,7 +368,15 @@ impl SetupCore {
             },
             body: Bytes::new(),
         };
-        self.start(ResponseMode::Normal, Op::Setup { stream_i, udp }, req)?;
+        self.start(
+            ResponseMode::Normal,
+            Op::Setup {
+                stream_i,
+                udp,
+                reorder,
+            },
+            req,
+        )?;
         self.flags |= if udp.is_some() {
             SessionFlag::UdpStreams
         } else {
@@ -447,7 +464,14 @@ impl SetupCore {
             (Op::Teardown, r) => super::teardown::status(r).map(|_| SessionEvent::TornDown),
             (_, Err(e)) => Err(e),
             (Op::Describe { url }, Ok(r)) => self.handle_describe(url, r),
-            (Op::Setup { stream_i, udp }, Ok(r)) => self.handle_setup(stream_i, udp, r),
+            (
+                Op::Setup {
+                    stream_i,
+                    udp,
+                    reorder,
+                },
+                Ok(r),
+            ) => self.handle_setup(stream_i, udp, reorder, r),
             (Op::Play { options }, Ok(r)) => self.handle_play(options, r),
         })
     }
@@ -469,6 +493,7 @@ impl SetupCore {
         &mut self,
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
         r: super::conn::Response,
     ) -> Result<SessionEvent, Error> {
         debug!("SETUP response: {:#?}", r.head);
@@ -553,6 +578,7 @@ impl SetupCore {
             initial_seq: None,
             initial_rtptime: None,
             ctx,
+            reorder: reorder.filter(|_| udp_peer.is_some()),
         });
         Ok(SessionEvent::SetUp { stream_i, udp_peer })
     }
@@ -591,6 +617,7 @@ impl SetupCore {
                 initial_seq,
                 ssrc,
                 ctx,
+                reorder,
             }) = s.state
             else {
                 continue;
@@ -665,6 +692,7 @@ impl SetupCore {
                 .map_err(|e| r.error(&conn_ctx, e.to_string()))?;
             core_streams[i] = Some(PlayingStream {
                 rtp_handler: rtp::StreamReceiver::new(receiver, policy.unknown_rtcp_ssrc),
+                reorderer: reorder.map(crate::rtp::Reorderer::new),
                 ctx,
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
                 reception: self
@@ -1278,6 +1306,7 @@ mod tests {
             1,
             SetupTransport::Udp {
                 client_rtp_port: 54060,
+                options: Default::default(),
             },
         )
         .unwrap();

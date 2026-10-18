@@ -9,11 +9,13 @@ use std::ops::Range;
 use crate::inputs::Input;
 
 mod receiver;
+mod reorder;
 mod timeline;
 
 pub use receiver::{
     OutOfOrder, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
 };
+pub use reorder::{Pushed, ReorderOptions, Reordered, Reorderer};
 
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///

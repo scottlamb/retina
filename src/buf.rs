@@ -593,6 +593,10 @@ pub struct PacketRef<'a, Ctx> {
     buf: &'a MarkBuf,
     payload_pos: u64,
     payload_len: u16,
+
+    /// The position a depacketizer pins to retain this packet's payload and
+    /// that of every packet pushed after it; see [`PacketRef::with_pin_pos`].
+    pin_pos: u64,
 }
 
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
@@ -624,13 +628,37 @@ impl<'a, Ctx> PacketRef<'a, Ctx> {
             buf,
             payload_pos,
             payload_len,
+            pin_pos: payload_pos,
         }
     }
 
-    /// Pin the payload position so the data stays accessible until the
-    /// returned [`Mark`] is dropped.
+    /// Sets the position a depacketizer pins to retain this packet's data.
+    ///
+    /// A depacketizer holding data from several packets pins only the first
+    /// one's position, relying on a [`MarkBuf`] to retain everything after
+    /// it. That holds when packets are pushed in the order they were received.
+    /// When they aren't, as with [`crate::rtp::Reorderer`], each packet's pin
+    /// position must be at or before the payload of every packet pushed after
+    /// it. `Reorderer` supplies such a position.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `pin_pos` is within `[start(), payload_pos]`, where
+    /// `start()` is the oldest position still in the buffer.
+    pub fn with_pin_pos(self, pin_pos: u64) -> Self {
+        assert!(
+            pin_pos >= self.buf.start() && pin_pos <= self.payload_pos,
+            "pin_pos {pin_pos} must be within [{}, {}]",
+            self.buf.start(),
+            self.payload_pos,
+        );
+        Self { pin_pos, ..self }
+    }
+
+    /// Pins this packet's data (and that of packets pushed after it) so it
+    /// stays accessible until the returned [`Mark`] is dropped.
     pub(crate) fn mark(&self) -> Mark {
-        self.buf.add_mark_at(self.payload_pos)
+        self.buf.add_mark_at(self.pin_pos)
     }
 
     /// Ring-buffer position of the first payload byte.

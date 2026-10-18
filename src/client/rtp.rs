@@ -45,6 +45,16 @@ fn note_stale_live555_data_if_tcp(
     }
 }
 
+/// Returns true if the packet should be skipped entirely.
+pub(crate) fn skip(header: &PacketHeader) -> bool {
+    // Skip pt=50 packets, sent by at least Geovision cameras.
+    if header.payload_type() == 50 {
+        debug!("skipping pkt with invalid payload type 50");
+        return true;
+    }
+    false
+}
+
 impl StreamReceiver {
     pub(crate) fn new(receiver: Receiver, unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy) -> Self {
         Self {
@@ -78,9 +88,7 @@ impl StreamReceiver {
         stream_id: usize,
         header: &PacketHeader,
     ) -> Result<Option<PacketMeta<PacketContext>>, Error> {
-        // Skip pt=50 packets, sent by at least Geovision cameras.
-        if header.payload_type() == 50 {
-            debug!("skipping pkt with invalid payload type 50");
+        if skip(header) {
             return Ok(None);
         }
         self.receiver.rtp(*pkt_ctx, header).map_err(|e| {
