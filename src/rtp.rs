@@ -8,6 +8,13 @@ use std::ops::Range;
 
 use crate::inputs::Input;
 
+mod receiver;
+mod timeline;
+
+pub use receiver::{
+    OutOfOrder, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
+};
+
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor

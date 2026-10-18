@@ -17,8 +17,8 @@ use super::parse::{self, SessionHeader};
 use super::playing::{PlayingCore, PlayingStream};
 use super::{
     InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions, Presentation, SessionFlag,
-    SessionIdPolicy, SessionOptions, Stream, StreamState, StreamStateInit, Timeline, Tool,
-    receiver_report, rtp,
+    SessionIdPolicy, SessionOptions, Stream, StreamState, StreamStateInit, Tool,
+    UnknownRtcpSsrcPolicy, receiver_report, rtp,
 };
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
@@ -641,15 +641,30 @@ impl SetupCore {
                     None
                 }
             };
-            let timeline = Timeline::new(
-                initial_rtptime,
-                s.clock_rate_hz,
-                policy.enforce_timestamps_with_max_jump_secs,
-            )
-            .map_err(|description| r.error(&conn_ctx, description))?;
+            let mut options = crate::rtp::ReceiverOptions::default()
+                .max_forward_jump_secs(policy.enforce_timestamps_with_max_jump_secs)
+                .out_of_order(if matches!(ctx.0, StreamContextInner::Udp(_)) {
+                    crate::rtp::OutOfOrder::Drop
+                } else {
+                    crate::rtp::OutOfOrder::Error
+                })
+                .learn_ssrc_from_sender_report(!matches!(
+                    policy.unknown_rtcp_ssrc,
+                    UnknownRtcpSsrcPolicy::ProcessPackets
+                ));
+            if let Some(ssrc) = ssrc {
+                options = options.ssrc(ssrc);
+            }
+            if let Some(seq) = initial_seq {
+                options = options.initial_sequence_number(seq);
+            }
+            if let Some(rtptime) = initial_rtptime {
+                options = options.initial_rtptime(rtptime);
+            }
+            let receiver = crate::rtp::Receiver::new(s.clock_rate_hz, options)
+                .map_err(|e| r.error(&conn_ctx, e.to_string()))?;
             core_streams[i] = Some(PlayingStream {
-                timeline,
-                rtp_handler: rtp::InorderParser::new(ssrc, initial_seq, policy.unknown_rtcp_ssrc),
+                rtp_handler: rtp::StreamReceiver::new(receiver, policy.unknown_rtcp_ssrc),
                 ctx,
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
                 reception: self

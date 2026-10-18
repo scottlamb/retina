@@ -15,7 +15,7 @@ use super::conn::ConnCore;
 use super::parse::{self, SessionHeader};
 use super::receiver_report::{ReceptionStats, ReportSchedule, ReportWriter};
 use super::session_core::{SetupCore, UdpTransmit};
-use super::{PlayingItem, Presentation, RtpPacket, Stream, Timeline, Tool, rtp::InorderParser};
+use super::{PlayingItem, Presentation, RtpPacket, Stream, Tool, rtp::StreamReceiver};
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
 use crate::{
@@ -66,8 +66,7 @@ pub(crate) struct Reports {
 
 /// The state of a stream which has been set up.
 pub(crate) struct PlayingStream {
-    pub(crate) timeline: Timeline,
-    pub(crate) rtp_handler: InorderParser,
+    pub(crate) rtp_handler: StreamReceiver,
     pub(crate) ctx: StreamContext,
 
     /// For a UDP stream, the buffer which datagrams are received into.
@@ -700,12 +699,9 @@ impl PlayingCore {
                     );
                 }
                 let Some(meta) = stream.rtp_handler.rtp(
-                    &self.conn.options,
+                    &self.conn,
                     &stream.ctx,
-                    self.conn.tool.as_ref(),
-                    &self.conn.ctx,
                     &item.pkt_ctx,
-                    &mut stream.timeline,
                     item.stream_i,
                     &header,
                 )?
@@ -726,12 +722,9 @@ impl PlayingCore {
                         .to_vec(),
                 );
                 match stream.rtp_handler.rtcp(
-                    &self.conn.options,
+                    &self.conn,
                     &stream.ctx,
-                    self.conn.tool.as_ref(),
-                    &self.conn.ctx,
                     &item.pkt_ctx,
-                    &mut stream.timeline,
                     item.stream_i,
                     body,
                 ) {
@@ -798,8 +791,18 @@ mod tests {
         }
         let new_stream = |s: &Stream, udp: bool| {
             Some(PlayingStream {
-                timeline: Timeline::new(None, s.clock_rate_hz(), None).unwrap(),
-                rtp_handler: InorderParser::new(None, None, UnknownRtcpSsrcPolicy::Default),
+                rtp_handler: StreamReceiver::new(
+                    crate::rtp::Receiver::new(
+                        s.clock_rate_hz(),
+                        crate::rtp::ReceiverOptions::default().out_of_order(if udp {
+                            crate::rtp::OutOfOrder::Drop
+                        } else {
+                            crate::rtp::OutOfOrder::Error
+                        }),
+                    )
+                    .unwrap(),
+                    UnknownRtcpSsrcPolicy::Default,
+                ),
                 ctx: StreamContext::dummy(),
                 udp_buf: udp.then(|| MarkBuf::new(65536)),
                 reception: None,

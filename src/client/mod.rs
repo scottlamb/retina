@@ -20,7 +20,6 @@ use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 pub use self::channel_mapping::ChannelType;
 use self::playing::PlayingCore;
 pub use self::session_core::{SessionCore, SessionEvent, SetupTransport, UdpTransmit};
-pub use self::timeline::Timeline;
 use crate::inputs::Input as _;
 use crate::rtsp::msg::{self as msg, OwnedMessage};
 use bytes::Bytes;
@@ -38,13 +37,10 @@ pub(crate) mod parse;
 mod playing;
 mod receiver_report;
 
-/// Internal API, public for a benchmark only.
-#[doc(hidden)]
-pub mod rtp;
+mod rtp;
 
 mod session_core;
 mod teardown;
-mod timeline;
 
 /// Assumed expiration time for stale live555 TCP sessions (case #2 of "Stale
 /// sessions" in [`SessionGroup`]).

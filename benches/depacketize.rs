@@ -6,11 +6,11 @@ use std::num::NonZeroU16;
 use criterion::{Criterion, criterion_group, criterion_main};
 use retina::PacketContext;
 use retina::buf::{MarkBuf, PacketRef};
-use retina::client::{Timeline, rtp::InorderParser};
 use retina::codec::{
     Accumulate, AudioDepacketizer, AudioFrameRef, AudioHandler, FrameFormat, VideoData,
     VideoDepacketizer, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+use retina::rtp::{Receiver, ReceiverOptions};
 use std::convert::TryFrom;
 use std::io::Write;
 
@@ -66,21 +66,12 @@ const BUNNY: &[u8] = include_bytes!("bunny.rtsp");
 // For now, this builds state via several internal interfaces.
 fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
     let mut remaining = BUNNY;
-    let mut timelines = [
-        Timeline::new(Some(0), 12_000, None).unwrap(),
-        Timeline::new(Some(0), 90_000, None).unwrap(),
-    ];
+    let opts = ReceiverOptions::default()
+        .initial_rtptime(0)
+        .initial_sequence_number(1);
     let mut rtps = [
-        InorderParser::new(
-            None,
-            Some(1),
-            retina::client::UnknownRtcpSsrcPolicy::Default,
-        ),
-        InorderParser::new(
-            None,
-            Some(1),
-            retina::client::UnknownRtcpSsrcPolicy::Default,
-        ),
+        Receiver::new(12_000, opts.clone()).unwrap(),
+        Receiver::new(90_000, opts).unwrap(),
     ];
     let mut audio = AudioDepacketizer::new("mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap();
     let mut video = VideoDepacketizer::new("h264", 90_000, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap();
@@ -90,8 +81,6 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
         f,
         frame: Vec::new(),
     };
-    let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     while !remaining.is_empty() {
         assert!(remaining.len() > 4);
@@ -108,19 +97,7 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
             _ => unreachable!(),
         };
         let (header, payload_range) = retina::rtp::PacketHeader::validate(&data[..]).unwrap();
-        let meta = match rtps[stream_id].rtp(
-            &retina::client::SessionOptions::default(),
-            &stream_ctx,
-            None,
-            &conn_ctx,
-            &pkt_ctx,
-            &mut timelines[stream_id],
-            stream_id,
-            &header,
-        ) {
-            Ok(Some(meta)) => meta,
-            _ => unreachable!(),
-        };
+        let meta = rtps[stream_id].rtp(pkt_ctx, &header).unwrap().unwrap();
         let buf = &mut bufs[stream_id];
         let pos = buf.end();
         buf.extend(&data);
