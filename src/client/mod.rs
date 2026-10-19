@@ -490,6 +490,7 @@ pub struct SessionOptions {
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
     receiver_reports: ReceiverReportPolicy,
+    bind_addr: Option<std::net::IpAddr>,
     backchannel: bool,
 }
 
@@ -695,6 +696,15 @@ impl SessionOptions {
     #[inline]
     pub fn creds(mut self, creds: Option<Credentials>) -> Self {
         self.creds = creds;
+        self
+    }
+
+    /// Binds outgoing connections (the RTSP TCP connection, and UDP data sockets when using UDP
+    /// transport) to this local address. Useful when the host has several local addresses and the
+    /// OS would otherwise pick a source address the server has no route back to (e.g. a link-local
+    /// address beside a routable one). The port is chosen by the OS.
+    pub fn bind(mut self, bind_addr: Option<std::net::IpAddr>) -> Self {
+        self.bind_addr = bind_addr;
         self
     }
 
@@ -1385,9 +1395,14 @@ impl RtspConnection {
         let host =
             RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
         let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(host, port, options.get_max_message_size())
-            .await
-            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        let inner = crate::tokio::Connection::connect(
+            host,
+            port,
+            options.get_max_message_size(),
+            options.bind_addr,
+        )
+        .await
+        .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
             inner,
             channels: ChannelMappings::default(),
@@ -3933,6 +3948,7 @@ mod tests {
         {
             let session = session.unwrap();
             tokio::pin!(session);
+            session.0.keepalive_timer = None; // see `simple`.
 
             // Packet.
             tokio::join!(
@@ -4557,8 +4573,12 @@ mod tests {
         receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
 
         // Hold off reports while packets arrive, so paused time can't
-        // auto-advance into the next one meanwhile.
+        // auto-advance into the next one meanwhile. Taking `reports` isn't
+        // enough: paused time auto-advances to any registered timer, polled or
+        // not. Replace the timer with one that isn't registered until polled
+        // or reset below; otherwise packets arrive at different instants.
         let mut reports = session.0.reports.take().unwrap();
+        reports.timer = Box::pin(tokio::time::sleep(std::time::Duration::ZERO));
         let ntp = 0xe436_2f99_cccc_cccc;
         tokio::join!(
             async {

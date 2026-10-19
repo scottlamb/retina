@@ -78,13 +78,49 @@ impl Connection {
         host: Host<&str>,
         port: u16,
         max_message_size: usize,
+        bind_addr: Option<std::net::IpAddr>,
     ) -> Result<Self, std::io::Error> {
-        let stream = match host {
-            Host::Domain(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv4(h) => TcpStream::connect((h, port)).await,
-            Host::Ipv6(h) => TcpStream::connect((h, port)).await,
-        }?;
+        let stream = match bind_addr {
+            None => match host {
+                Host::Domain(h) => TcpStream::connect((h, port)).await,
+                Host::Ipv4(h) => TcpStream::connect((h, port)).await,
+                Host::Ipv6(h) => TcpStream::connect((h, port)).await,
+            }?,
+            Some(local) => Self::connect_bound(host, port, local).await?,
+        };
         Self::from_stream(stream, max_message_size)
+    }
+
+    /// Connects to `host:port` from the local address `local` (port chosen by the OS).
+    async fn connect_bound(
+        host: Host<&str>,
+        port: u16,
+        local: std::net::IpAddr,
+    ) -> Result<TcpStream, std::io::Error> {
+        use tokio::net::{TcpSocket, lookup_host};
+        let host = host.to_string();
+        let mut last_err = None;
+        for addr in lookup_host((host.as_str(), port)).await? {
+            if addr.is_ipv4() != local.is_ipv4() {
+                continue; // can only bind a source of the same address family
+            }
+            let sock = if addr.is_ipv4() {
+                TcpSocket::new_v4()
+            } else {
+                TcpSocket::new_v6()
+            }?;
+            sock.bind(std::net::SocketAddr::new(local, 0))?;
+            match sock.connect(addr).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no resolved address matched the bind address family",
+            )
+        }))
     }
 
     pub(crate) fn from_stream(
@@ -560,6 +596,27 @@ impl UdpPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `connect` with a `bind_addr` binds the outgoing socket to that local address.
+    #[tokio::test]
+    async fn connect_binds_the_source() {
+        use url::Host;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let (client, accepted) = tokio::join!(
+            Connection::connect(
+                Host::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+                usize::MAX,
+                Some(local)
+            ),
+            listener.accept()
+        );
+        client.unwrap();
+        // the server sees the bound local address as the connection's source
+        assert_eq!(accepted.unwrap().1.ip(), local);
+    }
 
     #[test]
     fn crlf_data() {
