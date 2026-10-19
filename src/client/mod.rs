@@ -960,10 +960,6 @@ pub struct Stream {
     framerate: Option<f32>,
     control: Option<Url>,
     direction: StreamDirection,
-
-    /// For a sending stream, all RTP payload types offered in the SDP media
-    /// description, in order. Empty for a receiving stream.
-    rtp_payload_types: Box<[u8]>,
 }
 
 impl std::fmt::Debug for Stream {
@@ -3265,14 +3261,6 @@ impl Session<Playing> {
                 "sending stream unexpectedly isn't using TCP".into()
             ));
         };
-        let payload_type = sender.payload_type(&pkt);
-        if !stream.rtp_payload_types.contains(&payload_type) {
-            bail!(ErrorInt::InvalidArgument(format!(
-                "can't send payload type {payload_type} on stream {stream_id}: the server offered \
-                 only {:?}",
-                stream.rtp_payload_types
-            )));
-        }
         const MAX_PAYLOAD_LEN: usize = (u16::MAX - crate::rtp::PacketHeader::LEN) as usize;
         if pkt.payload.len() > MAX_PAYLOAD_LEN {
             bail!(ErrorInt::InvalidArgument(format!(
@@ -3309,7 +3297,7 @@ impl Session<Playing> {
 ///
 /// Errors are returned rather than panicking: `start_send` fails without
 /// sending anything if the packet is for a stream that isn't set up for sending
-/// or its payload type or length is unacceptable; the session is still usable.
+/// or its length is unacceptable; the session is still usable.
 /// Errors from `poll_ready`, `poll_flush`, and `poll_close` mean the connection
 /// has failed; any unsent data is discarded, and later sends fail too.
 ///
@@ -5247,10 +5235,6 @@ mod tests {
                 "has only 3 streams",
             ),
             (
-                crate::rtp::SendingPacket::new(2, 0, Bytes::new()).payload_type(8),
-                "offered only [0]",
-            ),
-            (
                 crate::rtp::SendingPacket::new(2, 0, Bytes::from(vec![0; 65_524])),
                 "at most 65523 bytes",
             ),
@@ -5276,10 +5260,11 @@ mod tests {
             sender.next_report = Some(tokio::time::Instant::now());
         }
         session
-            .send(
-                crate::rtp::SendingPacket::new(2, 320, Bytes::from_static(&[0xff; 160]))
-                    .payload_type(0),
-            )
+            .send(crate::rtp::SendingPacket::new(
+                2,
+                320,
+                Bytes::from_static(&[0xff; 160]),
+            ))
             .await
             .unwrap();
         let (channel, rtp) = next_data(&mut server).await;

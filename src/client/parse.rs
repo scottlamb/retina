@@ -330,19 +330,6 @@ fn parse_media(
         }
     }
 
-    // ONVIF Streaming Specification section 5.3.2: "The server shall list all
-    // supported decoding codecs [...] and the client chooses which one is
-    // used." Remember the offered payload types so a sent packet can be
-    // checked against them.
-    let rtp_payload_types = match direction {
-        StreamDirection::Sending => media_description
-            .fmt
-            .split_ascii_whitespace()
-            .filter_map(|f| u8::from_str_radix(f, 10).ok().filter(|&pt| pt < 0x80))
-            .collect(),
-        StreamDirection::Receiving => Box::default(),
-    };
-
     let encoding_name;
     let clock_rate;
     let channels;
@@ -406,7 +393,6 @@ fn parse_media(
         channels,
         framerate,
         direction,
-        rtp_payload_types,
         state: super::StreamState::Uninit,
     })
 }
@@ -1895,7 +1881,6 @@ mod tests {
         assert_eq!(back.encoding_name(), "pcmu");
         assert_eq!(back.rtp_payload_type(), 0);
         assert_eq!(back.clock_rate_hz(), 8_000);
-        assert_eq!(&*back.rtp_payload_types, &[0]);
         assert!(back.depacketizer.is_err());
         assert!(back.parameters().is_none());
         assert_eq!(
@@ -1908,7 +1893,6 @@ mod tests {
         assert_eq!(p.streams.len(), 3);
         for s in &p.streams[..] {
             assert_eq!(s.direction(), StreamDirection::Receiving);
-            assert!(s.rtp_payload_types.is_empty());
         }
         assert!(p.streams[2].depacketizer.is_ok());
     }
@@ -1929,10 +1913,9 @@ mod tests {
         let back = &p.streams[2];
         assert_eq!(back.direction(), StreamDirection::Sending);
 
-        // Retina describes the first format; the others are allowed when sending.
+        // Retina describes, and sends, the first format.
         assert_eq!(back.encoding_name(), "pcmu");
         assert_eq!(back.rtp_payload_type(), 0);
-        assert_eq!(&*back.rtp_payload_types, &[0, 97, 98, 99, 100]);
         assert_eq!(
             back.control().unwrap().as_str(),
             "rtsp://192.168.0.1/audioback"

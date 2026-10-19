@@ -238,8 +238,9 @@ impl ReceivedPacket {
 /// This is the sending counterpart of [`ReceivedPacket`], without the
 /// received-packet context. The caller supplies the payload and timing;
 /// Retina fills in the rest of the RTP header: the SSRC, the sequence number,
-/// and (unless overridden) the payload type that the server offered for the
-/// stream.
+/// and the payload type, [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type).
+/// When the server offers several formats (ONVIF Streaming Specification
+/// section 5.3.2.3), that's the first one.
 ///
 /// Currently the only streams Retina can send are ONVIF backchannels; see
 /// [`SessionOptions::backchannel`](crate::client::SessionOptions::backchannel).
@@ -248,7 +249,6 @@ pub struct SendingPacket {
     pub(crate) stream_id: usize,
     pub(crate) timestamp: u32,
     pub(crate) mark: bool,
-    pub(crate) payload_type: Option<u8>,
     pub(crate) payload: Bytes,
 }
 
@@ -281,7 +281,6 @@ impl SendingPacket {
             stream_id,
             timestamp,
             mark: false,
-            payload_type: None,
             payload,
         }
     }
@@ -295,20 +294,6 @@ impl SendingPacket {
     pub fn mark(self, mark: bool) -> Self {
         Self { mark, ..self }
     }
-
-    /// Overrides the RTP payload type.
-    ///
-    /// By default, Retina uses [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type),
-    /// the first format the server offered. A server may offer several (ONVIF
-    /// Streaming Specification section 5.3.2.3); the payload type must be one of
-    /// them, or sending fails.
-    #[inline]
-    pub fn payload_type(self, payload_type: u8) -> Self {
-        Self {
-            payload_type: Some(payload_type),
-            ..self
-        }
-    }
 }
 
 impl std::fmt::Debug for SendingPacket {
@@ -317,7 +302,6 @@ impl std::fmt::Debug for SendingPacket {
             .field("stream_id", &self.stream_id)
             .field("timestamp", &self.timestamp)
             .field("mark", &self.mark)
-            .field("payload_type", &self.payload_type)
             .field("payload", &crate::hex::LimitedHex::new(&self.payload, 64))
             .finish()
     }

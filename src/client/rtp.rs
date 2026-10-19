@@ -357,9 +357,8 @@ pub(crate) struct Sender {
     /// Added to the caller-supplied timestamps.
     pub(super) timestamp_offset: u32,
 
-    /// The payload type to use when the caller doesn't specify one: the first
-    /// one offered in the SDP.
-    default_payload_type: u8,
+    /// The payload type: the first one offered in the SDP.
+    payload_type: u8,
 
     /// The RTP clock rate from the SDP, used to extrapolate the sender
     /// report's RTP timestamp.
@@ -396,7 +395,7 @@ pub(crate) struct Sender {
 }
 
 impl Sender {
-    pub(crate) fn new(default_payload_type: u8, clock_rate_hz: u32) -> Self {
+    pub(crate) fn new(payload_type: u8, clock_rate_hz: u32) -> Self {
         use base64::Engine as _;
         use rand::Rng as _;
         let mut rng = rand::thread_rng();
@@ -405,7 +404,7 @@ impl Sender {
             ssrc: rng.r#gen(),
             next_seq: rng.r#gen(),
             timestamp_offset: rng.r#gen(),
-            default_payload_type,
+            payload_type,
             clock_rate_hz,
             anchor: None,
             packet_count: 0,
@@ -419,27 +418,21 @@ impl Sender {
         }
     }
 
-    /// Returns the RTP payload type to use for `pkt`.
-    pub(crate) fn payload_type(&self, pkt: &crate::rtp::SendingPacket) -> u8 {
-        pkt.payload_type.unwrap_or(self.default_payload_type)
-    }
-
     /// Appends the RTP packet for `pkt`, sent at `now`, to `out` and updates
     /// counters.
     ///
-    /// The caller has validated the payload type and length.
+    /// The caller has validated the payload length.
     pub(crate) fn write_rtp(
         &mut self,
         now: tokio::time::Instant,
         pkt: &crate::rtp::SendingPacket,
         out: &mut bytes::BytesMut,
     ) {
-        let payload_type = self.payload_type(pkt);
         let timestamp = pkt.timestamp.wrapping_add(self.timestamp_offset);
         self.anchor = Some((now, timestamp));
         out.extend_from_slice(&[
             2 << 6, // version=2, no padding, no extension, no CSRCs.
-            (u8::from(pkt.mark) << 7) | payload_type,
+            (u8::from(pkt.mark) << 7) | self.payload_type,
         ]);
         out.extend_from_slice(&self.next_seq.to_be_bytes());
         out.extend_from_slice(&timestamp.to_be_bytes());
