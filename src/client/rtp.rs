@@ -372,11 +372,13 @@ pub(crate) struct Sender {
     /// report's RTP timestamp.
     clock_rate_hz: u32,
 
-    /// The time the first RTP packet was sent and its RTP timestamp (offset
-    /// included), or `None` before then.
+    /// The time the most recent RTP packet was sent and its RTP timestamp
+    /// (offset included), or `None` before the first.
     ///
     /// Sender reports extrapolate the RTP timestamp from this anchor and the
-    /// clock rate.
+    /// clock rate. Anchoring to the latest packet rather than the first keeps
+    /// any drift between the caller's timestamps and the wall clock from
+    /// accumulating over the session.
     anchor: Option<(tokio::time::Instant, u32)>,
 
     /// RTP packets sent so far, for the sender report.
@@ -438,7 +440,7 @@ impl Sender {
     ) {
         let payload_type = self.payload_type(pkt);
         let timestamp = pkt.timestamp.wrapping_add(self.timestamp_offset);
-        self.anchor.get_or_insert((now, timestamp));
+        self.anchor = Some((now, timestamp));
         out.extend_from_slice(&[
             2 << 6, // version=2, no padding, no extension, no CSRCs.
             (u8::from(pkt.mark) << 7) | payload_type,
@@ -461,21 +463,21 @@ impl Sender {
 
     /// Returns the RTP timestamp corresponding to `now`.
     ///
-    /// This extrapolates from the first packet sent, at the clock rate, as
+    /// This extrapolates from the most recent packet sent, at the clock rate, as
     /// [RFC 3550 section 6.4.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1)
     /// describes: the result need not match any packet's timestamp. It wraps
     /// like any RTP timestamp. Before the first packet, it's the timestamp
     /// offset.
     fn rtp_timestamp_at(&self, now: tokio::time::Instant) -> u32 {
-        let Some((first_sent, first_timestamp)) = self.anchor else {
+        let Some((sent, sent_timestamp)) = self.anchor else {
             return self.timestamp_offset;
         };
-        let elapsed = now.saturating_duration_since(first_sent);
+        let elapsed = now.saturating_duration_since(sent);
 
         // Can't overflow: the nanoseconds fit in 94 bits and the clock rate in
         // 32. Truncating to 32 bits is the RTP timestamp's wraparound.
         let ticks = elapsed.as_nanos() * u128::from(self.clock_rate_hz) / 1_000_000_000;
-        first_timestamp.wrapping_add(ticks as u32)
+        sent_timestamp.wrapping_add(ticks as u32)
     }
 
     /// Appends a compound RTCP packet (sender report and SDES `CNAME`) to `out`
@@ -484,7 +486,7 @@ impl Sender {
     /// `now` and `ntp` are the current monotonic and wall times. RFC 3550
     /// section 6.4.1 says the report's NTP and RTP timestamps describe the same
     /// instant, which need not be when any packet was sampled. The RTP
-    /// timestamp is extrapolated from the first packet sent; see
+    /// timestamp is extrapolated from the most recent packet sent; see
     /// [`Sender::rtp_timestamp_at`].
     pub(crate) fn write_sender_report(
         &mut self,
@@ -603,8 +605,9 @@ mod tests {
     }
 
     /// The sender report's RTP timestamp describes the instant the report is
-    /// built, extrapolated from the first packet at the clock rate (RFC 3550
-    /// section 6.4.1), regardless of later packets' timestamps. It wraps.
+    /// built, extrapolated at the clock rate (RFC 3550 section 6.4.1) from the
+    /// most recent packet, so drift in the caller's timestamps doesn't
+    /// accumulate. It wraps.
     #[test]
     fn sender_report_rtp_timestamp() {
         let mut sender = Sender::new(0, 8_000);
@@ -619,16 +622,8 @@ mod tests {
         );
         assert_eq!(sender.anchor, Some((start, 0xffff_f100)));
 
-        // A later packet with an unrelated timestamp doesn't move the anchor.
-        let later = start + std::time::Duration::from_millis(500);
-        sender.write_rtp(
-            later,
-            &crate::rtp::SendingPacket::new(0, 0x9999, Bytes::from_static(b"x")),
-            &mut out,
-        );
-        assert_eq!(sender.anchor, Some((start, 0xffff_f100)));
-
         // 500 ms at 8 kHz is 4,000 ticks, which wraps past 2^32.
+        let later = start + std::time::Duration::from_millis(500);
         out.clear();
         sender.write_sender_report(later, crate::NtpTimestamp(0x1234), &mut out);
         assert_eq!(
@@ -639,7 +634,20 @@ mod tests {
             sender.rtp_timestamp_at(start + std::time::Duration::from_micros(125)),
             0xffff_f101
         );
-        assert_eq!(sender.rtp_timestamp_at(start), 0xffff_f100);
+
+        // A packet sent then whose timestamp has drifted 160 ticks behind
+        // becomes the new anchor.
+        sender.write_rtp(
+            later,
+            &crate::rtp::SendingPacket::new(0, 0x1000, Bytes::from_static(b"x")),
+            &mut out,
+        );
+        assert_eq!(sender.anchor, Some((later, 0)));
+        assert_eq!(sender.rtp_timestamp_at(later), 0);
+        assert_eq!(
+            sender.rtp_timestamp_at(later + std::time::Duration::from_millis(250)),
+            2_000
+        );
     }
 
     #[test]

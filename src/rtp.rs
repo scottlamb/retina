@@ -264,6 +264,15 @@ impl SendingPacket {
     /// recommends. For G.711 at 8 kHz, a packet of 160 samples advances the
     /// timestamp by 160.
     ///
+    /// The timestamp must keep advancing with the sampling clock while nothing
+    /// is sent, e.g. while a doorbell's talk button isn't pressed. RFC 3550
+    /// section 5.1: "If an audio application reads blocks covering 160
+    /// sampling periods from the input device, the timestamp would be
+    /// increased by 160 for each such block, regardless of whether the block
+    /// is transmitted in a packet or dropped as silent." The receiver uses the
+    /// timestamps to schedule playout, and Retina's RTCP sender reports pair
+    /// them with wall-clock time.
+    ///
     /// `payload` is the RTP payload, already packetized for the codec. Its
     /// length is checked when sending.
     #[inline]

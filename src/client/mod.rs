@@ -5189,7 +5189,6 @@ mod tests {
         // Packet 1 is followed by a sender report and SDES CNAME. The report
         // describes the instant packet 1 was sent, so its RTP timestamp is
         // packet 1's.
-        let sent_before = tokio::time::Instant::now();
         let ntp_before = crate::NtpTimestamp::now();
         session
             .send(crate::rtp::SendingPacket::new(2, 0, Bytes::from_static(&[0xff; 160])).mark(true))
@@ -5263,9 +5262,9 @@ mod tests {
 
         // When the report interval has passed, packet 3 is followed by another
         // sender report. (`client::rtp::tests::sender_report_schedule` checks
-        // the interval.) The sequence number and timestamp wrap. The report's
-        // RTP timestamp is extrapolated from packet 1 by the time since it was
-        // sent, at 8 kHz, rather than packet 3's.
+        // the interval.) The sequence number and timestamp wrap. The report is
+        // built as packet 3 is sent, so its RTP timestamp, extrapolated from the
+        // most recent packet, is packet 3's.
         {
             let StreamState::Playing {
                 sender: Some(sender),
@@ -5290,16 +5289,11 @@ mod tests {
             b"\x80\x00\x00\x00\x00\x00\x00\x40\x01\x02\x03\x04"
         );
         let (channel, rtcp) = next_data(&mut server).await;
-        let max_ticks = (sent_before.elapsed().as_micros() * 8 / 1_000) as u32 + 1;
         assert_eq!(channel, 3);
-        let rtp_timestamp = u32::from_be_bytes(rtcp[16..20].try_into().unwrap());
-        let ticks = rtp_timestamp.wrapping_sub(0xffff_ff00);
-        assert!(
-            ticks <= max_ticks,
-            "RTP timestamp {rtp_timestamp:#x} is {ticks} ticks after packet 1's; expected at most \
-             {max_ticks}"
+        assert_eq!(
+            &rtcp[16..28],
+            b"\x00\x00\x00\x40\x00\x00\x00\x03\x00\x00\x01\xe0"
         );
-        assert_eq!(&rtcp[20..28], b"\x00\x00\x00\x03\x00\x00\x01\xe0");
 
         // Receive while sending: RTP on the backchannel's channel is ignored;
         // video RTP and the server's RTCP receiver report come through.
