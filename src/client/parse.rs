@@ -389,8 +389,12 @@ fn parse_media(
     }
 
     let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
-    let depacketizer =
-        crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp);
+    let depacketizer = match direction {
+        StreamDirection::Receiving => {
+            crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp)
+        }
+        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
+    };
 
     Ok(Stream {
         media,
@@ -1892,6 +1896,8 @@ mod tests {
         assert_eq!(back.rtp_payload_type(), 0);
         assert_eq!(back.clock_rate_hz(), 8_000);
         assert_eq!(&*back.rtp_payload_types, &[0]);
+        assert!(back.depacketizer.is_err());
+        assert!(back.parameters().is_none());
         assert_eq!(
             back.control().unwrap().as_str(),
             "rtsp://192.168.0.1/audioback"
@@ -1904,6 +1910,7 @@ mod tests {
             assert_eq!(s.direction(), StreamDirection::Receiving);
             assert!(s.rtp_payload_types.is_empty());
         }
+        assert!(p.streams[2].depacketizer.is_ok());
     }
 
     /// Tests the ONVIF Streaming Specification section 5.3.2.3 example: a
