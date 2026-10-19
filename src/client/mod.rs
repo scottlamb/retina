@@ -1374,6 +1374,15 @@ enum SessionFlag {
 /// [ONVIF Streaming Specification](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf)
 /// section 5.3.1.
 const BACKCHANNEL_REQUIRE: &str = "www.onvif.org/ver20/backchannel";
+const _: () = assert!(crate::rtsp::table::is_valid_header_value(
+    BACKCHANNEL_REQUIRE.as_bytes()
+));
+
+/// Returns [`BACKCHANNEL_REQUIRE`] as a header value.
+fn backchannel_require() -> msg::HeaderValue {
+    msg::HeaderValue::try_from(BACKCHANNEL_REQUIRE)
+        .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
+}
 
 impl RtspConnection {
     async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
@@ -1689,10 +1698,7 @@ impl Session<Described> {
             // ONVIF Streaming Specification section 5.3.2: "A client shall
             // include the feature tag in its DESCRIBE request to indicate that a
             // bidirectional data connection shall be established."
-            headers.insert(
-                msg::HeaderName::REQUIRE,
-                msg::HeaderValue::try_from(BACKCHANNEL_REQUIRE).unwrap(),
-            );
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
         }
         let mut req = OwnedMessage::Request {
             head: msg::Request {
@@ -1824,10 +1830,7 @@ impl Session<Described> {
             // required to understand that feature to correctly perform the
             // request". Section 5.3.2.2's example sends it on the
             // backchannel's `SETUP` and not on the others.
-            headers.insert(
-                msg::HeaderName::REQUIRE,
-                msg::HeaderValue::try_from(BACKCHANNEL_REQUIRE).unwrap(),
-            );
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
         }
         let udp = match options.transport {
             Transport::Tcp(_) => {
@@ -2077,10 +2080,7 @@ impl Session<Described> {
             // PLAY command is necessary. The command covers both starting of
             // the video and audio stream from NVT to the client and starting
             // the audio connection from client to server."
-            headers.insert(
-                msg::HeaderName::REQUIRE,
-                msg::HeaderValue::try_from(BACKCHANNEL_REQUIRE).unwrap(),
-            );
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
         }
         let (msg_ctx, cseq, response, _resp_body) = conn
             .send(

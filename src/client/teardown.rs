@@ -89,12 +89,11 @@ pub(super) async fn teardown_loop_forever(
 ) {
     let mut headers: msg::Headers = [(msg::HeaderName::SESSION, session_id.clone())].into();
     if backchannel {
-        // ONVIF Streaming Specification section 5.3.2.2's example `TEARDOWN`
-        // carries the `Require` header.
-        headers.insert(
-            msg::HeaderName::REQUIRE,
-            msg::HeaderValue::try_from(super::BACKCHANNEL_REQUIRE).unwrap(),
-        );
+        // ONVIF Streaming Specification section 5.3.1: "An RTSP client that
+        // wants to build up an RTSP connection with a data backchannel shall
+        // include the Require header in its requests." Section 5.3.2.2's
+        // example `TEARDOWN` carries it too.
+        headers.insert(msg::HeaderName::REQUIRE, super::backchannel_require());
     }
     let mut req = OwnedMessage::Request {
         head: msg::Request {
