@@ -595,11 +595,7 @@ impl Depacketizer {
                 {
                     new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
                 }
-                u if matches!(
-                    u.unit_type_class(),
-                    nal::UnitTypeClass::Vcl { intra_coded: false }
-                ) =>
-                {
+                u if matches!(u.unit_type_class(), nal::UnitTypeClass::Vcl { irap: false }) => {
                     is_random_access_point = false;
                 }
                 _ => {}
@@ -1362,6 +1358,83 @@ mod tests {
             };
             let mut expected = Vec::new();
             for nal in [&*vps_nal, &*sps_nal, &*pps_nal, idr_nal] {
+                expected.extend_from_slice(&super::super::h26x::ANNEX_B_START_CODE);
+                expected.extend_from_slice(nal);
+            }
+            assert_eq_hex!(frame.data(), &expected);
+        }
+    }
+
+    /// Tests that every IRAP picture type (not just IDR) is a random access
+    /// point, and so gets the parameter sets prepended in `SIMPLE` mode.
+    /// See [#132](https://github.com/scottlamb/retina/issues/132).
+    #[test]
+    fn irap_random_access() {
+        init_logging();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let vps_nal = b64
+            .decode("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")
+            .unwrap();
+        let sps_nal = b64
+            .decode("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=")
+            .unwrap();
+        let pps_nal = b64.decode("RAHA8saNA7NA").unwrap();
+        let sprop = "profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==";
+
+        for (vcl_nal, want_rap) in [
+            (&b"\x2a\x01cra"[..], true),
+            (&b"\x20\x01bla_w_lp"[..], true),
+            (&b"\x22\x01bla_w_radl"[..], true),
+            (&b"\x24\x01bla_n_lp"[..], true),
+            (&b"\x26\x01idr_w_radl"[..], true),
+            (&b"\x28\x01idr_n_lp"[..], true),
+            (&b"\x02\x01trail_r"[..], false),
+            (&b"\x10\x01rasl_n"[..], false),
+        ] {
+            let mut buf = MarkBuf::new(65536);
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+            let pkt = ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(vcl_nal.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+            .unwrap();
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            assert_eq!(
+                frame.is_random_access_point(),
+                want_rap,
+                "NAL header {:02x?}",
+                &vcl_nal[..2]
+            );
+            let mut expected = Vec::new();
+            let param_nals: &[&[u8]] = if want_rap {
+                &[&vps_nal, &sps_nal, &pps_nal]
+            } else {
+                &[]
+            };
+            for nal in param_nals.iter().copied().chain([vcl_nal]) {
                 expected.extend_from_slice(&super::super::h26x::ANNEX_B_START_CODE);
                 expected.extend_from_slice(nal);
             }
