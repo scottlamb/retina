@@ -438,22 +438,30 @@ impl ReportWriter {
             block.write(&mut out);
         }
 
-        // Source description with one chunk: our SSRC, the CNAME item, a null
-        // octet to end the item list, and null octets to pad to a 32-bit
-        // boundary (RFC 3550 section 6.5).
-        let sdes_start = out.len();
-        out.extend_from_slice(&[(2 << 6) | 1, PT_SDES, 0, 0]); // length filled in below.
-        out.extend_from_slice(&self.ssrc.to_be_bytes());
-        out.extend_from_slice(&[SDES_CNAME, self.cname.len() as u8]);
-        out.extend_from_slice(self.cname.as_bytes());
-        out.push(0);
-        while out.len() % 4 != 0 {
-            out.push(0);
-        }
-        let sdes_len = ((out.len() - sdes_start) / 4 - 1) as u16;
-        out[sdes_start + 2..sdes_start + 4].copy_from_slice(&sdes_len.to_be_bytes());
+        write_sdes_cname(self.ssrc, &self.cname, &mut out);
         out
     }
+}
+
+/// Appends a source description with one chunk to `out`: `ssrc`, the `CNAME`
+/// item, a null octet to end the item list, and null octets to pad to a 32-bit
+/// boundary (RFC 3550 section 6.5).
+///
+/// Used by both receiver and sender reports. `cname` must be at most 255 bytes.
+pub(crate) fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut impl bytes::BufMut) {
+    debug_assert!(cname.len() <= 255);
+    let items_len = 2 + cname.len();
+    let padding = 4 - items_len % 4; // 1..=4 null octets.
+
+    // The packet's length in 32-bit words, minus one for the header: SSRC,
+    // items, padding.
+    let length_words = ((4 + items_len + padding) / 4) as u16;
+    out.put_slice(&[(2 << 6) | 1, PT_SDES]);
+    out.put_u16(length_words);
+    out.put_u32(ssrc);
+    out.put_slice(&[SDES_CNAME, cname.len() as u8]);
+    out.put_slice(cname.as_bytes());
+    out.put_slice(&[0; 4][..padding]);
 }
 
 /// Decides when reports are due, as described in [RFC 3550 section
@@ -490,8 +498,16 @@ impl ReportSchedule {
 
     /// Notes that reports were sent at `now`, scheduling the next.
     pub(crate) fn sent(&mut self, now: Instant, rng: &mut impl Rng) {
-        self.next = now + interval(MIN_INTERVAL, rng);
+        self.next = now + regular_interval(rng);
     }
+}
+
+/// Returns the randomized interval from one report to the next.
+///
+/// Shared by receiver and sender reports, which RFC 3550 section 6.3.1
+/// schedules alike given the 5-second minimum.
+pub(crate) fn regular_interval(rng: &mut impl Rng) -> Duration {
+    interval(MIN_INTERVAL, rng)
 }
 
 /// Randomizes the deterministic interval `td` as in RFC 3550 section 6.3.1.

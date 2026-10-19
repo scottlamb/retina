@@ -491,6 +491,7 @@ pub struct SessionOptions {
     max_message_size: Option<usize>,
     receiver_reports: ReceiverReportPolicy,
     bind_addr: Option<std::net::IpAddr>,
+    backchannel: bool,
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -590,6 +591,10 @@ impl std::str::FromStr for SessionIdPolicy {
 /// 6.4.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.2), tell
 /// the server about packet loss and jitter. RFC 3550 section 6 says this
 /// feedback "SHOULD be used in all environments".
+///
+/// Reports cover only streams Retina receives. A backchannel stream (see
+/// [`SessionOptions::backchannel`]) gets none; Retina describes the media it
+/// sends there in RTCP sender reports instead.
 ///
 /// Specify via [`SessionOptions::receiver_reports`].
 #[derive(Copy, Clone, Debug, Default, derive_more::Display)]
@@ -760,6 +765,35 @@ impl SessionOptions {
     fn get_max_message_size(&self) -> usize {
         self.max_message_size.unwrap_or(usize::MAX)
     }
+
+    /// Requests an ONVIF backchannel: media sent from the client to the server,
+    /// such as audio for a camera's speaker. Defaults to false.
+    ///
+    /// When true, the `DESCRIBE` request carries the `Require:
+    /// www.onvif.org/ver20/backchannel` header defined in the [ONVIF Streaming
+    /// Specification](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf)
+    /// section 5.3. A server which supports it adds media marked
+    /// `a=sendonly`, such as audio for its speaker; these appear in
+    /// [`Session::streams`] with [`Stream::direction`]
+    /// [`StreamDirection::Sending`]. Set one up with [`Session::setup`] (TCP
+    /// only) alongside the streams to receive, then send packets via the
+    /// [`futures::Sink`] impl on [`Session<Playing>`] or [`Demuxed`]. The
+    /// `SETUP` of a sending stream and the following `PLAY` and `TEARDOWN`
+    /// requests also carry the `Require` header.
+    ///
+    /// A server which doesn't understand the header fails the `DESCRIBE` with
+    /// status `551 Option not supported` (section 5.3.2); the error's
+    /// description then suggests the backchannel as the cause. Retina doesn't
+    /// retry. The spec says the client can try again without the backchannel;
+    /// callers can check [`Error::status_code`] to decide.
+    ///
+    /// A failed `SETUP` of a sending stream, as of any stream, leaves it
+    /// unused and the session usable: the caller may go on to set up others
+    /// and `PLAY` without it.
+    pub fn backchannel(mut self, backchannel: bool) -> Self {
+        self.backchannel = backchannel;
+        self
+    }
 }
 
 /// Per-stream options decided at `SETUP` time.
@@ -896,6 +930,30 @@ impl std::ops::Deref for Tool {
     }
 }
 
+/// The direction in which a [`Stream`]'s media flows, from the client's point of view.
+///
+/// See [`Stream::direction`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamDirection {
+    /// The server sends media; Retina receives it via the [`futures::Stream`]
+    /// impls on [`Session<Playing>`] and [`Demuxed`]. This is the usual case.
+    Receiving,
+
+    /// Retina sends media to the server via the [`futures::Sink`] impls on
+    /// [`Session<Playing>`] and [`Demuxed`].
+    ///
+    /// This is an ONVIF backchannel stream ([ONVIF Streaming
+    /// Specification](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf)
+    /// section 5.3). A stream is sending if the backchannel was requested via
+    /// [`SessionOptions::backchannel`] and the server's `DESCRIBE` response
+    /// marks its media description `a=sendonly`, which ONVIF uses for media
+    /// sent from the client to the server (section 5.3.2). A media description
+    /// without a direction attribute has the session's ([RFC 8866 section
+    /// 6.7](https://datatracker.ietf.org/doc/html/rfc8866#section-6.7)).
+    Sending,
+}
+
 /// Information about a stream offered within a presentation.
 ///
 /// Currently if multiple formats are offered, this only describes the first.
@@ -911,6 +969,7 @@ pub struct Stream {
     channels: Option<NonZeroU16>,
     framerate: Option<f32>,
     control: Option<Url>,
+    direction: StreamDirection,
 }
 
 impl std::fmt::Debug for Stream {
@@ -923,6 +982,7 @@ impl std::fmt::Debug for Stream {
             .field("clock_rate", &self.clock_rate_hz)
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
+            .field("direction", &self.direction)
             .field("depacketizer", &self.depacketizer)
             .field("state", &self.state)
             .finish()
@@ -989,6 +1049,16 @@ impl Stream {
     #[inline]
     pub fn control(&self) -> Option<&Url> {
         self.control.as_ref()
+    }
+
+    /// Returns whether Retina receives or sends this stream's media.
+    ///
+    /// This is [`StreamDirection::Receiving`] unless
+    /// [`SessionOptions::backchannel`] is set and the stream is an ONVIF
+    /// backchannel; see [`StreamDirection::Sending`] for the exact conditions.
+    #[inline]
+    pub fn direction(&self) -> StreamDirection {
+        self.direction
     }
 }
 
@@ -1071,6 +1141,9 @@ enum StreamState {
 
         /// Reception statistics for RTCP receiver reports, iff they're enabled.
         reception: Option<receiver_report::ReceptionStats>,
+
+        /// For a [`StreamDirection::Sending`] stream, the state of sent RTP and RTCP.
+        sender: Option<Box<rtp::Sender>>,
     },
 }
 
@@ -1124,8 +1197,27 @@ impl State for Described {}
 
 enum KeepaliveState {
     Idle,
-    Flushing { cseq: u32, method: KeepaliveMethod },
-    Waiting { cseq: u32, method: KeepaliveMethod },
+
+    /// The keepalive request has been queued but not completely written.
+    Flushing {
+        cseq: u32,
+        method: KeepaliveMethod,
+
+        /// The connection's [`written`](crate::tokio::Connection::written)
+        /// count at which the request will have been written.
+        ///
+        /// The write buffer is shared with backchannel media queued via the
+        /// `Sink` impl, so it may never be empty for long. The request counts as
+        /// written once this mark is reached, regardless of what's queued
+        /// after it.
+        end: u64,
+    },
+
+    /// The keepalive request has been written; awaiting the response.
+    Waiting {
+        cseq: u32,
+        method: KeepaliveMethod,
+    },
 }
 
 #[repr(u8)]
@@ -1201,6 +1293,8 @@ enum ResponseMode {
 /// 3. Start playing via [`Session::play`].
 /// 4. Get packets via the [`futures::stream::Stream`] impl on `Session<Playing>`,
 ///    or frames via the [`futures::stream::Stream`] impl returned by [`Session<Playing>::demuxed`].
+///    If a [`StreamDirection::Sending`] stream (ONVIF backchannel) was set up,
+///    send packets on it via the [`futures::sink::Sink`] impl on `Session<Playing>`.
 /// 5. Drop the session. Retina may issue a `TEARDOWN` in the background, depending on the
 ///    [`SessionOptions::teardown`] parameter.
 /// 6. Possibly wait for `TEARDOWN` to complete; see
@@ -1276,6 +1370,24 @@ enum SessionFlag {
     /// Set if an `OPTIONS` request has completed and advertised supported for
     /// `GET_PARAMETER`.
     GetParameterSupported = 0x10,
+
+    /// Set if a [`StreamDirection::Sending`] stream has been set up, so the
+    /// session uses the ONVIF backchannel.
+    Backchannel = 0x20,
+}
+
+/// The `Require` header value for the ONVIF backchannel, as defined in the
+/// [ONVIF Streaming Specification](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf)
+/// section 5.3.1.
+const BACKCHANNEL_REQUIRE: &str = "www.onvif.org/ver20/backchannel";
+const _: () = assert!(crate::rtsp::table::is_valid_header_value(
+    BACKCHANNEL_REQUIRE.as_bytes()
+));
+
+/// Returns [`BACKCHANNEL_REQUIRE`] as a header value.
+fn backchannel_require() -> msg::HeaderValue {
+    msg::HeaderValue::try_from(BACKCHANNEL_REQUIRE)
+        .expect("BACKCHANNEL_REQUIRE is checked to be a valid header value at compile time")
 }
 
 impl RtspConnection {
@@ -1588,15 +1700,22 @@ impl Session<Described> {
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
+        let mut headers: msg::Headers = [(
+            msg::HeaderName::ACCEPT,
+            msg::HeaderValue::try_from("application/sdp").unwrap(),
+        )]
+        .into();
+        if options.backchannel {
+            // ONVIF Streaming Specification section 5.3.2: "A client shall
+            // include the feature tag in its DESCRIBE request to indicate that a
+            // bidirectional data connection shall be established."
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
+        }
         let mut req = OwnedMessage::Request {
             head: msg::Request {
                 method: msg::Method::DESCRIBE,
                 request_uri: Some(url.clone()),
-                headers: [(
-                    msg::HeaderName::ACCEPT,
-                    msg::HeaderValue::try_from("application/sdp").unwrap(),
-                )]
-                .into(),
+                headers,
             },
             body: Bytes::new(),
         };
@@ -1609,18 +1728,46 @@ impl Session<Described> {
                 &mut requested_auth,
                 &mut req,
             )
-            .await?;
-        let presentation =
-            parse::parse_describe(url, &response, &resp_body).map_err(|description| {
-                wrap!(ErrorInt::RtspResponseError {
-                    conn_ctx: *conn.inner.ctx(),
+            .await
+            .map_err(|e| match &*e.0 {
+                // Point out the likely cause. ONVIF Streaming Specification
+                // section 5.3.2: "An RTSP server that does not understand the
+                // backchannel feature tag or does not support bidirectional
+                // data connections shall respond with an error code 551
+                // Option not supported".
+                ErrorInt::RtspResponseError {
+                    conn_ctx,
                     msg_ctx,
-                    method: msg::Method::DESCRIBE,
+                    method,
                     cseq,
-                    status: response.status_code,
+                    status,
                     description,
-                })
+                } if options.backchannel && *status == StatusCode::OPTION_NOT_SUPPORTED => {
+                    wrap!(ErrorInt::RtspResponseError {
+                        conn_ctx: *conn_ctx,
+                        msg_ctx: *msg_ctx,
+                        method: method.clone(),
+                        cseq: *cseq,
+                        status: *status,
+                        description: format!(
+                            "{description}; the server may not support the ONVIF backchannel \
+                             requested via SessionOptions::backchannel"
+                        ),
+                    })
+                }
+                _ => e,
             })?;
+        let presentation = parse::parse_describe(url, &response, &resp_body, options.backchannel)
+            .map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx,
+                method: msg::Method::DESCRIBE,
+                cseq,
+                status: response.status_code,
+                description,
+            })
+        })?;
         let describe_status = response.status_code;
         let sdp = resp_body;
         Ok(Session(
@@ -1660,6 +1807,10 @@ impl Session<Described> {
     /// seems like a bad idea to try to assign more interleaved channels without
     /// inspect that first.
     ///
+    /// A [`StreamDirection::Sending`] stream (ONVIF backchannel) can currently
+    /// only be set up with [`Transport::Tcp`]; `SETUP` with
+    /// [`Transport::Udp`] fails without sending a request.
+    ///
     /// Panics if `stream_i >= self.streams().len()`.
     pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
         let inner = &mut self.0.as_mut().project();
@@ -1671,12 +1822,27 @@ impl Session<Described> {
         if !matches!(stream.state, StreamState::Uninit) {
             bail!(ErrorInt::FailedPrecondition("stream already set up".into()));
         }
+        let sending = stream.direction == StreamDirection::Sending;
+        if sending && matches!(options.transport, Transport::Udp(_)) {
+            bail!(ErrorInt::Unsupported(format!(
+                "stream {stream_i} is an ONVIF backchannel (a=sendonly), which Retina can only send \
+                 over Transport::Tcp"
+            )));
+        }
         let url = stream
             .control
             .as_ref()
             .unwrap_or(&inner.presentation.control)
             .clone();
         let mut headers = msg::Headers::default();
+        if sending {
+            // ONVIF Streaming Specification section 5.3.1: the `Require`
+            // header "shall be included in any request where the server is
+            // required to understand that feature to correctly perform the
+            // request". Section 5.3.2.2's example sends it on the
+            // backchannel's `SETUP` and not on the others.
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
+        }
         let udp = match options.transport {
             Transport::Tcp(_) => {
                 let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
@@ -1865,6 +2031,9 @@ impl Session<Described> {
         {
             d.set_frame_format(format);
         }
+        if sending {
+            *inner.flags |= SessionFlag::Backchannel as u8;
+        }
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
@@ -1879,6 +2048,10 @@ impl Session<Described> {
     ///
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
+    ///
+    /// If a [`StreamDirection::Sending`] stream has been set up, the request
+    /// carries the ONVIF backchannel `Require` header, and the caller may send
+    /// on it as soon as this returns.
     pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
@@ -1904,6 +2077,22 @@ impl Session<Described> {
 
         trace!("PLAY with channel mappings: {:#?}", conn.channels);
         *inner.flags |= SessionFlag::MaybePlaying as u8;
+        let mut headers: msg::Headers = [
+            (msg::HeaderName::SESSION, session.id.clone()),
+            (
+                msg::HeaderName::RANGE,
+                msg::HeaderValue::try_from("npt=0.000-").unwrap(),
+            ),
+        ]
+        .into();
+        if *inner.flags & (SessionFlag::Backchannel as u8) != 0 {
+            // ONVIF Streaming Specification section 5.3.2.2: "The
+            // Require-header indicates that a special interpretation of the
+            // PLAY command is necessary. The command covers both starting of
+            // the video and audio stream from NVT to the client and starting
+            // the audio connection from client to server."
+            headers.insert(msg::HeaderName::REQUIRE, backchannel_require());
+        }
         let (msg_ctx, cseq, response, _resp_body) = conn
             .send(
                 ResponseMode::Play,
@@ -1914,14 +2103,7 @@ impl Session<Described> {
                     head: msg::Request {
                         method: msg::Method::PLAY,
                         request_uri: Some(inner.presentation.control.clone()),
-                        headers: [
-                            (msg::HeaderName::SESSION, session.id.clone()),
-                            (
-                                msg::HeaderName::RANGE,
-                                msg::HeaderValue::try_from("npt=0.000-").unwrap(),
-                            ),
-                        ]
-                        .into(),
+                        headers,
                     },
                     body: Bytes::new(),
                 },
@@ -1938,18 +2120,22 @@ impl Session<Described> {
             })
         })?;
 
-        // Count how many streams have been setup (not how many are in the presentation).
+        // Count how many streams to receive have been setup (not how many are
+        // in the presentation). Sending streams have no say in timestamps:
+        // servers don't necessarily describe them in `RTP-Info`.
         let setup_streams = inner
             .presentation
             .streams
             .iter()
-            .filter(|s| matches!(s.state, StreamState::Init(_)))
+            .filter(|s| {
+                s.direction == StreamDirection::Receiving && matches!(s.state, StreamState::Init(_))
+            })
             .count();
 
         let all_have_time = inner.presentation.streams.iter().all(|s| match s.state {
             StreamState::Init(StreamStateInit {
                 initial_rtptime, ..
-            }) => initial_rtptime.is_some(),
+            }) if s.direction == StreamDirection::Receiving => initial_rtptime.is_some(),
             _ => true,
         });
 
@@ -1957,6 +2143,41 @@ impl Session<Described> {
         // parameters are present while doing so.
         for (i, s) in inner.presentation.streams.iter_mut().enumerate() {
             match std::mem::replace(&mut s.state, StreamState::Uninit) {
+                StreamState::Init(StreamStateInit { ctx, .. })
+                    if s.direction == StreamDirection::Sending =>
+                {
+                    let conn_ctx = conn.inner.ctx();
+                    s.state = StreamState::Playing {
+                        // The timeline only places timestamps of any RTCP
+                        // sender reports the server sends on this stream.
+                        timeline: Timeline::new(None, s.clock_rate_hz, None).map_err(
+                            |description| {
+                                wrap!(ErrorInt::RtspResponseError {
+                                    conn_ctx: *conn_ctx,
+                                    msg_ctx,
+                                    method: msg::Method::PLAY,
+                                    cseq,
+                                    status: response.status_code,
+                                    description,
+                                })
+                            },
+                        )?,
+
+                        // Handles RTCP receiver reports the server sends about
+                        // Retina's packets. These have the server's SSRC, so
+                        // don't expect Retina's.
+                        rtp_handler: rtp::InorderParser::new(None, None, policy.unknown_rtcp_ssrc),
+                        ctx,
+                        udp_sockets: None,
+
+                        // Receiver reports describe only media Retina receives.
+                        reception: None,
+                        sender: Some(Box::new(rtp::Sender::new(
+                            s.rtp_payload_type,
+                            s.clock_rate_hz,
+                        ))),
+                    };
+                }
                 StreamState::Init(StreamStateInit {
                     initial_rtptime,
                     initial_seq,
@@ -2045,6 +2266,7 @@ impl Session<Described> {
                             .receiver_reports
                             .enabled()
                             .then(|| receiver_report::ReceptionStats::new(s.clock_rate_hz)),
+                        sender: None,
                     };
                 }
                 StreamState::Uninit => {}
@@ -2215,7 +2437,8 @@ impl Session<Playing> {
             .as_ref()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
         for s in &mut *inner.presentation.streams {
-            if matches!(s.state, StreamState::Playing { .. })
+            if s.direction == StreamDirection::Receiving
+                && matches!(s.state, StreamState::Playing { .. })
                 && let Err(ref description) = s.depacketizer
             {
                 bail!(ErrorInt::RtspResponseError {
@@ -2248,34 +2471,32 @@ impl Session<Playing> {
             .conn
             .as_mut()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        // Expect the previous keepalive request to have finished.
-        match inner.keepalive_state {
-            KeepaliveState::Flushing { cseq, .. } => bail!(ErrorInt::WriteError {
-                conn_ctx: *conn.inner.ctx(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Unable to write keepalive {cseq} within {keepalive_interval:?}",),
-                ),
-            }),
-            KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx: conn.inner.eof_ctx(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
+        // Expect the previous keepalive request to have finished. A request
+        // still marked `Flushing` may have been written since by the `Sink`
+        // impl's flush; then only the response is missing.
+        match *inner.keepalive_state {
+            KeepaliveState::Flushing { cseq, end, .. } if conn.inner.written() < end => {
+                bail!(ErrorInt::WriteError {
+                    conn_ctx: *conn.inner.ctx(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Unable to write keepalive {cseq} within {keepalive_interval:?}",),
                     ),
-                ),
-            }),
+                })
+            }
+            KeepaliveState::Flushing { cseq, .. } | KeepaliveState::Waiting { cseq, .. } => {
+                bail!(ErrorInt::RtspReadError {
+                    conn_ctx: *conn.inner.ctx(),
+                    msg_ctx: conn.inner.eof_ctx(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
+                        ),
+                    ),
+                })
+            }
             KeepaliveState::Idle => {}
-        }
-
-        // The only outbound data are keepalives and receiver reports, and the
-        // Sink queues them without limit, so there's no reason it shouldn't be ready.
-        if matches!(conn.inner.poll_ready_unpin(cx), Poll::Pending) {
-            bail!(ErrorInt::Internal(
-                "Unexpectedly not ready to send keepalive".into()
-            ));
         }
 
         // Send a new keepalive and reset the timer.
@@ -2314,13 +2535,21 @@ impl Session<Playing> {
         };
         let cseq = conn.fill_req(inner.options, inner.requested_auth, &mut req)?;
         trace!("sending {:?} keepalive", method);
-        conn.inner
-            .start_send_unpin(req)
-            .expect("encoding is infallible");
-        *inner.keepalive_state = match conn.inner.poll_flush_unpin(cx) {
-            Poll::Ready(Ok(())) => KeepaliveState::Waiting { cseq, method },
-            Poll::Ready(Err(e)) => bail!(e),
-            Poll::Pending => KeepaliveState::Flushing { cseq, method },
+
+        // The outbound data are keepalives, receiver reports, and backchannel
+        // media with its RTCP. The connection's `start_send` needs no
+        // readiness: it appends to the write buffer, after anything queued
+        // earlier, so a keepalive never waits on backchannel backpressure. It
+        // fails only if an earlier write failed.
+        conn.inner.start_send_unpin(req).map_err(|e| wrap!(e))?;
+        let end = conn.inner.queued_end();
+        if let Poll::Ready(Err(e)) = conn.inner.poll_flush_unpin(cx) {
+            bail!(e);
+        }
+        *inner.keepalive_state = if conn.inner.written() >= end {
+            KeepaliveState::Waiting { cseq, method }
+        } else {
+            KeepaliveState::Flushing { cseq, method, end }
         };
 
         inner
@@ -2383,7 +2612,7 @@ impl Session<Playing> {
                             channel_id: tcp.rtp_channel_id + 1,
                             body: Bytes::from(pkt),
                         })
-                        .expect("encoding is infallible");
+                        .map_err(|e| wrap!(e))?;
                 }
                 (None, _) => unreachable!("stream {i} has neither TCP nor UDP context"),
             }
@@ -2403,7 +2632,11 @@ impl Session<Playing> {
     ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         match inner.keepalive_state {
-            KeepaliveState::Waiting { cseq, method }
+            // The response may arrive while still `Flushing`: the write buffer
+            // is shared with the `Sink` impl, whose flush may write the
+            // keepalive before the `Stream` impl next checks.
+            KeepaliveState::Flushing { cseq, method, .. }
+            | KeepaliveState::Waiting { cseq, method }
                 if parse::get_cseq(&response) == Some(*cseq) =>
             {
                 // We don't care if the keepalive response succeeds or fails, but we should
@@ -2685,11 +2918,20 @@ impl Session<Playing> {
             ctx: stream_ctx,
             udp_sockets,
             reception,
+            ..
         } = &mut stream.state
         else {
             unreachable!("stream {} not in Playing state", item.stream_i);
         };
         match item.channel_type {
+            ChannelType::Rtp if stream.direction == StreamDirection::Sending => {
+                // Retina sends RTP on this stream; the server shouldn't.
+                debug!(
+                    "ignoring RTP packet received on sending stream {}",
+                    item.stream_i
+                );
+                Ok(None)
+            }
             ChannelType::Rtp => {
                 let body_len = usize::from(item.body_len);
                 let split = match udp_sockets {
@@ -2865,19 +3107,23 @@ impl Session<Playing> {
             }
 
             // Then finish flushing the current keepalive and/or receiver
-            // reports if necessary.
-            let keepalive_flushing =
-                matches!(self.0.keepalive_state, KeepaliveState::Flushing { .. });
+            // reports if necessary, along with any backchannel media queued
+            // via the `Sink` impl before or after them. The keepalive is
+            // written once the connection's count reaches its end, even if
+            // backchannel media queued after it keeps the flush pending.
+            let keepalive_flushing = match self.0.keepalive_state {
+                KeepaliveState::Flushing { cseq, method, end } => Some((cseq, method, end)),
+                _ => None,
+            };
             let conn = &mut self.0.conn.as_mut().unwrap().inner;
-            if keepalive_flushing || conn.has_unflushed() {
-                match conn.poll_flush_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
-                            self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
-                        }
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
-                    Poll::Pending => {}
+            if keepalive_flushing.is_some() || conn.has_unflushed() {
+                if let Poll::Ready(Err(e)) = conn.poll_flush_unpin(cx) {
+                    return Poll::Ready(Some(Err(Error(Arc::new(e)))));
+                }
+                if let Some((cseq, method, end)) = keepalive_flushing
+                    && conn.written() >= end
+                {
+                    self.0.keepalive_state = KeepaliveState::Waiting { cseq, method };
                 }
             }
 
@@ -2948,6 +3194,7 @@ impl PinnedDrop for SessionInner {
             this.presentation.base_url.clone(),
             this.presentation.tool.take(),
             session.id,
+            *this.flags & (SessionFlag::Backchannel as u8) != 0,
             just_try_once,
             std::mem::take(this.options),
             this.requested_auth.take(),
@@ -2990,6 +3237,135 @@ impl futures::Stream for Session<Playing> {
             Some(Err(e)) => Some(Err(e)),
             None => None,
         })
+    }
+}
+
+impl Session<Playing> {
+    /// Queues `pkt` on its stream's RTP channel, plus an RTCP sender report if
+    /// one is due. Implements [`futures::Sink::start_send`].
+    fn queue_packet(mut self: Pin<&mut Self>, pkt: crate::rtp::SendingPacket) -> Result<(), Error> {
+        let inner = self.0.as_mut().project();
+        let conn = inner
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+        let stream_id = pkt.stream_id;
+        let Some(stream) = inner.presentation.streams.get_mut(stream_id) else {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send on stream {stream_id}: presentation has only {} streams",
+                inner.presentation.streams.len()
+            )));
+        };
+        if stream.direction != StreamDirection::Sending {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send on stream {stream_id}: it isn't an ONVIF backchannel (a=sendonly) stream"
+            )));
+        }
+        let StreamState::Playing {
+            ctx: stream_ctx,
+            sender: Some(sender),
+            ..
+        } = &mut stream.state
+        else {
+            bail!(ErrorInt::FailedPrecondition(format!(
+                "can't send on stream {stream_id}: it wasn't set up before PLAY"
+            )));
+        };
+        let StreamContextInner::Tcp(TcpStreamContext { rtp_channel_id }) = stream_ctx.0 else {
+            bail!(ErrorInt::Internal(
+                "sending stream unexpectedly isn't using TCP".into()
+            ));
+        };
+        const MAX_PAYLOAD_LEN: usize = (u16::MAX - crate::rtp::PacketHeader::LEN) as usize;
+        if pkt.payload.len() > MAX_PAYLOAD_LEN {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send {}-byte payload on stream {stream_id}: RTSP interleaved data allows at \
+                 most {MAX_PAYLOAD_LEN} bytes after the RTP header",
+                pkt.payload.len()
+            )));
+        }
+        let now = tokio::time::Instant::now();
+        conn.inner
+            .queue_data(rtp_channel_id, |out| sender.write_rtp(now, &pkt, out))?;
+        if sender.report_due(now) {
+            let ntp = crate::NtpTimestamp::now();
+            conn.inner
+                .queue_data(rtp_channel_id.wrapping_add(1), |out| {
+                    sender.write_sender_report(now, ntp, out)
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// Sends RTP packets on [`StreamDirection::Sending`] streams (ONVIF backchannel).
+///
+/// Retina fills in the SSRC, sequence numbers, and payload type, and sends
+/// RTCP sender reports for each sending stream itself, every few seconds while
+/// packets flow. Packets go out on the RTSP connection, interleaved with RTSP
+/// requests.
+///
+/// `poll_ready` applies backpressure once a few kilobytes (about half a second
+/// of G.711 audio) are waiting to be written, so sent media stays close to real
+/// time when the server reads slowly. It then accepts one packet of any allowed
+/// size.
+///
+/// Errors are returned rather than panicking: `start_send` fails without
+/// sending anything if the packet is for a stream that isn't set up for sending
+/// or its length is unacceptable; the session is still usable.
+/// Errors from `poll_ready`, `poll_flush`, and `poll_close` mean the connection
+/// has failed; any unsent data is discarded, and later sends fail too.
+///
+/// The caller must keep polling the [`futures::Stream`] impl (or drop the
+/// session) for keepalives to be sent and RTCP and other incoming data to be
+/// processed, even if it only wishes to send. To do both from separate tasks,
+/// use [`futures::StreamExt::split`].
+///
+/// `poll_close` just flushes; it doesn't end the session. Drop the session to
+/// tear it down.
+impl futures::Sink<crate::rtp::SendingPacket> for Session<Playing> {
+    type Error = Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let conn = self
+            .0
+            .as_mut()
+            .project()
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+        conn.inner.poll_write_ready(cx).map_err(|e| wrap!(e))
+    }
+
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: crate::rtp::SendingPacket,
+    ) -> Result<(), Self::Error> {
+        self.queue_packet(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let conn = self
+            .0
+            .as_mut()
+            .project()
+            .conn
+            .as_mut()
+            .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
+        conn.inner.poll_flush_unpin(cx).map_err(|e| wrap!(e))
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
     }
 }
 
@@ -3058,6 +3434,45 @@ impl Demuxed {
     /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
         self.session.streams()
+    }
+}
+
+/// Sends RTP packets on [`StreamDirection::Sending`] streams (ONVIF backchannel)
+/// by forwarding to the [`futures::Sink`] impl on [`Session<Playing>`]; see
+/// there for details.
+///
+/// As there, the caller must keep polling the [`futures::Stream`] impl (or
+/// drop the `Demuxed`) for keepalives to be sent and incoming data to be
+/// processed. To do both from separate tasks, use [`futures::StreamExt::split`].
+impl futures::Sink<crate::rtp::SendingPacket> for Demuxed {
+    type Error = Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        futures::Sink::poll_ready(Pin::new(&mut self.session), cx)
+    }
+
+    fn start_send(
+        mut self: Pin<&mut Self>,
+        item: crate::rtp::SendingPacket,
+    ) -> Result<(), Self::Error> {
+        futures::Sink::start_send(Pin::new(&mut self.session), item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        futures::Sink::poll_flush(Pin::new(&mut self.session), cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        futures::Sink::poll_close(Pin::new(&mut self.session), cx)
     }
 }
 
@@ -3338,16 +3753,24 @@ mod tests {
     async fn req_response(
         server: &mut crate::tokio::Connection,
         expected_method: msg::Method,
-        (mut response, resp_body): (msg::Response, Bytes),
+        response: (msg::Response, Bytes),
     ) {
+        req_response_returning_req(server, expected_method, response).await;
+    }
+
+    /// As [`req_response`], also returning the request for inspection.
+    async fn req_response_returning_req(
+        server: &mut crate::tokio::Connection,
+        expected_method: msg::Method,
+        (mut response, resp_body): (msg::Response, Bytes),
+    ) -> msg::Request {
         let msg = server.next().await.unwrap().unwrap();
-        let cseq = match msg.msg {
-            msg::Message::Request(ref r) => {
-                assert_eq!(r.method, expected_method);
-                r.headers.get("CSeq").unwrap().to_string()
-            }
-            _ => panic!(),
+        let req = match msg.msg {
+            msg::Message::Request(r) => r,
+            o => panic!("expected {expected_method:?} request, got {o:#?}"),
         };
+        assert_eq!(req.method, expected_method);
+        let cseq = req.headers.get("CSeq").unwrap().to_string();
         response.headers.insert(
             msg::HeaderName::CSEQ,
             msg::HeaderValue::try_from(cseq).unwrap(),
@@ -3359,6 +3782,7 @@ mod tests {
             })
             .await
             .unwrap();
+        req
     }
 
     /// Tests the happy path from initialization to teardown (first attempt succeeds).
@@ -4462,6 +4886,758 @@ mod tests {
         }
         assert!(!ReceiverReportPolicy::default().enabled());
         assert!("sometimes".parse::<ReceiverReportPolicy>().is_err());
+    }
+
+    const BACKCHANNEL_URL: &str = "rtsp://192.168.0.1/";
+    const BACKCHANNEL_DESCRIBE: &[u8] = include_bytes!("testdata/onvif_backchannel_describe.txt");
+    const BACKCHANNEL_SETUP_VIDEO: &[u8] = b"RTSP/1.0 200 OK\r\n\
+        CSeq: 0\r\n\
+        Session: 12345678;timeout=60\r\n\
+        Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+    const BACKCHANNEL_SETUP_BACK: &[u8] = b"RTSP/1.0 200 OK\r\n\
+        CSeq: 0\r\n\
+        Session: 12345678;timeout=60\r\n\
+        Transport: RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=0BADF00D\r\n\r\n";
+    const BACKCHANNEL_PLAY: &[u8] = b"RTSP/1.0 200 OK\r\n\
+        CSeq: 0\r\n\
+        Session: 12345678\r\n\
+        RTP-Info: url=rtsp://192.168.0.1/video;seq=1;rtptime=0\r\n\r\n";
+    const BACKCHANNEL_TEARDOWN: &[u8] = b"RTSP/1.0 200 OK\r\n\
+        CSeq: 0\r\n\
+        Session: 12345678\r\n\r\n";
+
+    /// Receives an interleaved data message, returning its channel id and body.
+    ///
+    /// Fails rather than hanging if none arrives.
+    async fn next_data(server: &mut crate::tokio::Connection) -> (u8, Bytes) {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), server.next())
+            .await
+            .expect("expected interleaved data")
+            .unwrap()
+            .unwrap();
+        match msg.msg {
+            msg::Message::Data(d) => (
+                d.channel_id,
+                server.body_bytes(msg.body_pos, u32::from(d.body_len)),
+            ),
+            o => panic!("expected interleaved data, got {o:#?}"),
+        }
+    }
+
+    /// Returns the `Require` header of `req`, if any.
+    fn require(req: &msg::Request) -> Option<&str> {
+        req.headers.get("Require").map(|v| &**v)
+    }
+
+    /// The `Require` header is sent on `DESCRIBE` only when the caller asks
+    /// for a backchannel, and `a=sendonly` media are only then sending streams.
+    #[tokio::test]
+    async fn backchannel_require_only_when_requested() {
+        init_logging();
+        for backchannel in [false, true] {
+            let (conn, mut server) = connect_to_mock().await;
+            let (session, req) = tokio::join!(
+                Session::describe_with_conn(
+                    conn,
+                    SessionOptions::default().backchannel(backchannel),
+                    Url::parse(BACKCHANNEL_URL).unwrap(),
+                ),
+                req_response_returning_req(
+                    &mut server,
+                    msg::Method::DESCRIBE,
+                    response(BACKCHANNEL_DESCRIBE)
+                ),
+            );
+            let session = session.unwrap();
+            let directions: Vec<_> = session.streams().iter().map(Stream::direction).collect();
+            if backchannel {
+                assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+                assert_eq!(
+                    directions,
+                    [
+                        StreamDirection::Receiving,
+                        StreamDirection::Receiving,
+                        StreamDirection::Sending
+                    ]
+                );
+            } else {
+                assert_eq!(require(&req), None);
+                assert_eq!(directions, [StreamDirection::Receiving; 3]);
+            }
+        }
+    }
+
+    /// A server without backchannel support answers `551 Option not supported`
+    /// (ONVIF Streaming Specification section 5.3.2). The error carries the
+    /// status and a hint. Other errors, or a 551 without the backchannel
+    /// option, have no hint.
+    #[tokio::test]
+    async fn backchannel_describe_unsupported() {
+        init_logging();
+        for (backchannel, raw, status, hint) in [
+            (
+                true,
+                &b"RTSP/1.0 551 Option not supported\r\n\
+                   CSeq: 0\r\n\
+                   Unsupported: www.onvif.org/ver20/backchannel\r\n\r\n"[..],
+                551,
+                true,
+            ),
+            (
+                true,
+                b"RTSP/1.0 404 Not Found\r\nCSeq: 0\r\n\r\n",
+                404,
+                false,
+            ),
+            (
+                false,
+                b"RTSP/1.0 551 Option not supported\r\nCSeq: 0\r\n\r\n",
+                551,
+                false,
+            ),
+        ] {
+            let (conn, mut server) = connect_to_mock().await;
+            let (session, _) = tokio::join!(
+                Session::describe_with_conn(
+                    conn,
+                    SessionOptions::default().backchannel(backchannel),
+                    Url::parse(BACKCHANNEL_URL).unwrap(),
+                ),
+                req_response(&mut server, msg::Method::DESCRIBE, response(raw)),
+            );
+            let e = session.map(|_| ()).unwrap_err();
+            assert_eq!(e.status_code(), Some(status));
+            let msg = e.to_string();
+            assert_eq!(msg.contains("ONVIF backchannel"), hint, "{msg}");
+        }
+    }
+
+    /// `SETUP` of a sending stream over UDP fails without a request, and with
+    /// TCP carries the `Require` header.
+    #[tokio::test]
+    async fn backchannel_setup() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().backchannel(true),
+                Url::parse(BACKCHANNEL_URL).unwrap(),
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(BACKCHANNEL_DESCRIBE)
+            ),
+        );
+        let mut session = session.unwrap();
+        let e = session
+            .setup(
+                2,
+                SetupOptions::default().transport(Transport::Udp(UdpTransportOptions::default())),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::Unsupported(_)), "{e}");
+
+        // The next request the server sees is the TCP `SETUP`.
+        let (r, req) = tokio::join!(
+            session.setup(2, SetupOptions::default()),
+            req_response_returning_req(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_BACK)
+            ),
+        );
+        r.unwrap();
+        assert_eq!(
+            req.request_uri.as_ref().unwrap().as_str(),
+            "rtsp://192.168.0.1/audioback"
+        );
+        assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+        assert_eq!(
+            req.headers.get("Transport").map(|v| &**v),
+            Some("RTP/AVP/TCP;unicast;interleaved=0-1")
+        );
+    }
+
+    /// A refused `SETUP` of the backchannel leaves the session usable: it
+    /// plays the other streams, and as no sending stream was set up, `PLAY`
+    /// and `TEARDOWN` go without the `Require` header and sending fails.
+    #[tokio::test]
+    async fn backchannel_setup_refused() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().backchannel(true),
+                Url::parse(BACKCHANNEL_URL).unwrap(),
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(BACKCHANNEL_DESCRIBE)
+            ),
+        );
+        let mut session = session.unwrap();
+        let (r, _) = tokio::join!(
+            session.setup(0, SetupOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_VIDEO)
+            ),
+        );
+        r.unwrap();
+        let (r, _) = tokio::join!(
+            session.setup(2, SetupOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(b"RTSP/1.0 453 Not Enough Bandwidth\r\nCSeq: 0\r\n\r\n")
+            ),
+        );
+        assert_eq!(r.unwrap_err().status_code(), Some(453));
+        let (session, req) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response_returning_req(&mut server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
+        );
+        assert_eq!(require(&req), None);
+        let mut session = session.unwrap();
+        let e = session
+            .send(crate::rtp::SendingPacket::new(
+                2,
+                0,
+                Bytes::from_static(&[0xff; 160]),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::FailedPrecondition(_)), "{e}");
+        drop(session);
+        let req = req_response_returning_req(
+            &mut server,
+            msg::Method::TEARDOWN,
+            response(BACKCHANNEL_TEARDOWN),
+        )
+        .await;
+        assert_eq!(require(&req), None);
+    }
+
+    /// Plays a video stream and a backchannel on one connection: checks the
+    /// `Require` headers and the exact interleaved RTP and RTCP bytes sent,
+    /// receives on both streams, and checks errors for bad packets.
+    #[tokio::test]
+    async fn backchannel_send() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+
+        // DESCRIBE.
+        let (session, req) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().backchannel(true),
+                Url::parse(BACKCHANNEL_URL).unwrap(),
+            ),
+            req_response_returning_req(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(BACKCHANNEL_DESCRIBE)
+            ),
+        );
+        assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+        let mut session = session.unwrap();
+
+        // SETUP video, without `Require`, then the backchannel, with it.
+        let (r, req) = tokio::join!(
+            session.setup(0, SetupOptions::default()),
+            req_response_returning_req(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_VIDEO)
+            ),
+        );
+        r.unwrap();
+        assert_eq!(require(&req), None);
+        let (r, req) = tokio::join!(
+            session.setup(2, SetupOptions::default()),
+            req_response_returning_req(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_BACK)
+            ),
+        );
+        r.unwrap();
+        assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+
+        // PLAY, with `Require`. `RTP-Info` describes only the video stream.
+        let (session, req) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response_returning_req(&mut server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
+        );
+        assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+        let mut session = session.unwrap();
+
+        // Replace the random SSRC, sequence number, timestamp offset, and
+        // CNAME so the bytes are predictable. Start near wraparound.
+        {
+            let StreamState::Playing {
+                sender: Some(sender),
+                ..
+            } = &mut session.0.presentation.streams[2].state
+            else {
+                panic!("backchannel stream should be playing with a sender");
+            };
+            sender.ssrc = 0x0102_0304;
+            sender.next_seq = 0xfffe;
+            sender.timestamp_offset = 0xffff_ff00;
+            sender.cname = "abcdefghijklmnop".into();
+        }
+
+        // Packet 1 is followed by a sender report and SDES CNAME. The report
+        // describes the instant packet 1 was sent, so its RTP timestamp is
+        // packet 1's.
+        let ntp_before = crate::NtpTimestamp::now();
+        session
+            .send(crate::rtp::SendingPacket::new(2, 0, Bytes::from_static(&[0xff; 160])).mark(true))
+            .await
+            .unwrap();
+        let ntp_after = crate::NtpTimestamp::now();
+        let (channel, rtp) = next_data(&mut server).await;
+        assert_eq!(channel, 2);
+        let mut expected = b"\x80\x80\xff\xfe\xff\xff\xff\x00\x01\x02\x03\x04".to_vec();
+        expected.extend_from_slice(&[0xff; 160]);
+        crate::testutil::assert_eq_hex!(rtp, expected);
+        let (channel, rtcp) = next_data(&mut server).await;
+        assert_eq!(channel, 3);
+        let ntp = crate::NtpTimestamp(u64::from_be_bytes(rtcp[8..16].try_into().unwrap()));
+        assert!(
+            ntp_before <= ntp && ntp <= ntp_after,
+            "{ntp:?} not in [{ntp_before:?}, {ntp_after:?}]"
+        );
+        let mut expected = b"\x80\xc8\x00\x06\x01\x02\x03\x04".to_vec(); // SR header, SSRC.
+        expected.extend_from_slice(&ntp.0.to_be_bytes());
+        expected.extend_from_slice(b"\xff\xff\xff\x00"); // RTP timestamp.
+        expected.extend_from_slice(b"\x00\x00\x00\x01\x00\x00\x00\xa0"); // 1 packet, 160 octets.
+        expected.extend_from_slice(b"\x81\xca\x00\x06\x01\x02\x03\x04"); // SDES header, SSRC.
+        expected.extend_from_slice(b"\x01\x10abcdefghijklmnop\x00\x00"); // CNAME, end.
+        crate::rtcp::ReceivedCompoundPacket::validate(&rtcp).unwrap();
+        crate::testutil::assert_eq_hex!(rtcp, expected);
+
+        // Packet 2 comes soon after, so no sender report follows.
+        session
+            .send(crate::rtp::SendingPacket::new(
+                2,
+                160,
+                Bytes::from_static(&[0xff; 160]),
+            ))
+            .await
+            .unwrap();
+        let (channel, rtp) = next_data(&mut server).await;
+        assert_eq!(channel, 2);
+        assert_eq!(
+            &rtp[..12],
+            b"\x80\x00\xff\xff\xff\xff\xff\xa0\x01\x02\x03\x04"
+        );
+
+        // Bad packets fail without sending anything or advancing the sequence number.
+        for (pkt, want) in [
+            (
+                crate::rtp::SendingPacket::new(0, 0, Bytes::new()),
+                "isn't an ONVIF backchannel",
+            ),
+            (
+                crate::rtp::SendingPacket::new(1, 0, Bytes::new()),
+                "isn't an ONVIF backchannel",
+            ),
+            (
+                crate::rtp::SendingPacket::new(3, 0, Bytes::new()),
+                "has only 3 streams",
+            ),
+            (
+                crate::rtp::SendingPacket::new(2, 0, Bytes::from(vec![0; 65_524])),
+                "at most 65523 bytes",
+            ),
+        ] {
+            let e = session.send(pkt).await.unwrap_err();
+            assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{e}");
+            assert!(e.to_string().contains(want), "{e} should contain {want:?}");
+        }
+
+        // When the report interval has passed, packet 3 is followed by another
+        // sender report. (`client::rtp::tests::sender_report_schedule` checks
+        // the interval.) The sequence number and timestamp wrap. The report is
+        // built as packet 3 is sent, so its RTP timestamp, extrapolated from the
+        // most recent packet, is packet 3's.
+        {
+            let StreamState::Playing {
+                sender: Some(sender),
+                ..
+            } = &mut session.0.presentation.streams[2].state
+            else {
+                unreachable!();
+            };
+            sender.next_report = Some(tokio::time::Instant::now());
+        }
+        session
+            .send(crate::rtp::SendingPacket::new(
+                2,
+                320,
+                Bytes::from_static(&[0xff; 160]),
+            ))
+            .await
+            .unwrap();
+        let (channel, rtp) = next_data(&mut server).await;
+        assert_eq!(channel, 2);
+        assert_eq!(
+            &rtp[..12],
+            b"\x80\x00\x00\x00\x00\x00\x00\x40\x01\x02\x03\x04"
+        );
+        let (channel, rtcp) = next_data(&mut server).await;
+        assert_eq!(channel, 3);
+        assert_eq!(
+            &rtcp[16..28],
+            b"\x00\x00\x00\x40\x00\x00\x00\x03\x00\x00\x01\xe0"
+        );
+
+        // Receive while sending: RTP on the backchannel's channel is ignored;
+        // video RTP and the server's RTCP receiver report come through.
+        for (channel_id, body) in [
+            (2, &b"\x80\x00\x00\x01\x00\x00\x00\x00\xaa\xbb\xcc\xdd?"[..]),
+            (
+                0,
+                &b"\x80\x1a\x00\x01\x00\x00\x00\x00\x11\x22\x33\x44hello"[..],
+            ),
+            (3, &b"\x80\xc9\x00\x01\xaa\xbb\xcc\xdd"[..]),
+        ] {
+            server
+                .send(OwnedMessage::Data {
+                    channel_id,
+                    body: Bytes::from_static(body),
+                })
+                .await
+                .unwrap();
+        }
+        match session.next().await {
+            Some(Ok(PacketItem::Rtp(p))) => {
+                assert_eq!(p.stream_id(), 0);
+                assert_eq!(p.payload(), b"hello");
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        }
+        match session.next().await {
+            Some(Ok(PacketItem::Rtcp(p))) => {
+                assert_eq!(p.stream_id(), 2);
+                assert_eq!(p.raw(), b"\x80\xc9\x00\x01\xaa\xbb\xcc\xdd");
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        }
+
+        // TEARDOWN carries `Require`, as in the ONVIF spec's example.
+        drop(session);
+        let req = req_response_returning_req(
+            &mut server,
+            msg::Method::TEARDOWN,
+            response(BACKCHANNEL_TEARDOWN),
+        )
+        .await;
+        assert_eq!(require(&req), Some("www.onvif.org/ver20/backchannel"));
+    }
+
+    /// Describes [`BACKCHANNEL_DESCRIBE`] with the backchannel option, sets up
+    /// only the backchannel (stream 2), and plays, with keepalives disabled.
+    async fn play_backchannel(
+        conn: RtspConnection,
+        server: &mut crate::tokio::Connection,
+    ) -> Session<Playing> {
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().backchannel(true),
+                Url::parse(BACKCHANNEL_URL).unwrap(),
+            ),
+            req_response(
+                server,
+                msg::Method::DESCRIBE,
+                response(BACKCHANNEL_DESCRIBE)
+            ),
+        );
+        let mut session = session.unwrap();
+        let (r, _) = tokio::join!(
+            session.setup(2, SetupOptions::default()),
+            req_response(server, msg::Method::SETUP, response(BACKCHANNEL_SETUP_BACK)),
+        );
+        r.unwrap();
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
+        );
+        let mut session = session.unwrap();
+        session.0.keepalive_timer = None;
+        session
+    }
+
+    /// Sends `server` a response to a keepalive request with the given `CSeq`.
+    async fn send_keepalive_response(server: &mut crate::tokio::Connection, cseq: u32) {
+        let mut response = response(BACKCHANNEL_TEARDOWN).0;
+        response.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from(cseq.to_string()).unwrap(),
+        );
+        server
+            .send(OwnedMessage::Response {
+                head: response,
+                body: Bytes::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The `Sink` impl's flush may write a keepalive request before the
+    /// `Stream` impl sees it, so the response can arrive while the keepalive
+    /// is still marked as flushing. It's accepted.
+    #[tokio::test]
+    async fn keepalive_response_while_flushing() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let mut session = play_backchannel(conn, &mut server).await;
+        session.0.keepalive_state = KeepaliveState::Flushing {
+            cseq: 1000,
+            method: KeepaliveMethod::GetParameter,
+            end: u64::MAX,
+        };
+        send_keepalive_response(&mut server, 1000).await;
+        server
+            .send(OwnedMessage::Data {
+                channel_id: 3,
+                body: Bytes::from_static(b"\x80\xc9\x00\x01\xaa\xbb\xcc\xdd"),
+            })
+            .await
+            .unwrap();
+
+        // Let the response arrive, so the session reads it before it next
+        // tries to flush.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match session.next().await {
+            Some(Ok(PacketItem::Rtcp(p))) => assert_eq!(p.stream_id(), 2),
+            o => panic!("unexpected item: {o:#?}"),
+        }
+        assert!(matches!(session.0.keepalive_state, KeepaliveState::Idle));
+    }
+
+    /// The [`Demuxed`] wrapper sends via the session's `Sink` impl.
+    #[tokio::test]
+    async fn backchannel_send_demuxed() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let mut demuxed = play_backchannel(conn, &mut server).await.demuxed().unwrap();
+        demuxed
+            .send(crate::rtp::SendingPacket::new(2, 0, Bytes::from_static(&[0xff; 160])).mark(true))
+            .await
+            .unwrap();
+        let (channel, rtp) = next_data(&mut server).await;
+        assert_eq!(channel, 2);
+        assert_eq!(rtp.len(), 12 + 160);
+        assert_eq!(rtp[1], 0x80); // marker, payload type 0.
+        let (channel, rtcp) = next_data(&mut server).await;
+        assert_eq!(channel, 3);
+        assert_eq!(rtcp[1], 200); // sender report.
+        let e = demuxed
+            .send(crate::rtp::SendingPacket::new(0, 0, Bytes::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{e}");
+        demuxed.close().await.unwrap();
+    }
+
+    /// With receiver reports enabled, a video stream gets receiver reports on
+    /// its RTCP channel while the backchannel gets none: Retina sends rather
+    /// than receives its media, and describes it in sender reports instead.
+    #[tokio::test]
+    async fn backchannel_with_receiver_reports() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default()
+                    .backchannel(true)
+                    .receiver_reports(ReceiverReportPolicy::Always),
+                Url::parse(BACKCHANNEL_URL).unwrap(),
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(BACKCHANNEL_DESCRIBE)
+            ),
+        );
+        let mut session = session.unwrap();
+        let (r, _) = tokio::join!(
+            session.setup(0, SetupOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_VIDEO)
+            ),
+        );
+        r.unwrap();
+        let (r, _) = tokio::join!(
+            session.setup(2, SetupOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(BACKCHANNEL_SETUP_BACK)
+            ),
+        );
+        r.unwrap();
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(&mut server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+        session.0.keepalive_timer = None;
+        assert!(matches!(
+            session.0.presentation.streams[0].state,
+            StreamState::Playing {
+                reception: Some(_),
+                sender: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.0.presentation.streams[2].state,
+            StreamState::Playing {
+                reception: None,
+                sender: Some(_),
+                ..
+            }
+        ));
+
+        // Make a report due now. Only the video stream's goes out.
+        let reports = session.0.reports.as_mut().unwrap();
+        let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
+        reports.timer.as_mut().reset(tokio::time::Instant::now());
+        let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+        receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
+
+        // Backchannel media and its sender report follow directly, on the
+        // backchannel's channels.
+        session
+            .send(crate::rtp::SendingPacket::new(2, 0, Bytes::from_static(&[0xff; 160])).mark(true))
+            .await
+            .unwrap();
+        let (channel, rtp) = next_data(&mut server).await;
+        assert_eq!(channel, 2);
+        assert_eq!(rtp.len(), 12 + 160);
+        let (channel, rtcp) = next_data(&mut server).await;
+        assert_eq!(channel, 3);
+        assert_eq!(rtcp[1], 200); // sender report.
+    }
+
+    /// Backchannel media queued after a keepalive request can keep the write
+    /// buffer from emptying past the keepalive interval. The keepalive counts
+    /// as written once its own bytes are out, so the session waits for the
+    /// response rather than timing out writing it. A keepalive that really
+    /// can't be written still times out.
+    #[tokio::test]
+    async fn keepalive_written_while_media_queued() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let mut session = play_backchannel(conn, &mut server).await;
+        session.0.flags |= SessionFlag::GetParameterSupported as u8;
+
+        /// Queues 16 MiB of media on the backchannel: more than the socket
+        /// buffers hold.
+        fn queue_media(session: &mut Session<Playing>) {
+            let conn = &mut session.0.conn.as_mut().unwrap().inner;
+            for _ in 0..1024 {
+                conn.queue_data(2, |out| out.resize(out.len() + 16_384, 0xd5))
+                    .unwrap();
+            }
+        }
+
+        /// Makes the keepalive timer fire on the next poll.
+        fn fire_keepalive_timer(session: &mut Session<Playing>) {
+            session.0.keepalive_timer =
+                Some(Box::pin(tokio::time::sleep(std::time::Duration::ZERO)));
+        }
+
+        /// Polls `session` until `done`, failing if it yields an item.
+        async fn poll_until(
+            session: &mut Session<Playing>,
+            done: impl Fn(&KeepaliveState) -> bool,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !done(&session.0.keepalive_state) {
+                    match futures::poll!(session.next()) {
+                        Poll::Pending => tokio::task::yield_now().await,
+                        Poll::Ready(o) => panic!("unexpected item: {o:#?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        // The keepalive is queued behind media and can't be written yet. More
+        // media is queued behind it.
+        queue_media(&mut session);
+        fire_keepalive_timer(&mut session);
+        poll_until(&mut session, |s| {
+            matches!(s, KeepaliveState::Flushing { .. })
+        })
+        .await;
+        queue_media(&mut session);
+
+        // The server reads up to the keepalive request, which is then written,
+        // while media remains queued behind it.
+        let (cseq, ()) = tokio::join!(
+            async {
+                loop {
+                    let msg = server.next().await.unwrap().unwrap();
+                    if let msg::Message::Request(r) = msg.msg {
+                        assert_eq!(r.method, msg::Method::GET_PARAMETER);
+                        break r.headers.get("CSeq").unwrap().parse::<u32>().unwrap();
+                    }
+                }
+            },
+            poll_until(&mut session, |s| matches!(
+                s,
+                KeepaliveState::Waiting { .. }
+            )),
+        );
+        let conn = &session.0.conn.as_ref().unwrap().inner;
+        assert!(conn.written() < conn.queued_end());
+
+        // The response arrives, and the next keepalive is sent without error.
+        send_keepalive_response(&mut server, cseq).await;
+        poll_until(&mut session, |s| matches!(s, KeepaliveState::Idle)).await;
+        fire_keepalive_timer(&mut session);
+        poll_until(&mut session, |s| {
+            matches!(s, KeepaliveState::Flushing { .. })
+        })
+        .await;
+
+        // The server isn't reading, so that keepalive is never written.
+        fire_keepalive_timer(&mut session);
+        let e = loop {
+            match futures::poll!(session.next()) {
+                Poll::Pending => tokio::task::yield_now().await,
+                Poll::Ready(Some(Err(e))) => break e,
+                Poll::Ready(o) => panic!("unexpected item: {o:#?}"),
+            }
+        };
+        match &*e.0 {
+            ErrorInt::WriteError { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+                assert!(
+                    source.to_string().contains("Unable to write keepalive"),
+                    "{e}"
+                );
+            }
+            _ => panic!("unexpected error: {e}"),
+        }
     }
 
     // See with: cargo test -- --nocapture client::tests::print_sizes

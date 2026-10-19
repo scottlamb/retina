@@ -261,6 +261,7 @@ impl StatusCode {
     pub const UNAUTHORIZED: StatusCode = StatusCode(401);
     pub const SESSION_NOT_FOUND: StatusCode = StatusCode(454);
     pub const INTERNAL_SERVER_ERROR: StatusCode = StatusCode(500);
+    pub const OPTION_NOT_SUPPORTED: StatusCode = StatusCode(551);
 
     #[inline]
     pub fn as_u16(self) -> u16 {
@@ -388,6 +389,7 @@ impl HeaderName {
         CSEQ => "CSeq",
         PUBLIC => "Public",
         RANGE => "Range",
+        REQUIRE => "Require",
         RTP_INFO => "RTP-Info",
         SESSION => "Session",
         TRANSPORT => "Transport",
