@@ -432,7 +432,7 @@ impl Sender {
         &mut self,
         now: tokio::time::Instant,
         pkt: &crate::rtp::SendingPacket,
-        out: &mut Vec<u8>,
+        out: &mut bytes::BytesMut,
     ) {
         let payload_type = self.payload_type(pkt);
         let timestamp = pkt.timestamp.wrapping_add(self.timestamp_offset);
@@ -488,7 +488,7 @@ impl Sender {
         &mut self,
         now: tokio::time::Instant,
         ntp: crate::NtpTimestamp,
-        out: &mut Vec<u8>,
+        out: &mut bytes::BytesMut,
     ) {
         // Sender report, RFC 3550 section 6.4.1, with no report blocks: Retina
         // receives nothing in this RTP session.
@@ -570,7 +570,7 @@ mod tests {
         let mut sender = Sender::new(0, 8_000);
         let start = tokio::time::Instant::now();
         let pkt = crate::rtp::SendingPacket::new(0, 0, Bytes::from_static(b"x"));
-        let mut out = Vec::new();
+        let mut out = bytes::BytesMut::new();
         sender.write_rtp(start, &pkt, &mut out);
         assert!(sender.report_due(start));
         sender.write_sender_report(start, crate::NtpTimestamp(0), &mut out);
@@ -591,7 +591,7 @@ mod tests {
         sender.timestamp_offset = 0xffff_f000;
         let start = tokio::time::Instant::now();
         assert_eq!(sender.rtp_timestamp_at(start), 0xffff_f000);
-        let mut out = Vec::new();
+        let mut out = bytes::BytesMut::new();
         sender.write_rtp(
             start,
             &crate::rtp::SendingPacket::new(0, 0x100, Bytes::from_static(b"x")),

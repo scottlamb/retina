@@ -448,19 +448,20 @@ impl ReportWriter {
 /// boundary (RFC 3550 section 6.5).
 ///
 /// Used by both receiver and sender reports. `cname` must be at most 255 bytes.
-pub(crate) fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut Vec<u8>) {
+pub(crate) fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut impl bytes::BufMut) {
     debug_assert!(cname.len() <= 255);
-    let sdes_start = out.len();
-    out.extend_from_slice(&[(2 << 6) | 1, PT_SDES, 0, 0]); // length filled in below.
-    out.extend_from_slice(&ssrc.to_be_bytes());
-    out.extend_from_slice(&[SDES_CNAME, cname.len() as u8]);
-    out.extend_from_slice(cname.as_bytes());
-    out.push(0);
-    while !(out.len() - sdes_start).is_multiple_of(4) {
-        out.push(0);
-    }
-    let sdes_len = ((out.len() - sdes_start) / 4 - 1) as u16;
-    out[sdes_start + 2..sdes_start + 4].copy_from_slice(&sdes_len.to_be_bytes());
+    let items_len = 2 + cname.len();
+    let padding = 4 - items_len % 4; // 1..=4 null octets.
+
+    // The packet's length in 32-bit words, minus one for the header: SSRC,
+    // items, padding.
+    let length_words = ((4 + items_len + padding) / 4) as u16;
+    out.put_slice(&[(2 << 6) | 1, PT_SDES]);
+    out.put_u16(length_words);
+    out.put_u32(ssrc);
+    out.put_slice(&[SDES_CNAME, cname.len() as u8]);
+    out.put_slice(cname.as_bytes());
+    out.put_slice(&[0; 4][..padding]);
 }
 
 /// Decides when reports are due, as described in [RFC 3550 section

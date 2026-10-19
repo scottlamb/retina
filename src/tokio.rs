@@ -5,6 +5,7 @@
 //!
 //! In theory there could be a similar async-std-based implementation.
 
+use bytes::{Buf as _, BufMut as _, BytesMut};
 use futures::{Sink, Stream};
 use std::time::Instant;
 use tokio::io::AsyncWrite;
@@ -42,7 +43,10 @@ pub(crate) struct Connection {
 
     /// Write buffer for outgoing messages, appended to by `start_send` and
     /// [`Connection::queue_data`] and drained by `poll_flush`.
-    write_buf: Vec<u8>,
+    ///
+    /// A `BytesMut` so that `poll_flush` can drop a partial write from the
+    /// front in constant time, without moving what's left.
+    write_buf: BytesMut,
 
     /// Total bytes written to `stream` since the connection was established.
     ///
@@ -101,7 +105,7 @@ impl Connection {
                 .max_message_size(max_message_size)
                 .build(),
             read_buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
-            write_buf: Vec::new(),
+            write_buf: BytesMut::new(),
             written: 0,
             write_failed: None,
             write_waiters: Vec::new(),
@@ -170,7 +174,7 @@ impl Connection {
     /// message is sent later, and makes later writes fail.
     fn fail_write(&mut self, source: std::io::Error) -> ErrorInt {
         self.write_failed = Some(source.kind());
-        self.write_buf = Vec::new();
+        self.write_buf = BytesMut::new();
         self.wake_write_waiters();
         ErrorInt::WriteError {
             conn_ctx: self.ctx,
@@ -189,7 +193,7 @@ impl Connection {
     pub(crate) fn queue_data(
         &mut self,
         channel_id: u8,
-        write_body: impl FnOnce(&mut Vec<u8>),
+        write_body: impl FnOnce(&mut BytesMut),
     ) -> Result<(), Error> {
         if let Some(e) = self.write_failed_error() {
             return Err(wrap!(e));
@@ -469,8 +473,8 @@ impl Sink<OwnedMessage> for Connection {
         if let Some(e) = self.write_failed_error() {
             return Err(e);
         }
-        item.write(&mut self.write_buf)
-            .expect("Vec Writer is infallible");
+        item.write(&mut (&mut self.write_buf).writer())
+            .expect("BytesMut Writer is infallible");
         Ok(())
     }
 
@@ -484,8 +488,7 @@ impl Sink<OwnedMessage> for Connection {
         }
 
         // Bytes written by this call. They're removed from the front of
-        // `write_buf` once, on return, rather than after each partial write,
-        // which would move the rest of a large buffer every time.
+        // `write_buf` once, on return.
         let mut written = 0;
         while written < this.write_buf.len() {
             match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf[written..]) {
@@ -502,7 +505,7 @@ impl Sink<OwnedMessage> for Connection {
                     return std::task::Poll::Ready(Err(this.fail_write(e)));
                 }
                 std::task::Poll::Pending => {
-                    this.write_buf.drain(..written);
+                    this.write_buf.advance(written);
                     this.add_write_waiter(cx);
                     return std::task::Poll::Pending;
                 }
