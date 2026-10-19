@@ -341,13 +341,6 @@ impl InorderParser {
     }
 }
 
-/// Minimum interval between RTCP sender reports for a send stream.
-///
-/// [RFC 3550 section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
-/// recommends a minimum of 5 seconds, randomized by a factor in `[0.5, 1.5]`
-/// (section 6.3.1).
-const SENDER_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// RTP/RTCP marshaller for a stream that Retina sends, such as an ONVIF
 /// audio backchannel.
 ///
@@ -389,6 +382,9 @@ pub(crate) struct Sender {
 
     /// When to send the next sender report, or `None` to send one after the
     /// next RTP packet.
+    ///
+    /// Reports follow the receiver reports' schedule; see
+    /// [`super::receiver_report::regular_interval`].
     ///
     /// The first report follows the first RTP packet without delay: [RFC 3550
     /// section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
@@ -494,8 +490,6 @@ impl Sender {
         ntp: crate::NtpTimestamp,
         out: &mut Vec<u8>,
     ) {
-        use rand::Rng as _;
-
         // Sender report, RFC 3550 section 6.4.1, with no report blocks: Retina
         // receives nothing in this RTP session.
         out.extend_from_slice(&[
@@ -510,27 +504,9 @@ impl Sender {
         out.extend_from_slice(&self.packet_count.to_be_bytes());
         out.extend_from_slice(&self.octet_count.to_be_bytes());
 
-        // SDES with a single chunk holding a CNAME item, RFC 3550 section 6.5.
-        // The item list ends with at least one null octet and is padded to a
-        // 32-bit boundary. An item holds at most 255 octets.
-        let cname = self.cname.as_bytes();
-        let cname = &cname[..cname.len().min(255)];
-        let items_len = 2 + cname.len();
-        let padding = 4 - (items_len % 4); // 1..=4 null octets.
-        let chunk_len = 4 + items_len + padding; // SSRC, items, padding: at most 264.
-
-        // The length field is the packet's length in 32-bit words, minus one:
-        // the header word.
-        let length_words = (chunk_len / 4) as u16;
-        out.extend_from_slice(&[(2 << 6) | 1, 202]); // version=2, source count=1, packet type=SDES.
-        out.extend_from_slice(&length_words.to_be_bytes());
-        out.extend_from_slice(&self.ssrc.to_be_bytes());
-        out.extend_from_slice(&[1, cname.len() as u8]); // item type=CNAME, length.
-        out.extend_from_slice(cname);
-        out.extend_from_slice(&[0; 4][..padding]);
-
-        let interval = SENDER_REPORT_INTERVAL.mul_f64(rand::thread_rng().gen_range(0.5..1.5));
-        self.next_report = Some(now + interval);
+        super::receiver_report::write_sdes_cname(self.ssrc, &self.cname, out);
+        self.next_report =
+            Some(now + super::receiver_report::regular_interval(&mut rand::thread_rng()));
     }
 }
 
@@ -600,8 +576,9 @@ mod tests {
         sender.write_sender_report(start, crate::NtpTimestamp(0), &mut out);
         assert_eq!(out.len(), 13 + 28 + 28);
         assert!(!sender.report_due(start));
-        assert!(!sender.report_due(start + std::time::Duration::from_millis(2_499)));
-        assert!(sender.report_due(start + std::time::Duration::from_millis(7_500)));
+        // 5 s × [0.5, 1.5) / (e - 3/2) is about [2.0521, 6.1563) s.
+        assert!(!sender.report_due(start + std::time::Duration::from_millis(2_052)));
+        assert!(sender.report_due(start + std::time::Duration::from_millis(6_157)));
     }
 
     /// The sender report's RTP timestamp describes the instant the report is
