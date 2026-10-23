@@ -3,7 +3,7 @@
 
 //! Common logic between H.264 and H.265.
 
-use crate::buf::BufRange;
+use crate::buf::{BufRange, MarkBuf};
 use crate::inputs::{Input as _, Split};
 
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
@@ -101,6 +101,63 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
 
     fn finish_sei_payload(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
         self.inner.finish_sei_payload()
+    }
+}
+
+/// [`std::io::BufRead`] over a NAL's pieces within a [`MarkBuf`], without copying.
+///
+/// Wrap in [`h264_reader::rbsp::ByteReader`] to read the RBSP. The pieces
+/// exclude the NAL header, so use `ByteReader::without_skip`.
+#[derive(Clone)]
+pub(super) struct PiecesReader<'a> {
+    buf: &'a MarkBuf,
+    pieces: &'a [BufRange],
+    cur: &'a [u8],
+
+    /// The second half of the current piece, if it wraps around the ring buffer.
+    next: &'a [u8],
+}
+
+impl<'a> PiecesReader<'a> {
+    pub(super) fn new(buf: &'a MarkBuf, pieces: &'a [BufRange]) -> Self {
+        Self {
+            buf,
+            pieces,
+            cur: &[],
+            next: &[],
+        }
+    }
+}
+
+impl std::io::Read for PiecesReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead as _;
+        let chunk = self.fill_buf()?;
+        let amt = std::cmp::min(out.len(), chunk.len());
+        out[..amt].copy_from_slice(&chunk[..amt]);
+        self.consume(amt);
+        Ok(amt)
+    }
+}
+
+impl std::io::BufRead for PiecesReader<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        // Skip empty slices; an empty return means EOF.
+        while self.cur.is_empty() {
+            if !self.next.is_empty() {
+                self.cur = std::mem::take(&mut self.next);
+            } else if let Some((piece, rest)) = self.pieces.split_first() {
+                (self.cur, self.next) = self.buf.split(piece.pos, usize::from(piece.len)).slices();
+                self.pieces = rest;
+            } else {
+                break;
+            }
+        }
+        Ok(self.cur)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.cur = &self.cur[amt..];
     }
 }
 
@@ -367,5 +424,35 @@ impl<A: U8Array> AnnexBScanner<A> {
             }
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read as _;
+
+    use super::*;
+
+    /// Tests [`PiecesReader`] with a piece that wraps around the ring buffer
+    /// and an `emulation_prevention_three_byte` split across pieces.
+    #[test]
+    fn pieces_reader_wrap() {
+        let mut buf = MarkBuf::new(8);
+        assert_eq!(buf.capacity(), 8);
+        buf.extend(b"junkjk");
+        buf.advance_unparsed(6);
+        buf.extend(b"\x01\x00\x00\x03\x01\x02\x03\x04"); // reclaims; occupies [6, 14).
+        buf.advance_unparsed(14);
+        assert_eq!(
+            buf.split(6, 3).slices(),
+            (&b"\x01\x00"[..], &b"\x00"[..]),
+            "first piece should wrap"
+        );
+        let pieces = [BufRange { pos: 6, len: 3 }, BufRange { pos: 9, len: 5 }];
+        let mut rbsp = Vec::new();
+        h264_reader::rbsp::ByteReader::without_skip(PiecesReader::new(&buf, &pieces))
+            .read_to_end(&mut rbsp)
+            .unwrap();
+        assert_eq!(rbsp, b"\x01\x00\x00\x01\x02\x03\x04");
     }
 }
