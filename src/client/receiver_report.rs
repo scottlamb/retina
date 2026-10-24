@@ -57,7 +57,7 @@ const SDES_CNAME: u8 = 1;
 /// Per-source sequence number state, the `source` struct of RFC 3550 appendix
 /// A.1.
 #[derive(Clone, Debug)]
-struct SeqState {
+pub(crate) struct SeqState {
     /// The highest sequence number seen.
     max_seq: u16,
 
@@ -88,7 +88,7 @@ impl SeqState {
     ///
     /// The caller should then pass the same packet to [`SeqState::update`],
     /// as in appendix A.1.
-    fn new(seq: u16) -> Self {
+    pub(crate) fn new(seq: u16) -> Self {
         let mut s = SeqState {
             max_seq: 0,
             cycles: 0,
@@ -116,7 +116,7 @@ impl SeqState {
     }
 
     /// `update_seq` from appendix A.1. Returns true iff the packet is valid.
-    fn update(&mut self, seq: u16) -> bool {
+    pub(crate) fn update(&mut self, seq: u16) -> bool {
         let udelta = seq.wrapping_sub(self.max_seq);
 
         // Source is not valid until MIN_SEQUENTIAL packets with sequential

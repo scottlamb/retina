@@ -3,6 +3,7 @@
 
 use std::convert::TryFrom;
 use std::num::{NonZeroI32, NonZeroU32};
+use std::time::Duration;
 
 use crate::Timestamp;
 
@@ -88,13 +89,19 @@ impl Timeline {
         Ok(self.ts_and_delta(rtp_timestamp)?.0)
     }
 
-    /// Places `rtp_timestamp` at the timeline's current position and takes
-    /// later RTP timestamps relative to it.
+    /// Places `rtp_timestamp` `elapsed` after the timeline's current position
+    /// and takes later RTP timestamps relative to it.
     ///
     /// This is useful when the RTP timestamps restart from an unrelated base,
-    /// as on an SSRC change. Does nothing if no timestamp has been placed yet.
-    pub fn continue_at(&mut self, rtp_timestamp: u32) {
+    /// as on an SSRC change. `elapsed` is measured locally (e.g. the time
+    /// between the packets' arrivals), so it bypasses the time jump policy.
+    /// Does nothing if no timestamp has been placed yet.
+    pub fn continue_at(&mut self, rtp_timestamp: u32, elapsed: Duration) {
         if self.start.is_some() {
+            let elapsed = elapsed.as_nanos() * u128::from(self.clock_rate.get()) / 1_000_000_000;
+            self.timestamp = self
+                .timestamp
+                .saturating_add(i64::try_from(elapsed).unwrap_or(i64::MAX));
             self.rtp_timestamp_offset = (self.timestamp as u32).wrapping_sub(rtp_timestamp);
         }
     }

@@ -476,11 +476,11 @@ pub enum UnknownRtpSsrcPolicy {
     /// Treat the new `ssrc` as a replacement for the old one, as when a
     /// server restarts its encoder mid-session.
     ///
-    /// The stream continues from the new `ssrc`'s packets: its first packet
-    /// reports no loss, its timestamps continue from the stream's current
-    /// time, and a partial frame from the old `ssrc` is dropped. Don't use this
-    /// with servers which interleave packets from several `ssrc`s on one
-    /// stream; each change drops a partial frame.
+    /// The stream continues from the new `ssrc` once it has sent two
+    /// sequential packets, as in RFC 3550 appendix A.1. Packets before then
+    /// are dropped, as is a partial frame from the old `ssrc`. The first packet
+    /// taken from the new `ssrc` reports no loss, and its timestamp follows the
+    /// old `ssrc`'s last one by the time between their arrivals.
     #[display("follow-new-ssrc")]
     FollowNewSsrc,
 }
@@ -2215,7 +2215,12 @@ impl Session<Described> {
                         // Handles RTCP receiver reports the server sends about
                         // Retina's packets. These have the server's SSRC, so
                         // don't expect Retina's.
-                        rtp_handler: rtp::InorderParser::new(None, None, policy.unknown_rtcp_ssrc),
+                        rtp_handler: rtp::InorderParser::new(
+                            None,
+                            None,
+                            policy.unknown_rtcp_ssrc,
+                            policy.unknown_rtp_ssrc,
+                        ),
                         ctx,
                         udp_sockets: None,
 

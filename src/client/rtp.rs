@@ -3,6 +3,8 @@
 
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use log::{debug, warn};
 
@@ -14,6 +16,7 @@ use crate::{
     StreamContextInner,
 };
 
+use super::receiver_report::SeqState;
 use super::{SessionOptions, Timeline, UnknownRtcpSsrcPolicy, UnknownRtpSsrcPolicy};
 
 /// Describes how Retina formed its initial expectation for the stream's `ssrc` or `seq`.
@@ -63,7 +66,9 @@ struct Seq {
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. Some servers change it when
 /// restarting their encoder, with or without a BYE. [`UnknownRtpSsrcPolicy::FollowNewSsrc`]
-/// continues the stream from the new SSRC.
+/// continues the stream from the new SSRC once it has sent `MIN_SEQUENTIAL`
+/// sequential packets, as in RFC 3550 appendix A.1. The BYE itself is currently
+/// ignored.
 #[doc(hidden)] // pub only for the benchmarks; not a stable API.
 #[derive(Debug)]
 pub struct InorderParser {
@@ -80,6 +85,13 @@ pub struct InorderParser {
     seen_unknown_rtcp_session: bool,
 
     unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
+
+    /// Under [`UnknownRtpSsrcPolicy::FollowNewSsrc`], an SSRC other than
+    /// `ssrc` which is on probation to replace it.
+    new_ssrc: Option<(u32, SeqState)>,
+
+    /// When the last RTP packet accepted from the stream arrived.
+    last_rtp_received: Option<Instant>,
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -125,6 +137,8 @@ impl InorderParser {
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
             unknown_rtp_ssrc,
+            new_ssrc: None,
+            last_rtp_received: None,
         }
     }
 
@@ -154,6 +168,10 @@ impl InorderParser {
         let ssrc = header.ssrc();
         let ssrc_changed = matches!(self.ssrc, Some(s) if s.ssrc != ssrc);
         if ssrc_changed && matches!(self.unknown_rtp_ssrc, UnknownRtpSsrcPolicy::FollowNewSsrc) {
+            if !self.new_ssrc_passes_probation(ssrc, sequence_number) {
+                debug!("skipping seq={sequence_number} from ssrc={ssrc:08x} on probation");
+                return Ok(None);
+            }
             log::info!(
                 "following ssrc change to {:08x} after {} RTP pkts + {} RTCP pkts; was expecting ssrc={:?} seq={:?}",
                 ssrc,
@@ -167,7 +185,11 @@ impl InorderParser {
                 ssrc,
             });
             self.seq = None;
-            timeline.continue_at(header.timestamp());
+            let since_last_packet = self
+                .last_rtp_received
+                .map(|last| pkt_ctx.received().saturating_duration_since(last))
+                .unwrap_or_default();
+            timeline.continue_at(header.timestamp(), since_last_packet);
         } else if ssrc_changed {
             note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
@@ -234,7 +256,22 @@ impl InorderParser {
             next: sequence_number.wrapping_add(1),
         });
         self.seen_rtp_packets += 1;
+        self.last_rtp_received = Some(pkt_ctx.received());
         Ok(Some((timestamp, loss)))
+    }
+
+    /// Notes a packet from an SSRC other than the stream's, returning true once
+    /// that SSRC has passed probation.
+    fn new_ssrc_passes_probation(&mut self, ssrc: u32, sequence_number: u16) -> bool {
+        let seq = match &mut self.new_ssrc {
+            Some((s, seq)) if *s == ssrc => seq,
+            new_ssrc => &mut new_ssrc.insert((ssrc, SeqState::new(sequence_number))).1,
+        };
+        let passed = seq.update(sequence_number);
+        if passed {
+            self.new_ssrc = None;
+        }
+        passed
     }
 
     /// Formats an error description for a failed [`PacketHeader::validate`].
@@ -528,6 +565,7 @@ impl Sender {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::num::NonZeroU32;
+    use std::time::Duration;
 
     use crate::client::UdpStreamContext;
 
@@ -717,9 +755,10 @@ mod tests {
         }
     }
 
-    fn push_rtp(
+    fn push_rtp_at(
         parser: &mut InorderParser,
         timeline: &mut Timeline,
+        received: Instant,
         ssrc: u32,
         sequence_number: u16,
         timestamp: u32,
@@ -727,15 +766,36 @@ mod tests {
         let pkt =
             crate::rtp::build_raw_rtp(sequence_number, timestamp, 96, ssrc, true, *b"pkt").unwrap();
         let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+        let pkt_ctx = PacketContext(PacketContextInner::Udp {
+            received,
+            received_wall: crate::WallTime::now(),
+        });
         parser.rtp(
             &SessionOptions::default(),
             &StreamContext::dummy(),
             None,
             &ConnectionContext::dummy(),
-            &PacketContext::dummy(),
+            &pkt_ctx,
             timeline,
             0,
             &header,
+        )
+    }
+
+    fn push_rtp(
+        parser: &mut InorderParser,
+        timeline: &mut Timeline,
+        ssrc: u32,
+        sequence_number: u16,
+        timestamp: u32,
+    ) -> Result<Option<PacketMeta>, Error> {
+        push_rtp_at(
+            parser,
+            timeline,
+            Instant::now(),
+            ssrc,
+            sequence_number,
+            timestamp,
         )
     }
 
@@ -764,27 +824,69 @@ mod tests {
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::FollowNewSsrc,
         );
-        push_rtp(&mut parser, &mut timeline, 0x1111, 10, 1_000)
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        push_rtp_at(&mut parser, &mut timeline, at(0), 0x1111, 10, 1_000)
             .unwrap()
             .unwrap();
-        let old = push_rtp(&mut parser, &mut timeline, 0x1111, 11, 4_000)
+        let old = push_rtp_at(&mut parser, &mut timeline, at(33), 0x1111, 11, 4_000)
             .unwrap()
             .unwrap();
 
         // The new ssrc's sequence numbers and timestamps start lower than the
         // old ones, which would otherwise be an out-of-order packet and a
-        // backward time jump.
-        let first = push_rtp(&mut parser, &mut timeline, 0x2222, 5, 500)
+        // backward time jump. Its first packet is on probation.
+        assert!(
+            push_rtp_at(&mut parser, &mut timeline, at(100), 0x2222, 5, 500)
+                .unwrap()
+                .is_none()
+        );
+        let first = push_rtp_at(&mut parser, &mut timeline, at(133), 0x2222, 6, 3_500)
             .unwrap()
             .unwrap();
         assert_eq!(first.ssrc, 0x2222);
         assert_eq!(first.loss, 0);
-        assert_eq!(first.timestamp.elapsed(), old.timestamp.elapsed());
+        // 100 ms between the old ssrc's last packet and this one, at 90 kHz.
+        assert_eq!(first.timestamp.elapsed(), old.timestamp.elapsed() + 9_000);
 
-        let second = push_rtp(&mut parser, &mut timeline, 0x2222, 6, 3_500)
+        // A late packet from the old ssrc doesn't switch back.
+        assert!(
+            push_rtp_at(&mut parser, &mut timeline, at(140), 0x1111, 12, 7_000)
+                .unwrap()
+                .is_none()
+        );
+        let second = push_rtp_at(&mut parser, &mut timeline, at(166), 0x2222, 7, 6_500)
             .unwrap()
             .unwrap();
+        assert_eq!(second.ssrc, 0x2222);
         assert_eq!(second.loss, 0);
-        assert_eq!(second.timestamp.elapsed(), old.timestamp.elapsed() + 3_000);
+        assert_eq!(
+            second.timestamp.elapsed(),
+            first.timestamp.elapsed() + 3_000
+        );
+    }
+
+    #[test]
+    fn ssrc_change_after_a_long_gap_bypasses_the_time_jump_policy() {
+        let mut timeline = Timeline::new(None, 90_000, NonZeroU32::new(10)).unwrap();
+        let mut parser = InorderParser::new(
+            None,
+            None,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::FollowNewSsrc,
+        );
+        let start = Instant::now();
+        let old = push_rtp_at(&mut parser, &mut timeline, start, 0x1111, 10, 1_000)
+            .unwrap()
+            .unwrap();
+        let restarted = start + Duration::from_secs(30);
+        push_rtp_at(&mut parser, &mut timeline, restarted, 0x2222, 5, 500).unwrap();
+        let first = push_rtp_at(&mut parser, &mut timeline, restarted, 0x2222, 6, 500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.timestamp.elapsed(),
+            old.timestamp.elapsed() + 30 * 90_000
+        );
     }
 }
