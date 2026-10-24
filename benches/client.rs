@@ -7,8 +7,11 @@ use std::{io::ErrorKind, net::SocketAddr, num::NonZeroU32};
 
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use futures::StreamExt;
-use retina::client::{CodecItem, PlayOptions, SetupOptions};
+use retina::PacketContext;
+use retina::client::{PlayOptions, PlayingItem, SetupOptions};
+use retina::codec::{
+    Accumulate, Depacketizer, FrameFormat, VideoFrameEnd, VideoFrameStart, VideoHandler,
+};
 use std::convert::TryFrom;
 use tokio::io::AsyncWriteExt;
 use url::Url;
@@ -97,34 +100,43 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
     Bytes::from(data)
 }
 
+/// Counts frames, accumulating each as an owned `Vec<u8>`.
+struct Counter(usize);
+
+impl VideoHandler<PacketContext> for Counter {
+    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+        Accumulate::Yes
+    }
+
+    fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
+        std::hint::black_box(frame_end.complete_frame(FrameFormat::MP4).unwrap());
+        self.0 += 1;
+    }
+
+    fn loss(&mut self, loss: &retina::codec::Loss<'_, PacketContext>) {
+        panic!("unexpected loss: {:?}", loss.reason());
+    }
+}
+
 async fn read_to_eof(addr: SocketAddr) {
     let url = Url::parse(&format!("rtsp://{}/", addr)).unwrap();
     let mut session =
         retina::client::Session::describe(url, retina::client::SessionOptions::default())
             .await
             .unwrap();
-    session
-        .setup(
-            0,
-            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
-        )
-        .await
-        .unwrap();
-    let session = session
-        .play(PlayOptions::default())
-        .await
-        .unwrap()
-        .demuxed()
-        .unwrap();
-    tokio::pin!(session);
-    let mut i = 0;
-    while let Some(item) = session.next().await {
+    session.setup(0, SetupOptions::default()).await.unwrap();
+    let Ok(Depacketizer::Video(mut depacketizer)) = session.streams()[0].new_depacketizer() else {
+        panic!("expected a video depacketizer");
+    };
+    let mut session = session.play(PlayOptions::default()).await.unwrap();
+    let mut counter = Counter(0);
+    while let Some(item) = session.next_item().await {
         match item {
-            Ok(CodecItem::VideoFrame(_)) => i += 1,
+            Ok(PlayingItem::Rtp(pkt)) => depacketizer.push(pkt.packet(), &mut counter),
             o => panic!("bad item: {o:#?}"),
         }
     }
-    assert_eq!(i, 30 * 60);
+    assert_eq!(counter.0, 30 * 60);
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
