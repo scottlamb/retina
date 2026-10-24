@@ -38,18 +38,23 @@ mod mostly_ascii;
 #[doc(hidden)]
 pub mod testutil;
 
-pub use error::Error;
-
 /// Wraps the supplied `ErrorInt` and returns it as an `Err`.
+///
+/// Like [`wrap!`], this uses whatever `Error` is in scope at the call site.
 macro_rules! bail {
     ($e:expr) => {
-        return Err(crate::error::Error(std::sync::Arc::new($e)))
+        return Err(wrap!($e))
     };
 }
 
+/// Wraps the supplied `ErrorInt` in an `Error`.
+///
+/// `Error` resolves at the call site: `client::Error` or the private
+/// `crate::error::Error` used by code it shares. Both are tuple structs around
+/// an `Arc<ErrorInt>`, and the latter converts to the former via `From`.
 macro_rules! wrap {
     ($e:expr) => {
-        crate::error::Error(std::sync::Arc::new($e))
+        Error(std::sync::Arc::new($e))
     };
 }
 

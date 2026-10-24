@@ -56,7 +56,7 @@ use std::task::ready;
 use tokio::net::UdpSocket;
 use url::Url;
 
-use crate::{Error, ErrorInt, RtspMessageContext, StreamContext};
+use crate::{ErrorInt, RtspMessageContext, StreamContext};
 
 mod channel_mapping;
 mod conn;
@@ -68,6 +68,43 @@ mod rtp;
 
 mod session_core;
 mod teardown;
+
+/// An error from an RTSP client session or connection.
+///
+/// This is returned by [`Session`], [`SessionCore`], and
+/// [`SessionGroup::await_teardown`].
+///
+/// Currently the focus is on providing detailed human-readable error messages.
+/// In most cases they have enough information to find the offending packet
+/// in Wireshark.
+///
+/// If you wish to inspect Retina errors programmatically, or if you need
+/// errors formatted in a different way, please file an issue on the `retina`
+/// repository.
+#[derive(Clone, derive_more::Debug, derive_more::Display, derive_more::Error)]
+#[display("{_0}")]
+#[debug("{_0:?}")]
+pub struct Error(#[error(not(source))] pub(crate) Arc<ErrorInt>);
+
+impl Error {
+    /// Returns the status code, if the error is about a valid RTSP response.
+    ///
+    /// This includes a success response with an unparseable body. It's `None`
+    /// when there was no valid response at all.
+    pub fn status_code(&self) -> Option<u16> {
+        match self.0.as_ref() {
+            ErrorInt::RtspResponseError { status, .. } => Some((*status).into()),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::error::Error> for Error {
+    #[inline]
+    fn from(e: crate::error::Error) -> Self {
+        Self(e.0)
+    }
+}
 
 /// Assumed expiration time for stale live555 TCP sessions (case #2 of "Stale
 /// sessions" in [`SessionGroup`]).
@@ -458,17 +495,34 @@ pub enum TeardownPolicy {
     Never,
 }
 
+/// An error from parsing a client option, such as [`TeardownPolicy`], from a
+/// string: the name is unknown.
+///
+/// This is opaque; its [`std::fmt::Display`] output describes the problem.
+#[derive(Clone, Debug)]
+pub struct ParseOptionError(String);
+
+impl std::fmt::Display for ParseOptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseOptionError {}
+
 impl std::str::FromStr for TeardownPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "auto" => TeardownPolicy::Auto,
             "never" => TeardownPolicy::Never,
             "always" => TeardownPolicy::Always,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad TeardownPolicy {s}; expected auto, never, or always"
-            ))),
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad TeardownPolicy {s}; expected auto, never, or always"
+                )));
+            }
         })
     }
 }
@@ -503,7 +557,7 @@ pub enum InitialTimestampPolicy {
 }
 
 impl std::str::FromStr for InitialTimestampPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -511,10 +565,12 @@ impl std::str::FromStr for InitialTimestampPolicy {
             "require" => InitialTimestampPolicy::Require,
             "ignore" => InitialTimestampPolicy::Ignore,
             "permissive" => InitialTimestampPolicy::Permissive,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad InitialTimestampPolicy {s}; \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad InitialTimestampPolicy {s}; \
                  expected default, require, ignore or permissive"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -549,7 +605,7 @@ pub enum InitialSequenceNumberPolicy {
 }
 
 impl std::str::FromStr for InitialSequenceNumberPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -557,10 +613,12 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
             "respect" => InitialSequenceNumberPolicy::Respect,
             "ignore-suspicious-values" => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
             "ignore" => InitialSequenceNumberPolicy::Ignore,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad InitialSequenceNumberPolicy {s}; \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad InitialSequenceNumberPolicy {s}; \
                  expected default, respect, ignore-suspicious-values, or ignore"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -588,7 +646,7 @@ pub enum UnknownRtcpSsrcPolicy {
 }
 
 impl std::str::FromStr for UnknownRtcpSsrcPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -596,10 +654,12 @@ impl std::str::FromStr for UnknownRtcpSsrcPolicy {
             "abort-session" => UnknownRtcpSsrcPolicy::AbortSession,
             "drop-packets" => UnknownRtcpSsrcPolicy::DropPackets,
             "process-packets" => UnknownRtcpSsrcPolicy::ProcessPackets,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad UnknownRtcpSsrcPolicy {s}; \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad UnknownRtcpSsrcPolicy {s}; \
                  expected default, abort-session, drop-packets, or process-packets"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -662,7 +722,7 @@ pub enum UnassignedChannelDataPolicy {
 }
 
 impl std::str::FromStr for UnassignedChannelDataPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
@@ -670,10 +730,12 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
             "assume-stale-session" => UnassignedChannelDataPolicy::AssumeStaleSession,
             "error" => UnassignedChannelDataPolicy::Error,
             "ignore" => UnassignedChannelDataPolicy::Ignore,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad UnassignedChannelDataPolicy {s}; expected auto, assume-stale-session, error, \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad UnassignedChannelDataPolicy {s}; expected auto, assume-stale-session, error, \
                  or ignore"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -699,17 +761,19 @@ pub enum SessionIdPolicy {
 }
 
 impl std::str::FromStr for SessionIdPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "default" => SessionIdPolicy::Default,
             "require-match" => SessionIdPolicy::RequireMatch,
             "use-first" => SessionIdPolicy::UseFirst,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad SessionIdPolicy {s}; \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad SessionIdPolicy {s}; \
                  expected default, require-match or use-first"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -754,16 +818,18 @@ impl ReceiverReportPolicy {
 }
 
 impl std::str::FromStr for ReceiverReportPolicy {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "default" => ReceiverReportPolicy::Default,
             "never" => ReceiverReportPolicy::Never,
             "always" => ReceiverReportPolicy::Always,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad ReceiverReportPolicy {s}; expected default, never, or always"
-            ))),
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad ReceiverReportPolicy {s}; expected default, never, or always"
+                )));
+            }
         })
     }
 }
@@ -795,16 +861,18 @@ impl Default for Transport {
 }
 
 impl std::str::FromStr for Transport {
-    type Err = Error;
+    type Err = ParseOptionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "tcp" => Transport::Tcp(TcpTransportOptions::default()),
             "udp" => Transport::Udp(UdpTransportOptions::default()),
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "bad Transport {s}; \
+            _ => {
+                return Err(ParseOptionError(format!(
+                    "bad Transport {s}; \
                  expected tcp or udp"
-            ))),
+                )));
+            }
         })
     }
 }
@@ -1298,15 +1366,19 @@ impl Stream {
     /// This is equivalent to [`crate::codec::Depacketizer::new`] with
     /// [`Stream::payload_format`].
     ///
-    /// Returns an error if the codec is unsupported, the SDP's parameters
-    /// for it are invalid, or this is a [`StreamDirection::Sending`] stream.
+    /// Returns a [`crate::codec::ErrorKind::Unsupported`] error if the codec
+    /// is unsupported or this is a [`StreamDirection::Sending`] stream, or a
+    /// [`crate::codec::ErrorKind::Invalid`] error if the SDP's parameters for
+    /// it are invalid.
     ///
     /// Each depacketizer should be used with a single session; see
     /// [`crate::codec::VideoDepacketizer::push`].
-    pub fn new_depacketizer<Ctx: Clone>(&self) -> Result<crate::codec::Depacketizer<Ctx>, Error> {
+    pub fn new_depacketizer<Ctx: Clone>(
+        &self,
+    ) -> Result<crate::codec::Depacketizer<Ctx>, crate::codec::Error> {
         if self.direction == StreamDirection::Sending {
-            bail!(ErrorInt::InvalidArgument(
-                "can't depacketize a sending stream (ONVIF backchannel)".to_owned()
+            return Err(crate::codec::Error::unsupported(
+                "can't depacketize a sending stream (ONVIF backchannel)",
             ));
         }
         crate::codec::Depacketizer::new(&self.payload_format())

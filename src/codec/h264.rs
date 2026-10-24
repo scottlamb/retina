@@ -24,11 +24,13 @@ mod analyzer;
 pub(crate) use analyzer::Analyzer;
 
 /// Returns parameters for the given SPS and PPS, in that order.
-pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, super::Error> {
     let &[sps, pps] = sets else {
         unreachable!("expected SPS and PPS");
     };
-    InternalParameters::parse_sps_and_pps(sps, pps, true).map(|p| p.generic_parameters)
+    InternalParameters::parse_sps_and_pps(sps, pps, true)
+        .map(|p| p.generic_parameters)
+        .map_err(super::Error::invalid)
 }
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
@@ -187,11 +189,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new(
         clock_rate: u32,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, super::Error> {
         if clock_rate != 90_000 {
-            return Err(format!(
+            return Err(super::Error::invalid(format!(
                 "invalid H.264 clock rate {clock_rate}; must always be 90000"
-            ));
+            )));
         }
 
         let parameters = match format_specific_params {
@@ -740,11 +742,14 @@ impl super::events::ParametersOverrideSlot for Option<ParametersOverride> {
         self.as_ref().map(|o| &o.0.generic_parameters)
     }
 
-    fn set(&mut self, parameters: &VideoParameters) -> Result<(), String> {
+    fn set(&mut self, parameters: &VideoParameters) -> Result<(), super::Error> {
         let super::VideoParametersCodec::H264 { sps, pps } = &parameters.codec else {
-            return Err("parameters aren't for an H.264 stream".to_owned());
+            return Err(super::Error::invalid(
+                "parameters aren't for an H.264 stream",
+            ));
         };
-        let p = InternalParameters::parse_sps_and_pps(sps, pps, true)?;
+        let p =
+            InternalParameters::parse_sps_and_pps(sps, pps, true).map_err(super::Error::invalid)?;
         *self = Some(ParametersOverride(Box::new(p)));
         Ok(())
     }
@@ -1127,7 +1132,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
         }
     }
 
-    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, super::Error> {
         parameters_from_sets(sets)
     }
 

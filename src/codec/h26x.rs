@@ -55,7 +55,10 @@ impl Codec {
         }
     }
 
-    fn parameters(self, sets: &[&[u8]]) -> Result<crate::codec::VideoParameters, String> {
+    fn parameters(
+        self,
+        sets: &[&[u8]],
+    ) -> Result<crate::codec::VideoParameters, crate::codec::Error> {
         match self {
             #[cfg(feature = "h264")]
             Codec::H264 => crate::codec::h264::parameters_from_sets(sets),
@@ -70,22 +73,23 @@ impl Codec {
     pub(crate) fn parameters_from_unordered_sets<'s>(
         self,
         sets: impl IntoIterator<Item = &'s [u8]>,
-    ) -> Result<crate::codec::VideoParameters, String> {
+    ) -> Result<crate::codec::VideoParameters, crate::codec::Error> {
+        use crate::codec::Error;
         let mut ordered: [Option<&[u8]>; 3] = [None; 3];
         for set in sets {
             let hex = crate::hex::LimitedHex::new(set, 64);
             let Some(i) = self.set_index(set) else {
-                return Err(format!("not a parameter set: {hex}"));
+                return Err(Error::invalid(format!("not a parameter set: {hex}")));
             };
             if ordered[i].replace(set).is_some() {
-                return Err(format!(
+                return Err(Error::unsupported(format!(
                     "multiple parameter sets of the same type are currently unsupported: {hex}"
-                ));
+                )));
             }
         }
         let ordered = &ordered[..self.num_sets()];
         let Some(sets) = ordered.iter().copied().collect::<Option<Vec<_>>>() else {
-            return Err(format!(
+            return Err(Error::invalid(format!(
                 "expected {}",
                 match self {
                     #[cfg(feature = "h264")]
@@ -93,7 +97,7 @@ impl Codec {
                     #[cfg(feature = "h265")]
                     Codec::H265 => "a VPS, an SPS, and a PPS",
                 }
-            ));
+            )));
         };
         self.parameters(&sets)
     }
@@ -746,11 +750,13 @@ fn extend<Ctx>(
     if end == start {
         return Ok(());
     }
-    analyzer.extend_nal(
-        buf,
-        start,
-        usize::try_from(end - start).expect("len fits in usize"),
-    )
+    analyzer
+        .extend_nal(
+            buf,
+            start,
+            usize::try_from(end - start).expect("len fits in usize"),
+        )
+        .map_err(|e| e.to_string())
 }
 
 impl<A: U8Array> AnnexBScanner<A> {
@@ -790,7 +796,9 @@ impl<A: U8Array> AnnexBScanner<A> {
                             return Ok(());
                         }
                     }
-                    analyzer.start_nal(cur.as_mut(), buf, pos, 0)?;
+                    analyzer
+                        .start_nal(cur.as_mut(), buf, pos, 0)
+                        .map_err(|e| e.to_string())?;
                     *self = AnnexBScanner::Mid(Default::default());
                     match self {
                         AnnexBScanner::Mid(mid) => mid,
@@ -812,7 +820,7 @@ impl<A: U8Array> AnnexBScanner<A> {
                             // 00 00 00+ 01: start code complete.
                             data.advance(1);
                             pos += 1;
-                            analyzer.finish_nal()?;
+                            analyzer.finish_nal().map_err(|e| e.to_string())?;
                             *self = Self::default();
                             continue 'nal;
                         }
@@ -849,7 +857,7 @@ impl<A: U8Array> AnnexBScanner<A> {
                         mid.deferred = None;
                         data.advance(1);
                         pos += 1;
-                        analyzer.finish_nal()?;
+                        analyzer.finish_nal().map_err(|e| e.to_string())?;
                         *self = Self::default();
                         continue 'nal;
                     }
@@ -870,7 +878,7 @@ impl<A: U8Array> AnnexBScanner<A> {
             extend(analyzer, buf, run_start, pos - u64::from(zeros))?;
             if end {
                 // Any pending zeros are trailing zeros.
-                analyzer.finish_nal()?;
+                analyzer.finish_nal().map_err(|e| e.to_string())?;
                 *self = Self::default();
             } else if zeros > 0 {
                 let first = pos - u64::from(zeros);

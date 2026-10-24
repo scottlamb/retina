@@ -15,8 +15,8 @@ use super::{
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, PiecesReader, check_range};
 use crate::codec::{
-    Accumulate, Corruption, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason,
-    VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
+    Accumulate, Corruption, DecodabilityState, DecodabilityTracker, Error, FrameBody, Loss,
+    LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
 };
 
 /// Analyzes H.264 access units (frames), regardless of how they're transported.
@@ -371,10 +371,10 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         });
     }
 
-    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         check_range(buf, pos, len);
         if len == 0 {
-            return Err("empty NAL unit".into());
+            return Err(Error::invalid("empty NAL unit"));
         }
         let hdr = [buf.split(pos, 1).slices().0[0]];
         self.start_nal(&hdr, buf, pos + 1, len - 1)?;
@@ -387,7 +387,7 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         buf: &MarkBuf,
         body_pos: u64,
         body_len: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let au = self.au.as_mut().expect("start_nal without start_au");
         assert!(
             au.in_progress.is_none(),
@@ -395,23 +395,24 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         );
         check_range(buf, body_pos, body_len);
         let &[hdr] = header else {
-            return Err(format!(
+            return Err(Error::invalid(format!(
                 "expected a 1-byte NAL header; got {} bytes",
                 header.len()
-            ));
+            )));
         };
-        let hdr = NalHeader::new(hdr).map_err(|_| format!("bad NAL header {hdr:02x}"))?;
+        let hdr =
+            NalHeader::new(hdr).map_err(|_| Error::invalid(format!("bad NAL header {hdr:02x}")))?;
         au.in_progress = Some(InProgressNal { hdr, len: 1 });
         self.add_piece(buf, body_pos, body_len)
     }
 
-    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         assert!(self.has_nal(), "extend_nal without start_nal");
         check_range(buf, pos, len);
         self.add_piece(buf, pos, len)
     }
 
-    fn finish_nal(&mut self) -> Result<(), String> {
+    fn finish_nal(&mut self) -> Result<(), Error> {
         let ip = self
             .au
             .as_mut()
@@ -613,7 +614,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     }
 
     /// Adds `[pos, pos + len)` to the NAL unit in progress, pinning it.
-    fn add_piece(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn add_piece(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         if len == 0 {
             return Ok(());
         }
@@ -622,11 +623,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .as_mut()
             .and_then(|au| au.in_progress.as_mut())
             .expect("NAL unit in progress");
-        let piece_len = u32::try_from(len).map_err(|_| "excessively long NAL")?;
+        let piece_len = u32::try_from(len).map_err(|_| Error::invalid("excessively long NAL"))?;
         ip.len = ip
             .len
             .checked_add(piece_len)
-            .ok_or("excessively long NAL")?;
+            .ok_or_else(|| Error::invalid("excessively long NAL"))?;
         crate::codec::h26x::pin(&mut self.mark, buf, pos);
         self.pieces.push(BufRange {
             pos,

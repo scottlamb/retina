@@ -16,10 +16,27 @@ mod sender;
 mod seq;
 mod timeline;
 
-pub use receiver::{ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch};
+pub use receiver::{
+    OptionsError, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
+};
 pub use reorder::{Pushed, ReorderCounters, ReorderOptions, Reordered, Reorderer};
 #[cfg(feature = "unstable-send")]
 pub use sender::{OutgoingPacketRef, Sender, SenderOptions, SenderSink};
+pub use timeline::TimestampReason;
+
+/// An error from [`PacketHeader::validate`]: the packet is malformed.
+///
+/// This is opaque; its [`std::fmt::Display`] output describes the problem.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ParseError(&'static str);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
@@ -50,14 +67,14 @@ impl PacketHeader {
     ///
     /// Accepts any [`Input`] implementation: a `&[u8]` or a
     /// [`Split`] pair of ring-buffer slices.
-    pub fn validate<'i>(input: impl Input<'i>) -> Result<ValidatedPacket, &'static str> {
-        let len = u16::try_from(input.len()).map_err(|_| "too long")?;
+    pub fn validate<'i>(input: impl Input<'i>) -> Result<ValidatedPacket, ParseError> {
+        let len = u16::try_from(input.len()).map_err(|_| ParseError("too long"))?;
         if len < Self::LEN {
-            return Err("too short");
+            return Err(ParseError("too short"));
         }
         let header = Self(input.peek_array::<{ Self::LEN as usize }>());
         if (header.0[0] & 0b1100_0000) != 2 << 6 {
-            return Err("must be version 2");
+            return Err(ParseError("must be version 2"));
         }
         let has_padding = (header.0[0] & 0b0010_0000) != 0;
         let has_extension = (header.0[0] & 0b0001_0000) != 0;
@@ -65,7 +82,7 @@ impl PacketHeader {
         let csrc_end = Self::LEN + (4 * u16::from(csrc_count));
         let payload_start = if has_extension {
             if input.len() < usize::from(csrc_end + 4) {
-                return Err("extension is after end of packet");
+                return Err(ParseError("extension is after end of packet"));
             }
             let extension_len = u16::from_be_bytes([
                 input.byte_at(usize::from(csrc_end) + 2),
@@ -74,26 +91,26 @@ impl PacketHeader {
             extension_len
                 .checked_mul(4)
                 .and_then(|e| e.checked_add(csrc_end + 4))
-                .ok_or("extension extends beyond maximum packet size")?
+                .ok_or(ParseError("extension extends beyond maximum packet size"))?
         } else {
             csrc_end
         };
         if len < payload_start {
-            return Err("payload start is after end of packet");
+            return Err(ParseError("payload start is after end of packet"));
         }
         let payload_end = if has_padding {
             if len == payload_start {
-                return Err("missing padding");
+                return Err(ParseError("missing padding"));
             }
             let padding_len = u16::from(input.byte_at(input.len() - 1));
             if padding_len == 0 {
-                return Err("invalid padding length 0");
+                return Err(ParseError("invalid padding length 0"));
             }
             let payload_end = len
                 .checked_sub(padding_len)
-                .ok_or("padding larger than packet")?;
+                .ok_or(ParseError("padding larger than packet"))?;
             if payload_end < payload_start {
-                return Err("bad padding");
+                return Err(ParseError("bad padding"));
             }
             payload_end
         } else {

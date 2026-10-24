@@ -6,10 +6,24 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use super::timeline::Timeline;
+use super::timeline::{Timeline, TimestampReason};
 use super::{Continuity, PacketHeader, ReceivedPacketMeta};
 use crate::rtcp::SenderReportRef;
-use crate::{Error, ErrorInt, NtpTimestamp, Timestamp};
+use crate::{NtpTimestamp, Timestamp};
+
+/// An error from [`Receiver::new`]: the options are unacceptable.
+///
+/// This is opaque; its [`std::fmt::Display`] output describes the problem.
+#[derive(Clone, Debug)]
+pub struct OptionsError(pub(super) String);
+
+impl std::fmt::Display for OptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OptionsError {}
 
 /// Options for a [`Receiver`].
 #[derive(Clone, Debug)]
@@ -123,7 +137,9 @@ pub enum ReceiveError {
         /// The SSRC and sequence number of the RTP packet, or `None` for a
         /// sender report.
         rtp: Option<(u32, u16)>,
-        description: String,
+
+        /// Why the timestamp was rejected.
+        reason: TimestampReason,
     },
 }
 
@@ -149,12 +165,9 @@ impl std::fmt::Display for ReceiveError {
             ),
             ReceiveError::Timestamp {
                 rtp: Some(_),
-                description,
-            } => f.write_str(description),
-            ReceiveError::Timestamp {
-                rtp: None,
-                description,
-            } => write!(f, "{description} in RTCP SR"),
+                reason,
+            } => write!(f, "{reason}"),
+            ReceiveError::Timestamp { rtp: None, reason } => write!(f, "{reason} in RTCP SR"),
         }
     }
 }
@@ -281,13 +294,12 @@ impl Receiver {
     ///
     /// Errors on a clock rate of 0 or one too high for
     /// [`ReceiverOptions::max_forward_jump_secs`].
-    pub fn new(clock_rate: u32, options: ReceiverOptions) -> Result<Self, Error> {
+    pub fn new(clock_rate: u32, options: ReceiverOptions) -> Result<Self, OptionsError> {
         let timeline = Timeline::new(
             options.initial_rtptime,
             clock_rate,
             options.max_forward_jump_secs,
-        )
-        .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        )?;
         Ok(Self {
             timeline,
             ssrc: options.ssrc.map(|ssrc| Ssrc {
@@ -382,9 +394,9 @@ impl Receiver {
         let timestamp = self
             .timeline
             .advance_to(header.timestamp())
-            .map_err(|description| ReceiveError::Timestamp {
+            .map_err(|reason| ReceiveError::Timestamp {
                 rtp: Some((ssrc, sequence_number)),
-                description,
+                reason,
             })?;
         if self.ssrc.is_none() {
             self.ssrc = Some(Ssrc {
@@ -429,10 +441,7 @@ impl Receiver {
         let timestamp = self
             .timeline
             .place(sr.rtp_timestamp())
-            .map_err(|description| ReceiveError::Timestamp {
-                rtp: None,
-                description,
-            })?;
+            .map_err(|reason| ReceiveError::Timestamp { rtp: None, reason })?;
         let ssrc = sr.ssrc();
         let ssrc_match = match self.ssrc {
             Some(s) if s.ssrc == ssrc => SsrcMatch::Matched,

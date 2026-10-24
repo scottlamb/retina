@@ -4,7 +4,7 @@
 //! [`NalAnalyzer`], the interface of the H.264 and H.265 analyzers.
 
 use crate::buf::MarkBuf;
-use crate::codec::VideoParameters;
+use crate::codec::{Error, VideoParameters};
 
 /// Analyzes H.264 or H.265 access units (frames), regardless of how they're
 /// transported.
@@ -66,14 +66,14 @@ pub(crate) trait NalAnalyzer<Ctx> {
     /// This is equivalent to [`NalAnalyzer::start_nal`] followed by
     /// [`NalAnalyzer::finish_nal`].
     ///
-    /// Returns an error if the NAL unit
+    /// Returns an [`crate::codec::ErrorKind::Invalid`] error if the NAL unit
     /// is shorter than its header, or as [`NalAnalyzer::start_nal`] does.
     ///
     /// # Panics
     ///
     /// As with [`NalAnalyzer::start_nal`].
     #[cfg_attr(not(test), allow(dead_code))]
-    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String>;
+    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error>;
 
     /// Starts a NAL unit with the given `header` (1 byte for H.264, 2 bytes
     /// for H.265), supplying the first `body_len` bytes after it, at
@@ -88,7 +88,7 @@ pub(crate) trait NalAnalyzer<Ctx> {
     /// delivers the data so far via [`crate::codec::VideoHandler::data`], so a
     /// large slice can be passed on while it's still arriving.
     ///
-    /// Returns an error if the header is
+    /// Returns an [`crate::codec::ErrorKind::Invalid`] error if the header is
     /// invalid. No NAL unit is started, and the access unit is otherwise
     /// unaffected; the caller may continue it or not.
     ///
@@ -104,19 +104,19 @@ pub(crate) trait NalAnalyzer<Ctx> {
         buf: &MarkBuf,
         body_pos: u64,
         body_len: usize,
-    ) -> Result<(), String>;
+    ) -> Result<(), Error>;
 
     /// Supplies more of the NAL unit begun by [`NalAnalyzer::start_nal`]: the
     /// `len` bytes at `[pos, pos + len)` within `buf`.
     ///
-    /// Returns an error if the NAL unit
+    /// Returns an [`crate::codec::ErrorKind::Invalid`] error if the NAL unit
     /// would become too large to represent; the NAL unit is unaffected.
     ///
     /// # Panics
     ///
     /// Panics if no NAL unit is in progress, or as with
     /// [`NalAnalyzer::start_nal`].
-    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String>;
+    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error>;
 
     /// Ends the NAL unit begun by [`NalAnalyzer::start_nal`].
     ///
@@ -126,5 +126,5 @@ pub(crate) trait NalAnalyzer<Ctx> {
     /// # Panics
     ///
     /// Panics if no NAL unit is in progress.
-    fn finish_nal(&mut self) -> Result<(), String>;
+    fn finish_nal(&mut self) -> Result<(), Error>;
 }

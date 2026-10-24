@@ -12,8 +12,8 @@ use super::{AuData, FrameEndBody, InternalParameters, Nal, ParametersOverride, i
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, check_range};
 use crate::codec::{
-    Accumulate, Corruption, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason,
-    VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
+    Accumulate, Corruption, DecodabilityState, DecodabilityTracker, Error, FrameBody, Loss,
+    LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
 };
 
 /// Analyzes H.265 access units (frames), regardless of how they're transported.
@@ -294,10 +294,10 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         });
     }
 
-    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         check_range(buf, pos, len);
         if len < 2 {
-            return Err("NAL unit shorter than its header".into());
+            return Err(Error::invalid("NAL unit shorter than its header"));
         }
         let mut hdr = [0u8; 2];
         let (s1, s2) = buf.split(pos, 2).slices();
@@ -313,7 +313,7 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         buf: &MarkBuf,
         body_pos: u64,
         body_len: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), Error> {
         let au = self.au.as_mut().expect("start_nal without start_au");
         assert!(
             au.in_progress.is_none(),
@@ -321,23 +321,23 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         );
         check_range(buf, body_pos, body_len);
         let Ok(&hdr) = <&[u8; 2]>::try_from(header) else {
-            return Err(format!(
+            return Err(Error::invalid(format!(
                 "expected a 2-byte NAL header; got {} bytes",
                 header.len()
-            ));
+            )));
         };
-        let hdr = nal::Header::try_from(hdr).map_err(|e| e.0)?;
+        let hdr = nal::Header::try_from(hdr).map_err(|e| Error::invalid(e.0))?;
         au.in_progress = Some(InProgressNal { hdr, len: 2 });
         self.add_piece(buf, body_pos, body_len)
     }
 
-    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn extend_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         assert!(self.has_nal(), "extend_nal without start_nal");
         check_range(buf, pos, len);
         self.add_piece(buf, pos, len)
     }
 
-    fn finish_nal(&mut self) -> Result<(), String> {
+    fn finish_nal(&mut self) -> Result<(), Error> {
         let ip = self
             .au
             .as_mut()
@@ -524,7 +524,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     }
 
     /// Adds `[pos, pos + len)` to the NAL unit in progress, pinning it.
-    fn add_piece(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), String> {
+    fn add_piece(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
         if len == 0 {
             return Ok(());
         }
@@ -533,11 +533,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .as_mut()
             .and_then(|au| au.in_progress.as_mut())
             .expect("NAL unit in progress");
-        let piece_len = u32::try_from(len).map_err(|_| "excessively long NAL")?;
+        let piece_len = u32::try_from(len).map_err(|_| Error::invalid("excessively long NAL"))?;
         ip.len = ip
             .len
             .checked_add(piece_len)
-            .ok_or("excessively long NAL")?;
+            .ok_or_else(|| Error::invalid("excessively long NAL"))?;
         crate::codec::h26x::pin(&mut self.mark, buf, pos);
         self.pieces.push(BufRange {
             pos,
@@ -768,6 +768,7 @@ impl AuView<'_> {
         let seen_extra_trailing_data = old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
         InternalParameters::parse_vps_sps_pps(vps_nal, sps_nal, pps_nal, seen_extra_trailing_data)
             .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     /// Calls `frame_start` for a frame which is still in progress.

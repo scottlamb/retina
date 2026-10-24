@@ -11,12 +11,12 @@ use tokio::io::AsyncWrite;
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
+#[cfg(test)]
+use crate::ReceivedMessage;
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::OwnedMessage;
 use crate::rtsp::reader::Reader;
 use crate::{ConnectionContext, ErrorInt, WallTime};
-#[cfg(test)]
-use crate::{Error, ReceivedMessage};
 #[cfg(test)]
 use futures::Stream;
 #[cfg(test)]
@@ -192,7 +192,7 @@ fn poll_read(
 
 #[cfg(test)]
 impl Stream for Connection {
-    type Item = Result<ReceivedMessage, Error>;
+    type Item = Result<ReceivedMessage, crate::error::Error>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,

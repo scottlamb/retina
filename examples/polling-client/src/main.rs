@@ -239,7 +239,7 @@ impl Io {
         core: &mut SessionCore,
         stream_i: usize,
         channel_type: ChannelType,
-    ) -> Result<bool, retina::Error> {
+    ) -> Result<bool, retina::client::Error> {
         let socket = socket2::SockRef::from(self.udp_socket(stream_i, channel_type));
         let (first, second) = core.udp_buf(stream_i).spare_capacity(MAX_DATAGRAM);
         let first_len = first.len().min(MAX_DATAGRAM);

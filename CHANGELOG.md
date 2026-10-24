@@ -15,6 +15,32 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   BREAKING: replace the crate-wide `retina::Error` with module-scoped error
+    types, so signatures say what can fail:
+    *   `client::Error` for `Session::{describe, setup, play, next_item,
+        poll_next_item, queue_rtcp}`, `SessionGroup::await_teardown`,
+        and `SessionCore`. It keeps `status_code()`.
+    *   `codec::Error`, with a `kind()` of `codec::ErrorKind::Unsupported` or
+        `codec::ErrorKind::Invalid`, for `Depacketizer::new`,
+        `{Video,Audio,Message}Depacketizer::new`,
+        `client::Stream::new_depacketizer`,
+        `VideoParameters::{from_h264_parameter_sets, from_h265_parameter_sets}`,
+        `VideoPacketizer::{new, set_parameters, push_frame}`,
+        `VideoFrameStart::set_parameters`, and
+        `{Video,Audio}SampleEntryBuilder::build`. This lets callers skip
+        streams Retina doesn't handle without treating them like malformed
+        ones.
+    *   `rtp::ParseError` (instead of `&'static str`) for
+        `rtp::PacketHeader::validate`.
+    *   `rtcp::ParseError` (instead of `String`) for
+        `rtcp::PacketRef::{parse, as_typed, as_sender_report}`.
+    *   `h265::nal::Error` (instead of `String`) for
+        `h265::nal::Sps::all_pixel_dimensions`.
+    *   `rtp::OptionsError` for `rtp::Receiver::new`.
+    *   `client::ParseOptionError` for the `FromStr` impls of `Transport` and
+        the client policy enums.
+*   BREAKING: `rtp::ReceiveError::Timestamp` has a `reason:
+    rtp::TimestampReason` instead of `description: String`.
 *   BREAKING: add a `tokio` feature (enabled by default) for the tokio-based
     client: `client::Session`, `client::SessionGroup::await_stale_sessions`,
     and `client::SessionOptions::bind`. With it disabled, Retina doesn't

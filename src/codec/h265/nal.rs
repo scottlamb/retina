@@ -262,7 +262,7 @@ pub fn split(nal: &[u8]) -> Result<(Header, impl BitRead + '_), Error> {
     Ok((header, bits))
 }
 
-#[derive(Debug, derive_more::Display, derive_more::Error)]
+#[derive(Clone, Debug, derive_more::Display, derive_more::Error)]
 #[display("{_0}")]
 pub struct Error(#[error(not(source))] pub(crate) String);
 
@@ -501,15 +501,15 @@ impl Sps {
 
     /// Returns the pixel dimensions, unless the conformance cropping window is
     /// larger than the picture.
-    pub fn all_pixel_dimensions(&self) -> Result<AllPixelDimensions, String> {
+    pub fn all_pixel_dimensions(&self) -> Result<AllPixelDimensions, Error> {
         let coded_width: u16 = self
             .pic_width_in_luma_samples
             .try_into()
-            .map_err(|_| "bad pic_width_in_luma_samples")?;
+            .map_err(|_| Error("bad pic_width_in_luma_samples".to_owned()))?;
         let coded_height: u16 = self
             .pic_height_in_luma_samples
             .try_into()
-            .map_err(|_| "bad pic_height_in_luma_samples")?;
+            .map_err(|_| Error("bad pic_height_in_luma_samples".to_owned()))?;
         let mut display_width = coded_width;
         let mut display_height = coded_height;
         if let Some(ref c) = self.conformance_window {
@@ -522,19 +522,19 @@ impl Sps {
                 .checked_add(c.right_offset)
                 .and_then(|x| x.checked_shl(width_shift))
                 .and_then(|x| x.try_into().ok())
-                .ok_or("bad conformance window")?;
+                .ok_or_else(|| Error("bad conformance window".to_owned()))?;
             let sub_height = c
                 .top_offset
                 .checked_add(c.bottom_offset)
                 .and_then(|x| x.checked_shl(height_shift))
                 .and_then(|x| x.try_into().ok())
-                .ok_or("bad conformance window")?;
+                .ok_or_else(|| Error("bad conformance window".to_owned()))?;
             display_width = display_width
                 .checked_sub(sub_width)
-                .ok_or("bad conformance window")?;
+                .ok_or_else(|| Error("bad conformance window".to_owned()))?;
             display_height = display_height
                 .checked_sub(sub_height)
-                .ok_or("bad conformance window")?;
+                .ok_or_else(|| Error("bad conformance window".to_owned()))?;
         }
         Ok(AllPixelDimensions {
             display: (display_width, display_height),

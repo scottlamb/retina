@@ -9,11 +9,10 @@ use std::time::Instant;
 use bytes::Bytes;
 use log::{debug, warn};
 
+use super::Error;
 use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{PacketHeader, ReceiveError, ReceivedPacketMeta, Receiver, SsrcMatch};
-use crate::{
-    Error, ErrorInt, PacketContext, PacketContextInner, StreamContext, StreamContextInner,
-};
+use crate::{ErrorInt, PacketContext, PacketContextInner, StreamContext, StreamContextInner};
 
 use super::UnknownRtcpSsrcPolicy;
 use super::conn::ConnCore;
@@ -71,13 +70,12 @@ impl StreamReceiver {
     /// Formats an error description for a failed [`PacketHeader::validate`].
     pub(crate) fn validate_error(
         &self,
-        reason: &'static str,
+        reason: crate::rtp::ParseError,
         pkt: crate::inputs::Split<'_>,
     ) -> String {
         format!(
-            "corrupt RTP header; {:?}: {:?}\n{:#?}",
+            "corrupt RTP header; {:?}: {reason}\n{:#?}",
             self.receiver,
-            reason,
             crate::hex::LimitedHex::from_split(pkt, 64),
         )
     }
@@ -120,7 +118,7 @@ impl StreamReceiver {
         data: Bytes,
         now: Instant,
     ) -> Result<Option<ReceivedCompoundPacket>, String> {
-        let first_pkt = ReceivedCompoundPacket::validate(&data[..])?;
+        let first_pkt = ReceivedCompoundPacket::validate(&data[..]).map_err(|e| e.to_string())?;
         let mut rtp_timestamp = None;
         if let Ok(Some(sr)) = first_pkt.as_sender_report() {
             let info = self

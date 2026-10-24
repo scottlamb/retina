@@ -9,13 +9,14 @@ use std::time::Instant;
 use bytes::Bytes;
 use log::debug;
 
+use super::Error;
 use super::channel_mapping::ChannelMappings;
 use super::{SessionOptions, Tool, parse};
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 use crate::rtsp::reader::Reader;
 use crate::rtsp::transmit::TransmitBuf;
-use crate::{ConnectionContext, Error, ErrorInt, RtspMessageContext};
+use crate::{ConnectionContext, ErrorInt, RtspMessageContext};
 
 /// How [`ConnCore::poll_response`] treats messages other than the response
 /// it's waiting for.
@@ -140,7 +141,7 @@ impl ConnCore {
     }
 
     pub(crate) fn read_error(&self, source: std::io::Error, now: Instant) -> Error {
-        self.reader.read_error(&self.ctx, source, now)
+        self.reader.read_error(&self.ctx, source, now).into()
     }
 
     /// Returns true iff a request is awaiting its response.
@@ -242,7 +243,7 @@ impl ConnCore {
             let pending = self.pending.as_ref()?;
             let (cseq, mode) = (pending.cseq, pending.mode);
             let msg = match self.reader.decode(&self.ctx, self.eof, now) {
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(e.into())),
                 Ok(Some(msg)) => msg,
                 Ok(None) if !self.eof => return None,
                 Ok(None) => {

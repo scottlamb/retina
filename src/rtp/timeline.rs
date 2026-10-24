@@ -6,7 +6,90 @@ use std::num::{NonZeroI32, NonZeroU32};
 
 use crate::Timestamp;
 
+use super::OptionsError;
+
 const MAX_FORWARD_TIME_JUMP_SECS: u32 = 10;
+
+/// Why a timestamp was rejected, as in [`super::ReceiveError::Timestamp`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TimestampReason {
+    /// The timestamp jumped backward, or forward by more than
+    /// [`super::ReceiverOptions::max_forward_jump_secs`].
+    #[non_exhaustive]
+    Jump {
+        /// The previous extended timestamp.
+        from: i64,
+
+        /// The new extended timestamp.
+        to: i64,
+
+        /// The stream's clock rate, in Hz.
+        clock_rate: NonZeroU32,
+
+        /// The maximum forward jump allowed, in seconds.
+        max_forward_jump_secs: u32,
+    },
+
+    /// The extended timestamp would overflow `i64`.
+    #[non_exhaustive]
+    Overflow {
+        /// The previous extended timestamp.
+        timestamp: i64,
+
+        /// The (wrapping) difference from the previous timestamp.
+        delta: i32,
+    },
+
+    /// The elapsed time since the stream's start would underflow `i64`.
+    #[non_exhaustive]
+    Underflow {
+        /// The previous extended timestamp.
+        timestamp: i64,
+
+        /// The (wrapping) difference from the previous timestamp.
+        delta: i32,
+
+        /// The stream's starting RTP timestamp.
+        start: u32,
+    },
+}
+
+impl std::fmt::Display for TimestampReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            TimestampReason::Jump {
+                from,
+                to,
+                clock_rate,
+                max_forward_jump_secs,
+            } => {
+                let delta = to - from;
+                write!(
+                    f,
+                    "Timestamp jumped {} ({:.03} sec) from {} to {}; \
+                     policy is to allow 0..{} sec only",
+                    delta,
+                    (delta as f64) / f64::from(clock_rate.get()),
+                    from,
+                    to,
+                    max_forward_jump_secs
+                )
+            }
+            TimestampReason::Overflow { timestamp, delta } => {
+                write!(f, "timestamp {timestamp} + delta {delta} won't fit in i64!")
+            }
+            TimestampReason::Underflow {
+                timestamp,
+                delta,
+                start,
+            } => write!(
+                f,
+                "timestamp {timestamp} + delta {delta} - start {start} underflows i64!"
+            ),
+        }
+    }
+}
 
 /// Creates [Timestamp]s (which don't wrap and can be converted to NPT aka normal play time)
 /// from 32-bit (wrapping) RTP timestamps.
@@ -30,16 +113,17 @@ impl Timeline {
         start: Option<u32>,
         clock_rate: u32,
         enforce_with_max_forward_jump_secs: Option<NonZeroU32>,
-    ) -> Result<Self, String> {
-        let clock_rate = NonZeroU32::new(clock_rate)
-            .ok_or_else(|| "clock_rate=0 rejected to prevent division by zero".to_string())?;
+    ) -> Result<Self, OptionsError> {
+        let clock_rate = NonZeroU32::new(clock_rate).ok_or_else(|| {
+            OptionsError("clock_rate=0 rejected to prevent division by zero".to_owned())
+        })?;
         let max_forward_jump = enforce_with_max_forward_jump_secs
             .map(|j| i32::try_from(u64::from(j.get()) * u64::from(clock_rate.get())))
             .transpose()
             .map_err(|_| {
-                format!(
+                OptionsError(format!(
                     "clock_rate={clock_rate} rejected because max forward jump of {MAX_FORWARD_TIME_JUMP_SECS} sec exceeds i32::MAX"
-                )
+                ))
             })?
             .map(|j| NonZeroI32::new(j).expect("non-zero times non-zero must be non-zero"));
         Ok(Timeline {
@@ -57,18 +141,15 @@ impl Timeline {
     ///
     /// If enforcement was enabled, this produces a monotonically increasing
     /// [Timestamp], erroring on excessive or backward time jumps.
-    pub(crate) fn advance_to(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
+    pub(crate) fn advance_to(&mut self, rtp_timestamp: u32) -> Result<Timestamp, TimestampReason> {
         let (timestamp, delta) = self.ts_and_delta(rtp_timestamp)?;
         if matches!(self.max_forward_jump, Some(j) if !(0..j.get()).contains(&delta)) {
-            return Err(format!(
-                "Timestamp jumped {} ({:.03} sec) from {} to {}; \
-                   policy is to allow 0..{} sec only",
-                delta,
-                (delta as f64) / f64::from(self.clock_rate.get()),
-                self.timestamp,
-                timestamp,
-                self.max_forward_jump_secs
-            ));
+            return Err(TimestampReason::Jump {
+                from: self.timestamp,
+                to: timestamp.timestamp,
+                clock_rate: self.clock_rate,
+                max_forward_jump_secs: self.max_forward_jump_secs,
+            });
         }
         self.timestamp = timestamp.timestamp;
         Ok(timestamp)
@@ -79,11 +160,11 @@ impl Timeline {
     ///
     /// This is useful for RTP timestamps in RTCP packets. They commonly refer
     /// to time slightly before the most timestamp of the matching RTP stream.
-    pub(crate) fn place(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
+    pub(crate) fn place(&mut self, rtp_timestamp: u32) -> Result<Timestamp, TimestampReason> {
         Ok(self.ts_and_delta(rtp_timestamp)?.0)
     }
 
-    fn ts_and_delta(&mut self, rtp_timestamp: u32) -> Result<(Timestamp, i32), String> {
+    fn ts_and_delta(&mut self, rtp_timestamp: u32) -> Result<(Timestamp, i32), TimestampReason> {
         let start = match self.start {
             None => {
                 self.start = Some(rtp_timestamp);
@@ -96,23 +177,22 @@ impl Timeline {
         let timestamp = self
             .timestamp
             .checked_add(i64::from(delta))
-            .ok_or_else(|| {
-                // This probably won't happen even with a hostile server. It'd
-                // take ~2^32 packets (~ 4 billion) to advance the time this far
-                // forward or backward even with no limits on time jump per
-                // packet.
-                format!(
-                    "timestamp {} + delta {} won't fit in i64!",
-                    self.timestamp, delta
-                )
+            // This probably won't happen even with a hostile server. It'd
+            // take ~2^32 packets (~ 4 billion) to advance the time this far
+            // forward or backward even with no limits on time jump per
+            // packet.
+            .ok_or(TimestampReason::Overflow {
+                timestamp: self.timestamp,
+                delta,
             })?;
 
         // Also error in similarly-unlikely NPT underflow.
         if timestamp.checked_sub(i64::from(start)).is_none() {
-            return Err(format!(
-                "timestamp {} + delta {} - start {} underflows i64!",
-                self.timestamp, delta, start
-            ));
+            return Err(TimestampReason::Underflow {
+                timestamp: self.timestamp,
+                delta,
+                start,
+            });
         }
         Ok((
             Timestamp {

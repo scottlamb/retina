@@ -24,7 +24,7 @@ use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
 
 /// Returns parameters for the given VPS, SPS, and PPS, in that order.
-pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, super::Error> {
     let &[vps, sps, pps] = sets else {
         unreachable!("expected VPS, SPS, and PPS");
     };
@@ -123,11 +123,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new(
         clock_rate: u32,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, super::Error> {
         if clock_rate != 90_000 {
-            return Err(format!(
+            return Err(super::Error::invalid(format!(
                 "invalid H.265 clock rate {clock_rate}; must always be 90000"
-            ));
+            )));
         }
 
         let parameters = match format_specific_params {
@@ -404,7 +404,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             self.seen_single_fragment_fu = true;
                         }
                         self.analyzer
-                            .start_nal(&*hdr, buf, frag.pos, crate::to_usize(frag.len))?;
+                            .start_nal(&*hdr, buf, frag.pos, crate::to_usize(frag.len))
+                            .map_err(|e| e.to_string())?;
                         self.push_fragment(buf, None, end)?;
                         if !end {
                             access_unit.fu = Some(hdr);
@@ -468,7 +469,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Supplies a complete NAL with the given header, whose body is at
     /// `[pos, pos + len)`.
     fn push_nal(&mut self, buf: &MarkBuf, hdr: [u8; 2], pos: u64, len: u16) -> Result<(), String> {
-        self.analyzer.start_nal(&hdr, buf, pos, usize::from(len))?;
+        self.analyzer
+            .start_nal(&hdr, buf, pos, usize::from(len))
+            .map_err(|e| e.to_string())?;
         self.push_fragment(buf, None, true)
     }
 
@@ -481,10 +484,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     ) -> Result<(), String> {
         if let Some(frag) = frag {
             self.analyzer
-                .extend_nal(buf, frag.pos, crate::to_usize(frag.len))?;
+                .extend_nal(buf, frag.pos, crate::to_usize(frag.len))
+                .map_err(|e| e.to_string())?;
         }
         if end {
-            self.analyzer.finish_nal()?;
+            self.analyzer.finish_nal().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -650,9 +654,11 @@ impl super::events::ParametersOverrideSlot for Option<ParametersOverride> {
         self.as_ref().map(|o| &o.0.generic_parameters)
     }
 
-    fn set(&mut self, parameters: &VideoParameters) -> Result<(), String> {
+    fn set(&mut self, parameters: &VideoParameters) -> Result<(), super::Error> {
         let super::VideoParametersCodec::H265 { vps, sps, pps } = &parameters.codec else {
-            return Err("parameters aren't for an H.265 stream".to_owned());
+            return Err(super::Error::invalid(
+                "parameters aren't for an H.265 stream",
+            ));
         };
         let p = InternalParameters::parse_vps_sps_pps(vps, sps, pps, true)?;
         *self = Some(ParametersOverride(Box::new(p)));
@@ -701,7 +707,7 @@ impl InternalParameters {
         let vps_nal = vps_nal.ok_or_else(|| "no vps".to_string())?;
         let sps_nal = sps_nal.ok_or_else(|| "no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "no pps".to_string())?;
-        Self::parse_vps_sps_pps(&vps_nal, &sps_nal, &pps_nal, false)
+        Self::parse_vps_sps_pps(&vps_nal, &sps_nal, &pps_nal, false).map_err(|e| e.to_string())
     }
 
     fn store_sprop_nal(key: &str, value: &str, out: &mut Option<Vec<u8>>) -> Result<(), String> {
@@ -723,26 +729,29 @@ impl InternalParameters {
         sps_nal: &[u8],
         pps_nal: &[u8],
         mut seen_extra_trailing_data: bool,
-    ) -> Result<InternalParameters, String> {
-        let (vps_h, _vps_bits) =
-            nal::split(vps_nal).map_err(|e| format!("failed to parse VPS: {e}"))?;
+    ) -> Result<InternalParameters, super::Error> {
+        let (vps_h, _vps_bits) = nal::split(vps_nal).map_err(|e| {
+            super::Error::invalid(format!("failed to parse VPS: {e}")).with_source(e)
+        })?;
         if vps_h.unit_type() != nal::UnitType::VpsNut {
-            return Err("VPS NAL is not VPS".into());
+            return Err(super::Error::invalid("VPS NAL is not VPS"));
         }
 
         let sps_hex = crate::hex::LimitedHex::new(sps_nal, 256);
-        let (sps_h, sps_bits) =
-            nal::split(sps_nal).map_err(|e| format!("{e}\nwhile parsing SPS: {sps_hex}"))?;
+        let (sps_h, sps_bits) = nal::split(sps_nal).map_err(|e| {
+            super::Error::invalid(format!("{e}\nwhile parsing SPS: {sps_hex}")).with_source(e)
+        })?;
         if sps_h.unit_type() != nal::UnitType::SpsNut {
-            return Err("SPS NAL is not SPS".into());
+            return Err(super::Error::invalid("SPS NAL is not SPS"));
         }
         let mut sps_has_extra_trailing_data = false;
         let sps_bits = TolerantBitReader {
             inner: sps_bits,
             has_extra_trailing_data: &mut sps_has_extra_trailing_data,
         };
-        let sps = nal::Sps::from_bits(sps_bits)
-            .map_err(|e| format!("{e}\nwhile parsing SPS: {sps_hex}"))?;
+        let sps = nal::Sps::from_bits(sps_bits).map_err(|e| {
+            super::Error::invalid(format!("{e}\nwhile parsing SPS: {sps_hex}")).with_source(e)
+        })?;
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
             log::warn!(
                 "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."
@@ -751,18 +760,20 @@ impl InternalParameters {
         }
 
         let pps_hex = crate::hex::LimitedHex::new(pps_nal, 256);
-        let (pps_h, pps_bits) =
-            nal::split(pps_nal).map_err(|e| format!("{e}\nwhile parsing PPS: {pps_hex}"))?;
+        let (pps_h, pps_bits) = nal::split(pps_nal).map_err(|e| {
+            super::Error::invalid(format!("{e}\nwhile parsing PPS: {pps_hex}")).with_source(e)
+        })?;
         if pps_h.unit_type() != nal::UnitType::PpsNut {
-            return Err("PPS NAL is not PPS".into());
+            return Err(super::Error::invalid("PPS NAL is not PPS"));
         }
         let mut pps_has_extra_trailing_data = false;
         let pps_bits = TolerantBitReader {
             inner: pps_bits,
             has_extra_trailing_data: &mut pps_has_extra_trailing_data,
         };
-        let pps = nal::Pps::from_bits(pps_bits)
-            .map_err(|e| format!("{e}\nwhile parsing PPS: {pps_hex}"))?;
+        let pps = nal::Pps::from_bits(pps_bits).map_err(|e| {
+            super::Error::invalid(format!("{e}\nwhile parsing PPS: {pps_hex}")).with_source(e)
+        })?;
         if pps_has_extra_trailing_data && !seen_extra_trailing_data {
             log::warn!(
                 "Ignoring trailing data in PPS {pps_hex}; will not log about trailing data again for this stream."
@@ -772,7 +783,9 @@ impl InternalParameters {
 
         let rfc6381_codec = sps.rfc6381_codec();
 
-        let all_pixel_dimensions = sps.all_pixel_dimensions()?;
+        let all_pixel_dimensions = sps
+            .all_pixel_dimensions()
+            .map_err(|e| super::Error::invalid(format!("{e}\nin SPS: {sps_hex}")).with_source(e))?;
         let (pixel_aspect_ratio, frame_rate);
         if let Some(v) = sps.vui() {
             pixel_aspect_ratio = v
@@ -871,7 +884,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
         }
     }
 
-    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, super::Error> {
         parameters_from_sets(sets)
     }
 

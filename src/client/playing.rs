@@ -13,6 +13,7 @@ use bytes::Bytes;
 use log::{trace, warn};
 use url::Url;
 
+use super::Error;
 use super::channel_mapping::ChannelType;
 use super::conn::ConnCore;
 use super::parse::{self, SessionHeader};
@@ -23,7 +24,7 @@ use crate::buf::MarkBuf;
 use crate::rtp::{Pushed, Reorderer};
 use crate::rtsp::msg::{self, OwnedMessage};
 use crate::{
-    ConnectionContext, Error, ErrorInt, PacketContext, PacketContextInner, RtspMessageContext,
+    ConnectionContext, ErrorInt, PacketContext, PacketContextInner, RtspMessageContext,
     StreamContext, WallTime,
 };
 
@@ -394,7 +395,7 @@ impl PlayingCore {
                 Ok(None) => {}
             }
             let item = match self.conn.reader.decode(&self.conn.ctx, self.conn.eof, now) {
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(e.into())),
                 Ok(Some(msg)) => match msg.msg {
                     msg::Message::Data(d) => {
                         match self.handle_data(
