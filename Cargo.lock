@@ -2223,6 +2223,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "log",
+ "mylog",
+ "rand 0.8.5",
+ "retina",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"

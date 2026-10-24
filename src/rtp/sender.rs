@@ -15,11 +15,12 @@ use super::PacketHeader;
 /// handing packets to a depacketizer.
 ///
 /// When sending one source to several destinations (e.g. a server answering
-/// `PLAY` from several clients), give each destination its own `Sender`, so
-/// each sees an ordinary RTP session with its own SSRC and sequence numbers.
-/// Likewise give each its own packetizer: throttling (see
-/// [`crate::codec::PayloadSink::congested`]) changes the packetizer's state,
-/// so a shared one would let one slow destination drop data for all.
+/// `PLAY` from several clients, as in the `proxy` example), give each
+/// destination its own `Sender`, so each sees an ordinary RTP session with
+/// its own SSRC and sequence numbers. Likewise give each its own packetizer:
+/// throttling (see [`crate::codec::PayloadSink::congested`]) changes the
+/// packetizer's state, so a shared one would let one slow destination drop
+/// data for all.
 #[derive(Debug)]
 pub struct Sender {
     ssrc: u32,
