@@ -1,3 +1,8 @@
+## unreleased
+
+*   H.264 and H.265: an access unit without slices (possible only from a
+    misbehaving sender) no longer produces an empty frame.
+
 ## `v0.4.22` (2026-11-11)
 
 *   bump MSRV to 1.96 (from 1.88).
