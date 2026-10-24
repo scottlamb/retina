@@ -220,6 +220,8 @@ impl Depacketizer {
         }
 
         let mut r = Ok(());
+        // A stream joined mid-NAL has no earlier packet to count the loss from.
+        let joining = matches!(self.input_state, DepacketizerInputState::New);
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -459,7 +461,7 @@ impl Depacketizer {
                         }
                     }
                     (false, false) => {
-                        if loss > 0 {
+                        if loss > 0 || joining {
                             self.discard_au();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
@@ -1503,6 +1505,36 @@ mod tests {
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
         assert!(d.seen_inconsistent_fu_nal_hdr);
+    }
+    /// Tests that a stream joined mid-NAL drops the partial access unit.
+    #[test]
+    fn join_mid_fu() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let meta = |timestamp, sequence_number| crate::rtp::PacketMeta {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark: true,
+        };
+        // FU end fragment (S=0 E=1, TRAIL_R) as the first packet.
+        push_via_buf(&mut d, meta(0, 0), b"\x62\x01\x41tail", &mut buf).unwrap();
+        assert_eq!(d.pull(), None);
+        // The next access unit comes through.
+        push_via_buf(&mut d, meta(3000, 1), b"\x02\x01next", &mut buf).unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x02\x01next");
     }
 
     /// Tests that a FU with both S and E bits set is treated as a complete NAL
