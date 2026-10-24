@@ -8,6 +8,10 @@
 //! once: reading media and keepalive responses from the RTSP connection,
 //! writing keepalives and receiver reports, reading UDP sockets, and timers.
 //!
+//! When done, it ends the session on the server as a dropped `Session` would,
+//! via [`TeardownCore`]: first on the session's connection, then (if the
+//! server is known to be buggy, or with UDP) on fresh connections.
+//!
 //! It's meant to be copied and adapted, e.g. to put several sessions on one
 //! poller, or to substitute `mio`.
 
@@ -16,7 +20,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::str::FromStr as _;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Error, anyhow, bail};
+use anyhow::{Context as _, Error, bail};
 use clap::Parser;
 use log::{debug, info, warn};
 use polling::{Event, Events, Poller};
@@ -24,14 +28,14 @@ use retina::PacketContext;
 use retina::buf::MarkBuf;
 use retina::client::{
     ChannelType, Credentials, PlayOptions, PlayingItem, SessionCore, SessionEvent, SessionOptions,
-    SetupTransport,
+    SetupTransport, TeardownAction, TeardownCore,
 };
 use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
     VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 
-/// How long to wait for each request before `PLAY` (and for `TEARDOWN`).
+/// How long to wait for each request before `PLAY`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Datagrams can't be larger than this, so a UDP read needs at most this much
@@ -72,6 +76,54 @@ enum Transport {
 /// use `1 + 2*i` and `2 + 2*i`.
 const TCP_KEY: usize = 0;
 
+/// A sans-I/O core with bytes to write to the RTSP connection.
+trait Transmit {
+    fn transmit_buf(&self) -> (&[u8], &[u8]);
+    fn advance_transmit(&mut self, n: usize);
+}
+
+impl Transmit for SessionCore {
+    fn transmit_buf(&self) -> (&[u8], &[u8]) {
+        SessionCore::transmit_buf(self)
+    }
+    fn advance_transmit(&mut self, n: usize) {
+        SessionCore::advance_transmit(self, n)
+    }
+}
+
+impl Transmit for TeardownCore {
+    fn transmit_buf(&self) -> (&[u8], &[u8]) {
+        TeardownCore::transmit_buf(self)
+    }
+    fn advance_transmit(&mut self, n: usize) {
+        TeardownCore::advance_transmit(self, n)
+    }
+}
+
+/// Connects to the host and port named in `url`.
+///
+/// Name resolution and connection setup are left blocking for simplicity;
+/// the sans-I/O cores start once a connection is established.
+fn connect_tcp(url: &url::Url, timeout: Duration) -> io::Result<TcpStream> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL has no host"))?;
+    let port = url.port().unwrap_or(554);
+    let mut last_err = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{host} resolved to no addresses"),
+        )
+    }))
+}
+
 /// The sockets of a session, registered with a poller.
 struct Io {
     poller: Poller,
@@ -83,29 +135,8 @@ struct Io {
 }
 
 impl Io {
-    /// Connects to the server named in `url`.
-    ///
-    /// Name resolution and connection setup are left blocking for simplicity;
-    /// the sans-I/O cores start once a connection is established.
-    fn connect(url: &url::Url) -> Result<Self, Error> {
-        let host = url.host_str().ok_or_else(|| anyhow!("URL has no host"))?;
-        let port = url.port().unwrap_or(554);
-        let mut last_err = None;
-        let mut tcp = None;
-        for addr in (host, port).to_socket_addrs()? {
-            match TcpStream::connect_timeout(&addr, REQUEST_TIMEOUT) {
-                Ok(s) => {
-                    tcp = Some(s);
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        let tcp = match (tcp, last_err) {
-            (Some(tcp), _) => tcp,
-            (None, Some(e)) => return Err(e).context(format!("unable to connect to {host}")),
-            (None, None) => bail!("{host} resolved to no addresses"),
-        };
+    /// Registers a newly established RTSP connection with a fresh poller.
+    fn new(tcp: TcpStream) -> io::Result<Self> {
         tcp.set_nonblocking(true)?;
         tcp.set_nodelay(true)?;
         let poller = Poller::new()?;
@@ -158,7 +189,7 @@ impl Io {
     }
 
     /// Writes as much of `core`'s transmit buffer as the socket will take.
-    fn flush(&mut self, core: &mut SessionCore) -> io::Result<()> {
+    fn flush(&mut self, core: &mut impl Transmit) -> io::Result<()> {
         loop {
             let (first, second) = core.transmit_buf();
             if first.is_empty() {
@@ -246,7 +277,7 @@ impl Io {
     ///
     /// Spurious wakeups are fine; the caller tries everything non-blockingly
     /// afterward.
-    fn wait(&mut self, core: &SessionCore, deadline: Instant) -> io::Result<()> {
+    fn wait(&mut self, core: &impl Transmit, deadline: Instant) -> io::Result<()> {
         // `polling` registrations are one-shot; re-arm each time, asking for
         // writability only when there's something to write.
         let tcp_interest = if core.transmit_buf().0.is_empty() {
@@ -302,6 +333,65 @@ fn request(io: &mut Io, core: &mut SessionCore) -> Result<SessionEvent, Error> {
             bail!("request timed out after {REQUEST_TIMEOUT:?}");
         }
         io.wait(core, deadline)?;
+    }
+}
+
+/// Ends the session on the server, as [`SessionOptions::teardown`] says.
+///
+/// Returns `Ok(false)` if there was nothing to do.
+fn teardown(io: Io, core: SessionCore) -> Result<bool, Error> {
+    let Some(mut td) = core.into_teardown(Instant::now()) else {
+        return Ok(false);
+    };
+    let mut io = Some(io);
+    loop {
+        let now = Instant::now();
+        match td.poll(now) {
+            TeardownAction::Io { deadline } => {
+                let conn = io.as_mut().expect("Io follows a connection");
+                if let Err(e) = conn.flush(&mut td) {
+                    td.handle_io_error(e, Instant::now());
+                    continue;
+                }
+                let mut eof = false;
+                match conn.read_tcp(td.read_buf(), &mut eof) {
+                    Ok(true) => {
+                        if eof {
+                            td.handle_eof();
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        td.handle_io_error(e, Instant::now());
+                        continue;
+                    }
+                }
+                conn.wait(&td, deadline)?;
+            }
+            TeardownAction::Connect { deadline } => {
+                io = None;
+                info!("TEARDOWN: connecting to {}", td.url());
+                let timeout = deadline.saturating_duration_since(now);
+                match connect_tcp(td.url(), timeout).and_then(Io::new) {
+                    Ok(conn) => {
+                        td.connected(
+                            conn.tcp.local_addr()?,
+                            conn.tcp.peer_addr()?,
+                            Instant::now(),
+                        );
+                        io = Some(conn);
+                    }
+                    Err(e) => td.handle_io_error(e, Instant::now()),
+                }
+            }
+            TeardownAction::Wait { until } => {
+                io = None;
+                std::thread::sleep(until.saturating_duration_since(now));
+            }
+            TeardownAction::Done => return Ok(true),
+            _ => bail!("unexpected TeardownAction"),
+        }
     }
 }
 
@@ -490,7 +580,9 @@ fn run(opts: Opts) -> Result<(), Error> {
         username,
         password: opts.password.unwrap_or_default(),
     });
-    let mut io = Io::connect(&opts.url)?;
+    let tcp = connect_tcp(&opts.url, REQUEST_TIMEOUT)
+        .with_context(|| format!("unable to connect to {}", opts.url))?;
+    let mut io = Io::new(tcp)?;
     let local_addr: SocketAddr = io.tcp.local_addr()?;
     let mut core = SessionCore::new(
         local_addr,
@@ -561,14 +653,9 @@ fn run(opts: Opts) -> Result<(), Error> {
     if let Err(e) = &result {
         warn!("playing failed: {e}");
     }
-    if core.is_closed() {
-        return result;
-    }
-
-    // Tear down on the same connection.
-    core.teardown()?;
-    match request(&mut io, &mut core) {
-        Ok(_) => info!("TEARDOWN succeeded"),
+    match teardown(io, core) {
+        Ok(true) => info!("TEARDOWN done"),
+        Ok(false) => {}
         Err(e) => warn!("TEARDOWN failed: {e}"),
     }
     result

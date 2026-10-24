@@ -2,6 +2,18 @@
 
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
+*   BREAKING: `client::SessionGroup` no longer depends on tokio.
+    `SessionGroup::stale_sessions` takes a `now: std::time::Instant`, and
+    `StaleSessionStatus::max_expires` is a `std::time::Instant`. Expired
+    sessions are forgotten lazily rather than via spawned tasks.
+    `SessionGroup::await_teardown` works with any async runtime (and no
+    longer panics if the tokio runtime has shut down), as does the new
+    `SessionGroup::changed`.
+*   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
+    `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
+    does, per `client::TeardownPolicy` and tracked in the session's
+    `SessionGroup`, until success or the session's expiration. A dropped
+    `Session` now uses it internally.
 *   BREAKING: `client::Stream` describes every payload format its SDP media
     description offers, via `Stream::payload_formats`, a non-empty slice of
     `client::StreamFormat` (payload type and `codec::PayloadFormat`) in `m=`
