@@ -1,0 +1,16 @@
+[package]
+name = "polling-client"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1.0.41"
+clap = { version = "4.1.4", features = ["derive"] }
+log = "0.4.8"
+mylog = { git = "https://github.com/scottlamb/mylog" }
+polling = "3.11.0"
+retina = { path = "../../", features = ["unstable-sans-io"] }
+socket2 = "0.5"
+url = "2.2.1"

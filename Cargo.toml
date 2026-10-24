@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/client", "examples/ffmpeg-decode", "examples/webrtc-proxy", "fuzz"]
+members = [".", "examples/client", "examples/ffmpeg-decode", "examples/polling-client", "examples/webrtc-proxy", "fuzz"]
 default-members = ["."]
 
 [package]
@@ -19,6 +19,10 @@ rust-version = "1.88"
 default = ["h264", "h265"]
 h264 = ["dep:h264-reader"]
 h265 = ["dep:h264-reader"]
+
+# Exposes the sans-I/O client (`client::SessionCore`) API. It's experimental:
+# it may change in any release, without regard to semver.
+unstable-sans-io = []
 
 # Exposes the send side: packetizers (`codec::VideoPacketizer` and friends),
 # `rtp::Sender`, and the client's ONVIF backchannel
@@ -46,7 +50,6 @@ http-auth = "0.1.2"
 jiff = "0.2.0"
 log = "0.4.8"
 memchr = "2.7.4"
-pin-project = "1.0.7"
 pretty-hex = "0.4.0"
 rand = "0.8.3"
 sdp-types = "0.2.0"

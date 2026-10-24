@@ -10,3 +10,4 @@ pub mod msg;
 pub mod parse;
 pub(crate) mod reader;
 pub(crate) mod table;
+pub(crate) mod transmit;

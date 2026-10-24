@@ -3,6 +3,9 @@
 
 //! The sans-I/O core of a playing session; see [`PlayingCore`].
 
+// Without the feature, only what `Session` uses is reachable.
+#![cfg_attr(not(feature = "unstable-sans-io"), allow(dead_code))]
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -10,50 +13,32 @@ use bytes::Bytes;
 use log::{trace, warn};
 use url::Url;
 
-use super::channel_mapping::{ChannelMappings, ChannelType};
+use super::channel_mapping::ChannelType;
+use super::conn::ConnCore;
 use super::parse::{self, SessionHeader};
 use super::receiver_report::{ReceptionStats, ReportSchedule, ReportWriter};
-use super::{PlayingItem, RtpPacket, SessionOptions, Stream, Timeline, Tool, rtp::InorderParser};
+use super::session_core::{SetupCore, UdpTransmit};
+use super::{PlayingItem, Presentation, RtpPacket, Stream, Timeline, Tool, rtp::InorderParser};
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
-use crate::rtsp::reader::Reader;
 use crate::{
     ConnectionContext, Error, ErrorInt, PacketContext, PacketContextInner, RtspMessageContext,
     StreamContext, WallTime,
 };
 
-/// The sans-I/O core of a [`super::Session<super::Playing>`].
+/// The state of a playing session; see [`super::SessionCore`].
 ///
-/// This holds all the state of a playing session except for sockets and
-/// timers: the RTSP parser and the buffers received data is read into, each
-/// stream's RTP validation state, and keepalive and RTCP receiver report
-/// state. Time is supplied by the caller. The session is a thin driver around
-/// it:
-///
-/// *   It reads from the RTSP connection into [`PlayingCore::tcp_buf`] and
-///     from each UDP stream's sockets into [`PlayingCore::udp_buf`] (followed
-///     by [`PlayingCore::udp_received`]).
-/// *   It gets packets out via [`PlayingCore::poll_validated`] and
-///     [`PlayingCore::item`].
-/// *   It writes keepalive requests, interleaved receiver reports, and
-///     backchannel media (queued via [`PlayingCore::queue_rtp`]) from
-///     [`PlayingCore::poll_transmit`], reporting how many bytes have been
-///     written via [`PlayingCore::advance_transmit`].
-/// *   It sends UDP streams' receiver reports from
-///     [`PlayingCore::poll_transmit_udp`].
-/// *   It calls [`PlayingCore::handle_timeout`] at
-///     [`PlayingCore::poll_timeout`].
+/// This holds the RTSP parser and the buffers received data is read into,
+/// each stream's RTP validation state, and keepalive and RTCP receiver report
+/// state.
 pub(crate) struct PlayingCore {
-    conn_ctx: ConnectionContext,
-    reader: Reader,
+    conn: ConnCore,
+    presentation: Presentation,
+    sdp: Bytes,
+    session: SessionHeader,
 
-    /// True if the peer has closed the RTSP connection.
-    tcp_eof: bool,
-
-    channels: ChannelMappings,
-
-    /// True if data has been received on an unassigned interleaved channel.
-    seen_unassigned: bool,
+    /// Bitmask of [`super::SessionFlag`]s, for [`PlayingCore::into_setup`].
+    flags: u8,
 
     /// State for each stream in the presentation which has been set up.
     streams: Box<[Option<PlayingStream>]>,
@@ -61,79 +46,15 @@ pub(crate) struct PlayingCore {
     /// UDP datagrams which have been received but not yet parsed, in order.
     udp_pending: VecDeque<StreamItem>,
 
-    options: SessionOptions,
-    requested_auth: Option<http_auth::PasswordClient>,
-    tool: Option<Tool>,
-    next_cseq: u32,
     keepalive: Keepalive,
 
     /// The state of RTCP receiver reports, iff they're enabled via
-    /// [`SessionOptions::receiver_reports`].
+    /// [`super::SessionOptions::receiver_reports`].
     reports: Option<Reports>,
 
-    /// Keepalive requests, interleaved receiver reports, and backchannel
-    /// media for the RTSP connection.
-    transmit: Transmit,
-
-    /// Receiver reports for UDP streams, as `(stream_i, packet)`, which have
-    /// yet to be returned from `poll_transmit_udp`.
-    transmit_udp: VecDeque<(usize, Vec<u8>)>,
-}
-
-/// Bytes for [`PlayingCore::poll_transmit`].
-#[derive(Default)]
-struct Transmit {
-    buf: Vec<u8>,
-
-    /// True if `buf` has yet to be returned from `poll_transmit`.
-    ready: bool,
-
-    /// The total bytes queued so far.
-    queued: u64,
-
-    /// The total bytes the driver has reported written via
-    /// [`PlayingCore::advance_transmit`].
-    ///
-    /// Together with `queued`, this tells whether a particular message (such
-    /// as a keepalive request) has been written, even while backchannel media
-    /// queued after it remains unwritten.
-    written: u64,
-}
-
-impl Transmit {
-    /// Returns the buffer to append to, after any bytes not yet returned.
-    fn buf(&mut self) -> &mut Vec<u8> {
-        if !self.ready {
-            self.buf.clear();
-            self.ready = true;
-        }
-        &mut self.buf
-    }
-
-    /// Appends `msg` to any bytes not yet returned.
-    fn queue(&mut self, msg: OwnedMessage) {
-        let buf = self.buf();
-        let start = buf.len();
-        msg.write(&mut *buf).expect("Vec Writer is infallible");
-        self.queued += (buf.len() - start) as u64;
-    }
-
-    /// Appends an RTSP interleaved data message, whose body `write_body`
-    /// appends, to any bytes not yet returned.
-    ///
-    /// The caller must ensure the body fits the 16-bit length field ([RFC 2326
-    /// section 10.12](https://datatracker.ietf.org/doc/html/rfc2326#section-10.12)).
-    #[cfg(feature = "unstable-send")]
-    fn queue_data(&mut self, channel_id: u8, write_body: impl FnOnce(&mut Vec<u8>)) {
-        let buf = self.buf();
-        let start = buf.len();
-        buf.extend_from_slice(&[b'$', channel_id, 0, 0]);
-        write_body(buf);
-        let body_len =
-            u16::try_from(buf.len() - start - 4).expect("caller checked the body length");
-        buf[start + 2..start + 4].copy_from_slice(&body_len.to_be_bytes());
-        self.queued += (buf.len() - start) as u64;
-    }
+    /// Receiver reports for UDP streams which have yet to be returned from
+    /// `poll_transmit_udp`.
+    transmit_udp: VecDeque<UdpTransmit>,
 }
 
 /// The state of RTCP receiver reports.
@@ -163,28 +84,6 @@ pub(crate) struct PlayingStream {
     pub(crate) sending: bool,
 }
 
-/// Session state moved into [`PlayingCore::new`], to be returned by
-/// [`PlayingCore::into_parts`] when the session is dropped.
-pub(crate) struct Parts {
-    pub(crate) reader: Reader,
-    pub(crate) options: SessionOptions,
-    pub(crate) requested_auth: Option<http_auth::PasswordClient>,
-    pub(crate) next_cseq: u32,
-}
-
-/// Everything else [`PlayingCore::new`] needs.
-pub(crate) struct Init<'a> {
-    pub(crate) conn_ctx: ConnectionContext,
-    pub(crate) channels: ChannelMappings,
-    pub(crate) seen_unassigned: bool,
-    pub(crate) streams: Box<[Option<PlayingStream>]>,
-    pub(crate) tool: Option<Tool>,
-    pub(crate) session: &'a SessionHeader,
-
-    /// The URL keepalive requests are sent to.
-    pub(crate) keepalive_url: Url,
-}
-
 struct Keepalive {
     state: KeepaliveState,
     deadline: Instant,
@@ -202,22 +101,13 @@ struct Keepalive {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum KeepaliveState {
     Idle,
-
-    /// The keepalive request has been queued but not completely written.
+    /// Written once [`crate::rtsp::transmit::TransmitBuf::written`] reaches
+    /// `end`.
     Flushing {
         cseq: u32,
         method: KeepaliveMethod,
-
-        /// The [`Transmit::written`] count at which the request will have been
-        /// written.
-        ///
-        /// The connection is shared with backchannel media, so its write
-        /// buffer may never be empty for long. The request counts as written
-        /// once this mark is reached, regardless of what's queued after it.
         end: u64,
     },
-
-    /// The keepalive request has been written; awaiting the response.
     Waiting {
         cseq: u32,
         method: KeepaliveMethod,
@@ -279,9 +169,17 @@ pub(crate) struct ValidatedRtp {
 }
 
 impl PlayingCore {
-    pub(crate) fn new(parts: Parts, init: Init<'_>, now: Instant) -> Self {
-        let interval = keepalive_interval(init.session);
-        let reports = parts.options.receiver_reports.enabled().then(|| {
+    pub(crate) fn new(
+        conn: ConnCore,
+        presentation: Presentation,
+        sdp: Bytes,
+        session: SessionHeader,
+        streams: Box<[Option<PlayingStream>]>,
+        flags: u8,
+        now: Instant,
+    ) -> Self {
+        let interval = keepalive_interval(&session);
+        let reports = conn.options.receiver_reports.enabled().then(|| {
             let mut rng = rand::thread_rng();
             let schedule = ReportSchedule::new(now, &mut rng);
             Reports {
@@ -290,62 +188,78 @@ impl PlayingCore {
                 schedule,
             }
         });
+        let keepalive = Keepalive {
+            state: KeepaliveState::Idle,
+            deadline: now + interval,
+            interval,
+            url: presentation.base_url.clone(),
+            session_id: session.id.clone(),
+            set_parameter_supported: false,
+            get_parameter_supported: false,
+        };
         Self {
-            conn_ctx: init.conn_ctx,
-            reader: parts.reader,
-            tcp_eof: false,
-            channels: init.channels,
-            seen_unassigned: init.seen_unassigned,
-            streams: init.streams,
+            conn,
+            presentation,
+            sdp,
+            session,
+            flags,
+            streams,
             udp_pending: VecDeque::new(),
-            options: parts.options,
-            requested_auth: parts.requested_auth,
-            tool: init.tool,
-            next_cseq: parts.next_cseq,
-            keepalive: Keepalive {
-                state: KeepaliveState::Idle,
-                deadline: now + interval,
-                interval,
-                url: init.keepalive_url,
-                session_id: init.session.id.clone(),
-                set_parameter_supported: false,
-                get_parameter_supported: false,
-            },
+            keepalive,
             reports,
-            transmit: Transmit::default(),
             transmit_udp: VecDeque::new(),
         }
     }
 
-    /// Returns the state moved in by [`PlayingCore::new`].
-    pub(crate) fn into_parts(self) -> Parts {
-        Parts {
-            reader: self.reader,
-            options: self.options,
-            requested_auth: self.requested_auth,
-            next_cseq: self.next_cseq,
-        }
+    /// Returns to a [`SetupCore`] for the same session, so that it can be
+    /// torn down.
+    ///
+    /// Any data already received stays buffered; the `TEARDOWN` ignores it.
+    pub(crate) fn into_setup(self) -> SetupCore {
+        SetupCore::from_playing(
+            self.conn,
+            self.presentation,
+            self.sdp,
+            self.session,
+            self.flags,
+        )
+    }
+
+    pub fn sdp(&self) -> &[u8] {
+        &self.sdp
+    }
+
+    /// Returns the streams in the presentation.
+    #[inline]
+    pub fn streams(&self) -> &[Stream] {
+        &self.presentation.streams
+    }
+
+    /// Returns the server's version as declared in the `DESCRIBE` response's
+    /// `a:tool` SDP attribute.
+    pub fn tool(&self) -> Option<&Tool> {
+        self.conn.tool.as_ref()
     }
 
     /// Returns the buffer the caller should fill with bytes received on the
     /// RTSP connection, via `spare_capacity` and `advance_end`.
     #[inline]
-    pub(crate) fn tcp_buf(&mut self) -> &mut MarkBuf {
-        self.reader.buf_mut()
+    pub fn read_buf(&mut self) -> &mut MarkBuf {
+        self.conn.read_buf()
     }
 
     /// Notes that the peer has closed the RTSP connection.
     ///
-    /// Once [`PlayingCore::poll_validated`] has returned the remaining items,
+    /// Once [`PlayingCore::poll_item`] has returned the remaining items,
     /// [`PlayingCore::is_closed`] is true.
-    pub(crate) fn handle_tcp_eof(&mut self) {
-        self.tcp_eof = true;
+    pub fn handle_eof(&mut self) {
+        self.conn.eof = true;
     }
 
     /// Returns true if no more items will be returned, because the peer has
     /// closed the RTSP connection.
-    pub(crate) fn is_closed(&self) -> bool {
-        self.tcp_eof
+    pub fn is_closed(&self) -> bool {
+        self.conn.eof
     }
 
     /// Returns the buffer the caller should read a datagram for UDP stream
@@ -353,19 +267,27 @@ impl PlayingCore {
     /// [`PlayingCore::udp_received`].
     ///
     /// Panics if the stream isn't a set-up UDP stream.
-    pub(crate) fn udp_buf(&mut self, stream_i: usize) -> &mut MarkBuf {
+    pub fn udp_buf(&mut self, stream_i: usize) -> &mut MarkBuf {
         self.streams[stream_i]
             .as_mut()
             .and_then(|s| s.udp_buf.as_mut())
             .expect("udp_buf requires a UDP stream")
     }
 
+    /// Returns true if `stream_i` was set up with UDP transport, so its
+    /// sockets should be read into [`PlayingCore::udp_buf`].
+    pub fn is_udp(&self, stream_i: usize) -> bool {
+        self.streams[stream_i]
+            .as_ref()
+            .is_some_and(|s| s.udp_buf.is_some())
+    }
+
     /// Notes that a `len`-byte datagram was written to the start of
     /// [`PlayingCore::udp_buf`]'s spare capacity.
     ///
     /// The caller may receive several datagrams before calling
-    /// [`PlayingCore::poll_validated`]; they stay in the buffer until parsed.
-    pub(crate) fn udp_received(
+    /// [`PlayingCore::poll_item`]; they stay in the buffer until parsed.
+    pub fn udp_received(
         &mut self,
         stream_i: usize,
         channel_type: ChannelType,
@@ -389,13 +311,27 @@ impl PlayingCore {
 
     /// Returns a context for the RTSP connection.
     #[inline]
-    pub(crate) fn conn_ctx(&self) -> &ConnectionContext {
-        &self.conn_ctx
+    pub fn conn_ctx(&self) -> &ConnectionContext {
+        &self.conn.ctx
     }
 
     /// Returns an error for a failed read from the RTSP connection.
-    pub(crate) fn read_error(&self, source: std::io::Error, now: Instant) -> Error {
-        self.reader.read_error(&self.conn_ctx, source, now)
+    pub fn read_error(&self, source: std::io::Error, now: Instant) -> Error {
+        self.conn.read_error(source, now)
+    }
+
+    /// Returns an error for a failed receive on UDP stream `stream_i`.
+    pub fn udp_recv_error(&self, stream_i: usize, source: std::io::Error) -> Error {
+        let stream_ctx = self.streams[stream_i]
+            .as_ref()
+            .map(|s| s.ctx)
+            .unwrap_or_else(StreamContext::dummy);
+        wrap!(ErrorInt::UdpRecvError {
+            conn_ctx: self.conn.ctx,
+            stream_ctx,
+            when: WallTime::now(),
+            source,
+        })
     }
 
     /// Parses and validates the next packet from buffered data, if any.
@@ -403,9 +339,20 @@ impl PlayingCore {
     /// Returns `None` when more data is needed (or, if
     /// [`PlayingCore::is_closed`], never will be). Handles keepalive
     /// responses internally.
+    ///
+    /// The item borrows the core, so it must be dropped before the next call.
+    pub fn poll_item(&mut self, now: Instant) -> Option<Result<PlayingItem<'_>, Error>> {
+        match self.poll_validated(now)? {
+            Ok(v) => Some(Ok(self.item(v))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// The first half of [`PlayingCore::poll_item`], for drivers which return
+    /// the item from within a loop.
     pub(crate) fn poll_validated(&mut self, now: Instant) -> Option<Result<ValidatedItem, Error>> {
         loop {
-            let item = match self.reader.decode(&self.conn_ctx, self.tcp_eof, now) {
+            let item = match self.conn.reader.decode(&self.conn.ctx, self.conn.eof, now) {
                 Err(e) => return Some(Err(e)),
                 Ok(Some(msg)) => match msg.msg {
                     msg::Message::Data(d) => {
@@ -444,8 +391,8 @@ impl PlayingCore {
         }
     }
 
-    /// Builds a [`PlayingItem`] which borrows the core's buffers and `streams`.
-    pub(crate) fn item<'a>(&'a self, streams: &'a [Stream], v: ValidatedItem) -> PlayingItem<'a> {
+    /// Builds a [`PlayingItem`] which borrows the core's buffers and streams.
+    pub(crate) fn item(&self, v: ValidatedItem) -> PlayingItem<'_> {
         let rtp = match v {
             ValidatedItem::Rtcp(pkt) => return PlayingItem::Rtcp(pkt),
             ValidatedItem::Rtp(rtp) => rtp,
@@ -453,10 +400,10 @@ impl PlayingCore {
         let buf = self.streams[rtp.stream_id]
             .as_ref()
             .and_then(|s| s.udp_buf.as_ref())
-            .unwrap_or(self.reader.buf());
+            .unwrap_or(self.conn.reader.buf());
         PlayingItem::Rtp(RtpPacket {
             stream_id: rtp.stream_id,
-            stream: &streams[rtp.stream_id],
+            stream: &self.presentation.streams[rtp.stream_id],
             pkt: crate::rtp::ReceivedPacketRef::new(
                 rtp.meta,
                 buf,
@@ -468,22 +415,9 @@ impl PlayingCore {
         })
     }
 
-    /// Combines [`PlayingCore::poll_validated`] and [`PlayingCore::item`].
-    #[cfg(test)]
-    pub(crate) fn poll_item<'a>(
-        &'a mut self,
-        streams: &'a [Stream],
-        now: Instant,
-    ) -> Option<Result<PlayingItem<'a>, Error>> {
-        match self.poll_validated(now)? {
-            Ok(v) => Some(Ok(self.item(streams, v))),
-            Err(e) => Some(Err(e)),
-        }
-    }
-
     /// Returns the next time [`PlayingCore::handle_timeout`] should be called.
     #[inline]
-    pub(crate) fn poll_timeout(&self) -> Instant {
+    pub fn poll_timeout(&self) -> Instant {
         match &self.reports {
             Some(r) => self.keepalive.deadline.min(r.due),
             None => self.keepalive.deadline,
@@ -495,7 +429,7 @@ impl PlayingCore {
     ///
     /// Returns an error if the previous keepalive hasn't been flushed or
     /// answered in time.
-    pub(crate) fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
+    pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
         if now >= self.keepalive.deadline {
             self.send_keepalive(now)?;
         }
@@ -513,15 +447,15 @@ impl PlayingCore {
         // Expect the previous keepalive request to have finished.
         match keepalive.state {
             KeepaliveState::Flushing { cseq, .. } => bail!(ErrorInt::WriteError {
-                conn_ctx: self.conn_ctx,
+                conn_ctx: self.conn.ctx,
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("Unable to write keepalive {cseq} within {interval:?}",),
                 ),
             }),
             KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
-                conn_ctx: self.conn_ctx,
-                msg_ctx: self.reader.eof_ctx(now),
+                conn_ctx: self.conn.ctx,
+                msg_ctx: self.conn.reader.eof_ctx(now),
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("Server failed to respond to keepalive {cseq} within {interval:?}",),
@@ -564,19 +498,14 @@ impl PlayingCore {
             },
             body: Bytes::new(),
         };
-        let cseq = super::fill_req(
-            &mut self.next_cseq,
-            &self.options,
-            &mut self.requested_auth,
-            &mut req,
-        )?;
+        let cseq = self.conn.fill_req(&mut req)?;
         trace!("sending {:?} keepalive", method);
-        self.transmit.queue(req);
+        self.conn.queue(&req);
         let keepalive = &mut self.keepalive;
         keepalive.state = KeepaliveState::Flushing {
             cseq,
             method,
-            end: self.transmit.queued,
+            end: self.conn.transmit.queued_end(),
         };
         keepalive.deadline = now + interval;
         Ok(())
@@ -587,7 +516,7 @@ impl PlayingCore {
     ///
     /// Each stream is its own RTP session, so each gets its own report on its
     /// own RTCP channel or socket. Over TCP, the report is queued for
-    /// [`PlayingCore::poll_transmit`] (after any keepalive). Over UDP, it's
+    /// [`PlayingCore::transmit_buf`] (after any keepalive). Over UDP, it's
     /// queued for [`PlayingCore::poll_transmit_udp`].
     fn send_reports(&mut self, now: Instant) {
         let reports = self.reports.as_mut().expect("reports are enabled");
@@ -605,9 +534,13 @@ impl PlayingCore {
             trace!("sending RTCP receiver report for stream {i}: {block:?}");
             let pkt = reports.writer.write(block.as_ref());
             match (udp_buf, &ctx.0) {
-                (Some(_), _) => self.transmit_udp.push_back((i, pkt)),
+                (Some(_), _) => self.transmit_udp.push_back(UdpTransmit {
+                    stream_i: i,
+                    channel_type: ChannelType::Rtcp,
+                    data: pkt,
+                }),
                 (None, crate::StreamContextInner::Tcp(tcp)) => {
-                    self.transmit.queue(OwnedMessage::Data {
+                    self.conn.queue(&OwnedMessage::Data {
                         channel_id: tcp.rtp_channel_id + 1,
                         body: Bytes::from(pkt),
                     })
@@ -619,24 +552,34 @@ impl PlayingCore {
         reports.due = reports.schedule.next_due();
     }
 
-    /// Returns bytes to write to the RTSP connection, if any.
+    /// Returns the bytes to write to the RTSP connection, in order.
     ///
-    /// Each call returns new bytes; the caller should buffer them and report
-    /// progress via [`PlayingCore::advance_transmit`] as they're written.
-    pub(crate) fn poll_transmit(&mut self) -> Option<&[u8]> {
-        if !self.transmit.ready {
-            return None;
-        }
-        self.transmit.ready = false;
-        Some(&self.transmit.buf)
+    /// The first slice is empty iff there's nothing to write. After writing,
+    /// call [`PlayingCore::advance_transmit`].
+    pub fn transmit_buf(&self) -> (&[u8], &[u8]) {
+        self.conn.transmit_buf()
     }
 
-    /// Returns a receiver report to send on UDP stream `stream_i`'s RTCP
-    /// socket, as `(stream_i, packet)`, if any.
+    /// Notes that the first `n` bytes of [`PlayingCore::transmit_buf`] have
+    /// been written.
+    ///
+    /// # Panics
+    ///
+    /// If `n` exceeds the bytes available.
+    pub fn advance_transmit(&mut self, n: usize) {
+        self.conn.advance_transmit(n);
+        if let KeepaliveState::Flushing { cseq, method, end } = self.keepalive.state
+            && self.conn.transmit.written() >= end
+        {
+            self.keepalive.state = KeepaliveState::Waiting { cseq, method };
+        }
+    }
+
+    /// Returns a receiver report to send on a UDP stream's RTCP socket, if any.
     ///
     /// The caller should send it right away if the socket has room and
     /// otherwise drop it, as later reports carry cumulative statistics anyway.
-    pub(crate) fn poll_transmit_udp(&mut self) -> Option<(usize, Vec<u8>)> {
+    pub fn poll_transmit_udp(&mut self) -> Option<UdpTransmit> {
         self.transmit_udp.pop_front()
     }
 
@@ -655,7 +598,7 @@ impl PlayingCore {
     }
 
     /// Returns the state of the current keepalive request.
-    #[cfg(all(test, feature = "unstable-send"))]
+    #[cfg(test)]
     pub(crate) fn keepalive_state(&self) -> KeepaliveState {
         self.keepalive.state
     }
@@ -675,31 +618,20 @@ impl PlayingCore {
             .any(|s| s.as_ref().is_some_and(|s| s.reception.is_some()))
     }
 
-    /// Notes that the next `n` bytes returned by [`PlayingCore::poll_transmit`]
-    /// have been written.
-    pub(crate) fn advance_transmit(&mut self, n: u64) {
-        self.transmit.written += n;
-        debug_assert!(self.transmit.written <= self.transmit.queued);
-        if let KeepaliveState::Flushing { cseq, method, end } = self.keepalive.state
-            && self.transmit.written >= end
-        {
-            self.keepalive.state = KeepaliveState::Waiting { cseq, method };
-        }
-    }
-
-    /// Notes that everything returned by [`PlayingCore::poll_transmit`] has
-    /// been written.
-    #[cfg(test)]
-    pub(crate) fn advance_transmit_all(&mut self) {
-        self.advance_transmit(self.transmit.queued - self.transmit.written);
-    }
-
     /// Returns the interleaved RTP channel id of sending stream `stream_i`.
-    ///
-    /// The caller has checked that the stream is a
-    /// [`super::StreamDirection::Sending`] stream.
     #[cfg(feature = "unstable-send")]
     fn sending_channel(&self, stream_i: usize) -> Result<u8, Error> {
+        let Some(stream) = self.presentation.streams.get(stream_i) else {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send on stream {stream_i}: presentation has only {} streams",
+                self.presentation.streams.len()
+            )));
+        };
+        if stream.direction != super::StreamDirection::Sending {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send on stream {stream_i}: it isn't an ONVIF backchannel (a=sendonly) stream"
+            )));
+        }
         let Some(PlayingStream { ctx, .. }) = self.streams[stream_i].as_ref() else {
             bail!(ErrorInt::FailedPrecondition(format!(
                 "can't send on stream {stream_i}: it wasn't set up before PLAY"
@@ -715,30 +647,31 @@ impl PlayingCore {
     }
 
     /// Queues an RTP packet on sending stream `stream_i`'s interleaved
-    /// channel, for [`PlayingCore::poll_transmit`].
+    /// channel, for [`PlayingCore::transmit_buf`].
     ///
-    /// The caller has checked that the stream is a
-    /// [`super::StreamDirection::Sending`] stream. On error, nothing is queued.
+    /// On error, nothing is queued, and the session is still usable.
     #[cfg(feature = "unstable-send")]
-    pub(crate) fn queue_rtp(
+    pub fn queue_rtp(
         &mut self,
         stream_i: usize,
         pkt: &crate::rtp::OutgoingPacketRef<'_>,
     ) -> Result<(), Error> {
         let channel_id = self.sending_channel(stream_i)?;
+        let header = pkt.header();
+        let mut data = Vec::with_capacity(1 + pkt.data().len());
+        data.push(&header.as_bytes()[..]);
+        data.extend_from_slice(pkt.data());
         // `rtp::Sender::packet` ensures the packet fits.
-        self.transmit
-            .queue_data(channel_id, |out| pkt.write_to(out));
+        self.conn.queue_data(channel_id, &data);
         Ok(())
     }
 
     /// Queues an RTCP packet on sending stream `stream_i`'s interleaved
-    /// channel, for [`PlayingCore::poll_transmit`].
+    /// channel, for [`PlayingCore::transmit_buf`].
     ///
-    /// As with [`PlayingCore::queue_rtp`], the caller has checked the stream.
-    /// On error, nothing is queued.
+    /// On error, nothing is queued, and the session is still usable.
     #[cfg(feature = "unstable-send")]
-    pub(crate) fn queue_rtcp(&mut self, stream_i: usize, pkt: &[u8]) -> Result<(), Error> {
+    pub fn queue_rtcp(&mut self, stream_i: usize, pkt: &[u8]) -> Result<(), Error> {
         let channel_id = self.sending_channel(stream_i)?;
         if pkt.len() > usize::from(u16::MAX) {
             bail!(ErrorInt::InvalidArgument(format!(
@@ -747,8 +680,7 @@ impl PlayingCore {
                 pkt.len()
             )));
         }
-        self.transmit
-            .queue_data(channel_id.wrapping_add(1), |out| out.extend_from_slice(pkt));
+        self.conn.queue_data(channel_id.wrapping_add(1), &[pkt]);
         Ok(())
     }
 
@@ -787,7 +719,7 @@ impl PlayingCore {
 
         // The only response we expect in this state is to our keepalive request.
         bail!(ErrorInt::RtspFramingError {
-            conn_ctx: self.conn_ctx,
+            conn_ctx: self.conn.ctx,
             msg_ctx: *msg_ctx,
             description: format!("Unexpected RTSP response {response:#?}"),
         })
@@ -804,14 +736,14 @@ impl PlayingCore {
         body_pos: u64,
         body_len: u16,
     ) -> Result<Option<StreamItem>, Error> {
-        let Some(m) = self.channels.lookup(channel_id) else {
-            let body = self.reader.body_bytes(body_pos, u32::from(body_len));
+        let Some(m) = self.conn.channels.lookup(channel_id) else {
+            let body = self.conn.reader.body_bytes(body_pos, u32::from(body_len));
             super::handle_unassigned_data(
-                &self.conn_ctx,
-                &mut self.seen_unassigned,
+                &self.conn.ctx,
+                &mut self.conn.seen_unassigned,
                 *msg_ctx,
-                &self.options,
-                self.tool.as_ref(),
+                &self.conn.options,
+                self.conn.tool.as_ref(),
                 channel_id,
                 body,
             )?;
@@ -836,7 +768,7 @@ impl PlayingCore {
         let stream = self.streams[item.stream_i]
             .as_mut()
             .expect("only set-up streams have packets");
-        let buf = stream.udp_buf.as_ref().unwrap_or(self.reader.buf());
+        let buf = stream.udp_buf.as_ref().unwrap_or(self.conn.reader.buf());
         match item.channel_type {
             ChannelType::Rtp if stream.sending => {
                 // Retina sends RTP on this stream; the server shouldn't.
@@ -851,7 +783,7 @@ impl PlayingCore {
                 let (header, payload_range) =
                     crate::rtp::PacketHeader::validate(split).map_err(|reason| {
                         wrap!(ErrorInt::PacketError {
-                            conn_ctx: self.conn_ctx,
+                            conn_ctx: self.conn.ctx,
                             stream_ctx: stream.ctx,
                             pkt_ctx: item.pkt_ctx,
                             stream_id: item.stream_i,
@@ -874,10 +806,10 @@ impl PlayingCore {
                     );
                 }
                 let Some(meta) = stream.rtp_handler.rtp(
-                    &self.options,
+                    &self.conn.options,
                     &stream.ctx,
-                    self.tool.as_ref(),
-                    &self.conn_ctx,
+                    self.conn.tool.as_ref(),
+                    &self.conn.ctx,
                     &item.pkt_ctx,
                     &mut stream.timeline,
                     item.stream_i,
@@ -900,10 +832,10 @@ impl PlayingCore {
                         .to_vec(),
                 );
                 match stream.rtp_handler.rtcp(
-                    &self.options,
+                    &self.conn.options,
                     &stream.ctx,
-                    self.tool.as_ref(),
-                    &self.conn_ctx,
+                    self.conn.tool.as_ref(),
+                    &self.conn.ctx,
                     &item.pkt_ctx,
                     &mut stream.timeline,
                     item.stream_i,
@@ -925,7 +857,7 @@ impl PlayingCore {
                         Ok(p.map(ValidatedItem::Rtcp))
                     }
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
-                        conn_ctx: self.conn_ctx,
+                        conn_ctx: self.conn.ctx,
                         stream_ctx: stream.ctx,
                         pkt_ctx: item.pkt_ctx,
                         stream_id: item.stream_i,
@@ -940,7 +872,7 @@ impl PlayingCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::UnknownRtcpSsrcPolicy;
+    use crate::client::{SessionOptions, UnknownRtcpSsrcPolicy};
 
     const INTERVAL: Duration = Duration::from_secs(30);
 
@@ -948,7 +880,6 @@ mod tests {
     /// via TCP on channels 0–1 and its audio stream (1) via UDP.
     struct Fixture {
         core: PlayingCore,
-        streams: Box<[Stream]>,
         t0: Instant,
     }
 
@@ -958,8 +889,19 @@ mod tests {
             crate::testutil::response(include_bytes!("testdata/reolink_describe.txt"));
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
         let presentation = parse::parse_describe(url, &resp, &body, false).unwrap();
-        let mut channels = ChannelMappings::default();
-        channels.assign(0, 0).unwrap();
+        let mut conn = ConnCore::new(ConnectionContext::dummy(), SessionOptions::default());
+        conn.channels.assign(0, 0).unwrap();
+        for _ in 1..5 {
+            conn.fill_req(&mut OwnedMessage::Request {
+                head: msg::Request {
+                    method: msg::Method::OPTIONS,
+                    request_uri: None,
+                    headers: Default::default(),
+                },
+                body: Bytes::new(),
+            })
+            .unwrap();
+        }
         let new_stream = |s: &Stream, udp: bool| {
             Some(PlayingStream {
                 timeline: Timeline::new(None, s.clock_rate_hz(), None).unwrap(),
@@ -976,38 +918,31 @@ mod tests {
         ];
         let t0 = Instant::now();
         let core = PlayingCore::new(
-            Parts {
-                reader: Reader::default(),
-                options: SessionOptions::default(),
-                requested_auth: None,
-                next_cseq: 5,
+            conn,
+            presentation,
+            Bytes::new(),
+            SessionHeader {
+                id: msg::HeaderValue::try_from("F8F8E425").unwrap(),
+                timeout_sec: 60,
             },
-            Init {
-                conn_ctx: ConnectionContext::dummy(),
-                channels,
-                seen_unassigned: false,
-                streams: streams.into(),
-                tool: None,
-                session: &SessionHeader {
-                    id: msg::HeaderValue::try_from("F8F8E425").unwrap(),
-                    timeout_sec: 60,
-                },
-                keepalive_url: presentation.base_url.clone(),
-            },
+            streams.into(),
+            0,
             t0,
         );
-        Fixture {
-            core,
-            streams: presentation.streams,
-            t0,
-        }
+        Fixture { core, t0 }
     }
 
-    /// Returns the request passed to `poll_transmit`, which must be exactly one.
-    fn transmitted(core: &mut PlayingCore) -> String {
-        let req = String::from_utf8(core.poll_transmit().expect("should transmit").to_vec());
-        assert!(core.poll_transmit().is_none());
-        req.unwrap()
+    /// Returns the bytes not yet written, which must be non-empty.
+    fn transmitted(core: &PlayingCore) -> String {
+        let (a, b) = core.transmit_buf();
+        assert!(!a.is_empty(), "should transmit");
+        String::from_utf8([a, b].concat()).unwrap()
+    }
+
+    /// Writes all bytes from [`PlayingCore::transmit_buf`].
+    fn flush(core: &mut PlayingCore) {
+        let (a, b) = core.transmit_buf();
+        core.advance_transmit(a.len() + b.len());
     }
 
     /// Returns an interleaved data message holding an RTP packet.
@@ -1029,22 +964,18 @@ mod tests {
 
     #[test]
     fn keepalive_timing() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
+        let Fixture { mut core, t0 } = fixture();
         assert_eq!(core.poll_timeout(), t0 + INTERVAL);
 
         // Nothing is sent before the deadline.
         core.handle_timeout(t0 + INTERVAL - Duration::from_millis(1))
             .unwrap();
-        assert!(core.poll_transmit().is_none());
+        assert!(core.transmit_buf().0.is_empty());
 
         // At the deadline, an `OPTIONS` goes out, and the next deadline is set.
         let t1 = t0 + INTERVAL;
         core.handle_timeout(t1).unwrap();
-        let req = transmitted(&mut core);
+        let req = transmitted(&core);
         assert!(
             req.starts_with("OPTIONS rtsp://192.168.5.206/h264Preview_01_main/ RTSP/1.0\r\n"),
             "{req}"
@@ -1052,17 +983,17 @@ mod tests {
         assert!(req.contains("\r\nCSeq: 5\r\n"), "{req}");
         assert!(req.contains("\r\nSession: F8F8E425\r\n"), "{req}");
         assert_eq!(core.poll_timeout(), t1 + INTERVAL);
-        core.advance_transmit_all();
+        flush(&mut core);
 
         // The response advertises `SET_PARAMETER`; it's used from then on.
-        core.tcp_buf().extend(
+        core.read_buf().extend(
             b"RTSP/1.0 200 OK\r\nCSeq: 5\r\n\
               Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, SET_PARAMETER\r\n\r\n",
         );
-        assert!(core.poll_item(&streams, t1).is_none());
+        assert!(core.poll_item(t1).is_none());
         let t2 = t1 + INTERVAL;
         core.handle_timeout(t2).unwrap();
-        let req = transmitted(&mut core);
+        let req = transmitted(&core);
         assert!(req.starts_with("SET_PARAMETER "), "{req}");
         assert!(req.contains("\r\nCSeq: 6\r\n"), "{req}");
     }
@@ -1070,28 +1001,24 @@ mod tests {
     /// A failed keepalive is only logged, and doesn't change the method.
     #[test]
     fn keepalive_error_response() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
+        let Fixture { mut core, t0 } = fixture();
         let t1 = t0 + INTERVAL;
         core.handle_timeout(t1).unwrap();
-        assert!(transmitted(&mut core).starts_with("OPTIONS "));
-        core.advance_transmit_all();
-        core.tcp_buf()
+        assert!(transmitted(&core).starts_with("OPTIONS "));
+        flush(&mut core);
+        core.read_buf()
             .extend(b"RTSP/1.0 454 Session Not Found\r\nCSeq: 5\r\n\r\n");
-        assert!(core.poll_item(&streams, t1).is_none());
+        assert!(core.poll_item(t1).is_none());
         core.handle_timeout(t1 + INTERVAL).unwrap();
-        assert!(transmitted(&mut core).starts_with("OPTIONS "));
+        assert!(transmitted(&core).starts_with("OPTIONS "));
     }
 
     #[test]
     fn keepalive_unanswered() {
         let Fixture { mut core, t0, .. } = fixture();
         core.handle_timeout(t0 + INTERVAL).unwrap();
-        transmitted(&mut core);
-        core.advance_transmit_all();
+        transmitted(&core);
+        flush(&mut core);
         let e = core.handle_timeout(t0 + 2 * INTERVAL).unwrap_err();
         assert!(
             e.to_string()
@@ -1104,7 +1031,7 @@ mod tests {
     fn keepalive_unflushed() {
         let Fixture { mut core, t0, .. } = fixture();
         core.handle_timeout(t0 + INTERVAL).unwrap();
-        transmitted(&mut core);
+        transmitted(&core);
         let e = core.handle_timeout(t0 + 2 * INTERVAL).unwrap_err();
         assert!(
             e.to_string()
@@ -1113,16 +1040,36 @@ mod tests {
         );
     }
 
+    /// The keepalive is written once its last byte is, even if a partial
+    /// write left it short or more bytes are queued after it.
+    #[test]
+    fn keepalive_written_precisely() {
+        let Fixture { mut core, t0, .. } = fixture();
+        core.handle_timeout(t0 + INTERVAL).unwrap();
+        let len = transmitted(&core).len();
+        core.conn.queue(&OwnedMessage::Data {
+            channel_id: 1,
+            body: Bytes::from_static(b"rtcp"),
+        });
+        core.advance_transmit(len - 1);
+        assert!(matches!(
+            core.keepalive.state,
+            KeepaliveState::Flushing { .. }
+        ));
+        core.advance_transmit(1);
+        assert!(matches!(
+            core.keepalive.state,
+            KeepaliveState::Waiting { .. }
+        ));
+        assert_eq!(transmitted(&core), "$\x01\x00\x04rtcp");
+    }
+
     #[test]
     fn unexpected_response() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
-        core.tcp_buf()
+        let Fixture { mut core, t0 } = fixture();
+        core.read_buf()
             .extend(b"RTSP/1.0 200 OK\r\nCSeq: 42\r\n\r\n");
-        let Some(Err(e)) = core.poll_item(&streams, t0) else {
+        let Some(Err(e)) = core.poll_item(t0) else {
             panic!("expected error");
         };
         assert!(e.to_string().contains("Unexpected RTSP response"), "{e}");
@@ -1132,19 +1079,15 @@ mod tests {
     /// channels is ignored.
     #[test]
     fn interleaved_rtp() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
-        core.tcp_buf().extend(&interleaved(4, 1, b"unassigned"));
+        let Fixture { mut core, t0 } = fixture();
+        core.read_buf().extend(&interleaved(4, 1, b"unassigned"));
         let msg = interleaved(0, 0x41d4, b"\x65slice");
         let (first, second) = msg.split_at(10);
-        core.tcp_buf().extend(first);
-        assert!(core.poll_item(&streams, t0).is_none());
+        core.read_buf().extend(first);
+        assert!(core.poll_item(t0).is_none());
         let t1 = t0 + Duration::from_millis(5);
-        core.tcp_buf().extend(second);
-        match core.poll_item(&streams, t1) {
+        core.read_buf().extend(second);
+        match core.poll_item(t1) {
             Some(Ok(PlayingItem::Rtp(p))) => {
                 assert_eq!(p.stream_id(), 0);
                 assert_eq!(p.stream().media(), "video");
@@ -1155,16 +1098,12 @@ mod tests {
             }
             o => panic!("unexpected item: {o:#?}"),
         }
-        assert!(core.poll_item(&streams, t1).is_none());
+        assert!(core.poll_item(t1).is_none());
     }
 
     #[test]
     fn udp_rtp_and_rtcp() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
+        let Fixture { mut core, t0 } = fixture();
         let write = |core: &mut PlayingCore, data: &[u8]| {
             let (s1, _) = core.udp_buf(1).spare_capacity(data.len());
             s1[..data.len()].copy_from_slice(data);
@@ -1179,7 +1118,7 @@ mod tests {
                             \x2f\x4c\x34\x1d";
         let len = write(&mut core, SR);
         core.udp_received(1, ChannelType::Rtcp, len, t0);
-        match core.poll_item(&streams, t0) {
+        match core.poll_item(t0) {
             Some(Ok(PlayingItem::Rtp(p))) => {
                 assert_eq!(p.stream_id(), 1);
                 assert_eq!(p.packet().meta.ctx.received(), t0);
@@ -1187,44 +1126,33 @@ mod tests {
             }
             o => panic!("unexpected item: {o:#?}"),
         }
-        match core.poll_item(&streams, t0) {
+        match core.poll_item(t0) {
             Some(Ok(PlayingItem::Rtcp(p))) => {
                 assert_eq!(p.stream_id(), 1);
                 assert_eq!(p.raw(), SR);
             }
             o => panic!("unexpected item: {o:#?}"),
         }
-        assert!(core.poll_item(&streams, t0).is_none());
+        assert!(core.poll_item(t0).is_none());
     }
 
     #[test]
     fn eof() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
-        core.tcp_buf().extend(&interleaved(0, 1, b"\x65slice"));
-        core.handle_tcp_eof();
-        assert!(matches!(
-            core.poll_item(&streams, t0),
-            Some(Ok(PlayingItem::Rtp(_)))
-        ));
-        assert!(core.poll_item(&streams, t0).is_none());
+        let Fixture { mut core, t0 } = fixture();
+        core.read_buf().extend(&interleaved(0, 1, b"\x65slice"));
+        core.handle_eof();
+        assert!(matches!(core.poll_item(t0), Some(Ok(PlayingItem::Rtp(_)))));
+        assert!(core.poll_item(t0).is_none());
         assert!(core.is_closed());
     }
 
     #[test]
     fn eof_mid_message() {
-        let Fixture {
-            mut core,
-            streams,
-            t0,
-        } = fixture();
-        core.tcp_buf()
+        let Fixture { mut core, t0 } = fixture();
+        core.read_buf()
             .extend(&interleaved(0, 1, b"\x65slice")[..10]);
-        core.handle_tcp_eof();
-        let Some(Err(e)) = core.poll_item(&streams, t0) else {
+        core.handle_eof();
+        let Some(Err(e)) = core.poll_item(t0) else {
             panic!("expected error");
         };
         assert!(

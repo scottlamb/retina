@@ -5,10 +5,8 @@
 //!
 //! In theory there could be a similar async-std-based implementation.
 
-use bytes::{Buf as _, BufMut as _, BytesMut};
-use futures::{Sink, Stream};
+use futures::Sink;
 use std::task::{Context, Poll};
-use std::time::Instant;
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
@@ -16,46 +14,39 @@ use url::Host;
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::OwnedMessage;
 use crate::rtsp::reader::Reader;
-use crate::{Error, ErrorInt, RtspMessageContext};
+use crate::{ConnectionContext, ErrorInt, WallTime};
+#[cfg(test)]
+use crate::{Error, ReceivedMessage};
+#[cfg(test)]
+use futures::Stream;
+#[cfg(test)]
+use std::time::Instant;
 
-use super::{ConnectionContext, ReceivedMessage, WallTime};
-
-/// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
+/// A RTSP connection which implements `Sink`, `Unpin`, and (in tests, for
+/// mock servers) `Stream`.
+///
+/// The client reads into a sans-I/O core's buffer via
+/// [`Connection::poll_read`] instead of using the `Stream` impl.
 pub(crate) struct Connection {
     stream: TcpStream,
     ctx: ConnectionContext,
 
-    /// The reader, which is lent out while playing; see [`Connection::take_reader`].
+    /// The reader for the `Stream` impl; see [`Connection::with_reader`].
+    #[cfg_attr(not(test), allow(dead_code))]
     reader: Option<Reader>,
 
-    /// Write buffer for outgoing messages, appended to by `start_send` and
-    /// [`Connection::queue_write`] and drained by `poll_flush`.
-    ///
-    /// A `BytesMut` so that `poll_flush` can drop a partial write from the
-    /// front in constant time, without moving what's left.
-    write_buf: BytesMut,
-
-    /// Total bytes written to `stream` since the connection was established.
-    ///
-    /// This tells a [`crate::client::playing::PlayingCore`] how many of the
-    /// bytes it supplied have been written, so it knows when a particular
-    /// message (such as a keepalive request) is out, even while later
-    /// messages remain buffered.
-    written: u64,
-
-    /// Set once a write fails, to the kind of the error.
-    ///
-    /// `write_buf` is then cleared and all later writes fail: the remainder of
-    /// a partly written message would corrupt the framing of anything sent
-    /// after it.
-    write_failed: Option<std::io::ErrorKind>,
+    /// Write buffer for outgoing messages (appended then flushed).
+    write_buf: Vec<u8>,
 }
 
 impl Connection {
+    /// Connects to `host:port`, from `bind_addr` if specified.
+    ///
+    /// The connection has no reader; the caller parses what it reads via a
+    /// sans-I/O core.
     pub(crate) async fn connect(
         host: Host<&str>,
         port: u16,
-        max_message_size: usize,
         bind_addr: Option<std::net::IpAddr>,
     ) -> Result<Self, std::io::Error> {
         let stream = match bind_addr {
@@ -66,7 +57,7 @@ impl Connection {
             }?,
             Some(local) => Self::connect_bound(host, port, local).await?,
         };
-        Self::from_stream(stream, max_message_size)
+        Self::from_stream(stream)
     }
 
     /// Connects to `host:port` from the local address `local` (port chosen by the OS).
@@ -101,10 +92,8 @@ impl Connection {
         }))
     }
 
-    pub(crate) fn from_stream(
-        stream: TcpStream,
-        max_message_size: usize,
-    ) -> Result<Self, std::io::Error> {
+    /// Wraps `stream`, without a reader; see [`Connection::with_reader`].
+    pub(crate) fn from_stream(stream: TcpStream) -> Result<Self, std::io::Error> {
         let established_wall = WallTime::now();
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
@@ -115,50 +104,29 @@ impl Connection {
                 peer_addr,
                 established_wall,
             },
-            reader: Some(Reader::new(max_message_size)),
-            write_buf: BytesMut::new(),
-            written: 0,
-            write_failed: None,
+            reader: None,
+            write_buf: Vec::new(),
         })
+    }
+
+    /// Adds a reader, so this connection can be used via its `Stream` impl.
+    #[cfg(test)]
+    pub(crate) fn with_reader(mut self, max_message_size: usize) -> Self {
+        self.reader = Some(Reader::new(max_message_size));
+        self
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
         &self.ctx
     }
 
-    fn reader(&self) -> &Reader {
+    /// Reads body data from the ring buffer as `Bytes`; see [`Reader::body_bytes`].
+    #[cfg(test)]
+    pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
         self.reader
             .as_ref()
-            .expect("reader should be present except while playing")
-    }
-
-    /// Takes the reader, so that a [`crate::client::playing::PlayingCore`]
-    /// can parse messages without going through this connection's `Stream`
-    /// impl. Put it back with [`Connection::restore_reader`] before polling
-    /// the `Stream` impl again.
-    pub(crate) fn take_reader(&mut self) -> Reader {
-        self.reader
-            .take()
-            .expect("reader should be present except while playing")
-    }
-
-    pub(crate) fn restore_reader(&mut self, reader: Reader) {
-        assert!(self.reader.is_none());
-        self.reader = Some(reader);
-    }
-
-    /// Reads body data from the ring buffer as `Bytes`; see [`Reader::body_bytes`].
-    pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
-        self.reader().body_bytes(body_pos, body_len)
-    }
-
-    /// Returns true iff messages are queued that haven't been fully written.
-    pub(crate) fn has_unflushed(&self) -> bool {
-        !self.write_buf.is_empty()
-    }
-
-    pub(crate) fn eof_ctx(&self) -> RtspMessageContext {
-        self.reader().eof_ctx(Instant::now())
+            .expect("with_reader")
+            .body_bytes(body_pos, body_len)
     }
 
     /// Reads available bytes from the connection into `buf`, returning the
@@ -171,46 +139,26 @@ impl Connection {
         poll_read(&self.stream, cx, buf)
     }
 
-    /// Queues `data` to be written by [`Sink::poll_flush`].
+    /// Writes from `bufs` (a sans-I/O core's transmit buffer), returning the
+    /// number of bytes written.
     ///
-    /// If an earlier write failed, `data` is discarded; `poll_flush` returns
-    /// the error.
-    pub(crate) fn queue_write(&mut self, data: &[u8]) {
-        if self.write_failed.is_none() {
-            self.write_buf.extend_from_slice(data);
-        }
-    }
-
-    /// Returns the total bytes written so far.
-    pub(crate) fn written(&self) -> u64 {
-        self.written
-    }
-
-    /// Returns the number of bytes queued but not yet written.
-    #[cfg(feature = "unstable-send")]
-    pub(crate) fn queued_len(&self) -> usize {
-        self.write_buf.len()
-    }
-
-    /// Returns an error to report if an earlier write failed.
-    fn write_failed_error(&self) -> Option<ErrorInt> {
-        self.write_failed.map(|kind| ErrorInt::WriteError {
-            conn_ctx: self.ctx,
-            source: std::io::Error::new(kind, "connection unusable after an earlier write error"),
-        })
-    }
-
-    /// Records that a write failed with `source`, returning the error.
-    ///
-    /// Discards the write buffer, so nothing left over from a partly written
-    /// message is sent later, and makes later writes fail.
-    fn fail_write(&mut self, source: std::io::Error) -> ErrorInt {
-        self.write_failed = Some(source.kind());
-        self.write_buf = BytesMut::new();
-        ErrorInt::WriteError {
+    /// The client writes only this way, bypassing the `Sink` impl.
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: (&[u8], &[u8]),
+    ) -> Poll<Result<usize, ErrorInt>> {
+        debug_assert!(self.write_buf.is_empty());
+        let bufs = [std::io::IoSlice::new(bufs.0), std::io::IoSlice::new(bufs.1)];
+        let r = match std::pin::Pin::new(&mut self.stream).poll_write_vectored(cx, &bufs) {
+            Poll::Ready(Ok(0)) => Err(std::io::ErrorKind::WriteZero.into()),
+            Poll::Ready(r) => r,
+            Poll::Pending => return Poll::Pending,
+        };
+        Poll::Ready(r.map_err(|source| ErrorInt::WriteError {
             conn_ctx: self.ctx,
             source,
-        }
+        }))
     }
 }
 
@@ -242,6 +190,7 @@ fn poll_read(
     }
 }
 
+#[cfg(test)]
 impl Stream for Connection {
     type Item = Result<ReceivedMessage, Error>;
 
@@ -250,10 +199,7 @@ impl Stream for Connection {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
-        let reader = this
-            .reader
-            .as_mut()
-            .expect("reader should be present except while playing");
+        let reader = this.reader.as_mut().expect("with_reader");
         loop {
             // Try decoding from existing buffered data.
             match reader.decode(&this.ctx, false, Instant::now()) {
@@ -277,15 +223,6 @@ impl Stream for Connection {
     }
 }
 
-/// `Sink` impl for RTSP messages.
-///
-/// `poll_ready` is always ready: `start_send` appends to an unbounded write
-/// buffer, after anything queued earlier, so internal callers may send a small
-/// RTSP request without waiting for readiness. Bulk data is queued via
-/// [`Connection::queue_write`] instead.
-///
-/// Once a write fails, the connection is unusable for writing: `start_send`,
-/// `poll_flush`, and `poll_close` return errors without writing anything more.
 impl Sink<OwnedMessage> for Connection {
     type Error = ErrorInt;
 
@@ -305,11 +242,8 @@ impl Sink<OwnedMessage> for Connection {
         mut self: std::pin::Pin<&mut Self>,
         item: OwnedMessage,
     ) -> Result<(), Self::Error> {
-        if let Some(e) = self.write_failed_error() {
-            return Err(e);
-        }
-        item.write(&mut (&mut self.write_buf).writer())
-            .expect("BytesMut Writer is infallible");
+        item.write(&mut self.write_buf)
+            .expect("Vec Writer is infallible");
         Ok(())
     }
 
@@ -318,37 +252,26 @@ impl Sink<OwnedMessage> for Connection {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
         let this = &mut *self;
-        if let Some(e) = this.write_failed_error() {
-            return std::task::Poll::Ready(Err(e));
-        }
-
-        // Bytes written by this call. They're removed from the front of
-        // `write_buf` once, on return.
-        let mut written = 0;
-        while written < this.write_buf.len() {
-            match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf[written..]) {
-                std::task::Poll::Ready(Ok(0)) => {
-                    return std::task::Poll::Ready(Err(
-                        this.fail_write(std::io::ErrorKind::WriteZero.into())
-                    ));
-                }
+        while !this.write_buf.is_empty() {
+            match std::pin::Pin::new(&mut this.stream).poll_write(cx, &this.write_buf) {
                 std::task::Poll::Ready(Ok(n)) => {
-                    written += n;
-                    this.written += n as u64;
+                    this.write_buf.drain(..n);
                 }
                 std::task::Poll::Ready(Err(e)) => {
-                    return std::task::Poll::Ready(Err(this.fail_write(e)));
+                    return std::task::Poll::Ready(Err(ErrorInt::WriteError {
+                        conn_ctx: this.ctx,
+                        source: e,
+                    }));
                 }
-                std::task::Poll::Pending => {
-                    this.write_buf.advance(written);
-                    return std::task::Poll::Pending;
-                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
-        this.write_buf.clear();
         match std::pin::Pin::new(&mut this.stream).poll_flush(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(this.fail_write(e))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
+                conn_ctx: this.ctx,
+                source: e,
+            })),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -364,7 +287,10 @@ impl Sink<OwnedMessage> for Connection {
         let this = &mut *self;
         match std::pin::Pin::new(&mut this.stream).poll_shutdown(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(this.fail_write(e))),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
+                conn_ctx: this.ctx,
+                source: e,
+            })),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -402,12 +328,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let (client, accepted) = tokio::join!(
-            Connection::connect(
-                Host::Ipv4(std::net::Ipv4Addr::LOCALHOST),
-                port,
-                usize::MAX,
-                Some(local)
-            ),
+            Connection::connect(Host::Ipv4(std::net::Ipv4Addr::LOCALHOST), port, Some(local)),
             listener.accept()
         );
         client.unwrap();
@@ -428,8 +349,10 @@ mod tests {
             TcpStream::connect(listener.local_addr().unwrap()),
             listener.accept()
         );
-        let mut client = Connection::from_stream(client.unwrap(), usize::MAX).unwrap();
-        let mut server = Connection::from_stream(server.unwrap().0, usize::MAX).unwrap();
+        let mut client = Connection::from_stream(client.unwrap()).unwrap();
+        let mut server = Connection::from_stream(server.unwrap().0)
+            .unwrap()
+            .with_reader(usize::MAX);
 
         client
             .start_send_unpin(OwnedMessage::Request {
@@ -471,81 +394,5 @@ mod tests {
             }
             o => panic!("expected data, got {o:#?}"),
         }
-    }
-
-    /// `written` counts bytes as they go out.
-    #[tokio::test]
-    async fn written() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let mut conn = Connection::from_stream(client, usize::MAX).unwrap();
-        assert_eq!(conn.written(), 0);
-        conn.queue_write(b"$\x00\x00\x03abc");
-        assert_eq!(conn.written(), 0);
-        futures::SinkExt::<OwnedMessage>::flush(&mut conn)
-            .await
-            .unwrap();
-        assert_eq!(conn.written(), 7);
-        conn.queue_write(b"$\x01\x00\x02de");
-        assert_eq!(conn.written(), 7);
-    }
-
-    /// Once a write fails, the rest of the buffer is discarded and later
-    /// writes fail without sending anything, so the remainder of a partly
-    /// written message can't corrupt a later request's framing (such as the
-    /// `TEARDOWN` attempted when the session is dropped).
-    #[tokio::test]
-    async fn write_error_discards_buffer() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        drop(server);
-        let mut conn = Connection::from_stream(client, usize::MAX).unwrap();
-
-        // Writes to the closed peer fail once its reset arrives.
-        let kind = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                conn.queue_write(&[0; 1024]);
-                match futures::SinkExt::<OwnedMessage>::flush(&mut conn).await {
-                    Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                    Err(ErrorInt::WriteError { source, .. }) => break source.kind(),
-                    Err(e) => panic!("unexpected error: {e}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(conn.write_buf.is_empty());
-        let written = conn.written();
-
-        let check = |r: Result<(), ErrorInt>| match r {
-            Err(ErrorInt::WriteError { source, .. }) => {
-                assert_eq!(source.kind(), kind);
-                assert!(
-                    source.to_string().contains("earlier write error"),
-                    "{source}"
-                );
-            }
-            o => panic!("expected write error, got {o:?}"),
-        };
-        conn.queue_write(b"x");
-        assert!(conn.write_buf.is_empty());
-        check(
-            futures::SinkExt::<OwnedMessage>::send(
-                &mut conn,
-                OwnedMessage::Data {
-                    channel_id: 0,
-                    body: bytes::Bytes::from_static(b"x"),
-                },
-            )
-            .await,
-        );
-        check(futures::SinkExt::<OwnedMessage>::flush(&mut conn).await);
-        assert!(conn.write_buf.is_empty());
-        assert_eq!(conn.written(), written);
     }
 }
