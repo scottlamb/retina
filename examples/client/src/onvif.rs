@@ -41,8 +41,8 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
         .iter()
         .position(|s| {
             matches!(
-                s.parameters(),
-                Some(retina::codec::ParametersRef::Message(..))
+                s.new_depacketizer::<()>(),
+                Ok(retina::codec::Depacketizer::Message(..))
             )
         })
         .ok_or_else(|| anyhow!("couldn't find onvif stream"))?;

@@ -6,7 +6,6 @@
 use bytes::Bytes;
 use log::{debug, warn};
 
-use crate::client::PacketItem;
 use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{PacketHeader, ReceivedPacketMeta};
 use crate::{
@@ -323,7 +322,7 @@ impl InorderParser {
         timeline: &mut Timeline,
         stream_id: usize,
         data: Bytes,
-    ) -> Result<Option<PacketItem>, String> {
+    ) -> Result<Option<ReceivedCompoundPacket>, String> {
         let first_pkt = crate::rtcp::ReceivedCompoundPacket::validate(&data[..])?;
         let mut rtp_timestamp = None;
         if let Ok(Some(sr)) = first_pkt.as_sender_report() {
@@ -376,12 +375,12 @@ impl InorderParser {
             )?);
         }
         self.seen_rtcp_packets += 1;
-        Ok(Some(PacketItem::Rtcp(ReceivedCompoundPacket {
+        Ok(Some(ReceivedCompoundPacket {
             ctx: *pkt_ctx,
             stream_id,
             rtp_timestamp,
             raw: data,
-        })))
+        }))
     }
 }
 

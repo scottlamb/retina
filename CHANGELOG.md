@@ -2,6 +2,15 @@
 
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
+*   BREAKING: `client::Stream` describes every payload format its SDP media
+    description offers, via `Stream::payload_formats`, a non-empty slice of
+    `client::StreamFormat` (payload type and `codec::PayloadFormat`) in `m=`
+    line order. The first is the default; formats after it that Retina
+    can't describe are omitted. This replaces `Stream::encoding_name`,
+    `rtp_payload_type`, `clock_rate_hz`, and `channels`, which described
+    only the first. An ONVIF backchannel caller can choose which format to
+    send. `Stream::parameters` is also removed: use
+    `Stream::new_depacketizer` and its `parameters`.
 
 ## `v0.4.22` (2026-11-11)
 

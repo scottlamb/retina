@@ -255,17 +255,25 @@ fn parse_media(
     // RFC 8866 continues: "When a list of payload type numbers is given,
     // this implies that all of these payload formats MAY be used in the
     // session, but the first of these formats SHOULD be used as the default
-    // format for the session." Just use the first until we find a stream
-    // where this isn't the right thing to do.
-    let rtp_payload_type_str = media_description
-        .fmt
-        .split_ascii_whitespace()
+    // format for the session." The first must be valid; others that aren't
+    // valid RTP payload types are ignored.
+    let mut fmts = media_description.fmt.split_ascii_whitespace();
+    let rtp_payload_type_str = fmts
         .next()
         .ok_or_else(|| "media description has no format".to_string())?;
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
         .map_err(|_| format!("invalid RTP payload type {rtp_payload_type_str:?}"))?;
     if (rtp_payload_type & 0x80) != 0 {
         return Err(format!("invalid RTP payload type {rtp_payload_type}"));
+    }
+    let mut rtp_payload_types = vec![rtp_payload_type];
+    for f in fmts {
+        if let Ok(pt) = u8::from_str_radix(f, 10)
+            && pt < 0x80
+            && !rtp_payload_types.contains(&pt)
+        {
+            rtp_payload_types.push(pt);
+        }
     }
 
     // Capture interesting attributes.
@@ -274,8 +282,8 @@ fn parse_media(
     // type number to a media encoding name that identifies the payload
     // format. The "a=fmtp:" attribute MAY be used to specify format
     // parameters (see Section 6.15)."
-    let mut rtpmap = None;
-    let mut fmtp = None;
+    let mut rtpmaps = Vec::new();
+    let mut fmtps = Vec::new();
     let mut control = None;
     let mut framerate = None;
     for a in &media_description.attributes {
@@ -299,8 +307,8 @@ fn parse_media(
                 let (rtpmap_payload_type, v) = v
                     .split_once(' ')
                     .ok_or_else(|| "invalid rtmap attribute".to_string())?;
-                if rtpmap_payload_type == rtp_payload_type_str {
-                    rtpmap = Some(v);
+                if let Ok(pt) = u8::from_str_radix(rtpmap_payload_type, 10) {
+                    rtpmaps.push((pt, v));
                 }
             }
             "fmtp" => {
@@ -311,8 +319,8 @@ fn parse_media(
                     .ok_or_else(|| "fmtp attribute with no value".to_string())?;
 
                 if let Some((fmtp_payload_type, v)) = v.split_once(' ') {
-                    if fmtp_payload_type == rtp_payload_type_str {
-                        fmtp = Some(v);
+                    if let Ok(pt) = u8::from_str_radix(fmtp_payload_type, 10) {
+                        fmtps.push((pt, v));
                     }
                 } else {
                     // Ubiquiti cameras sometimes have e.g. "a=fmtp:96": payload
@@ -338,6 +346,59 @@ fn parse_media(
         }
     }
 
+    // Describe each format. The first (default) format must be describable;
+    // others that aren't are left out of `payload_formats`. If an attribute
+    // is repeated for a payload type, the last one wins.
+    fn lookup<'v>(attrs: &[(u8, &'v str)], pt: u8) -> Option<&'v str> {
+        attrs.iter().rev().find(|&&(p, _)| p == pt).map(|&(_, v)| v)
+    }
+    let mut payload_formats = Vec::with_capacity(rtp_payload_types.len());
+    for (i, &pt) in rtp_payload_types.iter().enumerate() {
+        match parse_format(&media, pt, lookup(&rtpmaps, pt), lookup(&fmtps, pt)) {
+            Ok(format) => payload_formats.push(super::StreamFormat {
+                payload_type: pt,
+                format,
+            }),
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => debug!("ignoring undescribed format {pt}: {e}"),
+        }
+    }
+
+    let format = &payload_formats[0].format;
+    let depacketizer = match direction {
+        StreamDirection::Receiving => {
+            let d = crate::codec::Depacketizer::new(format).map_err(|e| e.to_string());
+            if let Err(e) = &d {
+                log::info!(
+                    "no depacketizer for media/encoding_name {media}/{}: {e}",
+                    format.encoding_name()
+                );
+            }
+            d
+        }
+        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
+    };
+
+    Ok(Stream {
+        frame_format: Default::default(),
+        media,
+        payload_formats: payload_formats.into(),
+        depacketizer,
+        control,
+        framerate,
+        direction,
+        state: super::StreamState::Uninit,
+    })
+}
+
+/// Describes payload type `pt` of a `media` stream, given its `rtpmap` and
+/// `fmtp` attribute values, without the leading payload type.
+fn parse_format(
+    media: &str,
+    pt: u8,
+    rtpmap: Option<&str>,
+    fmtp: Option<&str>,
+) -> Result<crate::codec::PayloadFormat, String> {
     let encoding_name;
     let clock_rate;
     let channels;
@@ -362,7 +423,7 @@ fn parse_media(
                 .transpose()?;
             clock_rate = match clock_rate_from_rtpmap {
                 Some(c) if c != 0 => c,
-                _ => fixed_clock_rate(&media, &encoding_name.to_ascii_lowercase()).ok_or_else(
+                _ => fixed_clock_rate(media, &encoding_name.to_ascii_lowercase()).ok_or_else(
                     || format!("rtpmap has no usable clock rate: {clock_rate_str:?}"),
                 )?,
             };
@@ -377,17 +438,15 @@ fn parse_media(
         }
         None => {
             let type_ = STATIC_PAYLOAD_TYPES
-                .get(usize::from(rtp_payload_type))
+                .get(usize::from(pt))
                 .and_then(Option::as_ref)
                 .ok_or_else(|| {
-                    format!(
-                        "Expected rtpmap parameter or assigned static payload type (got {rtp_payload_type})"
-                    )
+                    format!("Expected rtpmap parameter or assigned static payload type (got {pt})")
                 })?;
             encoding_name = type_.encoding;
             clock_rate = type_.clock_rate;
             channels = type_.channels;
-            if type_.media != &*media {
+            if type_.media != media {
                 return Err(format!(
                     "SDP media type {} must match RTP payload type {:#?}",
                     media, type_
@@ -396,27 +455,18 @@ fn parse_media(
         }
     }
 
-    let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
-    let depacketizer = match direction {
-        StreamDirection::Receiving => {
-            crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp)
-        }
-        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
-    };
-
-    Ok(Stream {
-        frame_format: Default::default(),
-        media,
-        encoding_name,
-        clock_rate_hz: clock_rate,
-        rtp_payload_type,
-        depacketizer,
-        control,
-        channels,
-        framerate,
-        direction,
-        state: super::StreamState::Uninit,
-    })
+    let mut format = crate::codec::PayloadFormat::new(
+        media.to_string(),
+        encoding_name.to_ascii_lowercase(),
+        clock_rate,
+    );
+    if let Some(c) = channels {
+        format = format.with_channels(c);
+    }
+    if let Some(f) = fmtp {
+        format = format.with_fmtp(f);
+    }
+    Ok(format)
 }
 
 use crate::mostly_ascii::MostlyAscii;
@@ -835,6 +885,29 @@ mod tests {
 
     use super::super::StreamState;
     use super::*;
+
+    /// Shorthands for a stream's default format, as `Stream` itself has none.
+    trait DefaultFormat {
+        fn f(&self) -> &crate::codec::PayloadFormat;
+        fn pt(&self) -> u8;
+
+        /// A depacketizer for the default format, if Retina has one.
+        fn depacketizer(&self) -> Option<crate::codec::Depacketizer<()>>;
+    }
+
+    impl DefaultFormat for Stream {
+        fn f(&self) -> &crate::codec::PayloadFormat {
+            self.payload_formats()[0].format()
+        }
+
+        fn pt(&self) -> u8 {
+            self.payload_formats()[0].payload_type()
+        }
+
+        fn depacketizer(&self) -> Option<crate::codec::Depacketizer<()>> {
+            self.new_depacketizer().ok()
+        }
+    }
     use crate::testutil::{init_logging, response};
 
     /// Checks static payload types' clock rates against those in RFC 3551 tables 4 and 5.
@@ -986,10 +1059,15 @@ mod tests {
             &(prefix.to_string() + "/trackID=0")
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.64001E");
                 assert_eq!(v.pixel_dimensions(), (704, 480));
@@ -1005,10 +1083,14 @@ mod tests {
             &(prefix.to_string() + "/trackID=1")
         );
         assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "mpeg4-generic");
-        assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate_hz, 48_000);
-        match p.streams[1].parameters() {
+        assert_eq!(p.streams[1].f().encoding_name(), "mpeg4-generic");
+        assert_eq!(p.streams[1].pt(), 97);
+        assert_eq!(p.streams[1].f().clock_rate(), 48_000);
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+        {
             Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
@@ -1019,11 +1101,14 @@ mod tests {
             &(prefix.to_string() + "/trackID=4")
         );
         assert_eq!(p.streams[2].media(), "application");
-        assert_eq!(p.streams[2].encoding_name(), "vnd.onvif.metadata");
-        assert_eq!(p.streams[2].rtp_payload_type, 107);
-        assert_eq!(p.streams[2].clock_rate_hz, 90_000);
+        assert_eq!(p.streams[2].f().encoding_name(), "vnd.onvif.metadata");
+        assert_eq!(p.streams[2].pt(), 107);
+        assert_eq!(p.streams[2].f().clock_rate(), 90_000);
         assert!(matches!(
-            p.streams[2].parameters(),
+            p.streams[2]
+                .depacketizer()
+                .as_ref()
+                .and_then(crate::codec::Depacketizer::parameters),
             Some(ParametersRef::Message(_))
         ));
 
@@ -1074,20 +1159,37 @@ mod tests {
         // Abridged test; similar to the other Dahua test.
         assert_eq!(p.streams.len(), 2);
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h265");
-        assert_eq!(p.streams[0].rtp_payload_type, 98);
+        assert_eq!(p.streams[0].f().encoding_name(), "h265");
+        assert_eq!(p.streams[0].pt(), 98);
 
         if cfg!(feature = "h265") {
-            assert!(p.streams[0].parameters().is_some());
+            assert!(
+                p.streams[0]
+                    .depacketizer()
+                    .as_ref()
+                    .and_then(crate::codec::Depacketizer::parameters)
+                    .is_some()
+            );
             assert_eq!(p.streams[1].media(), "audio");
-            assert_eq!(p.streams[1].encoding_name(), "pcma");
-            assert_eq!(p.streams[1].rtp_payload_type, 8);
-            match p.streams[1].parameters().unwrap() {
+            assert_eq!(p.streams[1].f().encoding_name(), "pcma");
+            assert_eq!(p.streams[1].pt(), 8);
+            match p.streams[1]
+                .depacketizer()
+                .as_ref()
+                .and_then(crate::codec::Depacketizer::parameters)
+                .unwrap()
+            {
                 ParametersRef::Audio(_) => {}
                 _ => panic!(),
             };
         } else {
-            assert!(p.streams[0].parameters().is_none());
+            assert!(
+                p.streams[0]
+                    .depacketizer()
+                    .as_ref()
+                    .and_then(crate::codec::Depacketizer::parameters)
+                    .is_none()
+            );
         }
     }
 
@@ -1115,10 +1217,15 @@ mod tests {
             &(prefix.to_string() + "/trackID=1?transportmode=unicast&profile=Profile_1")
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D0029");
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
@@ -1134,11 +1241,14 @@ mod tests {
             &(prefix.to_string() + "/trackID=3?transportmode=unicast&profile=Profile_1")
         );
         assert_eq!(p.streams[1].media(), "application");
-        assert_eq!(p.streams[1].encoding_name(), "vnd.onvif.metadata");
-        assert_eq!(p.streams[1].rtp_payload_type, 107);
-        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
+        assert_eq!(p.streams[1].f().encoding_name(), "vnd.onvif.metadata");
+        assert_eq!(p.streams[1].pt(), 107);
+        assert_eq!(p.streams[1].f().clock_rate(), 90_000);
         assert!(matches!(
-            p.streams[1].parameters(),
+            p.streams[1]
+                .depacketizer()
+                .as_ref()
+                .and_then(crate::codec::Depacketizer::parameters),
             Some(ParametersRef::Message(_))
         ));
 
@@ -1204,10 +1314,15 @@ mod tests {
             &(base.to_string() + "trackID=1")
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.640033");
                 assert_eq!(v.pixel_dimensions(), (2560, 1440));
@@ -1223,10 +1338,14 @@ mod tests {
             &(base.to_string() + "trackID=2")
         );
         assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "mpeg4-generic");
-        assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate_hz, 16_000);
-        match p.streams[1].parameters() {
+        assert_eq!(p.streams[1].f().encoding_name(), "mpeg4-generic");
+        assert_eq!(p.streams[1].pt(), 97);
+        assert_eq!(p.streams[1].f().clock_rate(), 16_000);
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+        {
             Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
@@ -1290,11 +1409,15 @@ mod tests {
             &(prefix.to_string() + "/trackID=1")
         );
         assert_eq!(p.streams[0].media(), "audio");
-        assert_eq!(p.streams[0].encoding_name(), "mpeg4-generic");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 12_000);
-        assert_eq!(p.streams[0].channels, NonZeroU16::new(2));
-        match p.streams[0].parameters() {
+        assert_eq!(p.streams[0].f().encoding_name(), "mpeg4-generic");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 12_000);
+        assert_eq!(p.streams[0].f().channels(), NonZeroU16::new(2));
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+        {
             Some(ParametersRef::Audio(_)) => {}
             _ => panic!(),
         }
@@ -1305,10 +1428,15 @@ mod tests {
             &(prefix.to_string() + "/trackID=2")
         );
         assert_eq!(p.streams[1].media(), "video");
-        assert_eq!(p.streams[1].encoding_name(), "h264");
-        assert_eq!(p.streams[1].rtp_payload_type, 97);
-        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
-        match p.streams[1].parameters().unwrap() {
+        assert_eq!(p.streams[1].f().encoding_name(), "h264");
+        assert_eq!(p.streams[1].pt(), 97);
+        assert_eq!(p.streams[1].f().clock_rate(), 90_000);
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.42C01E");
                 assert_eq!(v.pixel_dimensions(), (240, 160));
@@ -1369,7 +1497,7 @@ mod tests {
         );
         let p = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(p.streams.len(), 1);
-        assert_eq!(p.streams[0].encoding_name(), "h264");
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
     }
 
     /// A single-rate codec whose rtpmap clock rate is 0 or missing falls back to that rate.
@@ -1386,10 +1514,76 @@ mod tests {
         );
         let p = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(p.streams.len(), 2);
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        assert_eq!(p.streams[1].encoding_name(), "jpeg");
-        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        assert_eq!(p.streams[1].f().encoding_name(), "jpeg");
+        assert_eq!(p.streams[1].f().clock_rate(), 90_000);
+    }
+
+    /// Each of a stream's formats gets its own `rtpmap` and `fmtp`. Formats
+    /// after the first that can't be described are left out of
+    /// `payload_formats`.
+    #[test]
+    fn multiple_formats() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let (response, body) = sdp_response(
+            b"v=0\n\
+              m=audio 0 RTP/AVP 97 8 99 101 13\n\
+              a=rtpmap:97 MPEG4-GENERIC/16000/1\n\
+              a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;\
+              indexlength=3;indexdeltalength=3;config=1408\n\
+              a=rtpmap:101 telephone-event/8000\n\
+              a=fmtp:101 0-15\n",
+        );
+        let p = super::parse_describe(url, &response, &body, false).unwrap();
+        assert_eq!(p.streams.len(), 1);
+        let s = &p.streams[0];
+        let formats: Vec<_> = s
+            .payload_formats()
+            .iter()
+            .map(|f| {
+                (
+                    f.payload_type(),
+                    f.format().encoding_name(),
+                    f.format().clock_rate(),
+                    f.format().fmtp(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            formats,
+            [
+                (
+                    97,
+                    "mpeg4-generic",
+                    16_000,
+                    Some(
+                        "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;\
+                         indexlength=3;indexdeltalength=3;config=1408"
+                    )
+                ),
+                (8, "pcma", 8_000, None),
+                // 99 is dynamic with no rtpmap, so it's left out.
+                (101, "telephone-event", 8_000, Some("0-15")),
+                (13, "cn", 8_000, None),
+            ]
+        );
+    }
+
+    /// The first (default) format must be describable.
+    #[test]
+    fn undescribed_default_format() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let (response, body) = sdp_response(
+            b"v=0\n\
+              m=video 0 RTP/AVP 97 96\na=rtpmap:96 H264/90000\n\
+              m=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
+        );
+        let p = super::parse_describe(url, &response, &body, false).unwrap();
+        assert_eq!(p.streams.len(), 1);
+        assert_eq!(p.streams[0].pt(), 96);
     }
 
     /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
@@ -1440,10 +1634,15 @@ mod tests {
             &(prefix.to_string() + "/track1")
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        match p.streams[0].parameters().unwrap() {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D001F");
                 assert_eq!(v.pixel_dimensions(), (1280, 720));
@@ -1459,11 +1658,16 @@ mod tests {
             &(prefix.to_string() + "/track2")
         );
         assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "pcmu");
-        assert_eq!(p.streams[1].rtp_payload_type, 0);
-        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
-        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
-        match p.streams[1].parameters().unwrap() {
+        assert_eq!(p.streams[1].f().encoding_name(), "pcmu");
+        assert_eq!(p.streams[1].pt(), 0);
+        assert_eq!(p.streams[1].f().clock_rate(), 8_000);
+        assert_eq!(p.streams[1].f().channels(), NonZeroU16::new(1));
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
@@ -1488,11 +1692,16 @@ mod tests {
 
         assert_eq!(p.streams[0].media(), "video");
 
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
 
-        match p.streams[0].parameters().unwrap() {
+        match p.streams[0]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Video(v) => {
                 assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
@@ -1508,11 +1717,16 @@ mod tests {
             &(prefix.to_string() + "/track1")
         );
         assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "pcma");
-        assert_eq!(p.streams[1].rtp_payload_type, 8);
-        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
-        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
-        match p.streams[1].parameters().unwrap() {
+        assert_eq!(p.streams[1].f().encoding_name(), "pcma");
+        assert_eq!(p.streams[1].pt(), 8);
+        assert_eq!(p.streams[1].f().clock_rate(), 8_000);
+        assert_eq!(p.streams[1].f().channels(), NonZeroU16::new(1));
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
@@ -1537,10 +1751,11 @@ mod tests {
             "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        let Some(ParametersRef::Video(v)) = p.streams[0].parameters() else {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        let d = p.streams[0].depacketizer().unwrap();
+        let Some(ParametersRef::Video(v)) = d.parameters() else {
             panic!();
         };
         assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
@@ -1551,11 +1766,16 @@ mod tests {
             "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/audio"
         );
         assert_eq!(p.streams[1].media(), "audio");
-        assert_eq!(p.streams[1].encoding_name(), "pcmu"); // rtpmap wins over static list.
-        assert_eq!(p.streams[1].rtp_payload_type, 8);
-        assert_eq!(p.streams[1].clock_rate_hz, 8_000);
-        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
-        match p.streams[1].parameters().unwrap() {
+        assert_eq!(p.streams[1].f().encoding_name(), "pcmu"); // rtpmap wins over static list.
+        assert_eq!(p.streams[1].pt(), 8);
+        assert_eq!(p.streams[1].f().clock_rate(), 8_000);
+        assert_eq!(p.streams[1].f().channels(), NonZeroU16::new(1));
+        match p.streams[1]
+            .depacketizer()
+            .as_ref()
+            .and_then(crate::codec::Depacketizer::parameters)
+            .unwrap()
+        {
             ParametersRef::Audio(_) => {}
             _ => panic!(),
         };
@@ -1631,10 +1851,11 @@ mod tests {
             "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media(), "video");
-        assert_eq!(p.streams[0].encoding_name(), "h264");
-        assert_eq!(p.streams[0].rtp_payload_type, 96);
-        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
-        let Some(ParametersRef::Video(v)) = p.streams[0].parameters() else {
+        assert_eq!(p.streams[0].f().encoding_name(), "h264");
+        assert_eq!(p.streams[0].pt(), 96);
+        assert_eq!(p.streams[0].f().clock_rate(), 90_000);
+        let d = p.streams[0].depacketizer().unwrap();
+        let Some(ParametersRef::Video(v)) = d.parameters() else {
             panic!();
         };
         assert_eq!(v.rfc6381_codec(), "avc1.4D001E");
@@ -2006,18 +2227,23 @@ mod tests {
         let raw = include_bytes!("testdata/onvif_backchannel_describe.txt");
         let p = parse_backchannel_describe("rtsp://192.168.0.1/", raw, true);
         assert_eq!(p.streams.len(), 3);
-        assert_eq!(p.streams[0].encoding_name(), "jpeg");
+        assert_eq!(p.streams[0].f().encoding_name(), "jpeg");
         assert_eq!(p.streams[0].direction(), StreamDirection::Receiving);
-        assert_eq!(p.streams[1].encoding_name(), "pcmu");
+        assert_eq!(p.streams[1].f().encoding_name(), "pcmu");
         assert_eq!(p.streams[1].direction(), StreamDirection::Receiving);
         let back = &p.streams[2];
         assert_eq!(back.direction(), StreamDirection::Sending);
         assert_eq!(back.media(), "audio");
-        assert_eq!(back.encoding_name(), "pcmu");
-        assert_eq!(back.rtp_payload_type(), 0);
-        assert_eq!(back.clock_rate_hz(), 8_000);
+        assert_eq!(back.f().encoding_name(), "pcmu");
+        assert_eq!(back.pt(), 0);
+        assert_eq!(back.f().clock_rate(), 8_000);
         assert!(back.depacketizer.is_err());
-        assert!(back.parameters().is_none());
+        assert!(
+            back.depacketizer()
+                .as_ref()
+                .and_then(crate::codec::Depacketizer::parameters)
+                .is_none()
+        );
         assert_eq!(
             back.control().unwrap().as_str(),
             "rtsp://192.168.0.1/audioback"
@@ -2048,9 +2274,28 @@ mod tests {
         let back = &p.streams[2];
         assert_eq!(back.direction(), StreamDirection::Sending);
 
-        // Retina describes, and sends, the first format.
-        assert_eq!(back.encoding_name(), "pcmu");
-        assert_eq!(back.rtp_payload_type(), 0);
+        // Every format is described, in order.
+        let formats: Vec<_> = back
+            .payload_formats()
+            .iter()
+            .map(|f| {
+                (
+                    f.payload_type(),
+                    f.format().encoding_name(),
+                    f.format().clock_rate(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            formats,
+            [
+                (0, "pcmu", 8_000),
+                (97, "g726-16", 8_000),
+                (98, "g726-24", 8_000),
+                (99, "g726-32", 8_000),
+                (100, "g726-40", 8_000),
+            ]
+        );
         assert_eq!(
             back.control().unwrap().as_str(),
             "rtsp://192.168.0.1/audioback"

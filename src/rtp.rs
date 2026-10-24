@@ -135,7 +135,8 @@ impl std::fmt::Debug for PacketHeader {
 /// This is the sending counterpart of [`crate::client::ReceivedPacket`], without the
 /// received-packet context. The caller supplies the payload and timing;
 /// Retina fills in the rest of the RTP header: the SSRC, the sequence number,
-/// and the payload type, [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type).
+/// and the payload type: that of the stream's default format, the first of
+/// [`Stream::payload_formats`](crate::client::Stream::payload_formats).
 /// When the server offers several formats (ONVIF Streaming Specification
 /// section 5.3.2.3), that's the first one.
 ///
@@ -153,8 +154,8 @@ impl SendingPacket {
     /// Creates a packet for the stream with index `stream_id` within
     /// [`Session::streams`](crate::client::Session::streams).
     ///
-    /// `timestamp` is in units of the stream's
-    /// [clock rate](crate::client::Stream::clock_rate_hz), relative to an
+    /// `timestamp` is in units of the stream's default format's [clock
+    /// rate](crate::codec::PayloadFormat::clock_rate), relative to an
     /// arbitrary starting point of the caller's choosing (e.g. `0` for the first
     /// packet), and wraps like an RTP timestamp. Retina adds a random offset, as
     /// [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1)

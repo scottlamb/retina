@@ -151,7 +151,8 @@ async fn run() -> Result<(), Error> {
 
     // Prepare outbound state for each track of interest.
     for (i, stream) in upstream_session.streams().iter().enumerate() {
-        if stream.media() != "video" || !["h264", "h265"].contains(&stream.encoding_name()) {
+        let encoding_name = stream.payload_formats()[0].format().encoding_name();
+        if stream.media() != "video" || !["h264", "h265"].contains(&encoding_name) {
             // Currently we only support H.264/H.265 video.
             continue;
         }
@@ -175,7 +176,7 @@ async fn run() -> Result<(), Error> {
         // #3 seems ideal but is not yet implemented. The current approach is #2.
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
-                mime_type: format!("video/{}", stream.encoding_name()),
+                mime_type: format!("video/{encoding_name}"),
                 ..Default::default()
             },
             format!("{i}-video"),

@@ -120,15 +120,13 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     .await?;
     let video_stream_i = {
         let s = session.streams().iter().position(|s| {
+            let encoding_name = s.payload_formats()[0].format().encoding_name();
             if s.media() == "image" || s.media() == "video" {
-                if s.encoding_name() == "jpeg" {
+                if encoding_name == "jpeg" {
                     log::info!("Using jpeg video stream");
                     return true;
                 }
-                log::info!(
-                    "Ignoring {} video stream because it's unsupported",
-                    s.encoding_name(),
-                );
+                log::info!("Ignoring {encoding_name} video stream because it's unsupported");
             }
             false
         });

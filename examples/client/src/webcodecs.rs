@@ -137,7 +137,7 @@ async fn receive_frames(
     let mut cur_parameters = None;
     while let Some(item) = session.next().await {
         if let retina::client::CodecItem::VideoFrame(frame) = item? {
-            let stream_params = session.streams()[frame.stream_id()].parameters();
+            let stream_params = session.parameters(frame.stream_id());
             let parameters = if let Some(cur_parameters) = cur_parameters.as_ref()
                 && !frame.has_new_parameters()
             {
@@ -293,15 +293,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
 
     let video_stream_i = session.streams().iter().position(|s| {
         if s.media() == "video" {
-            let encoding_name = s.encoding_name();
+            let encoding_name = s.payload_formats()[0].format().encoding_name();
             if matches!(encoding_name, "h264" | "h265" | "jpeg") {
                 log::info!("Using {encoding_name} video stream");
                 return true;
             }
-            log::info!(
-                "Ignoring {} video stream because it's unsupported",
-                s.encoding_name(),
-            );
+            log::info!("Ignoring {encoding_name} video stream because it's unsupported");
         }
         false
     });

@@ -510,7 +510,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 
     async fn video(
         &mut self,
-        stream: &retina::client::Stream,
+        parameters: Option<ParametersRef<'_>>,
         frame: retina::client::VideoFrame,
     ) -> Result<(), Error> {
         println!(
@@ -526,7 +526,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
             // scan through self.video_sample_index.
             i
         } else {
-            match stream.parameters() {
+            match parameters {
                 Some(ParametersRef::Video(params)) => {
                     log::info!("new video params: {:?}", params);
                     let pos = self.video_params.iter().position(|p| p == params);
@@ -609,9 +609,9 @@ async fn copy<'a>(
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => {
-                        let stream = &session.streams()[f.stream_id()];
+                        let parameters = session.parameters(f.stream_id());
                         let start_ctx = *f.start_ctx();
-                        mp4.video(stream, f).await.with_context(
+                        mp4.video(parameters, f).await.with_context(
                             || format!("Error processing video frame starting with {start_ctx}"))?;
                     },
                     CodecItem::AudioFrame(f) => {
@@ -712,15 +712,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let video_stream_i = if !opts.no_video {
         let s = session.streams().iter().position(|s| {
             if s.media() == "video" {
-                let encoding_name = s.encoding_name();
+                let encoding_name = s.payload_formats()[0].format().encoding_name();
                 if matches!(encoding_name, "h264" | "h265" | "jpeg") {
                     log::info!("Using {encoding_name} video stream");
                     return true;
                 }
-                log::info!(
-                    "Ignoring {} video stream because it's unsupported",
-                    s.encoding_name(),
-                );
+                log::info!("Ignoring {encoding_name} video stream because it's unsupported");
             }
             false
         });
@@ -747,18 +744,31 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .streams()
             .iter()
             .enumerate()
-            .find_map(|(i, s)| match s.parameters() {
+            .find_map(|(i, s)| {
+                if s.media() != "audio" {
+                    return None;
+                }
+                let encoding_name = s.payload_formats()[0].format().encoding_name();
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
-                Some(retina::codec::ParametersRef::Audio(a)) if a.mp4_sample_entry().build().is_ok() => {
-                    log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
-                    Some((i, Box::new(a.clone())))
+                match s.new_depacketizer::<()>() {
+                    Ok(retina::codec::Depacketizer::Audio(d))
+                        if d.parameters().mp4_sample_entry().build().is_ok() =>
+                    {
+                        let a = d.parameters();
+                        log::info!(
+                            "Using {encoding_name} audio stream (rfc 6381 codec {})",
+                            a.rfc6381_codec().unwrap()
+                        );
+                        Some((i, Box::new(a.clone())))
+                    }
+                    _ => {
+                        log::info!(
+                            "Ignoring {encoding_name} audio stream because it can't be placed into a .mp4 file without transcoding"
+                        );
+                        None
+                    }
                 }
-                _ if s.media() == "audio" => {
-                    log::info!("Ignoring {} audio stream because it can't be placed into a .mp4 file without transcoding", s.encoding_name());
-                    None
-                }
-                _ => None,
             });
         if s.is_none() {
             log::info!("No suitable audio stream found");

@@ -63,7 +63,8 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
     }
     let (stream_i, stream, encode) = backchannels
         .find_map(|(i, s)| {
-            let encode: fn(i16) -> u8 = match (s.encoding_name(), s.clock_rate_hz()) {
+            let f = s.payload_formats()[0].format();
+            let encode: fn(i16) -> u8 = match (f.encoding_name(), f.clock_rate()) {
                 ("pcmu", 8_000) => linear_to_ulaw,
                 ("pcma", 8_000) => linear_to_alaw,
                 _ => return None,

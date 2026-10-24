@@ -202,8 +202,9 @@ async fn run() -> Result<(), Error> {
         .iter()
         .enumerate()
         .find_map(|(i, s)| {
+            let encoding_name = s.payload_formats()[0].format().encoding_name();
             if s.media() == "video" {
-                match s.encoding_name() {
+                match encoding_name {
                     "jpeg" => return Some((i, ffmpeg::codec::Id::MJPEG)),
                     "h264" => return Some((i, ffmpeg::codec::Id::H264)),
                     #[cfg(feature = "h265")]
@@ -211,7 +212,7 @@ async fn run() -> Result<(), Error> {
                     _ => {
                         log::info!(
                             "Ignoring {} video stream because it's unsupported",
-                            s.encoding_name(),
+                            encoding_name,
                         );
                     }
                 }
