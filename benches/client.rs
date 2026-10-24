@@ -8,10 +8,7 @@ use std::{io::ErrorKind, net::SocketAddr, num::NonZeroU32};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures::StreamExt;
-use retina::{
-    client::{PlayOptions, SetupOptions},
-    codec::CodecItem,
-};
+use retina::client::{CodecItem, PlayOptions, SetupOptions};
 use std::convert::TryFrom;
 use tokio::io::AsyncWriteExt;
 use url::Url;

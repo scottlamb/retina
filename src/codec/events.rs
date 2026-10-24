@@ -3,135 +3,160 @@
 
 //! Push-through depacketization: the [`Handler`] trait and the events it receives.
 //!
-//! A depacketizer is fed one RTP packet at a time and calls back into a
-//! caller-supplied [`Handler`] as frames begin, as their data arrives, and as
-//! they end. Handlers are generic parameters, so methods left at their default
-//! (empty) implementations compile to nothing.
-//!
-//! Video frames produce this sequence of events:
-//!
-//! 1. [`Handler::frame_start`] exactly once. The handler decides whether the
-//!    depacketizer should retain the frame's data until the end
-//!    ([`Accumulate::Yes`]) or only stream it ([`Accumulate::No`]).
-//! 2. [`Handler::data`] zero or more times, with *unframed* codec units (e.g.
-//!    H.264 NAL units), in order.
-//! 3. [`Handler::frame_end`] exactly once, unless [`Handler::loss`] intervenes.
-//!    If the handler requested accumulation, [`FrameEnd::complete_frame`] or
-//!    [`FrameEnd::visit_frame_data`] provide the whole frame with the requested
-//!    [`FrameFormat`].
-//!
-//! Audio and message streams instead produce one [`Handler::audio_frame`] or
-//! [`Handler::message_frame`] per frame.
-//!
-//! `Ctx` is a caller-chosen packet context type, supplied with each packet and
-//! handed back with the events it contributed to. Within a [`crate::client`]
-//! session it's [`crate::PacketContext`]; a caller depacketizing from a capture
-//! file might use a file offset or capture timestamp instead.
-
-#![allow(dead_code)] // TODO: remove when this is public API.
+//! See [`Handler`].
 
 use std::num::NonZeroU32;
 
-use super::{FrameFormat, ParametersRef};
+use super::{FrameFormat, VideoParameters};
 
-/// Receives depacketization events.
+/// Receives video depacketization events from a [`super::VideoDepacketizer`].
 ///
-/// See the [module-level documentation](self) for the sequence of calls.
-pub trait Handler<Ctx> {
-    /// A new video frame (access unit) has begun.
+/// A depacketizer is fed one RTP packet at a time and calls back into a
+/// caller-supplied handler as frames begin, as their data arrives, and as
+/// they end. Handlers are generic parameters, so methods left at their default
+/// (empty) implementations compile to nothing.
+///
+/// Each frame produces this sequence of events:
+///
+/// 1. [`VideoHandler::frame_start`] exactly once. The handler decides whether
+///    the depacketizer should retain the frame's data until the end
+///    ([`Accumulate::Yes`]) or only stream it ([`Accumulate::No`]).
+/// 2. [`VideoHandler::data`] zero or more times, with *unframed* codec units
+///    (e.g. H.264 NAL units), in order.
+/// 3. [`VideoHandler::frame_end`] exactly once, unless [`VideoHandler::loss`]
+///    intervenes. If the handler requested accumulation,
+///    [`VideoFrameEnd::complete_frame`] or [`VideoFrameEnd::visit_frame_data`]
+///    provide the whole frame with the requested [`FrameFormat`].
+///
+/// `Ctx` is a caller-chosen packet context type, supplied with each packet and
+/// handed back with the events it contributed to. Within a [`crate::client`]
+/// session it's [`crate::PacketContext`]; a caller depacketizing from a capture
+/// file might use a file offset or capture timestamp instead.
+pub trait VideoHandler<Ctx> {
+    /// A new frame (access unit) has begun.
     ///
     /// The depacketizer calls this as early as it can determine the frame's
     /// basic properties, which may be before all of its packets have arrived.
     /// The values here are therefore the best knowledge so far; the values on
-    /// [`FrameEnd`] are authoritative.
+    /// [`VideoFrameEnd`] are authoritative.
     ///
     /// Return [`Accumulate::Yes`] to have the depacketizer retain the frame's
-    /// data for [`FrameEnd::complete_frame`]. [`Handler::data`] events are
-    /// delivered either way.
-    fn frame_start(&mut self, frame_start: &FrameStart<'_, Ctx>) -> Accumulate;
+    /// data for [`VideoFrameEnd::complete_frame`]. [`VideoHandler::data`]
+    /// events are delivered either way.
+    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate;
 
-    /// A chunk of unframed codec unit data. See [`Data`].
-    fn data(&mut self, _data: &Data<'_>) {}
+    /// A chunk of unframed codec unit data. See [`VideoData`].
+    fn data(&mut self, _data: &VideoData<'_>) {}
 
-    /// The video frame begun by the last [`Handler::frame_start`] is complete.
-    fn frame_end(&mut self, _frame_end: &mut FrameEnd<'_, Ctx>) {}
+    /// The frame begun by the last [`VideoHandler::frame_start`] is complete.
+    fn frame_end(&mut self, _frame_end: &mut VideoFrameEnd<'_, Ctx>) {}
 
     /// Packets were lost or data was corrupt.
     ///
-    /// If a video frame was in progress (`frame_start` was called without a
-    /// matching `frame_end`), it has been abandoned: no `frame_end` will follow
-    /// for it.
+    /// If a frame was in progress (`frame_start` was called without a matching
+    /// `frame_end`), it has been abandoned: no `frame_end` will follow for it.
     fn loss(&mut self, _loss: &Loss<'_, Ctx>) {}
+}
 
+/// Receives audio depacketization events from a [`super::AudioDepacketizer`].
+///
+/// See [`VideoHandler`] for an overview. Each audio frame arrives complete, in
+/// one [`AudioHandler::audio_frame`] call.
+pub trait AudioHandler<Ctx> {
     /// A complete audio frame.
     fn audio_frame(&mut self, _frame: &AudioFrameRef<'_, Ctx>) {}
 
-    /// A complete message, for `application` media types.
-    fn message_frame(&mut self, _frame: &MessageFrameRef<'_, Ctx>) {}
+    /// Packets were lost or data was corrupt.
+    fn loss(&mut self, _loss: &Loss<'_, Ctx>) {}
 }
 
-impl<Ctx, H: Handler<Ctx> + ?Sized> Handler<Ctx> for &mut H {
+/// Receives message depacketization events from a [`super::MessageDepacketizer`].
+///
+/// See [`VideoHandler`] for an overview. Each message arrives complete, in one
+/// [`MessageHandler::message_frame`] call.
+pub trait MessageHandler<Ctx> {
+    /// A complete message.
+    fn message_frame(&mut self, _frame: &MessageFrameRef<'_, Ctx>) {}
+
+    /// Packets were lost or data was corrupt. Any in-progress message was discarded.
+    fn loss(&mut self, _loss: &Loss<'_, Ctx>) {}
+}
+
+impl<Ctx, H: VideoHandler<Ctx> + ?Sized> VideoHandler<Ctx> for &mut H {
     #[inline]
-    fn frame_start(&mut self, frame_start: &FrameStart<'_, Ctx>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
         (**self).frame_start(frame_start)
     }
 
     #[inline]
-    fn data(&mut self, data: &Data<'_>) {
+    fn data(&mut self, data: &VideoData<'_>) {
         (**self).data(data)
     }
 
     #[inline]
-    fn frame_end(&mut self, frame_end: &mut FrameEnd<'_, Ctx>) {
+    fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, Ctx>) {
         (**self).frame_end(frame_end)
     }
 
     #[inline]
     fn loss(&mut self, loss: &Loss<'_, Ctx>) {
-        (**self).loss(loss)
+        VideoHandler::loss(&mut **self, loss)
     }
+}
 
+impl<Ctx, H: AudioHandler<Ctx> + ?Sized> AudioHandler<Ctx> for &mut H {
     #[inline]
     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, Ctx>) {
         (**self).audio_frame(frame)
     }
 
     #[inline]
+    fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+        AudioHandler::loss(&mut **self, loss)
+    }
+}
+
+impl<Ctx, H: MessageHandler<Ctx> + ?Sized> MessageHandler<Ctx> for &mut H {
+    #[inline]
     fn message_frame(&mut self, frame: &MessageFrameRef<'_, Ctx>) {
         (**self).message_frame(frame)
+    }
+
+    #[inline]
+    fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+        MessageHandler::loss(&mut **self, loss)
     }
 }
 
 /// Whether the depacketizer should retain a video frame's data until its end.
 ///
-/// Returned from [`Handler::frame_start`].
+/// Returned from [`VideoHandler::frame_start`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Accumulate {
-    /// Retain the frame, so that [`FrameEnd::complete_frame`] and
-    /// [`FrameEnd::visit_frame_data`] can supply it.
+    /// Retain the frame, so that [`VideoFrameEnd::complete_frame`] and
+    /// [`VideoFrameEnd::visit_frame_data`] can supply it.
     Yes,
 
     /// Don't retain the frame. The handler sees its data only via
-    /// [`Handler::data`], and the depacketizer releases buffer space as soon as
+    /// [`VideoHandler::data`], and the depacketizer releases buffer space as soon as
     /// each chunk has been delivered.
     No,
 }
 
 /// Information about a video frame that has just begun.
 ///
-/// Passed to [`Handler::frame_start`]. Values are the best knowledge so far;
-/// see [`FrameEnd`] for authoritative values.
-pub struct FrameStart<'a, Ctx> {
+/// Passed to [`VideoHandler::frame_start`]. Values are the best knowledge so far;
+/// see [`VideoFrameEnd`] for authoritative values.
+pub struct VideoFrameStart<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) ctx: &'a Ctx,
-    pub(crate) loss: u16,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
-    pub(crate) parameters: Option<ParametersRef<'a>>,
+    pub(crate) parameters: Option<&'a VideoParameters>,
 }
 
-impl<Ctx> FrameStart<'_, Ctx> {
+impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// Returns the frame's timestamp.
     #[inline]
     pub fn timestamp(&self) -> crate::Timestamp {
@@ -144,15 +169,9 @@ impl<Ctx> FrameStart<'_, Ctx> {
         self.ctx
     }
 
-    /// Returns the number of lost RTP packets before this frame.
-    #[inline]
-    pub fn loss(&self) -> u16 {
-        self.loss
-    }
-
     /// Returns if this frame appears to be a random access point.
     ///
-    /// See [`FrameEnd::is_random_access_point`].
+    /// See [`VideoFrameEnd::is_random_access_point`].
     #[inline]
     pub fn is_random_access_point(&self) -> bool {
         self.is_random_access_point
@@ -160,7 +179,7 @@ impl<Ctx> FrameStart<'_, Ctx> {
 
     /// Returns if this frame appears to be disposable.
     ///
-    /// See [`FrameEnd::is_disposable`].
+    /// See [`VideoFrameEnd::is_disposable`].
     #[inline]
     pub fn is_disposable(&self) -> bool {
         self.is_disposable
@@ -168,7 +187,7 @@ impl<Ctx> FrameStart<'_, Ctx> {
 
     /// Returns if this frame appears to set new parameters.
     ///
-    /// See [`FrameEnd::has_new_parameters`].
+    /// See [`VideoFrameEnd::has_new_parameters`].
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
         self.has_new_parameters
@@ -176,19 +195,19 @@ impl<Ctx> FrameStart<'_, Ctx> {
 
     /// Returns the parameters in effect for this frame, if known.
     ///
-    /// If [`FrameStart::has_new_parameters`] is true, these are the new
-    /// parameters. [`super::Depacketizer::parameters`] doesn't reflect them
+    /// If [`VideoFrameStart::has_new_parameters`] is true, these are the new
+    /// parameters. [`super::VideoDepacketizer::parameters`] doesn't reflect them
     /// until the frame ends.
     #[inline]
-    pub fn parameters(&self) -> Option<ParametersRef<'_>> {
-        self.parameters.clone()
+    pub fn parameters(&self) -> Option<&VideoParameters> {
+        self.parameters
     }
 }
 
-/// A chunk of unframed codec unit data, passed to [`Handler::data`].
+/// A chunk of unframed codec unit data, passed to [`VideoHandler::data`].
 ///
 /// "Unframed" means that no length prefix, Annex B start code, or other
-/// container framing is applied. [`Data::position`] says where this chunk falls
+/// container framing is applied. [`VideoData::position`] says where this chunk falls
 /// within its codec unit so the handler can apply its own framing. For example:
 ///
 /// * For Annex B output, write `00 00 00 01` before each
@@ -202,9 +221,9 @@ impl<Ctx> FrameStart<'_, Ctx> {
 ///
 /// H.264 and H.265 parameter set NAL units (VPS, SPS, PPS) are omitted. They
 /// are instead reflected in the stream's parameters; see
-/// [`FrameStart::has_new_parameters`].
+/// [`VideoFrameStart::has_new_parameters`].
 #[derive(Debug)]
-pub struct Data<'a> {
+pub struct VideoData<'a> {
     /// The position of this chunk within its codec unit.
     pub position: UnitPosition,
 
@@ -215,21 +234,21 @@ pub struct Data<'a> {
     pub data: &'a [&'a [u8]],
 }
 
-impl Data<'_> {
-    /// Returns the total length of [`Data::data`] in bytes.
+impl VideoData<'_> {
+    /// Returns the total length of [`VideoData::data`] in bytes.
     #[inline]
     pub fn len(&self) -> usize {
         self.data.iter().map(|d| d.len()).sum()
     }
 
-    /// Returns true if [`Data::data`] is empty.
+    /// Returns true if [`VideoData::data`] is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.data.iter().all(|d| d.is_empty())
     }
 }
 
-/// The position of a [`Data`] chunk within its codec unit.
+/// The position of a [`VideoData`] chunk within its codec unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitPosition {
     /// The entire unit, in one chunk.
@@ -248,6 +267,7 @@ pub enum UnitPosition {
 impl UnitPosition {
     /// Returns the position of a chunk given whether it's the first and/or last chunk.
     #[inline]
+    #[cfg(any(feature = "h264", feature = "h265"))]
     pub(crate) fn new(first: bool, last: bool) -> Self {
         match (first, last) {
             (true, true) => UnitPosition::Complete,
@@ -272,8 +292,8 @@ impl UnitPosition {
 
 /// Information about a video frame that has just ended.
 ///
-/// Passed to [`Handler::frame_end`].
-pub struct FrameEnd<'a, Ctx> {
+/// Passed to [`VideoHandler::frame_end`].
+pub struct VideoFrameEnd<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) start_ctx: &'a Ctx,
     pub(crate) end_ctx: &'a Ctx,
@@ -296,13 +316,13 @@ pub(crate) enum FrameBody<'a> {
     Owned {
         /// The data, if accumulated and not yet taken.
         data: Option<Vec<u8>>,
-        parameters: Option<ParametersRef<'a>>,
+        parameters: Option<&'a VideoParameters>,
     },
 }
 
 // Only the H.26x codecs use `format`.
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
-impl<Ctx> FrameEnd<'_, Ctx> {
+impl<Ctx> VideoFrameEnd<'_, Ctx> {
     /// Returns the frame's timestamp.
     #[inline]
     pub fn timestamp(&self) -> crate::Timestamp {
@@ -324,21 +344,31 @@ impl<Ctx> FrameEnd<'_, Ctx> {
         self.end_ctx
     }
 
-    /// Returns the number of lost RTP packets before this frame.
-    ///
-    /// Note that if loss occurs during a fragmented frame, more than this
-    /// number of packets' worth of data may be skipped.
+    /// Returns the number of lost RTP packets before this frame, for
+    /// `Demuxed`. Handlers learn of loss via [`VideoHandler::loss`].
     #[inline]
-    pub fn loss(&self) -> u16 {
+    pub(crate) fn loss(&self) -> u16 {
         self.loss
     }
 
-    /// Returns if this is a "random access point (RAP)" aka "instantaneous
-    /// decoding refresh (IDR)" picture.
+    /// Returns if this is a "random access point (RAP)" picture: one where
+    /// decoding can start, as it can be decoded without any other.
     ///
-    /// The former is defined in ISO/IEC 14496-12; the latter in H.264. Both
-    /// mean that this picture can be decoded without any other AND no pictures
-    /// following this one depend on any pictures before this one.
+    /// This includes:
+    ///
+    /// *   "instantaneous decoding refresh (IDR)" pictures (H.264 and H.265).
+    ///     No pictures following this one depend on any pictures before it.
+    /// *   "open GOP" random access points: in H.264, pictures with a recovery
+    ///     point SEI message with `recovery_frame_cnt` 0; in H.265, other
+    ///     "intra random access point (IRAP)" pictures, namely "clean random
+    ///     access (CRA)" and "broken link access (BLA)". Some leading pictures
+    ///     (those that follow this one in decoding order but precede it in
+    ///     output order; in H.265, "random access skipped leading (RASL)"
+    ///     pictures) may depend on pictures before this one, so they can't be
+    ///     decoded correctly when decoding starts here. Retina currently passes
+    ///     them through unmarked; a decoder starting here should discard them.
+    ///     All other pictures following this one don't depend on any pictures
+    ///     before it.
     #[inline]
     pub fn is_random_access_point(&self) -> bool {
         self.is_random_access_point
@@ -359,33 +389,21 @@ impl<Ctx> FrameEnd<'_, Ctx> {
     }
 
     /// Returns the parameters in effect for this frame, if known.
-    pub fn parameters(&self) -> Option<ParametersRef<'_>> {
+    pub fn parameters(&self) -> Option<&VideoParameters> {
         match &self.body {
             #[cfg(feature = "h264")]
             FrameBody::H264(b) => b.parameters(),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.parameters(),
-            FrameBody::Owned { parameters, .. } => parameters.clone(),
-        }
-    }
-
-    /// Returns the length in bytes that [`FrameEnd::complete_frame`] would
-    /// produce with the given format, or `None` if the frame wasn't accumulated.
-    pub fn data_len(&self, format: FrameFormat) -> Option<usize> {
-        match &self.body {
-            #[cfg(feature = "h264")]
-            FrameBody::H264(b) => b.data_len(format),
-            #[cfg(feature = "h265")]
-            FrameBody::H265(b) => b.data_len(format),
-            FrameBody::Owned { data, .. } => data.as_ref().map(Vec::len),
+            FrameBody::Owned { parameters, .. } => *parameters,
         }
     }
 
     /// Returns the accumulated frame data in the given format.
     ///
-    /// Returns `None` if [`Handler::frame_start`] didn't return
+    /// Returns `None` if [`VideoHandler::frame_start`] didn't return
     /// [`Accumulate::Yes`] or if this has already been called for this frame.
-    pub fn complete_frame(&mut self, format: FrameFormat) -> Option<CompleteFrame> {
+    pub fn complete_frame(&mut self, format: FrameFormat) -> Option<Vec<u8>> {
         match &mut self.body {
             #[cfg(feature = "h264")]
             FrameBody::H264(b) => b.build(format),
@@ -393,14 +411,13 @@ impl<Ctx> FrameEnd<'_, Ctx> {
             FrameBody::H265(b) => b.build(format),
             FrameBody::Owned { data, .. } => data.take(),
         }
-        .map(|data| CompleteFrame { data })
     }
 
     /// Visits the accumulated frame data in the given format without
     /// allocating, calling `visitor` for each contiguous chunk in order.
     ///
     /// Returns false (without calling `visitor`) if the frame wasn't
-    /// accumulated or [`FrameEnd::complete_frame`] has already been called.
+    /// accumulated or [`VideoFrameEnd::complete_frame`] has already been called.
     pub fn visit_frame_data(&self, format: FrameFormat, visitor: &mut impl FnMut(&[u8])) -> bool {
         match &self.body {
             #[cfg(feature = "h264")]
@@ -418,35 +435,7 @@ impl<Ctx> FrameEnd<'_, Ctx> {
     }
 }
 
-/// A complete, framed video frame, as returned by [`FrameEnd::complete_frame`].
-#[derive(Clone, PartialEq, Eq)]
-pub struct CompleteFrame {
-    data: Vec<u8>,
-}
-
-impl CompleteFrame {
-    /// Returns the frame data.
-    #[inline]
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Returns the frame data as an owned vector.
-    #[inline]
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-}
-
-impl std::fmt::Debug for CompleteFrame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompleteFrame")
-            .field("data", &crate::hex::LimitedHex::new(&self.data, 64))
-            .finish()
-    }
-}
-
-/// Notice of lost or corrupt data, passed to [`Handler::loss`].
+/// Notice of lost or corrupt data, passed to [`VideoHandler::loss`].
 pub struct Loss<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) reason: LossReason,
@@ -471,6 +460,7 @@ impl<Ctx> Loss<'_, Ctx> {
 #[non_exhaustive]
 pub enum LossReason {
     /// RTP packets were lost, as indicated by a gap in sequence numbers.
+    #[non_exhaustive]
     PacketLoss {
         /// The number of lost packets.
         packets: u16,
@@ -480,19 +470,42 @@ pub enum LossReason {
     ///
     /// It discards any in-progress frame and resynchronizes at the next frame
     /// boundary.
-    Corrupt {
-        /// A human-readable description of the problem.
-        description: String,
-    },
+    Corrupt(Corruption),
 }
 
-/// A complete audio frame, passed to [`Handler::audio_frame`].
+/// Details of corrupt data, as reported by [`LossReason::Corrupt`].
+///
+/// Currently this offers only a human-readable description, via its
+/// [`std::fmt::Display`] impl.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corruption(std::borrow::Cow<'static, str>);
+
+impl Corruption {
+    pub(crate) fn new(description: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self(description.into())
+    }
+}
+
+impl std::fmt::Display for Corruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Corruption {}
+
+/// A complete audio frame, passed to [`AudioHandler::audio_frame`].
 pub struct AudioFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) frame_length: NonZeroU32,
     pub(crate) loss: u16,
+
+    /// The raw frame data.
     pub(crate) data: &'a [u8],
+
+    /// For AAC, the parameters for [`super::aac::Framing::Adts`].
+    pub(crate) adts: Option<super::aac::AdtsParams>,
 }
 
 impl<Ctx> AudioFrameRef<'_, Ctx> {
@@ -514,21 +527,34 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
         self.frame_length
     }
 
-    /// Returns the number of lost RTP packets before this frame.
+    /// Returns the number of lost RTP packets before this frame, for
+    /// `Demuxed`. Handlers learn of loss via [`AudioHandler::loss`].
     #[inline]
-    pub fn loss(&self) -> u16 {
+    pub(crate) fn loss(&self) -> u16 {
         self.loss
     }
 
-    /// Returns the frame data, in a format that depends on the depacketizer's
-    /// [`FrameFormat`].
-    #[inline]
-    pub fn data(&self) -> &[u8] {
-        self.data
+    /// Returns the frame data in the given format.
+    ///
+    /// This borrows the depacketizer's data unless the format requires adding
+    /// framing, as with [`super::aac::Framing::Adts`].
+    pub fn data(&self, format: FrameFormat) -> std::borrow::Cow<'_, [u8]> {
+        match self.header(format) {
+            None => std::borrow::Cow::Borrowed(self.data),
+            Some(h) => std::borrow::Cow::Owned([&h[..], self.data].concat()),
+        }
+    }
+
+    /// Returns the header to prepend in the given format, if any.
+    fn header(&self, format: FrameFormat) -> Option<[u8; 7]> {
+        match (self.adts, format.aac_framing) {
+            (Some(adts), super::aac::Framing::Adts) => Some(adts.header(self.data.len())),
+            _ => None,
+        }
     }
 }
 
-/// A complete message, passed to [`Handler::message_frame`].
+/// A complete message, passed to [`MessageHandler::message_frame`].
 pub struct MessageFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
@@ -549,9 +575,10 @@ impl<Ctx> MessageFrameRef<'_, Ctx> {
         self.timestamp
     }
 
-    /// Returns the number of lost RTP packets before this message.
+    /// Returns the number of lost RTP packets before this message, for
+    /// `Demuxed`. Handlers learn of loss via [`MessageHandler::loss`].
     #[inline]
-    pub fn loss(&self) -> u16 {
+    pub(crate) fn loss(&self) -> u16 {
         self.loss
     }
 
@@ -571,7 +598,6 @@ pub(crate) mod testutil {
     #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum Event {
         FrameStart {
-            loss: u16,
             is_random_access_point: bool,
             is_disposable: bool,
             has_new_parameters: bool,
@@ -624,10 +650,9 @@ pub(crate) mod testutil {
         crate::testutil::HexDebug(data.to_vec())
     }
 
-    impl<Ctx> Handler<Ctx> for Recorder {
-        fn frame_start(&mut self, frame_start: &FrameStart<'_, Ctx>) -> Accumulate {
+    impl<Ctx> VideoHandler<Ctx> for Recorder {
+        fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
             self.events.push(Event::FrameStart {
-                loss: frame_start.loss(),
                 is_random_access_point: frame_start.is_random_access_point(),
                 is_disposable: frame_start.is_disposable(),
                 has_new_parameters: frame_start.has_new_parameters(),
@@ -637,7 +662,7 @@ pub(crate) mod testutil {
             self.accumulate
         }
 
-        fn data(&mut self, data: &Data<'_>) {
+        fn data(&mut self, data: &VideoData<'_>) {
             let flat = data.data.concat();
             assert_eq!(flat.len(), data.len());
             assert_eq!(data.position.is_first(), self.unit_start.is_none());
@@ -655,14 +680,12 @@ pub(crate) mod testutil {
                 .push(Event::Data(data.position, crate::testutil::HexDebug(flat)));
         }
 
-        fn frame_end(&mut self, frame_end: &mut FrameEnd<'_, Ctx>) {
-            let len = frame_end.data_len(self.format);
+        fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, Ctx>) {
             let mut visited = Vec::new();
             let visited_ok =
                 frame_end.visit_frame_data(self.format, &mut |c| visited.extend_from_slice(c));
-            let data = frame_end.complete_frame(self.format).map(|f| f.into_data());
-            assert_eq!(len.is_some(), visited_ok);
-            assert_eq!(len, data.as_ref().map(Vec::len));
+            let data = frame_end.complete_frame(self.format);
+            assert_eq!(data.is_some(), visited_ok);
             if let Some(d) = data.as_ref() {
                 assert_eq!(&visited, d);
             }
@@ -690,9 +713,24 @@ pub(crate) mod testutil {
             self.unit_start = None;
             self.events.push(Event::Loss(loss.reason().clone()));
         }
+    }
+
+    impl<Ctx> AudioHandler<Ctx> for Recorder {
+        fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+            self.unit_start = None;
+            self.events.push(Event::Loss(loss.reason().clone()));
+        }
 
         fn audio_frame(&mut self, frame: &AudioFrameRef<'_, Ctx>) {
-            self.events.push(Event::AudioFrame(hex(frame.data())));
+            let data = frame.data(self.format);
+            self.events.push(Event::AudioFrame(hex(&data)));
+        }
+    }
+
+    impl<Ctx> MessageHandler<Ctx> for Recorder {
+        fn loss(&mut self, loss: &Loss<'_, Ctx>) {
+            self.unit_start = None;
+            self.events.push(Event::Loss(loss.reason().clone()));
         }
 
         fn message_frame(&mut self, frame: &MessageFrameRef<'_, Ctx>) {

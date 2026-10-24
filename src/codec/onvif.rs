@@ -8,9 +8,9 @@
 //! version 19.12 section 5.2.1.1. The RTP layer muxing is simple: RTP packets with the MARK
 //! bit set end messages.
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
-use super::{Handler, MessageFrameRef, MessageParameters};
+use super::{MessageFrameRef, MessageHandler, MessageParameters};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CompressionType {
@@ -46,15 +46,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        Some(super::ParametersRef::Message(&self.parameters))
+    pub(super) fn parameters(&self) -> &super::MessageParameters {
+        &self.parameters
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push_with(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl MessageHandler<Ctx>,
     ) -> Result<(), String> {
         if pkt.meta.loss > 0
             && let Some(in_progress) = &self.in_progress

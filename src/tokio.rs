@@ -13,7 +13,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
 use crate::buf::MarkBuf;
-use crate::inputs::{Input as _, Split};
+use crate::inputs::Split;
 use crate::rtsp::msg::OwnedMessage;
 use crate::{Error, ErrorInt, RtspMessageContext};
 

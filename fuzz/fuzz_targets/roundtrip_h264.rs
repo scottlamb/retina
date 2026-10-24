@@ -50,18 +50,17 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         Ok(p) => p,
         Err(_) => return Corpus::Reject,
     };
-    let mut d = retina::codec::Depacketizer::new(
-        "video",
+    let mut d = retina::codec::VideoDepacketizer::<u64>::new(
         "h264",
         90_000,
-        None,
         Some("packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4"),
     )
     .unwrap();
-    // The packetizer doesn't insert parameter sets, so the depacketizer shouldn't either.
-    d.set_frame_format(retina::codec::FrameFormat::MP4);
+    // The packetizer doesn't insert parameter sets; `CheckingHandler` uses
+    // `FrameFormat::MP4`, which doesn't either.
+    let mut h = retina_fuzz::CheckingHandler::new(retina::codec::Accumulate::Yes, true);
     let timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
-    let mut buf = retina::testutil::DepacketizeBuf::new(65536);
+    let mut buf = retina::buf::MarkBuf::new(65536);
 
     if p.push(timestamp, Bytes::copy_from_slice(input.data))
         .is_err()
@@ -72,38 +71,41 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         match p.pull() {
             Ok(Some(pkt)) => {
                 let mark = pkt.mark();
-                let meta = retina::rtp::PacketMeta::from_received(&pkt);
-                let payload = pkt.payload();
-                if buf.push(&mut d, meta, payload).is_err() {
+                let meta = retina::rtp::ReceivedPacketMeta::new(
+                    0,
+                    pkt.timestamp(),
+                    pkt.sequence_number(),
+                    pkt.ssrc(),
+                    mark,
+                    pkt.loss(),
+                );
+                retina_fuzz::push(&mut buf, meta, pkt.payload(), &mut [(&mut d, &mut h)]);
+                if h.events
+                    .iter()
+                    .any(|e| matches!(e, retina_fuzz::Event::Loss(_)))
+                {
                     return Corpus::Keep;
                 }
-                match d.pull() {
-                    Some(Err(_)) => return Corpus::Keep,
-                    Some(Ok(retina::codec::CodecItem::VideoFrame(f))) => {
-                        assert!(mark);
-                        break f;
-                    }
-                    Some(Ok(_)) => panic!(),
-                    None => {
-                        // XXX: assert!(!mark)
-                        //
-                        // One would expect that a frame would be produced if the packet has mark
-                        // set. This used to be true, but Retina now has a workaround for some
-                        // RTSP servers that spuriously set the mark bit. See
-                        // `retina::codec::h264::can_end_au`. In this case, just exit.
-                        if mark {
-                            assert!(matches!(p.pull(), Ok(None)));
-                            return Corpus::Keep;
-                        }
-                    }
+                if let Some(f) = h.frames.pop() {
+                    assert!(mark);
+                    break f;
+                }
+                // XXX: assert!(!mark)
+                //
+                // One would expect that a frame would be produced if the packet has mark
+                // set. This used to be true, but Retina now has a workaround for some
+                // RTSP servers that spuriously set the mark bit. See
+                // `retina::codec::h264::can_end_au`. In this case, just exit.
+                if mark {
+                    assert!(matches!(p.pull(), Ok(None)));
+                    return Corpus::Keep;
                 }
             }
             Ok(None) => panic!("packetizer ran out of packets before depacketizer produced frame"),
             Err(_) => return Corpus::Keep,
         }
     };
-    assert_eq!(input.data, frame.data());
-    assert_eq!(d.pull(), None);
+    assert_eq!(input.data, &frame[..]);
     assert_eq!(p.pull(), Ok(None));
     Corpus::Keep
 });

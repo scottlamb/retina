@@ -6,16 +6,16 @@
 
 use std::ops::Range;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
+use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
-use crate::{PacketContext, Timestamp};
 
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor
 /// methods for the individual fields. It can be constructed on-the-fly
-/// from a [`ReceivedPacket`] or via [`PacketHeader::validate`].
+/// from a [`crate::client::ReceivedPacket`] or via [`PacketHeader::validate`].
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PacketHeader(
     /// ```text
@@ -38,7 +38,7 @@ impl PacketHeader {
     /// Validates an RTP packet, returning the fixed header and payload range.
     ///
     /// Accepts any [`Input`] implementation: a `&[u8]` or a
-    /// [`Split`](crate::inputs::Split) pair of ring-buffer slices.
+    /// [`Split`] pair of ring-buffer slices.
     pub fn validate<'i>(input: impl Input<'i>) -> Result<(Self, Range<u16>), &'static str> {
         let len = u16::try_from(input.len()).map_err(|_| "too long")?;
         if len < Self::LEN {
@@ -129,113 +129,10 @@ impl std::fmt::Debug for PacketHeader {
     }
 }
 
-/// A received RTP packet.
-///
-/// This holds more information than the packet itself: also a
-/// [`PacketContext`], the stream, and extended timestamp.
-#[derive(Eq, PartialEq)]
-pub struct ReceivedPacket {
-    pub(crate) ctx: PacketContext,
-    pub(crate) stream_id: usize,
-    pub(crate) timestamp: crate::Timestamp,
-
-    /// Full packet data, including headers.
-    pub(crate) data: Bytes,
-    pub(crate) payload_range: Range<u16>,
-
-    // TODO: consider dropping this field in favor of a PacketItem::Loss.
-    // https://github.com/scottlamb/retina/issues/47
-    pub(crate) loss: u16,
-}
-
-impl std::fmt::Debug for ReceivedPacket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReceivedPacket")
-            .field("ctx", &self.ctx)
-            .field("stream_id", &self.stream_id)
-            .field("timestamp", &self.timestamp)
-            .field("ssrc", &self.ssrc())
-            .field("sequence_number", &self.sequence_number())
-            .field("mark", &self.mark())
-            .field("payload", &crate::hex::LimitedHex::new(self.payload(), 64))
-            .finish()
-    }
-}
-
-impl ReceivedPacket {
-    /// Returns the fixed 12-byte RTP header.
-    ///
-    /// This constructs a [`PacketHeader`] on-the-fly from the packet data;
-    /// inlining should avoid an actual copy in most cases.
-    #[inline]
-    pub fn header(&self) -> PacketHeader {
-        PacketHeader(self.data[..PacketHeader::LEN as usize].try_into().unwrap())
-    }
-
-    #[inline]
-    pub fn timestamp(&self) -> crate::Timestamp {
-        self.timestamp
-    }
-
-    #[inline]
-    pub fn mark(&self) -> bool {
-        self.header().mark()
-    }
-
-    #[inline]
-    pub fn ctx(&self) -> &PacketContext {
-        &self.ctx
-    }
-
-    #[inline]
-    pub fn stream_id(&self) -> usize {
-        self.stream_id
-    }
-
-    #[inline]
-    pub fn ssrc(&self) -> u32 {
-        self.header().ssrc()
-    }
-
-    #[inline]
-    pub fn sequence_number(&self) -> u16 {
-        self.header().sequence_number()
-    }
-
-    /// Returns the raw bytes, including the RTP headers.
-    #[inline]
-    pub fn raw(&self) -> &[u8] {
-        &self.data[..]
-    }
-
-    /// Returns only the payload bytes.
-    #[inline]
-    pub fn payload(&self) -> &[u8] {
-        &self.data[usize::from(self.payload_range.start)..usize::from(self.payload_range.end)]
-    }
-
-    #[inline]
-    pub fn loss(&self) -> u16 {
-        self.loss
-    }
-
-    /// Consumes the `ReceivedPacket` and returns the `Payload` as a [`Bytes`].
-    ///
-    /// This is currently very efficient (no copying or reference-counting),
-    /// although that is not an API guarantee.
-    #[inline]
-    pub fn into_payload_bytes(self) -> Bytes {
-        let mut data = self.data;
-        data.truncate(usize::from(self.payload_range.end));
-        data.advance(usize::from(self.payload_range.start));
-        data
-    }
-}
-
 /// An RTP packet to send, as accepted by the [`futures::Sink`] impl on
 /// [`Session<Playing>`](crate::client::Session).
 ///
-/// This is the sending counterpart of [`ReceivedPacket`], without the
+/// This is the sending counterpart of [`crate::client::ReceivedPacket`], without the
 /// received-packet context. The caller supplies the payload and timing;
 /// Retina fills in the rest of the RTP header: the SSRC, the sequence number,
 /// and the payload type, [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type).
@@ -307,100 +204,128 @@ impl std::fmt::Debug for SendingPacket {
     }
 }
 
-/// Metadata extracted from a received RTP packet, for use by depacketizers.
+/// Metadata about an RTP packet, as supplied to a depacketizer such as
+/// [`crate::codec::VideoDepacketizer`]
+/// within a [`ReceivedPacketRef`].
 ///
-/// This allows depacketizers to work without depending on [`ReceivedPacket`],
-/// enabling the `Demuxed` path to pass data directly from the ring buffer.
+/// `Ctx` is a caller-chosen packet context type, returned with the events the
+/// packet contributes to. See [`crate::codec::VideoHandler`].
 ///
-/// `Ctx` is a caller-chosen packet context type, returned with the resulting frames.
+/// This is `#[non_exhaustive]` so that fields can be added later; construct
+/// it via [`ReceivedPacketMeta::new`].
 #[derive(Clone, Copy, Debug)]
-#[doc(hidden)]
-pub struct PacketMeta<Ctx = crate::PacketContext> {
+#[non_exhaustive]
+pub struct ReceivedPacketMeta<Ctx> {
+    /// The caller's context for this packet.
     pub ctx: Ctx,
-    pub stream_id: usize,
+
+    /// The packet's timestamp, extended from the RTP header's 32-bit
+    /// timestamp to avoid wraparound.
     pub timestamp: crate::Timestamp,
+
+    /// The RTP sequence number.
     pub sequence_number: u16,
+
+    /// The RTP synchronization source.
     pub ssrc: u32,
+
+    /// The RTP marker bit.
     pub mark: bool,
+
+    /// The number of packets lost immediately before this one, as determined
+    /// by a gap in sequence numbers.
     pub loss: u16,
 }
 
-impl PacketMeta {
-    pub fn from_received(pkt: &ReceivedPacket) -> Self {
-        let header = pkt.header();
-        PacketMeta {
-            ctx: *pkt.ctx(),
-            stream_id: pkt.stream_id(),
-            timestamp: pkt.timestamp(),
-            sequence_number: header.sequence_number(),
-            ssrc: header.ssrc(),
-            mark: header.mark(),
-            loss: pkt.loss(),
+impl<Ctx> ReceivedPacketMeta<Ctx> {
+    /// Creates metadata with the given field values.
+    #[inline]
+    pub fn new(
+        ctx: Ctx,
+        timestamp: crate::Timestamp,
+        sequence_number: u16,
+        ssrc: u32,
+        mark: bool,
+        loss: u16,
+    ) -> Self {
+        Self {
+            ctx,
+            timestamp,
+            sequence_number,
+            ssrc,
+            mark,
+            loss,
         }
     }
 }
 
-/// Builds raw RTP packet bytes for testing.
-pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
-    sequence_number: u16,
-    timestamp: u32,
-    payload_type: u8,
-    ssrc: u32,
-    mark: bool,
-    payload: P,
-) -> Result<Bytes, &'static str> {
-    if payload_type >= 0x80 {
-        return Err("payload type too large");
+/// An RTP packet whose payload is in a [`MarkBuf`].
+///
+/// Passed to depacketizers such as [`crate::codec::VideoDepacketizer::push`],
+/// bundling packet metadata with buffer access.
+pub struct ReceivedPacketRef<'a, Ctx> {
+    /// The packet's metadata.
+    pub meta: ReceivedPacketMeta<Ctx>,
+    buf: &'a MarkBuf,
+    payload_pos: u64,
+    payload_len: u16,
+}
+
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
+impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
+    /// Creates a `ReceivedPacketRef` for a payload at stream positions
+    /// `[payload_pos, payload_pos + payload_len)` in `buf`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload isn't within `buf`'s parsed bytes, `[start(),
+    /// unparsed())`. See the [`MarkBuf`] contract.
+    pub fn new(
+        meta: ReceivedPacketMeta<Ctx>,
+        buf: &'a MarkBuf,
+        payload_pos: u64,
+        payload_len: u16,
+    ) -> Self {
+        assert!(
+            payload_pos >= buf.start()
+                && payload_pos
+                    .checked_add(u64::from(payload_len))
+                    .is_some_and(|end| end <= buf.unparsed()),
+            "payload [{payload_pos}, +{payload_len}) must be within parsed bytes [{}, {})",
+            buf.start(),
+            buf.unparsed(),
+        );
+        Self {
+            meta,
+            buf,
+            payload_pos,
+            payload_len,
+        }
     }
-    let data: Bytes = [
-        2 << 6, // version=2, no padding, no extensions, no CSRCs.
-        if mark { 0b1000_0000 } else { 0 } | payload_type,
-    ]
-    .into_iter()
-    .chain(sequence_number.to_be_bytes())
-    .chain(timestamp.to_be_bytes())
-    .chain(ssrc.to_be_bytes())
-    .chain(payload)
-    .collect();
-    let _ = u16::try_from(data.len()).map_err(|_| "payload too long")?;
-    Ok(data)
-}
 
-/// Testing API; exposed for fuzz tests.
-#[doc(hidden)]
-pub struct ReceivedPacketBuilder {
-    pub ctx: PacketContext,
-    pub stream_id: usize,
-    pub sequence_number: u16,
-    pub timestamp: Timestamp,
-    pub payload_type: u8,
-    pub ssrc: u32,
-    pub mark: bool,
-    pub loss: u16,
-}
+    /// Ring-buffer position of the first payload byte.
+    #[inline]
+    pub(crate) fn payload_pos(&self) -> u64 {
+        self.payload_pos
+    }
 
-impl ReceivedPacketBuilder {
-    pub fn build<P: IntoIterator<Item = u8>>(
-        self,
-        payload: P,
-    ) -> Result<ReceivedPacket, &'static str> {
-        let data = build_raw_rtp(
-            self.sequence_number,
-            self.timestamp.timestamp as u32,
-            self.payload_type,
-            self.ssrc,
-            self.mark,
-            payload,
-        )?;
-        let len = data.len() as u16;
-        Ok(ReceivedPacket {
-            ctx: self.ctx,
-            stream_id: self.stream_id,
-            timestamp: self.timestamp,
-            data,
-            payload_range: PacketHeader::LEN..len,
-            loss: self.loss,
-        })
+    /// Payload length in bytes.
+    #[inline]
+    pub(crate) fn payload_len(&self) -> u16 {
+        self.payload_len
+    }
+
+    /// Returns the payload.
+    #[inline]
+    pub fn payload(&self) -> Split<'a> {
+        self.buf
+            .split(self.payload_pos, usize::from(self.payload_len))
+    }
+
+    /// Returns the buffer holding the payload.
+    #[inline]
+    pub(crate) fn buf(&self) -> &'a MarkBuf {
+        self.buf
     }
 }
 
@@ -420,5 +345,43 @@ mod tests {
         assert_eq!(payload_range, 28..55);
         assert_eq!(data[payload_range.start as usize], 0x67);
         assert!(!header.mark());
+    }
+
+    fn meta() -> ReceivedPacketMeta<()> {
+        crate::rtp::ReceivedPacketMeta {
+            ctx: (),
+            timestamp: crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            sequence_number: 0,
+            ssrc: 0,
+            mark: false,
+            loss: 0,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_unparsed() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        let _ = ReceivedPacketRef::new(meta(), &buf, 0, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be within parsed bytes")]
+    fn packet_ref_beyond_end() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let _ = ReceivedPacketRef::new(meta(), &buf, 1, 5);
+    }
+
+    #[test]
+    fn packet_ref_ok() {
+        let mut buf = MarkBuf::new(64);
+        buf.extend(b"hello");
+        buf.advance_unparsed(5);
+        let pkt = ReceivedPacketRef::new(meta(), &buf, 1, 4);
+        assert_eq!(pkt.payload().to_vec(), b"ello");
     }
 }

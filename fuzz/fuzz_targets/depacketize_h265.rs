@@ -1,11 +1,16 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Fuzzes depacketization, checking that streaming and accumulating
+//! depacketizers agree.
+
 #![no_main]
 use derive_more::Debug;
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use libfuzzer_sys::fuzz_target;
 use pretty_hex::PrettyHex as _;
+use retina::codec::Accumulate;
+use retina_fuzz::CheckingHandler;
 use std::num::NonZeroU32;
 
 #[derive(Arbitrary, Debug)]
@@ -20,43 +25,45 @@ struct Pkt<'i> {
 
 fuzz_target!(|pkts: Vec<Pkt<'_>>| {
     retina_fuzz::init_logging();
-    let mut depacketizer = retina::codec::Depacketizer::new(
-        "video", "h265", 90_000, None, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
+    let new = || {
+        retina::codec::VideoDepacketizer::<u64>::new("h265", 90_000, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap()
+    };
+    let mut accumulating = new();
+    let mut streaming = new();
+    let mut accumulating_h = CheckingHandler::new(Accumulate::Yes, true);
+    let mut streaming_h = CheckingHandler::new(Accumulate::No, true);
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
-    let pkt_ctx = retina::PacketContext::dummy();
-    let mut buf = retina::testutil::DepacketizeBuf::new(65536);
-    for pkt in pkts {
+    let mut buf = retina::buf::MarkBuf::new(65536);
+    for (i, pkt) in pkts.iter().enumerate() {
+        log::trace!("pkt: {pkt:?}");
         if pkt.loss {
             sequence_number = sequence_number.wrapping_add(1);
         }
         if pkt.ts_change {
             timestamp = timestamp.try_add(1).unwrap();
         }
-        let meta = retina::rtp::PacketMeta {
-            ctx: pkt_ctx,
-            stream_id: 0,
+        let meta = retina::rtp::ReceivedPacketMeta::new(
+            i as u64,
             timestamp,
-            ssrc: 0,
             sequence_number,
-            loss: u16::from(pkt.loss),
-            mark: pkt.mark,
-        };
-        log::trace!("pkt: {pkt:?}");
-        if let Err(e) = buf.push(&mut depacketizer, meta, pkt.payload) {
-            log::info!("depacketizer push error: {e}");
-            depacketizer.check_invariants();
+            0,
+            pkt.mark,
+            u16::from(pkt.loss),
+        );
+        let Ok(_) = u16::try_from(pkt.payload.len()) else {
             return;
-        }
-        depacketizer.check_invariants();
-        while let Some(item) = depacketizer.pull() {
-            depacketizer.check_invariants();
-            if let Err(e) = item {
-                log::info!("depacketizer pull error: {e:?}");
-                return;
-            }
-        }
-        depacketizer.check_invariants();
+        };
+        retina_fuzz::push(
+            &mut buf,
+            meta,
+            pkt.payload,
+            &mut [
+                (&mut accumulating, &mut accumulating_h),
+                (&mut streaming, &mut streaming_h),
+            ],
+        );
         sequence_number = sequence_number.wrapping_add(1);
     }
+    assert_eq!(accumulating_h.events, streaming_h.events);
 });

@@ -7,7 +7,7 @@
 #![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
 
 use crate::buf::{BufRange, Mark, MarkBuf};
-use crate::codec::{Data, Handler, UnitPosition};
+use crate::codec::{UnitPosition, VideoData, VideoHandler};
 use crate::inputs::Input as _;
 
 mod analyzer;
@@ -29,6 +29,16 @@ pub enum Framing {
 
     /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
     AnnexB,
+}
+
+/// Returns the given parameter set NALs, each preceded by [`ANNEX_B_START_CODE`].
+pub(super) fn annex_b_parameter_sets(nals: &[&[u8]]) -> bytes::Bytes {
+    let mut buf = Vec::with_capacity(nals.iter().map(|n| 4 + n.len()).sum());
+    for nal in nals {
+        buf.extend_from_slice(&ANNEX_B_START_CODE);
+        buf.extend_from_slice(nal);
+    }
+    buf.into()
 }
 
 /// A NAL unit header, as stored by the H.264 and H.265 depacketizers.
@@ -103,7 +113,7 @@ impl Delivery {
         pieces: &[BufRange],
         in_progress: Option<H>,
         buf: &MarkBuf,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) {
         let mut piece_idx = crate::to_usize(self.pieces);
         for nal in &nals[crate::to_usize(self.nals)..] {
@@ -228,7 +238,7 @@ pub(super) fn visit_frame<H: NalHeader>(
 /// Collects slices on the stack, splitting into several [`Data`] events if
 /// there are too many pieces to fit.
 pub(super) fn deliver<Ctx>(
-    handler: &mut impl Handler<Ctx>,
+    handler: &mut impl VideoHandler<Ctx>,
     header: &[u8],
     pieces: &[BufRange],
     buf: &MarkBuf,
@@ -245,7 +255,7 @@ pub(super) fn deliver<Ctx>(
     }
     for piece in pieces {
         if n + 2 > MAX_SLICES {
-            handler.data(&Data {
+            handler.data(&VideoData {
                 position: UnitPosition::new(first, false),
                 data: &slices[..n],
             });
@@ -260,7 +270,7 @@ pub(super) fn deliver<Ctx>(
             n += 1;
         }
     }
-    handler.data(&Data {
+    handler.data(&VideoData {
         position: UnitPosition::new(first, last),
         data: &slices[..n],
     });
@@ -661,17 +671,23 @@ pub(super) fn check_range(buf: &MarkBuf, pos: u64, len: usize) {
 /// after it in the buffer, which holds when the transport supplies data in
 /// the order it read it.
 ///
-/// Panics if data is supplied before the existing mark, or as
-/// [`MarkBuf::add_mark_at`] does.
+/// Panics if data is supplied before the existing mark, if `mark` belongs to
+/// a different buffer, or as [`MarkBuf::add_mark_at`] does.
 #[inline]
 pub(super) fn pin(mark: &mut Option<Mark>, buf: &MarkBuf, pos: u64) {
     match mark {
         None => *mark = Some(buf.add_mark_at(pos)),
-        Some(m) => assert!(
-            pos >= m.pos(),
-            "NAL data at {pos} supplied after data at {}; data must be supplied in buffer order",
-            m.pos(),
-        ),
+        Some(m) => {
+            assert!(
+                m.belongs_to(buf),
+                "analyzer holding data from one MarkBuf was supplied data from another"
+            );
+            assert!(
+                pos >= m.pos(),
+                "NAL data at {pos} supplied after data at {}; data must be supplied in buffer order",
+                m.pos(),
+            );
+        }
     }
 }
 
@@ -687,15 +703,15 @@ mod tests {
     struct Data(Vec<u8>, Option<crate::codec::Accumulate>);
 
     #[cfg(feature = "h264")]
-    impl crate::codec::Handler<()> for Data {
+    impl crate::codec::VideoHandler<()> for Data {
         fn frame_start(
             &mut self,
-            _: &crate::codec::FrameStart<'_, ()>,
+            _: &crate::codec::VideoFrameStart<'_, ()>,
         ) -> crate::codec::Accumulate {
             self.1.unwrap_or(crate::codec::Accumulate::No)
         }
 
-        fn data(&mut self, data: &crate::codec::Data<'_>) {
+        fn data(&mut self, data: &VideoData<'_>) {
             for d in data.data {
                 self.0.extend_from_slice(d);
             }
@@ -752,6 +768,14 @@ mod tests {
         assert_eq!(mark.as_ref().map(Mark::pos), Some(4));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(&mut mark, &buf, 3)));
         assert!(r.is_err(), "out-of-order data should panic");
+
+        // Data from another buffer panics.
+        let mut other = MarkBuf::new(16);
+        other.extend(b"x");
+        other.advance_unparsed(1);
+        let r =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(&mut mark, &other, 0)));
+        assert!(r.is_err(), "data from another buffer should panic");
     }
 
     /// Tests [`PiecesReader`] with a piece that wraps around the ring buffer

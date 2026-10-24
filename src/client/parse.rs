@@ -384,6 +384,7 @@ fn parse_media(
     };
 
     Ok(Stream {
+        frame_format: Default::default(),
         media,
         encoding_name,
         clock_rate_hz: clock_rate,

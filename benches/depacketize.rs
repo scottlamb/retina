@@ -4,19 +4,57 @@
 use std::num::NonZeroU16;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use retina::PacketContext;
+use retina::buf::MarkBuf;
 use retina::client::{Timeline, rtp::InorderParser};
-use retina::codec::{CodecItem, Depacketizer};
+use retina::codec::{
+    Accumulate, AudioDepacketizer, AudioFrameRef, AudioHandler, FrameFormat, VideoData,
+    VideoDepacketizer, VideoFrameEnd, VideoFrameStart, VideoHandler,
+};
+use retina::rtp::ReceivedPacketRef;
 use std::convert::TryFrom;
 use std::io::Write;
 
-/// Helper to push a payload to a depacketizer via a `DepacketizeBuf`.
-fn push_payload(
-    depacketizer: &mut Depacketizer,
-    meta: retina::rtp::PacketMeta,
-    payload: &[u8],
-    buf: &mut retina::testutil::DepacketizeBuf,
-) {
-    buf.push(depacketizer, meta, payload).unwrap();
+/// Handles frames by calling `f` with each whole frame, either as accumulated by the
+/// depacketizer or as assembled by the handler from streamed data.
+struct BenchHandler<F> {
+    accumulate: Accumulate,
+    f: F,
+
+    /// The frame so far, when streaming. Kept around to reuse the allocation.
+    frame: Vec<u8>,
+}
+
+impl<F: FnMut(&[u8])> VideoHandler<PacketContext> for BenchHandler<F> {
+    fn frame_start(&mut self, _: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+        self.frame.clear();
+        self.accumulate
+    }
+
+    fn data(&mut self, data: &VideoData<'_>) {
+        if self.accumulate == Accumulate::No {
+            if data.position.is_first() {
+                self.frame.extend_from_slice(&[0, 0, 0, 1]); // Annex B start code.
+            }
+            for d in data.data {
+                self.frame.extend_from_slice(d);
+            }
+        }
+    }
+
+    fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
+        if let Some(frame) = frame_end.complete_frame(FrameFormat::default()) {
+            (self.f)(&frame);
+        } else {
+            (self.f)(&self.frame);
+        }
+    }
+}
+
+impl<F> AudioHandler<PacketContext> for BenchHandler<F> {
+    fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
+        std::hint::black_box(frame.data(FrameFormat::default()));
+    }
 }
 
 // This holds just the RTSP data portions of a session from this public endpoint.
@@ -27,7 +65,7 @@ const BUNNY: &[u8] = include_bytes!("bunny.rtsp");
 
 // TODO: it'd be nice to have a slick way of loading saved RTSP flows for testing.
 // For now, this builds state via several internal interfaces.
-fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
+fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
     let mut remaining = BUNNY;
     let mut timelines = [
         Timeline::new(Some(0), 12_000, None).unwrap(),
@@ -45,14 +83,14 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             retina::client::UnknownRtcpSsrcPolicy::Default,
         ),
     ];
-    let mut depacketizers = [
-        Depacketizer::new("audio", "mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap(),
-        Depacketizer::new("video", "h264", 90_000, None, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap(),
-    ];
-    let mut bufs = [
-        retina::testutil::DepacketizeBuf::new(65536),
-        retina::testutil::DepacketizeBuf::new(65536),
-    ];
+    let mut audio = AudioDepacketizer::new("mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap();
+    let mut video = VideoDepacketizer::new("h264", 90_000, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap();
+    let mut bufs = [MarkBuf::new(65536), MarkBuf::new(65536)];
+    let mut handler = BenchHandler {
+        accumulate,
+        f,
+        frame: Vec::new(),
+    };
     let conn_ctx = retina::ConnectionContext::dummy();
     let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
@@ -84,15 +122,19 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             Ok(Some(meta)) => meta,
             _ => unreachable!(),
         };
-        let payload = &data[usize::from(payload_range.start)..usize::from(payload_range.end)];
-        push_payload(
-            &mut depacketizers[stream_id],
+        let buf = &mut bufs[stream_id];
+        let pos = buf.end();
+        buf.extend(&data);
+        buf.advance_unparsed(buf.end());
+        let pkt = ReceivedPacketRef::new(
             meta,
-            payload,
-            &mut bufs[stream_id],
+            buf,
+            pos + u64::from(payload_range.start),
+            payload_range.end - payload_range.start,
         );
-        while let Some(pkt) = depacketizers[stream_id].pull() {
-            f(pkt.unwrap());
+        match stream_id {
+            0 => audio.push(&pkt, &mut handler),
+            _ => video.push(&pkt, &mut handler),
         }
     }
 }
@@ -108,18 +150,14 @@ fn criterion_benchmark(c: &mut Criterion) {
         u64::try_from(BUNNY.len()).unwrap(),
     ));
     g.bench_function("h264_aac_discard", |b| {
-        b.iter(|| h264_aac(|_pkt: CodecItem| ()))
+        b.iter(|| h264_aac(Accumulate::Yes, |_| ()))
     });
+    let mut w2 = w.try_clone().unwrap();
     g.bench_function("h264_aac_writevideo", move |b| {
-        b.iter(|| {
-            h264_aac(|pkt: CodecItem| {
-                let v = match pkt {
-                    CodecItem::VideoFrame(v) => v,
-                    _ => return,
-                };
-                w.write_all(v.data()).unwrap();
-            })
-        })
+        b.iter(|| h264_aac(Accumulate::Yes, |d| w.write_all(d).unwrap()))
+    });
+    g.bench_function("h264_aac_streamvideo", move |b| {
+        b.iter(|| h264_aac(Accumulate::No, |d| w2.write_all(d).unwrap()))
     });
 }
 
