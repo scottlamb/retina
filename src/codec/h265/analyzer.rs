@@ -10,9 +10,9 @@ use log::{debug, log_enabled, trace};
 
 use super::{AuData, FrameEndBody, InternalParameters, Nal, nal};
 use crate::buf::{BufRange, Mark, MarkBuf};
-use crate::codec::h26x::{Delivery, Framing, NalAnalyzer, check_range};
+use crate::codec::h26x::{Delivery, NalAnalyzer, check_range};
 use crate::codec::{
-    Accumulate, FrameBody, FrameEnd, FrameStart, Handler, Loss, LossReason, ParametersRef,
+    Accumulate, FrameBody, Loss, LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler,
     VideoParameters,
 };
 
@@ -25,9 +25,6 @@ use crate::codec::{
 #[derive(Debug)]
 pub struct Analyzer<Ctx> {
     parameters: Option<InternalParameters>,
-
-    /// The framing of the parameters' `extra_data`.
-    framing: Framing,
 
     /// Parameter sets which differ from `parameters`, to take effect at the
     /// next access unit's first slice. These followed the first slice of an
@@ -344,7 +341,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// This is optional; [`Analyzer::finish_au_with`] does the same. Calling
     /// it after each NAL unit or fragment delivers events with lower latency,
     /// and with [`Accumulate::No`] releases the buffer data supplied so far.
-    pub(crate) fn stream_with<H: Handler<Ctx>>(&mut self, buf: &MarkBuf, handler: &mut H) {
+    pub(crate) fn stream_with<H: VideoHandler<Ctx>>(&mut self, buf: &MarkBuf, handler: &mut H) {
         if self.au.is_none() {
             return;
         }
@@ -354,7 +351,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// Finishes the current access unit, delivering any remaining events to
     /// `handler`.
     ///
-    /// `end_ctx` will be supplied as [`FrameEnd::end_ctx`]. If the access
+    /// `end_ctx` will be supplied as [`VideoFrameEnd::end_ctx`]. If the access
     /// unit is invalid (for example, it has an invalid parameter set, or a NAL
     /// unit is still in progress), discards it and returns an error instead
     /// of finishing the frame. An access unit without slices produces no
@@ -363,7 +360,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// # Panics
     ///
     /// Panics if no access unit is in progress.
-    pub(crate) fn finish_au_with<H: Handler<Ctx>>(
+    pub(crate) fn finish_au_with<H: VideoHandler<Ctx>>(
         &mut self,
         buf: &MarkBuf,
         end_ctx: &Ctx,
@@ -380,28 +377,6 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         r
     }
 
-    /// Sets the framing of the parameters' `extra_data`.
-    ///
-    /// If existing parameters were parsed with a different framing, they are
-    /// re-parsed to produce the correct `extra_data` format.
-    pub(crate) fn set_framing(&mut self, framing: Framing) {
-        self.framing = framing;
-
-        // Re-parse existing parameters so extra_data matches the new framing.
-        if let Some(ref ip) = self.parameters {
-            self.parameters = Some(
-                InternalParameters::parse_vps_sps_pps(
-                    &ip.vps_nal,
-                    &ip.sps_nal,
-                    &ip.pps_nal,
-                    ip.seen_extra_trailing_data,
-                    framing,
-                )
-                .expect("re-parse of previously valid VPS/SPS/PPS should not fail"),
-            );
-        }
-    }
-
     /// Changes the current access unit's timestamp, if any, affecting only
     /// events not yet delivered. For senders which erroneously change
     /// timestamps mid-access unit.
@@ -414,7 +389,6 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     pub(super) fn with_internal_parameters(parameters: Option<InternalParameters>) -> Self {
         Analyzer {
             parameters,
-            framing: Framing::default(),
             pending: None,
             mark: None,
             pieces: Vec::new(),
@@ -430,7 +404,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     ///
     /// Discards any in-progress access unit. Lost packets are counted toward
     /// the next one, which may be missing its beginning.
-    pub(crate) fn loss<H: Handler<Ctx>>(&mut self, ctx: &Ctx, reason: LossReason, handler: &mut H) {
+    pub(crate) fn loss<H: VideoHandler<Ctx>>(
+        &mut self,
+        ctx: &Ctx,
+        reason: LossReason,
+        handler: &mut H,
+    ) {
         if let LossReason::PacketLoss { packets } = reason {
             self.lost = self.lost.saturating_add(packets);
         }
@@ -520,12 +499,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     }
 
     /// Starts the frame if possible and delivers its data so far.
-    fn stream_inner(&mut self, buf: &MarkBuf, handler: &mut impl Handler<Ctx>) {
+    fn stream_inner(&mut self, buf: &MarkBuf, handler: &mut impl VideoHandler<Ctx>) {
         let Some(au) = self.au.as_mut() else {
             return;
         };
         let view = AuView {
-            framing: self.framing,
             parameters: &self.parameters,
             nals: &self.nals,
             pieces: &self.pieces,
@@ -560,13 +538,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         au: &mut AuState<Ctx>,
         end_ctx: &Ctx,
         buf: &MarkBuf,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         if !au.trimmed && log_enabled!(log::Level::Debug) {
             log_access_unit(&self.nals, au);
         }
         let view = AuView {
-            framing: self.framing,
             parameters: &self.parameters,
             nals: &self.nals,
             pieces: &self.pieces,
@@ -601,23 +578,19 @@ impl<Ctx: Clone> Analyzer<Ctx> {
 
         let accumulate = match au.started {
             Some(a) => a,
-            None => handler.frame_start(&FrameStart {
+            None => handler.frame_start(&VideoFrameStart {
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
-                loss: au.loss,
                 is_random_access_point: au.meta.is_random_access_point,
                 is_disposable: false,
                 has_new_parameters,
-                parameters: self
-                    .parameters
-                    .as_ref()
-                    .map(|p| ParametersRef::Video(&p.generic_parameters)),
+                parameters: self.parameters.as_ref().map(|p| &p.generic_parameters),
             }),
         };
         au.delivery
             .deliver(&self.nals, &self.pieces, None, buf, handler);
 
-        handler.frame_end(&mut FrameEnd {
+        handler.frame_end(&mut VideoFrameEnd {
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx,
@@ -643,7 +616,6 @@ impl<Ctx: Clone> Analyzer<Ctx> {
 /// The analyzer's state other than the current access unit, borrowed
 /// separately from it.
 struct AuView<'a> {
-    framing: Framing,
     parameters: &'a Option<InternalParameters>,
     nals: &'a [Nal],
     pieces: &'a [BufRange],
@@ -712,21 +684,15 @@ impl AuView<'_> {
             return Ok(None);
         };
         let seen_extra_trailing_data = old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
-        InternalParameters::parse_vps_sps_pps(
-            vps_nal,
-            sps_nal,
-            pps_nal,
-            seen_extra_trailing_data,
-            self.framing,
-        )
-        .map(Some)
+        InternalParameters::parse_vps_sps_pps(vps_nal, sps_nal, pps_nal, seen_extra_trailing_data)
+            .map(Some)
     }
 
     /// Calls `frame_start` for a frame which is still in progress.
     ///
     /// The frame's metadata so far is provisional. In particular, parameters
     /// are parsed but not committed to `parameters` until the frame ends.
-    fn start_frame<Ctx>(&self, au: &mut AuState<Ctx>, handler: &mut impl Handler<Ctx>) {
+    fn start_frame<Ctx>(&self, au: &mut AuState<Ctx>, handler: &mut impl VideoHandler<Ctx>) {
         let mut is_random_access_point = au.meta.is_random_access_point;
         if let Some(ip) = au.in_progress.as_ref()
             && matches!(
@@ -749,16 +715,15 @@ impl AuView<'_> {
             .as_ref()
             .and_then(|np| np.parsed.as_ref());
         au.started = Some(
-            handler.frame_start(&FrameStart {
+            handler.frame_start(&VideoFrameStart {
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
-                loss: au.loss,
                 is_random_access_point,
                 is_disposable: false,
                 has_new_parameters: new_params.is_some(),
                 parameters: new_params
                     .or(self.parameters.as_ref())
-                    .map(|p| ParametersRef::Video(&p.generic_parameters)),
+                    .map(|p| &p.generic_parameters),
             }),
         );
     }
@@ -866,7 +831,7 @@ mod tests {
     use super::Analyzer;
     use crate::buf::MarkBuf;
     use crate::codec::h26x::NalAnalyzer as _;
-    use crate::codec::{Accumulate, FrameEnd, FrameStart, Handler, Loss};
+    use crate::codec::{Accumulate, Loss, VideoFrameEnd, VideoFrameStart, VideoHandler};
 
     /// An event delivered to [`Events`].
     #[derive(Debug, PartialEq, Eq)]
@@ -885,13 +850,13 @@ mod tests {
     #[derive(Default)]
     struct Events(Vec<Event>);
 
-    impl Handler<u32> for Events {
-        fn frame_start(&mut self, _: &FrameStart<'_, u32>) -> Accumulate {
+    impl VideoHandler<u32> for Events {
+        fn frame_start(&mut self, _: &VideoFrameStart<'_, u32>) -> Accumulate {
             self.0.push(Event::Start);
             Accumulate::No
         }
 
-        fn data(&mut self, data: &crate::codec::Data<'_>) {
+        fn data(&mut self, data: &crate::codec::VideoData<'_>) {
             self.0.push(Event::Data {
                 first: data.position.is_first(),
                 last: data.position.is_last(),
@@ -899,7 +864,7 @@ mod tests {
             });
         }
 
-        fn frame_end(&mut self, _: &mut FrameEnd<'_, u32>) {
+        fn frame_end(&mut self, _: &mut VideoFrameEnd<'_, u32>) {
             self.0.push(Event::End);
         }
 

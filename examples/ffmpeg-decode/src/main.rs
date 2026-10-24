@@ -7,10 +7,7 @@ use anyhow::{Error, anyhow, bail};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
-use retina::{
-    client::SetupOptions,
-    codec::{CodecItem, VideoFrame},
-};
+use retina::client::{CodecItem, SetupOptions, VideoFrame};
 use std::{fs::File, io::Write, path::Path, str::FromStr, sync::Arc};
 
 /// Decodes video streams using ffmpeg, writing them into `frame<i>.ppm` images.

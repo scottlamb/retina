@@ -9,12 +9,12 @@ use crate::codec::VideoParameters;
 /// Analyzes H.264 or H.265 access units (frames), regardless of how they're
 /// transported.
 ///
-/// This is the codec layer beneath the H.264 and H.265 RTP depacketizers,
-/// implemented by [`crate::codec::h264::Analyzer`] and
-/// [`crate::codec::h265::Analyzer`]. The
+/// This is the codec layer beneath the RTP depacketizer
+/// ([`crate::codec::VideoDepacketizer`]), implemented by
+/// [`crate::codec::h264::Analyzer`] and [`crate::codec::h265::Analyzer`]. The
 /// transport finds access unit boundaries and supplies each access unit's NAL
 /// units; the analyzer tracks parameter sets and random access state across
-/// access units and reports each to a [`crate::codec::Handler`]: whether
+/// access units and reports each to a [`crate::codec::VideoHandler`]: whether
 /// each frame is a random access point, disposable, and so on.
 ///
 /// NAL units are supplied as byte ranges within a [`MarkBuf`]. The analyzer
@@ -32,13 +32,13 @@ use crate::codec::VideoParameters;
 ///     [`NalAnalyzer::start_nal`], [`NalAnalyzer::extend_nal`], and
 ///     [`NalAnalyzer::finish_nal`] to supply it in fragments as it arrives.
 ///     Optionally, the analyzer's `stream_with` after each to deliver
-///     [`crate::codec::Handler::frame_start`] and
-///     [`crate::codec::Handler::data`] events as early as possible.
+///     [`crate::codec::VideoHandler::frame_start`] and
+///     [`crate::codec::VideoHandler::data`] events as early as possible.
 /// 3.  The analyzer's `finish_au_with`.
 ///
 /// A parameter set takes effect at the first slice that follows it. In
 /// particular, one that follows an access unit's first slice applies starting
-/// with the next access unit, so [`crate::codec::FrameStart`] always
+/// with the next access unit, so [`crate::codec::VideoFrameStart`] always
 /// reports a frame's final parameters. (A parameter set there can't be for the
 /// current picture; see H.264 sections 7.4.1.2.1 and 7.4.3, and H.265 sections
 /// 7.4.2.4.2 and 7.4.7.1.)
@@ -46,13 +46,13 @@ pub(crate) trait NalAnalyzer<Ctx> {
     /// Returns the current parameters, if known.
     ///
     /// These may change as access units finish; see
-    /// [`crate::codec::FrameEnd::has_new_parameters`].
+    /// [`crate::codec::VideoFrameEnd::has_new_parameters`].
     fn parameters(&self) -> Option<&VideoParameters>;
 
     /// Starts an access unit.
     ///
-    /// `ctx` will be supplied as [`crate::codec::FrameStart::ctx`] and
-    /// [`crate::codec::FrameEnd::start_ctx`].
+    /// `ctx` will be supplied as [`crate::codec::VideoFrameStart::ctx`] and
+    /// [`crate::codec::VideoFrameEnd::start_ctx`].
     ///
     /// # Panics
     ///
@@ -84,7 +84,7 @@ pub(crate) trait NalAnalyzer<Ctx> {
     /// Supply the rest of the NAL unit, as it arrives, with
     /// [`NalAnalyzer::extend_nal`], then end it with
     /// [`NalAnalyzer::finish_nal`]. Each `stream_with` call in between
-    /// delivers the data so far via [`crate::codec::Handler::data`], so a
+    /// delivers the data so far via [`crate::codec::VideoHandler::data`], so a
     /// large slice can be passed on while it's still arriving.
     ///
     /// Returns an error if the header is

@@ -17,7 +17,10 @@ use derive_more::Debug;
 use libfuzzer_sys::Corpus;
 use libfuzzer_sys::arbitrary::{self, Arbitrary};
 use pretty_hex::PrettyHex as _;
+use retina::codec::{Accumulate, VideoDepacketizer};
 use std::num::NonZeroU32;
+
+use crate::CheckingHandler;
 
 #[derive(Copy, Clone, Debug)]
 pub enum Codec {
@@ -135,6 +138,8 @@ impl Payload<'_> {
 }
 
 /// Runs the given packets through a depacketizer for `codec`, checking invariants throughout.
+/// Runs an accumulating and a streaming depacketizer side by side on `pkts`,
+/// checking that they produce identical events.
 pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
     crate::init_logging();
     let (encoding, params) = match codec {
@@ -150,14 +155,16 @@ pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
     if matches!(codec, Codec::H264) && pkts.first().is_none_or(|p| p.ts_change) {
         return Corpus::Reject;
     }
-    let mut depacketizer =
-        retina::codec::Depacketizer::new("video", encoding, 90_000, None, Some(params)).unwrap();
+    let new = || VideoDepacketizer::<u64>::new(encoding, 90_000, Some(params)).unwrap();
+    let mut accumulating = new();
+    let mut streaming = new();
+    let mut accumulating_h = CheckingHandler::new(Accumulate::Yes, true);
+    let mut streaming_h = CheckingHandler::new(Accumulate::No, true);
     let mut timestamp = retina::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
     let mut sequence_number: u16 = 0;
-    let pkt_ctx = retina::PacketContext::dummy();
-    let mut buf = retina::testutil::DepacketizeBuf::new(65536);
+    let mut buf = retina::buf::MarkBuf::new(65536);
     let mut payload = Vec::new();
-    for pkt in pkts {
+    for (i, pkt) in pkts.iter().enumerate() {
         pkt.payload.serialize(codec, &mut payload);
         log::trace!(
             "pkt: {pkt:?} -> {:?}",
@@ -172,38 +179,31 @@ pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
         if pkt.ts_change {
             timestamp = timestamp.try_add(1).unwrap();
         }
-        let meta = retina::rtp::PacketMeta {
-            ctx: pkt_ctx,
-            stream_id: 0,
+        let meta = retina::rtp::ReceivedPacketMeta::new(
+            i as u64,
             timestamp,
-            ssrc: 0,
+            96, // payload type
             sequence_number,
-            loss: u16::from(pkt.loss),
-            mark: pkt.mark,
-        };
-        if let Err(e) = buf.push(&mut depacketizer, meta, &payload) {
-            log::info!("depacketizer push error: {e:?}");
-            depacketizer.check_invariants();
-            return Corpus::Keep;
-        }
-        depacketizer.check_invariants();
-        while let Some(item) = depacketizer.pull() {
-            depacketizer.check_invariants();
-            match item {
-                Ok(retina::codec::CodecItem::VideoFrame(f)) => {
-                    if matches!(codec, Codec::H264) {
-                        retina::testutil::validate_avcc_frame(f.data()).unwrap();
-                    }
-                }
-                Ok(_) => unreachable!(),
-                Err(e) => {
-                    log::info!("depacketizer pull error: {e:?}");
-                    return Corpus::Keep;
-                }
-            }
-        }
-        depacketizer.check_invariants();
+            0,
+            pkt.mark,
+            u16::from(pkt.loss),
+        );
+        crate::push(
+            &mut buf,
+            meta,
+            &payload,
+            &mut [
+                (&mut accumulating, &mut accumulating_h),
+                (&mut streaming, &mut streaming_h),
+            ],
+        );
         sequence_number = sequence_number.wrapping_add(1);
+    }
+    assert_eq!(accumulating_h.events, streaming_h.events);
+    if matches!(codec, Codec::H264) {
+        for f in &accumulating_h.frames {
+            retina::testutil::validate_avcc_frame(f).unwrap();
+        }
     }
     Corpus::Keep
 }

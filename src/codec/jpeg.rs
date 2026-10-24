@@ -19,12 +19,12 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
 use crate::{Timestamp, codec::AllPixelDimensions};
 
-use super::{Accumulate, Data, FrameBody, FrameEnd, FrameStart, Handler, UnitPosition};
-use super::{ParametersRef, VideoParameters};
+use super::{Accumulate, FrameBody, UnitPosition, VideoData, VideoFrameEnd, VideoFrameStart};
+use super::{VideoHandler, VideoParameters};
 
 const MAX_FRAME_LEN: usize = 2_000_000;
 
@@ -304,7 +304,9 @@ pub struct Depacketizer<Ctx> {
 
     /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
     #[cfg(test)]
-    pending: std::collections::VecDeque<Result<super::CodecItem, super::DepacketizeError>>,
+    pending: std::collections::VecDeque<
+        Result<crate::client::CodecItem, crate::client::DepacketizeError>,
+    >,
 
     parameters: Option<VideoParameters>,
 
@@ -328,8 +330,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push_with(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         self.loss = self.loss.saturating_add(pkt.meta.loss);
         if pkt.meta.loss > 0 && self.metadata.is_some() {
@@ -489,7 +491,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             rfc6381_codec: "mp4v.6C".to_owned(),
                             pixel_aspect_ratio: None,
                             frame_rate: None,
-                            extra_data: Bytes::new(),
+                            decoder_config_record: Bytes::new(),
+                            #[cfg(any(feature = "h264", feature = "h265"))]
+                            annex_b_parameter_sets: Bytes::new(),
                             codec: super::VideoParametersCodec::Jpeg,
                         }),
                     });
@@ -529,19 +533,18 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             if has_new_parameters {
                 self.parameters = metadata.parameters;
             }
-            let parameters = self.parameters.as_ref().map(ParametersRef::Video);
+            let parameters = self.parameters.as_ref();
             let loss = std::mem::take(&mut self.loss);
 
-            let accumulate = handler.frame_start(&FrameStart {
+            let accumulate = handler.frame_start(&VideoFrameStart {
                 timestamp,
                 ctx: &metadata.start_ctx,
-                loss,
                 is_random_access_point: true,
                 is_disposable: true,
                 has_new_parameters,
-                parameters: parameters.clone(),
+                parameters,
             });
-            handler.data(&Data {
+            handler.data(&VideoData {
                 position: UnitPosition::Complete,
                 data: &[&self.data],
             });
@@ -549,7 +552,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 Accumulate::Yes => std::mem::take(&mut self.data),
                 Accumulate::No => Vec::new(),
             };
-            let mut frame_end = FrameEnd {
+            let mut frame_end = VideoFrameEnd {
                 timestamp,
                 start_ctx: &metadata.start_ctx,
                 end_ctx: ctx,
@@ -584,8 +587,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         Ok(())
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        self.parameters.as_ref().map(super::ParametersRef::Video)
+    pub(super) fn parameters(&self) -> Option<&VideoParameters> {
+        self.parameters.as_ref()
     }
 }
 
@@ -638,16 +641,17 @@ impl<Ctx: Clone> Default for Depacketizer<Ctx> {
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the legacy `push`/`pull` interface.
-    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
         let mut pending = std::mem::take(&mut self.pending);
         let r = self.push_with(
             pkt,
-            &mut super::LegacyHandler {
+            &mut crate::client::LegacyHandler {
                 pending: &mut pending,
                 meta: &pkt.meta,
+                stream_id: 0,
                 format: super::FrameFormat::default(),
             },
         );
@@ -655,7 +659,9 @@ impl Depacketizer<crate::PacketContext> {
         r
     }
 
-    fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+    fn pull(
+        &mut self,
+    ) -> Option<Result<crate::client::CodecItem, crate::client::DepacketizeError>> {
         self.pending.pop_front()
     }
 }
@@ -664,21 +670,27 @@ impl Depacketizer<crate::PacketContext> {
 mod tests {
     use std::num::NonZeroU32;
 
-    use crate::buf::{MarkBuf, PacketRef};
+    use crate::buf::MarkBuf;
+    use crate::rtp::ReceivedPacketRef;
     use crate::testutil::{assert_eq_hex, init_logging};
-    use crate::{codec::CodecItem, rtp::ReceivedPacketBuilder};
+    use crate::{client::CodecItem, client::ReceivedPacketBuilder};
 
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
         d: &mut super::Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::PacketMeta,
+        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
         payload: &[u8],
         buf: &mut MarkBuf,
     ) -> Result<(), String> {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+        d.push(&ReceivedPacketRef::new(
+            meta,
+            buf,
+            pos,
+            payload.len() as u16,
+        ))
     }
 
     // Raw RTP payload from a MJPEG encoded Big Buck Bunny stream
@@ -976,7 +988,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 buf,
             )
@@ -1000,7 +1012,7 @@ mod tests {
         sequence_number: u16,
         loss: u16,
         payload: &[u8],
-    ) -> Option<crate::codec::VideoFrame> {
+    ) -> Option<crate::client::VideoFrame> {
         let pkt = ReceivedPacketBuilder {
             ctx: crate::PacketContext::dummy(),
             stream_id: 0,
@@ -1019,7 +1031,7 @@ mod tests {
         .unwrap();
         push_via_buf(
             d,
-            crate::rtp::PacketMeta::from_received(&pkt),
+            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
             pkt.payload(),
             buf,
         )

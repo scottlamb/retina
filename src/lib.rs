@@ -19,8 +19,6 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::{Instant, SystemTime};
 
-/// Exposed for benchmarks and fuzz tests; not a stable API.
-#[doc(hidden)]
 pub mod buf;
 mod error;
 mod hex;

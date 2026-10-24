@@ -32,6 +32,10 @@ pub enum Framing {
     ///
     /// Each audio frame is prefixed with a 7-byte ADTS fixed+variable header.
     /// This is self-describing, so `extra_data` is empty/unneeded.
+    ///
+    /// ADTS can't represent every stream. [`AudioFrameRef::data`](super::AudioFrameRef::data)
+    /// fails for audio object types other than 1–4, sampling frequencies
+    /// without an index, and frames over 8184 bytes.
     Adts,
 }
 use std::{
@@ -40,10 +44,10 @@ use std::{
     num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
-use crate::buf::PacketRef;
-use crate::{Error, error::ErrorInt, rtp::PacketMeta};
+use crate::rtp::ReceivedPacketRef;
+use crate::{Error, error::ErrorInt, rtp::ReceivedPacketMeta};
 
-use super::{AudioFrameRef, AudioParameters, FmtpParser, Handler, Loss, LossReason};
+use super::{AudioFrameRef, AudioHandler, AudioParameters, FmtpParser, Loss, LossReason};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -199,62 +203,6 @@ impl AudioSpecificConfig {
             audio_object_type,
             sampling_frequency_index,
         })
-    }
-
-    /// Builds a 7-byte ADTS fixed+variable header for the given frame size.
-    ///
-    /// See ISO/IEC 13818-7 section 6.2. Fails if this config or frame size
-    /// can't be represented in ADTS.
-    fn adts_header(&self, aac_frame_len: usize) -> Result<[u8; 7], String> {
-        // ADTS profile is audio_object_type - 1, in 2 bits.
-        let profile = match self.audio_object_type {
-            1..=4 => self.audio_object_type - 1,
-            o => {
-                return Err(format!(
-                    "audio_object_type {o} can't be represented in ADTS"
-                ));
-            }
-        };
-        let freq_index = match self.sampling_frequency_index {
-            i @ 0x0..=0xc => i,
-            _ => {
-                return Err(format!(
-                    "sampling frequency {} can't be represented in ADTS",
-                    self.parameters.clock_rate
-                ));
-            }
-        };
-        let channel_config = match self.parameters.codec {
-            super::AudioParametersCodec::Aac { channels_config_id } => channels_config_id.get(),
-            _ => unreachable!(),
-        };
-        // ADTS frame length = header (7 bytes) + raw AAC frame data, in 13 bits.
-        let adts_frame_len = match u16::try_from(7 + aac_frame_len) {
-            Ok(l) if l < (1 << 13) => l,
-            _ => {
-                return Err(format!(
-                    "{aac_frame_len}-byte AAC frame is too large for ADTS"
-                ));
-            }
-        };
-        Ok([
-            // Byte 0: syncword high 8 bits.
-            0xFF,
-            // Byte 1: syncword low 4 bits, ID=0 (MPEG-4), layer=00, protection_absent=1.
-            0xF1,
-            // Byte 2: profile (2 bits), sampling_freq_index (4 bits), private=0,
-            //   channel_config high bit (1 bit).
-            (profile << 6) | (freq_index << 2) | (channel_config >> 2),
-            // Byte 3: channel_config low 2 bits, originality=0, home=0,
-            //   copyright_id=0, copyright_start=0, frame_length high 2 bits.
-            ((channel_config & 0x3) << 6) | ((adts_frame_len >> 11) as u8),
-            // Byte 4: frame_length middle 8 bits.
-            (adts_frame_len >> 3) as u8,
-            // Byte 5: frame_length low 3 bits, buffer_fullness high 5 bits (0x7FF = VBR).
-            ((adts_frame_len & 0x7) << 5) as u8 | 0x1F,
-            // Byte 6: buffer_fullness low 6 bits (0x7FF = VBR), number_of_raw_data_blocks=0.
-            0xFC,
-        ])
     }
 }
 
@@ -419,26 +367,112 @@ fn parse_format_specific_params(
     Ok(config)
 }
 
+/// The parameters needed to build an ADTS header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdtsParams {
+    profile: u8,
+    freq_index: u8,
+    channel_config: u8,
+}
+
+/// Why a frame can't be represented in ADTS.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AdtsError {
+    AudioObjectType(u8),
+    SamplingFrequency(u32),
+    FrameTooLarge(usize),
+}
+
+impl std::fmt::Display for AdtsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdtsError::AudioObjectType(o) => {
+                write!(f, "audio_object_type {o} can't be represented in ADTS")
+            }
+            AdtsError::SamplingFrequency(r) => {
+                write!(f, "sampling frequency {r} can't be represented in ADTS")
+            }
+            AdtsError::FrameTooLarge(l) => write!(f, "{l}-byte AAC frame is too large for ADTS"),
+        }
+    }
+}
+
+impl AdtsParams {
+    /// Returns the ADTS parameters for `config`, if ADTS can represent it.
+    fn new(config: &AudioSpecificConfig) -> Result<Self, AdtsError> {
+        Ok(AdtsParams {
+            // ADTS profile is audio_object_type - 1, in 2 bits.
+            profile: match config.audio_object_type {
+                1..=4 => config.audio_object_type - 1,
+                o => return Err(AdtsError::AudioObjectType(o)),
+            },
+            freq_index: match config.sampling_frequency_index {
+                i @ 0x0..=0xc => i,
+                _ => return Err(AdtsError::SamplingFrequency(config.parameters.clock_rate)),
+            },
+            channel_config: match config.parameters.codec {
+                super::AudioParametersCodec::Aac { channels_config_id } => channels_config_id.get(),
+                _ => unreachable!(),
+            },
+        })
+    }
+
+    /// Builds a 7-byte ADTS fixed+variable header for the given frame size.
+    ///
+    /// See ISO/IEC 13818-7 section 6.2. Fails if the frame is too large.
+    pub(crate) fn header(&self, aac_frame_len: usize) -> Result<[u8; 7], AdtsError> {
+        let AdtsParams {
+            profile,
+            freq_index,
+            channel_config,
+        } = *self;
+        // ADTS frame length = header (7 bytes) + raw AAC frame data, in 13 bits.
+        let adts_frame_len = match u16::try_from(7 + aac_frame_len) {
+            Ok(l) if l < (1 << 13) => l,
+            _ => return Err(AdtsError::FrameTooLarge(aac_frame_len)),
+        };
+        Ok([
+            // Byte 0: syncword high 8 bits.
+            0xFF,
+            // Byte 1: syncword low 4 bits, ID=0 (MPEG-4), layer=00, protection_absent=1.
+            0xF1,
+            // Byte 2: profile (2 bits), sampling_freq_index (4 bits), private=0,
+            //   channel_config high bit (1 bit).
+            (profile << 6) | (freq_index << 2) | (channel_config >> 2),
+            // Byte 3: channel_config low 2 bits, originality=0, home=0,
+            //   copyright_id=0, copyright_start=0, frame_length high 2 bits.
+            ((channel_config & 0x3) << 6) | ((adts_frame_len >> 11) as u8),
+            // Byte 4: frame_length middle 8 bits.
+            (adts_frame_len >> 3) as u8,
+            // Byte 5: frame_length low 3 bits, buffer_fullness high 5 bits (0x7FF = VBR).
+            ((adts_frame_len & 0x7) << 5) as u8 | 0x1F,
+            // Byte 6: buffer_fullness low 6 bits (0x7FF = VBR), number_of_raw_data_blocks=0.
+            0xFC,
+        ])
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Depacketizer<Ctx> {
     config: AudioSpecificConfig,
     state: DepacketizerState<Ctx>,
-    framing: Framing,
 
-    /// The original `AudioSpecificConfig` bytes, preserved so that
-    /// `extra_data` can be restored if framing is switched back to `Raw`.
-    audio_specific_config: Vec<u8>,
+    /// Parameters for ADTS framing, as supplied with each frame.
+    adts: Result<AdtsParams, AdtsError>,
 
     /// The current packet's payload, copied contiguously. Kept around to
     /// re-use the allocation.
     payload: Vec<u8>,
 
-    /// Scratch space for an ADTS-framed frame. Kept around to re-use the allocation.
-    adts: Vec<u8>,
+    /// The format used by the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    test_format: super::FrameFormat,
 
     /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
     #[cfg(test)]
-    pending: std::collections::VecDeque<Result<super::CodecItem, super::DepacketizeError>>,
+    pending: std::collections::VecDeque<
+        Result<crate::client::CodecItem, crate::client::DepacketizeError>,
+    >,
 }
 
 /// A complete AAC frame.
@@ -468,7 +502,7 @@ enum FrameData {
 /// beginning of a fragment.
 #[derive(Debug)]
 struct Aggregate<Ctx> {
-    meta: PacketMeta<Ctx>,
+    meta: ReceivedPacketMeta<Ctx>,
 
     /// RTP packets lost before the next frame in this aggregate. Includes old
     /// loss that caused a previous fragment to be too short.
@@ -553,46 +587,34 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 channels, config.channels
             ));
         }
-        let audio_specific_config = config.parameters.extra_data.clone();
+        let adts = AdtsParams::new(&config);
         Ok(Self {
             config,
             state: DepacketizerState::default(),
-            framing: Framing::default(),
-            audio_specific_config,
+            adts,
             payload: Vec::new(),
-            adts: Vec::new(),
+            #[cfg(test)]
+            test_format: Default::default(),
             #[cfg(test)]
             pending: Default::default(),
         })
     }
 
-    pub(super) fn set_frame_format(&mut self, config: super::FrameFormat) {
-        self.framing = config.aac_framing;
-        match config.aac_framing {
-            Framing::Raw => {
-                // Restore AudioSpecificConfig as extra_data.
-                self.config
-                    .parameters
-                    .extra_data
-                    .clone_from(&self.audio_specific_config);
-            }
-            Framing::Adts => {
-                // Clear extra_data: a decoder receiving AudioSpecificConfig would
-                // expect raw AAC frames and misparse the ADTS-wrapped data.
-                self.config.parameters.extra_data.clear();
-            }
-        }
+    /// Sets the format used by the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    fn set_frame_format(&mut self, format: super::FrameFormat) {
+        self.test_format = format;
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        Some(super::ParametersRef::Audio(&self.config.parameters))
+    pub(super) fn parameters(&self) -> &super::AudioParameters {
+        &self.config.parameters
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push_with(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl AudioHandler<Ctx>,
     ) -> Result<(), String> {
         if let Err(description) = self.push_inner(pkt) {
             // Abandon any in-progress fragment, so the next packet can start
@@ -612,27 +634,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         while let Some(r) = self.pull_inner() {
             match r {
                 Ok(f) => {
-                    let raw = match &f.data {
+                    let data = match &f.data {
                         FrameData::Payload(r) => &self.payload[r.clone()],
                         FrameData::Owned(b) => &b[..],
-                    };
-                    let data = match self.framing {
-                        Framing::Raw => raw,
-                        Framing::Adts => match self.config.adts_header(raw.len()) {
-                            Ok(header) => {
-                                self.adts.clear();
-                                self.adts.extend_from_slice(&header);
-                                self.adts.extend_from_slice(raw);
-                                &self.adts[..]
-                            }
-                            Err(description) => {
-                                handler.loss(&Loss {
-                                    ctx: &f.ctx,
-                                    reason: LossReason::Corrupt { description },
-                                });
-                                continue;
-                            }
-                        },
                     };
                     handler.audio_frame(&AudioFrameRef {
                         ctx: &f.ctx,
@@ -640,18 +644,19 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         frame_length: f.frame_length,
                         loss: f.loss,
                         data,
+                        adts: Some(self.adts),
                     })
                 }
                 Err(description) => handler.loss(&Loss {
                     ctx: &pkt.meta.ctx,
-                    reason: LossReason::Corrupt { description },
+                    reason: LossReason::Corrupt(super::Corruption::new(description)),
                 }),
             }
         }
         Ok(())
     }
 
-    fn push_inner(&mut self, pkt: &PacketRef<'_, Ctx>) -> Result<(), String> {
+    fn push_inner(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>) -> Result<(), String> {
         let meta = &pkt.meta;
         let (s1, s2) = pkt.payload().slices();
         self.payload.clear();
@@ -856,47 +861,56 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the legacy `push`/`pull` interface.
-    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
         let mut pending = std::mem::take(&mut self.pending);
         let r = self.push_with(
             pkt,
-            &mut super::LegacyHandler {
+            &mut crate::client::LegacyHandler {
                 pending: &mut pending,
                 meta: &pkt.meta,
-                format: super::FrameFormat::default(),
+                stream_id: 0,
+                format: self.test_format,
             },
         );
         self.pending = pending;
         r
     }
 
-    fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+    fn pull(
+        &mut self,
+    ) -> Option<Result<crate::client::CodecItem, crate::client::DepacketizeError>> {
         self.pending.pop_front()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::buf::{MarkBuf, PacketRef};
-    use crate::codec::CodecItem;
-    use crate::{PacketContext, rtp::ReceivedPacketBuilder};
+    use crate::buf::MarkBuf;
+    use crate::client::CodecItem;
+    use crate::rtp::ReceivedPacketRef;
+    use crate::{PacketContext, client::ReceivedPacketBuilder};
 
     use super::*;
 
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
         d: &mut super::Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::PacketMeta,
+        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
         payload: &[u8],
         buf: &mut MarkBuf,
     ) -> Result<(), String> {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+        d.push(&ReceivedPacketRef::new(
+            meta,
+            buf,
+            pos,
+            payload.len() as u16,
+        ))
     }
 
     #[test]
@@ -953,7 +967,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -991,7 +1005,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1040,7 +1054,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1069,7 +1083,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1098,7 +1112,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1150,7 +1164,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1178,7 +1192,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1209,7 +1223,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1261,7 +1275,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1291,7 +1305,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1322,7 +1336,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1374,7 +1388,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1404,7 +1418,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1435,7 +1449,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1490,7 +1504,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1521,7 +1535,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1569,7 +1583,7 @@ mod tests {
         .unwrap();
         let e = push_via_buf(
             &mut d,
-            crate::rtp::PacketMeta::from_received(&pkt),
+            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
             pkt.payload(),
             &mut buf,
         )
@@ -1612,7 +1626,7 @@ mod tests {
         .unwrap();
         push_via_buf(
             &mut d,
-            crate::rtp::PacketMeta::from_received(&pkt),
+            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
             pkt.payload(),
             &mut buf,
         )
@@ -1621,6 +1635,53 @@ mod tests {
             Some(Err(e)) => assert!(e.description.contains("audio_object_type 23"), "{e:?}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    /// Tests that [`AudioFrameRef::data`] fails for ADTS when the config or
+    /// frame size can't be represented, and that the raw format always works.
+    #[test]
+    fn audio_frame_data_formats() {
+        use crate::codec::{FrameFormat, events::AudioFrameRef};
+        let raw = FrameFormat {
+            aac_framing: Framing::Raw,
+            ..FrameFormat::default()
+        };
+        let adts = FrameFormat {
+            aac_framing: Framing::Adts,
+            ..FrameFormat::default()
+        };
+        let frame = |config: &[u8], data| AudioFrameRef {
+            ctx: &(),
+            timestamp: crate::Timestamp::new(0, NonZeroU32::new(48_000).unwrap(), 0).unwrap(),
+            frame_length: NonZeroU32::new(1024).unwrap(),
+            loss: 0,
+            data,
+            adts: Some(AdtsParams::new(
+                &AudioSpecificConfig::parse(config).unwrap(),
+            )),
+        };
+
+        // AAC-LC (audio_object_type 2), 48 kHz, stereo: representable.
+        let lc = [0x11, 0x90];
+        assert_eq!(&frame(&lc, b"asdf").data(raw).unwrap()[..], b"asdf");
+        let f = frame(&lc, b"asdf");
+        let d = f.data(adts).unwrap();
+        assert_eq!(d.len(), 7 + 4);
+        assert_eq!(&d[7..], b"asdf");
+
+        // The largest frame ADTS can hold, and one byte more.
+        let big = vec![0; (1 << 13) - 1 - 7];
+        frame(&lc, &big).data(adts).unwrap();
+        let bigger = vec![0; (1 << 13) - 7];
+        let e = frame(&lc, &bigger).data(adts).unwrap_err();
+        assert!(e.to_string().contains("too large for ADTS"), "{e}");
+        assert_eq!(frame(&lc, &bigger).data(raw).unwrap().len(), bigger.len());
+
+        // ER AAC LD (audio_object_type 23): not representable in ADTS.
+        let ld = [0xb9, 0x88];
+        let e = frame(&ld, b"asdf").data(adts).unwrap_err();
+        assert!(e.to_string().contains("audio_object_type 23"), "{e}");
+        assert_eq!(&frame(&ld, b"asdf").data(raw).unwrap()[..], b"asdf");
     }
 
     /// After an error mid-fragment, the depacketizer should resync on the
@@ -1659,7 +1720,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1687,7 +1748,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1716,7 +1777,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1742,13 +1803,11 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let mut buf = MarkBuf::new(65536);
-        let get_extra_data = |d: &Depacketizer<PacketContext>| match d.parameters().unwrap() {
-            crate::codec::ParametersRef::Audio(a) => a.extra_data().to_vec(),
-            _ => panic!(),
-        };
-        assert!(!get_extra_data(&d).is_empty());
+        let get_extra_data =
+            |d: &Depacketizer<PacketContext>, format| d.parameters().extra_data(format).to_vec();
+        assert!(!get_extra_data(&d, crate::codec::FrameFormat::default()).is_empty());
+        assert!(get_extra_data(&d, crate::codec::FrameFormat::SIMPLE).is_empty());
         d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
-        assert!(get_extra_data(&d).is_empty());
         let timestamp = crate::Timestamp {
             timestamp: 42,
             clock_rate: NonZeroU32::new(48_000).unwrap(),
@@ -1775,7 +1834,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1826,7 +1885,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1867,7 +1926,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1893,7 +1952,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )

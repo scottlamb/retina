@@ -11,7 +11,7 @@ use anyhow::{Error, anyhow, bail};
 use clap::Parser;
 use futures::{Future, StreamExt};
 use log::info;
-use retina::{client::SetupOptions, codec::CodecItem};
+use retina::client::{CodecItem, SetupOptions};
 
 #[derive(Parser)]
 pub struct Opts {

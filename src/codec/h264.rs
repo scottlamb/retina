@@ -15,15 +15,16 @@ use h264_reader::nal::{NalHeader, UnitType};
 use log::debug;
 
 use crate::Error;
-use crate::buf::{BufRange, MarkBuf, PacketRef};
-use crate::codec::{AllPixelDimensions, Handler, LossReason};
+use crate::buf::{BufRange, MarkBuf};
 #[cfg(test)]
-use crate::codec::{CodecItem, DepacketizeError};
+use crate::client::{CodecItem, DepacketizeError};
+use crate::codec::{AllPixelDimensions, LossReason, VideoHandler};
 use crate::inputs::Input as _;
+use crate::rtp::ReceivedPacketRef;
 use crate::{
     Timestamp,
+    client::{ReceivedPacket, ReceivedPacketBuilder},
     codec::h26x::{NalAnalyzer as _, TolerantBitReader},
-    rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
 use super::{FmtpParser, VideoParameters};
@@ -48,9 +49,8 @@ pub(crate) use analyzer::Analyzer;
 pub fn parameters_from_sps_and_pps(
     sps_nal: &[u8],
     pps_nal: &[u8],
-    framing: super::h26x::Framing,
 ) -> Result<VideoParameters, Error> {
-    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true, framing)
+    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true)
         .map(|int| int.generic_parameters)
         .map_err(|s| wrap!(crate::error::ErrorInt::InvalidArgument(s)))
 }
@@ -112,8 +112,9 @@ pub(crate) struct Depacketizer<Ctx> {
     /// FU-A, forbidden by RFC 6184 section 5.8).
     seen_single_fragment_fu_a: bool,
 
-    /// Output format controlling NAL framing and parameter set insertion.
-    frame_format: super::FrameFormat,
+    /// The format used by the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    test_format: super::FrameFormat,
 }
 
 type Nal = super::h26x::Nal<NalHeader>;
@@ -227,17 +228,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             analyzer: Analyzer::with_internal_parameters(parameters),
             seen_inconsistent_fu_a_nal_hdr: false,
             seen_single_fragment_fu_a: false,
-            frame_format: Default::default(),
+            #[cfg(test)]
+            test_format: Default::default(),
         })
     }
 
-    /// Sets the frame format for output assembly.
-    ///
-    /// If existing parameters were parsed with a different framing, they are
-    /// re-parsed to produce the correct `extra_data` format.
-    pub(super) fn set_frame_format(&mut self, format: super::FrameFormat) {
-        self.frame_format = format;
-        self.analyzer.set_framing(format.h26x_framing);
+    /// Sets the format used by the test-only `push`/`pull` interface.
+    #[cfg(test)]
+    fn set_frame_format(&mut self, format: super::FrameFormat) {
+        self.test_format = format;
     }
 
     pub(super) fn check_invariants(&self) {
@@ -246,12 +245,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        self.analyzer.parameters().map(super::ParametersRef::Video)
+    pub(super) fn parameters(&self) -> Option<&VideoParameters> {
+        self.analyzer.parameters()
     }
 
     /// Starts an access unit with the given packet.
-    fn start_au(&mut self, meta: &crate::rtp::PacketMeta<Ctx>) -> AccessUnit {
+    fn start_au(&mut self, meta: &crate::rtp::ReceivedPacketMeta<Ctx>) -> AccessUnit {
         self.analyzer.start_au(meta.timestamp, meta.ctx.clone());
         AccessUnit { fu_a: None }
     }
@@ -259,12 +258,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Supplies a new packet, delivering any resulting events to `handler`.
     ///
     /// Returns errors detected as the packet arrives, for the legacy
-    /// interface, rather than reporting them via [`Handler::loss`];
+    /// interface, rather than reporting them via [`VideoHandler::loss`];
     /// [`Depacketizer::report_corrupt`] reports them.
     pub(super) fn push_with(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         let r = self.push_inner(pkt, handler);
 
@@ -282,16 +281,19 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         &mut self,
         ctx: &Ctx,
         description: String,
-        handler: &mut impl Handler<Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) {
-        self.analyzer
-            .loss(ctx, LossReason::Corrupt { description }, handler);
+        self.analyzer.loss(
+            ctx,
+            LossReason::Corrupt(super::Corruption::new(description)),
+            handler,
+        );
     }
 
     fn push_inner(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
         let meta = &pkt.meta;
         let payload_pos = pkt.payload_pos();
@@ -302,9 +304,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         // its timestamp.
         let au_timestamp = self.analyzer.au_timestamp();
         let loss = meta.loss;
-        if loss > 0 {
-            self.analyzer
-                .loss(&meta.ctx, LossReason::PacketLoss { packets: loss }, handler);
+        if let Some(reason) = super::packet_loss_reason(meta.loss) {
+            self.analyzer.loss(&meta.ctx, reason, handler);
         }
 
         // A stream joined mid-NAL has no earlier packet to count the loss from.
@@ -331,12 +332,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         if access_unit.fu_a.is_some() {
                             self.analyzer.loss(
                             &meta.ctx,
-                            LossReason::Corrupt {
- description: format!(
+                            LossReason::Corrupt(super::Corruption::new(format!(
                                 "timestamp changed from {} to {} in the middle of a fragmented NAL",
                                 au_timestamp, meta.timestamp
-                            ),
-},
+                            ))),
                             handler,
                         );
                             self.start_au(meta)
@@ -570,17 +569,18 @@ impl Depacketizer<crate::PacketContext> {
     ///
     /// Between any two calls to `push`, the caller must call `pull` until it
     /// returns `None`.
-    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
         let mut pending = std::mem::take(&mut self.pending);
-        let format = self.frame_format;
+        let format = self.test_format;
         let r = self.push_with(
             pkt,
-            &mut super::LegacyHandler {
+            &mut crate::client::LegacyHandler {
                 pending: &mut pending,
                 meta: &pkt.meta,
+                stream_id: 0,
                 format,
             },
         );
@@ -603,7 +603,7 @@ fn is_non_idr_slice(hdr: NalHeader) -> bool {
     matches!(u8::from(hdr) & 0b11111, 1..=4)
 }
 
-/// Access to a finished access unit, for [`FrameEnd`].
+/// Access to a finished access unit, for [`VideoFrameEnd`].
 pub(crate) struct FrameEndBody<'a> {
     /// The access unit's data, if accumulated and not yet taken.
     au: Option<AuData<'a>>,
@@ -619,10 +619,8 @@ struct AuData<'a> {
 }
 
 impl FrameEndBody<'_> {
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        self.parameters
-            .as_ref()
-            .map(|p| super::ParametersRef::Video(&p.generic_parameters))
+    pub(super) fn parameters(&self) -> Option<&VideoParameters> {
+        self.parameters.as_ref().map(|p| &p.generic_parameters)
     }
 
     /// Returns the parameters to prepend to the frame in the given format, if any.
@@ -783,19 +781,13 @@ impl InternalParameters {
         }
         let sps_nal = sps_nal.ok_or_else(|| "bad sprop-parameter-sets: no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "bad sprop-parameter-sets: no pps".to_string())?;
-        Self::parse_sps_and_pps(
-            &sps_nal,
-            &pps_nal,
-            false,
-            super::h26x::Framing::FourByteLength,
-        )
+        Self::parse_sps_and_pps(&sps_nal, &pps_nal, false)
     }
 
     fn parse_sps_and_pps(
         sps_nal: &[u8],
         pps_nal: &[u8],
         mut seen_extra_trailing_data: bool,
-        framing: super::h26x::Framing,
     ) -> Result<InternalParameters, String> {
         let sps_rbsp = h264_reader::rbsp::decode_nal(sps_nal).map_err(|_| "bad sps")?;
         if sps_rbsp.len() < 5 {
@@ -824,72 +816,53 @@ impl InternalParameters {
         let all_pixel_dimensions = Self::all_pixel_dimensions(&sps)
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
 
-        let (extra_data, sps_nal, pps_nal) = match framing {
-            super::h26x::Framing::FourByteLength => {
-                // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
-                // The beginning of the AVCDecoderConfiguration takes a few values from
-                // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
-                let mut buf = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
-                buf.put_u8(1); // configurationVersion
-                buf.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
-                // ...misc bits... . profile_compatibility
-                // level_idc . AVCLevelIndication
+        let (decoder_config_record, sps_nal, pps_nal) = {
+            // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
+            // The beginning of the AVCDecoderConfiguration takes a few values from
+            // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
+            let mut buf = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
+            buf.put_u8(1); // configurationVersion
+            buf.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
+            // ...misc bits... . profile_compatibility
+            // level_idc . AVCLevelIndication
 
-                // Hardcode lengthSizeMinusOne to 3, matching 4-byte lengths.
-                buf.put_u8(0xff);
+            // Hardcode lengthSizeMinusOne to 3, matching 4-byte lengths.
+            buf.put_u8(0xff);
 
-                // Only support one SPS and PPS.
-                // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
-                // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
-                buf.put_u8(0xe1);
-                buf.extend(
-                    &u16::try_from(sps_nal.len())
-                        .map_err(|_| {
-                            format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len())
-                        })?
-                        .to_be_bytes()[..],
-                );
-                let sps_nal_start = buf.len();
-                buf.extend_from_slice(sps_nal);
-                let sps_nal_end = buf.len();
-                buf.put_u8(1); // # of PPSs.
-                buf.extend(
-                    &u16::try_from(pps_nal.len())
-                        .map_err(|_| {
-                            format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len())
-                        })?
-                        .to_be_bytes()[..],
-                );
-                let pps_nal_start = buf.len();
-                buf.extend_from_slice(pps_nal);
-                let pps_nal_end = buf.len();
-                assert_eq!(
-                    buf.len(),
-                    11 + (sps_nal_end - sps_nal_start) + (pps_nal_end - pps_nal_start)
-                );
+            // Only support one SPS and PPS.
+            // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
+            // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
+            buf.put_u8(0xe1);
+            buf.extend(
+                &u16::try_from(sps_nal.len())
+                    .map_err(|_| {
+                        format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len())
+                    })?
+                    .to_be_bytes()[..],
+            );
+            let sps_nal_start = buf.len();
+            buf.extend_from_slice(sps_nal);
+            let sps_nal_end = buf.len();
+            buf.put_u8(1); // # of PPSs.
+            buf.extend(
+                &u16::try_from(pps_nal.len())
+                    .map_err(|_| {
+                        format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len())
+                    })?
+                    .to_be_bytes()[..],
+            );
+            let pps_nal_start = buf.len();
+            buf.extend_from_slice(pps_nal);
+            let pps_nal_end = buf.len();
+            assert_eq!(
+                buf.len(),
+                11 + (sps_nal_end - sps_nal_start) + (pps_nal_end - pps_nal_start)
+            );
 
-                let buf = buf.freeze();
-                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
-                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
-                (buf, sps_nal, pps_nal)
-            }
-            super::h26x::Framing::AnnexB => {
-                // Annex B: start code prefix + SPS + start code prefix + PPS.
-                let mut buf = BytesMut::with_capacity(8 + sps_nal.len() + pps_nal.len());
-                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
-                let sps_nal_start = buf.len();
-                buf.extend_from_slice(sps_nal);
-                let sps_nal_end = buf.len();
-                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
-                let pps_nal_start = buf.len();
-                buf.extend_from_slice(pps_nal);
-                let pps_nal_end = buf.len();
-
-                let buf = buf.freeze();
-                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
-                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
-                (buf, sps_nal, pps_nal)
-            }
+            let buf = buf.freeze();
+            let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
+            let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
+            (buf, sps_nal, pps_nal)
         };
 
         let (pixel_aspect_ratio, frame_rate);
@@ -919,7 +892,8 @@ impl InternalParameters {
                 all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
-                extra_data,
+                annex_b_parameter_sets: super::h26x::annex_b_parameter_sets(&[&sps_nal, &pps_nal]),
+                decoder_config_record,
                 codec: super::VideoParametersCodec::H264 {
                     sps: sps_nal.clone(),
                     pps: pps_nal.clone(),
@@ -1241,9 +1215,10 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::buf::{MarkBuf, PacketRef};
-    use crate::codec::CodecItem;
-    use crate::rtp::ReceivedPacketBuilder;
+    use crate::buf::MarkBuf;
+    use crate::client::CodecItem;
+    use crate::client::ReceivedPacketBuilder;
+    use crate::rtp::ReceivedPacketRef;
     use crate::testutil::{assert_eq_hex, assert_eq_hexes, init_logging};
 
     use super::*;
@@ -1251,14 +1226,19 @@ mod tests {
     /// Helper: writes payload into `buf`, then pushes to depacketizer.
     fn push_via_buf(
         d: &mut Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::PacketMeta,
+        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
         payload: &[u8],
         buf: &mut MarkBuf,
     ) -> Result<(), String> {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+        d.push(&ReceivedPacketRef::new(
+            meta,
+            buf,
+            pos,
+            payload.len() as u16,
+        ))
     }
 
     /*
@@ -1345,7 +1325,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1368,7 +1348,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1391,7 +1371,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1414,7 +1394,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1437,7 +1417,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1492,7 +1472,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1515,7 +1495,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1538,7 +1518,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1588,7 +1568,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1611,7 +1591,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1638,7 +1618,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1692,7 +1672,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1720,7 +1700,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1743,7 +1723,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1766,7 +1746,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1791,7 +1771,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 packetization-mode=1;profile-level-id=4d002a;sprop-parameter-sets=Z00AKp2oHgCJ+WbgICAoAAADAAgAAAMAfCA=,aO48gA==")).unwrap();
         match d.parameters() {
-            Some(crate::codec::ParametersRef::Video(v)) => {
+            Some(v) => {
                 assert_eq!(v.pixel_dimensions(), (1920, 1080));
             }
             o => panic!("{o:?}"),
@@ -1814,7 +1794,7 @@ mod tests {
         }.build(*b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10").unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1837,7 +1817,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1860,7 +1840,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -1878,7 +1858,7 @@ mod tests {
         // After pull, new_parameters and parameters() both reflect the change.
         assert!(frame.has_new_parameters);
         match d.parameters() {
-            Some(crate::codec::ParametersRef::Video(v)) => {
+            Some(v) => {
                 assert_eq!(v.pixel_dimensions(), (640, 480));
             }
             _ => unreachable!(),
@@ -1925,7 +1905,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2024,7 +2004,7 @@ mod tests {
         ).unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2047,7 +2027,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2070,7 +2050,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2115,7 +2095,7 @@ mod tests {
         ).unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2138,7 +2118,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2161,7 +2141,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2256,7 +2236,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2315,7 +2295,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2345,7 +2325,7 @@ mod tests {
                         .unwrap();
                         push_via_buf(
                             &mut d,
-                            crate::rtp::PacketMeta::from_received(&pkt),
+                            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                             pkt.payload(),
                             &mut buf,
                         )
@@ -2374,7 +2354,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2440,7 +2420,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2466,7 +2446,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2512,7 +2492,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2564,7 +2544,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2593,7 +2573,7 @@ mod tests {
                         .unwrap();
                         push_via_buf(
                             &mut d,
-                            crate::rtp::PacketMeta::from_received(&pkt),
+                            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                             pkt.payload(),
                             &mut buf,
                         )
@@ -2621,7 +2601,7 @@ mod tests {
                     .unwrap();
                     push_via_buf(
                         &mut d,
-                        crate::rtp::PacketMeta::from_received(&pkt),
+                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                         pkt.payload(),
                         &mut buf,
                     )
@@ -2665,7 +2645,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2703,7 +2683,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2727,7 +2707,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2753,9 +2733,9 @@ mod tests {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
             ..Default::default()
         });
-        let meta = |timestamp, sequence_number| crate::rtp::PacketMeta {
+        let meta = |timestamp, sequence_number| crate::rtp::ReceivedPacketMeta {
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
+            payload_type: 96,
             timestamp: crate::Timestamp {
                 timestamp,
                 clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -2801,9 +2781,9 @@ mod tests {
         // FU indicator \x7c = F=0 NRI=3 type=28.
         push_via_buf(
             &mut d,
-            crate::rtp::PacketMeta {
+            crate::rtp::ReceivedPacketMeta {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
+                payload_type: 96,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2856,7 +2836,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2879,7 +2859,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2902,7 +2882,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -2994,7 +2974,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3022,7 +3002,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3090,7 +3070,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3114,7 +3094,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3138,7 +3118,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3162,7 +3142,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3242,7 +3222,7 @@ mod tests {
                 .unwrap();
                 push_via_buf(
                     &mut d,
-                    crate::rtp::PacketMeta::from_received(&pkt),
+                    crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                     pkt.payload(),
                     &mut buf,
                 )
@@ -3311,7 +3291,7 @@ mod tests {
             .unwrap();
             push_via_buf(
                 &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
+                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
                 pkt.payload(),
                 &mut buf,
             )
@@ -3432,9 +3412,9 @@ mod tests {
         payload: &[u8],
         h: &mut crate::codec::events::testutil::Recorder,
     ) -> Result<(), String> {
-        let meta = crate::rtp::PacketMeta {
+        let meta = crate::rtp::ReceivedPacketMeta {
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
+            payload_type: 96,
             timestamp: crate::Timestamp {
                 timestamp,
                 clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -3448,7 +3428,10 @@ mod tests {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
+        d.push_with(
+            &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
+            h,
+        )
     }
 
     const EVENTS_FMTP: &str = "packetization-mode=1;profile-level-id=4d002a;\
@@ -3479,7 +3462,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3506,7 +3488,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: true,
                     has_new_parameters: false,
@@ -3521,7 +3502,6 @@ mod tests {
                 },
                 // The next frame starts streaming immediately.
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: true,
                     has_new_parameters: false,
@@ -3544,7 +3524,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3574,7 +3553,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3592,7 +3570,6 @@ mod tests {
             events[1..],
             [
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3626,7 +3603,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3678,7 +3654,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3742,7 +3717,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: true,
@@ -3786,7 +3760,6 @@ mod tests {
             events,
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3868,7 +3841,6 @@ mod tests {
             h.take(),
             vec![
                 Event::FrameStart {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3876,7 +3848,6 @@ mod tests {
                 Event::Data(UnitPosition::Start, hex(b"\x65start")),
                 Event::Loss(LossReason::PacketLoss { packets: 1 }),
                 Event::FrameStart {
-                    loss: 1,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,

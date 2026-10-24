@@ -23,8 +23,9 @@ use clap::Parser;
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
+    client::CodecItem,
     client::{SetupOptions, Transport},
-    codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters},
+    codec::{AudioParameters, ParametersRef, VideoParameters},
 };
 
 use std::num::NonZeroU32;
@@ -510,7 +511,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     async fn video(
         &mut self,
         stream: &retina::client::Stream,
-        frame: retina::codec::VideoFrame,
+        frame: retina::client::VideoFrame,
     ) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
@@ -564,7 +565,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn audio(&mut self, frame: retina::codec::AudioFrame) -> Result<(), Error> {
+    async fn audio(&mut self, frame: retina::client::AudioFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte audio frame",
             frame.timestamp(),

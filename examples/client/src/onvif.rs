@@ -5,8 +5,8 @@ use anyhow::{Error, anyhow};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};
+use retina::client::CodecItem;
 use retina::client::{SessionGroup, SetupOptions};
-use retina::codec::CodecItem;
 use std::sync::Arc;
 
 #[derive(Parser)]

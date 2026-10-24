@@ -10,9 +10,9 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use crate::buf::PacketRef;
+use crate::rtp::ReceivedPacketRef;
 
-use super::{AudioFrameRef, AudioParameters, Handler};
+use super::{AudioFrameRef, AudioHandler, AudioParameters};
 
 /// The RTP clock rate of Opus, whatever rate the stream was encoded at, as in
 /// [RFC 7587 section 4.1](https://datatracker.ietf.org/doc/html/rfc7587#section-4.1).
@@ -69,15 +69,15 @@ impl Depacketizer {
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        Some(super::ParametersRef::Audio(&self.parameters))
+    pub(super) fn parameters(&self) -> &super::AudioParameters {
+        &self.parameters
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
     pub(super) fn push_with<Ctx>(
         &mut self,
-        pkt: &PacketRef<'_, Ctx>,
-        handler: &mut impl Handler<Ctx>,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl AudioHandler<Ctx>,
     ) -> Result<(), String> {
         let (s1, s2) = pkt.payload().slices();
         let joined;
@@ -99,6 +99,7 @@ impl Depacketizer {
             frame_length,
             loss: pkt.meta.loss,
             data: payload,
+            adts: None,
         });
         Ok(())
     }
@@ -107,19 +108,14 @@ impl Depacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::{MarkBuf, PacketRef};
-    use crate::codec::{Accumulate, FrameStart};
-    use crate::{PacketContext, rtp::ReceivedPacketBuilder};
+    use crate::buf::MarkBuf;
+    use crate::{PacketContext, client::ReceivedPacketBuilder};
 
     /// Records audio frames as `(timestamp, frame_length, data)`.
     #[derive(Default)]
     struct Frames(Vec<(crate::Timestamp, u32, Vec<u8>)>);
 
-    impl Handler<PacketContext> for Frames {
-        fn frame_start(&mut self, _: &FrameStart<'_, PacketContext>) -> Accumulate {
-            unreachable!()
-        }
-
+    impl AudioHandler<PacketContext> for Frames {
         fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
             self.0.push((
                 frame.timestamp,
@@ -163,8 +159,11 @@ mod tests {
         let pos = buf.end();
         buf.extend(pkt.payload());
         buf.advance_unparsed(buf.end());
-        let meta = crate::rtp::PacketMeta::from_received(&pkt);
-        d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
+        let meta = crate::rtp::ReceivedPacketMeta::from_received(&pkt);
+        d.push_with(
+            &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
+            h,
+        )
     }
 
     #[test]
@@ -253,9 +252,7 @@ mod tests {
     #[test]
     fn parameters() {
         let d = Depacketizer::new(48_000, None).unwrap();
-        let Some(super::super::ParametersRef::Audio(p)) = d.parameters() else {
-            panic!("expected audio parameters");
-        };
+        let p = d.parameters();
         assert_eq!(p.rfc6381_codec(), Some("Opus"));
         assert_eq!(p.clock_rate(), 48_000);
         assert_eq!(p.frame_length(), None);

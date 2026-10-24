@@ -6,7 +6,7 @@ use base64::{Engine as _, engine::general_purpose};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info, warn};
-use retina::{client::SetupOptions, codec::CodecItem};
+use retina::client::{CodecItem, SetupOptions};
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
     api::{APIBuilder, interceptor_registry::register_default_interceptors},
