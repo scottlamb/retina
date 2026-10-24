@@ -286,7 +286,7 @@ impl Connection {
             Poll::Pending => return Poll::Pending,
         };
         Poll::Ready(r.map_err(|source| ErrorInt::WriteError {
-            conn_ctx: self.ctx,
+            conn_ctx: self.ctx.clone(),
             source,
         }))
     }
@@ -378,7 +378,7 @@ impl Sink<OwnedMessage> for Connection {
                 }
                 std::task::Poll::Ready(Err(e)) => {
                     return std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                        conn_ctx: this.ctx,
+                        conn_ctx: this.ctx.clone(),
                         source: e,
                     }));
                 }
@@ -388,7 +388,7 @@ impl Sink<OwnedMessage> for Connection {
         match std::pin::Pin::new(&mut this.stream).poll_flush(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                conn_ctx: this.ctx,
+                conn_ctx: this.ctx.clone(),
                 source: e,
             })),
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -407,7 +407,7 @@ impl Sink<OwnedMessage> for Connection {
         match std::pin::Pin::new(&mut this.stream).poll_shutdown(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(ErrorInt::WriteError {
-                conn_ctx: this.ctx,
+                conn_ctx: this.ctx.clone(),
                 source: e,
             })),
             std::task::Poll::Pending => std::task::Poll::Pending,

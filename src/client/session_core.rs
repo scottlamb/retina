@@ -598,7 +598,7 @@ impl SetupCore {
         r: super::conn::Response,
     ) -> Result<SessionEvent, Error> {
         debug!("SETUP response: {:#?}", r.head);
-        let conn_ctx = self.conn.ctx;
+        let conn_ctx = self.conn.ctx.clone();
         let response =
             parse::parse_setup(&r.head).map_err(|description| r.error(&conn_ctx, description))?;
         match &self.session {
@@ -692,7 +692,7 @@ impl SetupCore {
         policy: PlayOptions,
         r: super::conn::Response,
     ) -> Result<SessionEvent, Error> {
-        let conn_ctx = self.conn.ctx;
+        let conn_ctx = self.conn.ctx.clone();
         let presentation = self.presentation.as_mut().expect("described");
         parse::parse_play(&r.head, presentation)
             .map_err(|description| r.error(&conn_ctx, description))?;
@@ -724,7 +724,7 @@ impl SetupCore {
                 initial_rtptime,
                 initial_seq,
                 ssrc,
-                ctx,
+                ref ctx,
                 reorder,
             }) = s.state
             else {
@@ -753,7 +753,7 @@ impl SetupCore {
                 core_streams[i] = Some(PlayingStream {
                     receiver,
                     policy: rtp::StreamPolicy::new(policy.unknown_rtcp_ssrc),
-                    ctx,
+                    ctx: ctx.clone(),
                     udp_buf: None,
 
                     // Receiver reports describe only media Retina receives.
@@ -829,7 +829,7 @@ impl SetupCore {
             core_streams[i] = Some(PlayingStream {
                 receiver,
                 policy: rtp::StreamPolicy::new(policy.unknown_rtcp_ssrc),
-                ctx,
+                ctx: ctx.clone(),
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| {
                     let mut buf = MarkBuf::new(65536);
                     buf.set_max_retained(self.conn.options.get_max_retained_bytes());
@@ -842,8 +842,8 @@ impl SetupCore {
 
         // Move all streams that have been set up from Init to Playing state.
         for s in presentation.streams.iter_mut() {
-            if let StreamState::Init(StreamStateInit { ctx, .. }) = s.state {
-                s.state = StreamState::Playing { ctx };
+            if let StreamState::Init(StreamStateInit { ctx, .. }) = &s.state {
+                s.state = StreamState::Playing { ctx: ctx.clone() };
             }
         }
         self.played = Some(core_streams);
@@ -890,7 +890,7 @@ fn note_backchannel_unsupported(e: Error) -> Error {
             description,
         } if *status == msg::StatusCode::OPTION_NOT_SUPPORTED => {
             wrap!(ErrorInt::RtspResponseError {
-                conn_ctx: *conn_ctx,
+                conn_ctx: conn_ctx.clone(),
                 msg_ctx: *msg_ctx,
                 method: method.clone(),
                 cseq: *cseq,
@@ -1271,7 +1271,7 @@ impl SessionCore {
         match self.playing() {
             Some(c) => c.udp_recv_error(stream_i, source),
             None => wrap!(ErrorInt::UdpRecvError {
-                conn_ctx: *self.conn_ctx(),
+                conn_ctx: self.conn_ctx().clone(),
                 stream_ctx: StreamContext::dummy(),
                 when: WallTime::now(),
                 source,

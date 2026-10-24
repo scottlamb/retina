@@ -57,7 +57,7 @@ impl Response {
     /// Returns an error about this response.
     pub(crate) fn error(&self, conn_ctx: &ConnectionContext, description: String) -> Error {
         wrap!(ErrorInt::RtspResponseError {
-            conn_ctx: *conn_ctx,
+            conn_ctx: conn_ctx.clone(),
             msg_ctx: self.msg_ctx,
             method: self.method.clone(),
             cseq: self.cseq,
@@ -247,7 +247,7 @@ impl ConnCore {
                 Ok(None) if !self.eof => return None,
                 Ok(None) => {
                     return Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: self.ctx,
+                        conn_ctx: self.ctx.clone(),
                         msg_ctx: self.reader.eof_ctx(now),
                         source: std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -306,7 +306,7 @@ impl ConnCore {
             };
             let method = pending.req.method_str();
             return Some(Err(wrap!(ErrorInt::RtspFramingError {
-                conn_ctx: self.ctx,
+                conn_ctx: self.ctx.clone(),
                 msg_ctx,
                 description: format!(
                     "Expected response to {method} CSeq {cseq}, got {description}"

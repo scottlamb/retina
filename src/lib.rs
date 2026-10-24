@@ -323,7 +323,7 @@ impl From<WallTime> for SystemTime {
 /// RTSP connection context.
 ///
 /// This gives enough information to pick out the flow in a packet capture.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ConnectionContext {
     local_addr: std::net::SocketAddr,
     peer_addr: std::net::SocketAddr,
@@ -397,7 +397,7 @@ impl Display for RtspMessageContext {
 }
 
 /// Context for an active stream (RTP+RTCP session), either TCP or UDP. Owned version.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct StreamContext(StreamContextInner);
 
 impl StreamContext {
@@ -424,7 +424,7 @@ impl Display for StreamContext {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum StreamContextInner {
     Tcp(TcpStreamContext),
     Udp(UdpStreamContext),
