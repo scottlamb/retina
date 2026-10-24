@@ -9,8 +9,8 @@ use log::{error, info, warn};
 use retina::PacketContext;
 use retina::client::{PlayingItem, SetupOptions};
 use retina::codec::{
-    Accumulate, Depacketizer, Loss, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart,
-    VideoHandler, VideoParametersCodec,
+    Accumulate, Depacketizer, FrameFormat, Loss, VideoData, VideoDepacketizer, VideoFrameEnd,
+    VideoFrameStart, VideoHandler,
 };
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
@@ -112,23 +112,16 @@ struct UpstreamHandler {
 }
 
 impl VideoHandler<PacketContext> for UpstreamHandler {
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         self.buf.clear();
 
         // Browsers need parameter sets in-band before each key frame.
         if frame_start.is_random_access_point()
             && let Some(p) = frame_start.parameters()
         {
-            let nals: &[&[u8]] = match p.codec_params() {
-                VideoParametersCodec::H264 { sps, pps } => &[sps, pps],
-                VideoParametersCodec::H265 { vps, sps, pps } => &[vps, sps, pps],
-                _ => &[],
-            };
-            for nal in nals {
-                self.buf
-                    .extend_from_slice(&retina::codec::h26x::ANNEX_B_START_CODE);
-                self.buf.extend_from_slice(nal);
-            }
+            // The parameter sets, each with a start code.
+            self.buf
+                .extend_from_slice(p.extra_data(FrameFormat::SIMPLE));
         }
         Accumulate::No
     }

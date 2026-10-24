@@ -719,7 +719,7 @@ mod tests {
     impl crate::codec::VideoHandler<()> for Data {
         fn frame_start(
             &mut self,
-            _: &crate::codec::VideoFrameStart<'_, ()>,
+            _: &mut crate::codec::VideoFrameStart<'_, ()>,
         ) -> crate::codec::Accumulate {
             self.1.unwrap_or(crate::codec::Accumulate::No)
         }

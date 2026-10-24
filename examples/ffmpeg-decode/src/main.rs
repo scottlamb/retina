@@ -72,7 +72,7 @@ async fn main() {
 struct Frames(Vec<Vec<u8>>);
 
 impl VideoHandler<PacketContext> for Frames {
-    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, _frame_start: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         Accumulate::Yes
     }
 

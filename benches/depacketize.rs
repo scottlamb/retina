@@ -26,7 +26,7 @@ struct BenchHandler<F> {
 }
 
 impl<F: FnMut(&[u8])> VideoHandler<PacketContext> for BenchHandler<F> {
-    fn frame_start(&mut self, _: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+    fn frame_start(&mut self, _: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
         self.frame.clear();
         self.accumulate
     }
