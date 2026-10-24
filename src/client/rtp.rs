@@ -369,7 +369,7 @@ pub(crate) struct Sender {
     /// clock rate. Anchoring to the latest packet rather than the first keeps
     /// any drift between the caller's timestamps and the wall clock from
     /// accumulating over the session.
-    anchor: Option<(tokio::time::Instant, u32)>,
+    anchor: Option<(std::time::Instant, u32)>,
 
     /// RTP packets sent so far, for the sender report.
     packet_count: u32,
@@ -387,7 +387,7 @@ pub(crate) struct Sender {
     /// section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
     /// says that for unicast sessions "the delay before sending the initial
     /// compound RTCP packet MAY be zero".
-    pub(super) next_report: Option<tokio::time::Instant>,
+    pub(super) next_report: Option<std::time::Instant>,
 
     pub(super) cname: Box<str>,
 }
@@ -422,9 +422,9 @@ impl Sender {
     /// The caller has validated the payload length.
     pub(crate) fn write_rtp(
         &mut self,
-        now: tokio::time::Instant,
+        now: std::time::Instant,
         pkt: &crate::rtp::SendingPacket,
-        out: &mut bytes::BytesMut,
+        out: &mut Vec<u8>,
     ) {
         let timestamp = pkt.timestamp.wrapping_add(self.timestamp_offset);
         self.anchor = Some((now, timestamp));
@@ -444,7 +444,7 @@ impl Sender {
     }
 
     /// Returns true if a sender report is due at `now`, after an RTP packet has been sent.
-    pub(crate) fn report_due(&self, now: tokio::time::Instant) -> bool {
+    pub(crate) fn report_due(&self, now: std::time::Instant) -> bool {
         self.next_report.is_none_or(|t| now >= t)
     }
 
@@ -455,7 +455,7 @@ impl Sender {
     /// describes: the result need not match any packet's timestamp. It wraps
     /// like any RTP timestamp. Before the first packet, it's the timestamp
     /// offset.
-    fn rtp_timestamp_at(&self, now: tokio::time::Instant) -> u32 {
+    fn rtp_timestamp_at(&self, now: std::time::Instant) -> u32 {
         let Some((sent, sent_timestamp)) = self.anchor else {
             return self.timestamp_offset;
         };
@@ -477,9 +477,9 @@ impl Sender {
     /// [`Sender::rtp_timestamp_at`].
     pub(crate) fn write_sender_report(
         &mut self,
-        now: tokio::time::Instant,
+        now: std::time::Instant,
         ntp: crate::NtpTimestamp,
-        out: &mut bytes::BytesMut,
+        out: &mut Vec<u8>,
     ) {
         // Sender report, RFC 3550 section 6.4.1, with no report blocks: Retina
         // receives nothing in this RTP session.
@@ -559,9 +559,9 @@ mod tests {
     #[test]
     fn sender_report_schedule() {
         let mut sender = Sender::new(0, 8_000);
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         let pkt = crate::rtp::SendingPacket::new(0, 0, Bytes::from_static(b"x"));
-        let mut out = bytes::BytesMut::new();
+        let mut out = Vec::new();
         sender.write_rtp(start, &pkt, &mut out);
         assert!(sender.report_due(start));
         sender.write_sender_report(start, crate::NtpTimestamp(0), &mut out);
@@ -580,9 +580,9 @@ mod tests {
     fn sender_report_rtp_timestamp() {
         let mut sender = Sender::new(0, 8_000);
         sender.timestamp_offset = 0xffff_f000;
-        let start = tokio::time::Instant::now();
+        let start = std::time::Instant::now();
         assert_eq!(sender.rtp_timestamp_at(start), 0xffff_f000);
-        let mut out = bytes::BytesMut::new();
+        let mut out = Vec::new();
         sender.write_rtp(
             start,
             &crate::rtp::SendingPacket::new(0, 0x100, Bytes::from_static(b"x")),
