@@ -13,7 +13,7 @@ use retina::codec::{
     VideoFrameEnd, VideoFrameInfo, VideoFrameStart, VideoHandler, VideoPacketizer,
 };
 use retina::rtp::ReceivedPacketRef;
-use retina::rtp::{OutgoingPacketRef, PacketHeader, ReceivedPacketMeta, Sender};
+use retina::rtp::{OutgoingPacketRef, PacketHeader, ReceivedPacketMeta, Sender, ValidatedPacket};
 
 /// Pushes raw RTP packets into a depacketizer, computing loss from sequence
 /// numbers. (No timestamp wraparound handling; the capture is short.)
@@ -36,7 +36,9 @@ impl Feeder {
         d: &mut VideoDepacketizer<()>,
         h: &mut impl VideoHandler<()>,
     ) -> PacketHeader {
-        let (header, payload) = PacketHeader::validate(raw).unwrap();
+        let ValidatedPacket {
+            header, payload, ..
+        } = PacketHeader::validate(raw).unwrap();
         let loss = self
             .next_seq
             .map_or(0, |s| header.sequence_number().wrapping_sub(s));

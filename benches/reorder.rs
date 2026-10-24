@@ -50,7 +50,7 @@ fn run(options: ReceiverOptions, packets: &[(Vec<u8>, PacketHeader)]) {
 fn prepare(seqs: impl Iterator<Item = u16>) -> Vec<(Vec<u8>, PacketHeader)> {
     seqs.map(|seq| {
         let raw = raw_rtp(seq);
-        let header = PacketHeader::validate(&raw[..]).unwrap().0;
+        let header = PacketHeader::validate(&raw[..]).unwrap().header;
         (raw, header)
     })
     .collect()

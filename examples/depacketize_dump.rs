@@ -32,7 +32,9 @@ use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
     PayloadFormat, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
-use retina::rtp::{PacketHeader, Received, Receiver, ReceiverOptions, ReorderOptions};
+use retina::rtp::{
+    PacketHeader, Received, Receiver, ReceiverOptions, ReorderOptions, ValidatedPacket,
+};
 
 /// The packet context: the packet's byte offset within the file.
 type Ctx = u64;
@@ -183,7 +185,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if hdr[1] != channel {
                 continue;
             }
-            let (header, payload) = PacketHeader::validate(buf.split(pkt_pos, len.into()))
+            let ValidatedPacket {
+                header, payload, ..
+            } = PacketHeader::validate(buf.split(pkt_pos, len.into()))
                 .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
             let receiver = receiver.get_or_insert_with(|| {
                 let reorder = ReorderOptions::default().max_delay(std::time::Duration::ZERO);

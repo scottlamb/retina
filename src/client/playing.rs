@@ -890,20 +890,19 @@ impl PlayingCore {
             }
             ChannelType::Rtp => {
                 let split = buf.split(item.body_pos, usize::from(item.body_len));
-                let (header, payload_range) =
-                    crate::rtp::PacketHeader::validate(split).map_err(|reason| {
-                        wrap!(ErrorInt::PacketError {
-                            conn_ctx: self.conn.ctx,
-                            stream_ctx: stream.ctx,
-                            pkt_ctx: item.pkt_ctx,
-                            stream_id: item.stream_i,
-                            description: super::rtp::validate_error(
-                                &stream.receiver,
-                                reason,
-                                split,
-                            ),
-                        })
-                    })?;
+                let crate::rtp::ValidatedPacket {
+                    header,
+                    payload: payload_range,
+                    ..
+                } = crate::rtp::PacketHeader::validate(split).map_err(|reason| {
+                    wrap!(ErrorInt::PacketError {
+                        conn_ctx: self.conn.ctx,
+                        stream_ctx: stream.ctx,
+                        pkt_ctx: item.pkt_ctx,
+                        stream_id: item.stream_i,
+                        description: super::rtp::validate_error(&stream.receiver, reason, split),
+                    })
+                })?;
 
                 let pushed = stream.receiver.push(
                     buf,

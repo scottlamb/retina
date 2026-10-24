@@ -187,7 +187,9 @@ impl TestPacket {
             payload,
         )
         .unwrap();
-        let (_, payload_range) = crate::rtp::PacketHeader::validate(&raw[..]).unwrap();
+        let payload_range = crate::rtp::PacketHeader::validate(&raw[..])
+            .unwrap()
+            .payload;
         let pos = buf.end();
         buf.extend(&raw);
         buf.advance_unparsed(buf.end());

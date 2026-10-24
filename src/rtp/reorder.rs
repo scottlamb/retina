@@ -633,7 +633,7 @@ mod tests {
             let pos = self.buf.end();
             self.buf.extend(&raw);
             self.buf.advance_unparsed(self.buf.end());
-            let header = PacketHeader::validate(&raw[..]).unwrap().0;
+            let header = PacketHeader::validate(&raw[..]).unwrap().header;
             let t = self.t0 + Duration::from_millis(at_ms);
             (self.r.push(&self.buf, header, pos, t, ()), pos)
         }
@@ -880,7 +880,7 @@ mod tests {
         f.push(2, 0);
         let (_, pos) = f.push(3, 0);
         let raw = build_raw_rtp(1, 0, 96, 1, true, *b"x").unwrap();
-        let header = PacketHeader::validate(&raw[..]).unwrap().0;
+        let header = PacketHeader::validate(&raw[..]).unwrap().header;
         f.r.push(&f.buf, header, pos - 1, f.t0, ());
     }
 
@@ -916,6 +916,7 @@ mod tests {
             VideoHandler,
         };
         use crate::rtp::ReceivedPacketRef;
+        use crate::rtp::ValidatedPacket;
 
         #[derive(Default)]
         struct Frames(Vec<Vec<u8>>);
@@ -949,7 +950,9 @@ mod tests {
             let pos = buf.end();
             buf.extend(&raw);
             buf.advance_unparsed(buf.end());
-            let (header, payload) = PacketHeader::validate(&raw[..]).unwrap();
+            let ValidatedPacket {
+                header, payload, ..
+            } = PacketHeader::validate(&raw[..]).unwrap();
             let payload = pos + u64::from(payload.start)..pos + u64::from(payload.end);
             assert_eq!(r.push(buf, header, pos, t0, payload), Pushed::Held);
         };
@@ -996,6 +999,7 @@ mod tests {
             Accumulate, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart, VideoHandler,
         };
         use crate::rtp::ReceivedPacketRef;
+        use crate::rtp::ValidatedPacket;
         for accumulate in [Accumulate::No, Accumulate::Yes] {
             struct Frames {
                 accumulate: Accumulate,
@@ -1045,7 +1049,9 @@ mod tests {
                 let pos = buf.end();
                 buf.extend(&raw);
                 buf.advance_unparsed(buf.end());
-                let (header, payload) = PacketHeader::validate(&raw[..]).unwrap();
+                let ValidatedPacket {
+                    header, payload, ..
+                } = PacketHeader::validate(&raw[..]).unwrap();
                 let payload = pos + u64::from(payload.start)..pos + u64::from(payload.end);
                 assert_eq!(r.push(buf, header, pos, t0, payload), Pushed::Held);
             };

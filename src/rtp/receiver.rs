@@ -871,7 +871,7 @@ mod tests {
             let pos = self.buf.end();
             self.buf.extend(&raw);
             self.buf.advance_unparsed(self.buf.end());
-            let header = PacketHeader::validate(&raw[..]).unwrap().0;
+            let header = PacketHeader::validate(&raw[..]).unwrap().header;
             let t = self.at(ms);
             self.r.push(&self.buf, header, pos, t, ())
         }

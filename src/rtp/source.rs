@@ -353,7 +353,7 @@ mod tests {
         let pos = buf.end();
         buf.extend(&raw);
         buf.advance_unparsed(buf.end());
-        let header = PacketHeader::validate(&raw[..]).unwrap().0;
+        let header = PacketHeader::validate(&raw[..]).unwrap().header;
         s.push(buf, header, pos, at, NonZeroU32::new(90_000).unwrap(), ());
     }
 

@@ -116,7 +116,9 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
 
         // Recover the metadata from the header, which also checks header
         // parsing in the round trip.
-        let (header, payload) = retina::rtp::PacketHeader::validate(&pkt[..])
+        let retina::rtp::ValidatedPacket {
+            header, payload, ..
+        } = retina::rtp::PacketHeader::validate(&pkt[..])
             .expect("packetizer should produce valid RTP packets");
         let mark = header.mark();
         let meta = retina::rtp::ReceivedPacketMeta::new(
