@@ -9,13 +9,15 @@ use std::sync::{Arc, Mutex};
 
 /// A reference to a byte range within a [`MarkBuf`].
 ///
-/// 10 bytes of data (16 with padding).
+/// 12 bytes of data (16 with padding).
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BufRange {
     pub pos: u64,
-    pub len: u16,
+    pub len: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<BufRange>() == 16);
 
 /// A power-of-two ring buffer.
 ///
@@ -484,18 +486,18 @@ impl MarkBuf {
 ///
 /// Passed to [`Depacketizer::push`](crate::codec::Depacketizer::push),
 /// bundling packet metadata with buffer access.
-pub(crate) struct PacketRef<'a> {
-    pub meta: crate::rtp::PacketMeta,
+pub(crate) struct PacketRef<'a, Ctx = crate::PacketContext> {
+    pub meta: crate::rtp::PacketMeta<Ctx>,
     buf: &'a MarkBuf,
     payload_pos: u64,
     payload_len: u16,
 }
 
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
-impl<'a> PacketRef<'a> {
+impl<'a, Ctx> PacketRef<'a, Ctx> {
     /// Creates a `PacketRef`.
     pub fn new(
-        meta: crate::rtp::PacketMeta,
+        meta: crate::rtp::PacketMeta<Ctx>,
         buf: &'a MarkBuf,
         payload_pos: u64,
         payload_len: u16,
@@ -506,12 +508,6 @@ impl<'a> PacketRef<'a> {
             payload_pos,
             payload_len,
         }
-    }
-
-    /// Pin the payload position so the data stays accessible until the
-    /// returned [`Mark`] is dropped.
-    pub fn mark(&self) -> Mark {
-        self.buf.add_mark_at(self.payload_pos)
     }
 
     /// Ring-buffer position of the first payload byte.

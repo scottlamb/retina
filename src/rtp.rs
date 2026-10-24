@@ -311,10 +311,12 @@ impl std::fmt::Debug for SendingPacket {
 ///
 /// This allows depacketizers to work without depending on [`ReceivedPacket`],
 /// enabling the `Demuxed` path to pass data directly from the ring buffer.
+///
+/// `Ctx` is a caller-chosen packet context type, returned with the resulting frames.
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)]
-pub struct PacketMeta {
-    pub ctx: crate::PacketContext,
+pub struct PacketMeta<Ctx = crate::PacketContext> {
+    pub ctx: Ctx,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
     pub sequence_number: u16,

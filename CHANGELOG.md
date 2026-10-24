@@ -4,6 +4,8 @@
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
     `Display` is accurate through 2106, not just 2038.
+*   H.264 and H.265: an access unit without slices (possible only from a
+    misbehaving sender) no longer produces an empty frame.
 *   H.265: treat all intra random access point (IRAP) pictures as random
     access points, not just IDR pictures. Previously CRA and BLA pictures
     were reported with `is_random_access_point() == false`, so e.g.

@@ -7,22 +7,21 @@
 #[doc(hidden)] // `pub` only for fuzz tests.
 pub mod nal;
 
+mod analyzer;
 mod record;
+
+pub(crate) use analyzer::Analyzer;
 
 use std::collections::VecDeque;
 use std::convert::TryFrom;
-use std::fmt::Write;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use log::{debug, log_enabled, trace};
 
-use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
-use crate::codec::h26x::TolerantBitReader;
-use crate::codec::{CodecItem, DepacketizeError};
+use crate::buf::{BufRange, MarkBuf, PacketRef};
+use crate::codec::h26x::{NalAnalyzer as _, TolerantBitReader};
+use crate::codec::{CodecItem, DepacketizeError, Handler, LossReason, ParametersRef};
 use crate::inputs::Input as _;
-
-use super::VideoFrame;
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -38,25 +37,15 @@ use super::VideoFrame;
 /// Currently expects that the stream starts at an access unit boundary unless
 /// packet loss is indicated.
 #[derive(Debug)]
-pub(crate) struct Depacketizer {
+pub(crate) struct Depacketizer<Ctx> {
     input_state: DepacketizerInputState,
 
-    /// Complete frame ready to pull.
-    pending: VecDeque<Result<VideoFrame, DepacketizeError>>,
+    /// Completed items ready to be pulled via the legacy `push`/`pull` interface.
+    pending: VecDeque<Result<CodecItem, DepacketizeError>>,
 
-    parameters: Option<InternalParameters>,
-
-    /// Mark pinning ring buffer data for the current access unit's ranges.
-    /// Set when the first piece is added; cleared on finalize/discard.
-    mark: Option<Mark>,
-
-    /// In state `PreMark`, pieces of NALs, excluding their header bytes.
-    /// Kept around (empty) in other states to re-use the backing allocation.
-    pieces: Vec<BufRange>,
-
-    /// In state `PreMark`, an entry for each NAL.
-    /// Kept around (empty) in other states to re-use the backing allocation.
-    nals: Vec<Nal>,
+    /// The transport-independent layer, which holds the current access unit's
+    /// NALs (in state `PreMark`) and the stream's parameters.
+    analyzer: Analyzer<Ctx>,
 
     /// True if we've seen a FU sequence where the NAL headers differ between
     /// fragments.
@@ -70,58 +59,50 @@ pub(crate) struct Depacketizer {
     frame_format: super::FrameFormat,
 }
 
-#[derive(Debug)]
-struct Nal {
-    hdr: nal::Header,
+type Nal = super::h26x::Nal<nal::Header>;
 
-    /// The length of `Depacketizer::pieces` as this NAL finishes.
-    next_piece_idx: u32,
+impl super::h26x::NalHeader for nal::Header {
+    type Bytes = [u8; 2];
 
-    /// The total length of this NAL, including the 2 header bytes.
-    len: u32,
+    #[inline]
+    fn bytes(self) -> [u8; 2] {
+        *self
+    }
+
+    #[inline]
+    fn is_parameter_set(self) -> bool {
+        matches!(
+            self.unit_type(),
+            nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+        )
+    }
 }
 
-/// An access unit that is currently being accumulated during `PreMark` state.
+/// RTP-level state of an access unit being accumulated during `PreMark` state.
+/// The rest of its state is in the [`Analyzer`].
 #[derive(Debug)]
 struct AccessUnit {
-    start_ctx: crate::PacketContext,
-    end_ctx: crate::PacketContext,
-    timestamp: crate::Timestamp,
-    stream_id: usize,
-
-    /// True iff currently processing a FU.
-    in_fu: bool,
-
-    /// RTP packets lost as this access unit was starting.
-    loss: u16,
-
-    same_ts_as_prev: bool,
+    /// The initial header of the NAL being assembled from fragmentation
+    /// units, if any.
+    fu: Option<nal::Header>,
 }
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum DepacketizerInputState {
-    /// Not yet processing an access unit.
+    /// Not processing an access unit; the next packet starts one.
     New,
 
-    /// Ignoring the remainder of an access unit because of interior packet loss.
-    Loss {
-        timestamp: crate::Timestamp,
-        pkts: u16,
-    },
+    /// Ignoring the remainder of an access unit with the given timestamp,
+    /// because of interior packet loss.
+    Loss { timestamp: crate::Timestamp },
 
     /// Currently processing an access unit.
     /// This will be flushed after a marked packet or when receiving a later timestamp.
     PreMark(AccessUnit),
-
-    /// Finished processing the given packet. It's an error to receive the same timestamp again.
-    PostMark {
-        timestamp: crate::Timestamp,
-        loss: u16,
-    },
 }
 
-impl Depacketizer {
+impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new(
         clock_rate: u32,
         format_specific_params: Option<&str>,
@@ -145,10 +126,7 @@ impl Depacketizer {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             pending: VecDeque::with_capacity(1),
-            mark: None,
-            pieces: Vec::new(),
-            nals: Vec::new(),
-            parameters,
+            analyzer: Analyzer::with_internal_parameters(parameters),
             seen_inconsistent_fu_nal_hdr: false,
             seen_single_fragment_fu: false,
             frame_format: Default::default(),
@@ -161,122 +139,104 @@ impl Depacketizer {
     /// re-parsed to produce the correct `extra_data` format.
     pub(super) fn set_frame_format(&mut self, format: super::FrameFormat) {
         self.frame_format = format;
-
-        // Re-parse existing parameters so extra_data matches the new framing.
-        if let Some(ref ip) = self.parameters {
-            self.parameters = Some(
-                InternalParameters::parse_vps_sps_pps(
-                    &ip.vps_nal,
-                    &ip.sps_nal,
-                    &ip.pps_nal,
-                    ip.seen_extra_trailing_data,
-                    format.h26x_framing,
-                )
-                .expect("re-parse of previously valid VPS/SPS/PPS should not fail"),
-            );
-        }
+        self.analyzer.set_framing(format.h26x_framing);
     }
 
     pub(super) fn check_invariants(&self) {
         if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
-            assert!(self.nals.is_empty());
-            assert!(self.pieces.is_empty());
-            assert!(self.mark.is_none());
+            assert!(self.analyzer.is_idle());
         }
     }
 
-    fn discard_au(&mut self) {
-        self.nals.clear();
-        self.pieces.clear();
-        self.mark = None;
-    }
-
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
-        self.parameters
-            .as_ref()
-            .map(|p| super::ParametersRef::Video(&p.generic_parameters))
+        self.analyzer.parameters().map(super::ParametersRef::Video)
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        let r = self.push_inner(pkt);
+    /// Starts an access unit with the given packet.
+    fn start_au(&mut self, meta: &crate::rtp::PacketMeta<Ctx>) -> AccessUnit {
+        self.analyzer.start_au(meta.timestamp, meta.ctx.clone());
+        AccessUnit { fu: None }
+    }
+
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        let r = self.push_inner(pkt, handler);
 
         // Several error paths within `push_inner` just use the `?` operator to bail out with
         // `input_state` at `New` when they encounter a problem mid-access unit. Restore
         // the invariant so the caller can try to recover after error.
         if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
-            self.discard_au();
+            self.analyzer.discard_lossy_au();
         }
         r
     }
 
-    fn push_inner(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        let meta = pkt.meta;
+    fn push_inner(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        let meta = &pkt.meta;
         let payload_pos = pkt.payload_pos();
         let payload_len = pkt.payload_len();
         let buf = pkt.buf();
-        // Push shouldn't be called until pull is exhausted.
-        if let Some(ref p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
+
+        // Reporting loss discards any access unit in progress, so first note
+        // its timestamp.
+        let au_timestamp = self.analyzer.au_timestamp();
+        let loss = meta.loss;
+        if loss > 0 {
+            self.analyzer
+                .loss(&meta.ctx, LossReason::PacketLoss { packets: loss }, handler);
         }
 
         let mut r = Ok(());
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
-                DepacketizerInputState::New => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&meta, 0, false)
-                }
-                DepacketizerInputState::PreMark(mut access_unit) => {
-                    let loss = meta.loss;
+                DepacketizerInputState::New => self.start_au(meta),
+                DepacketizerInputState::PreMark(access_unit) => {
+                    let au_timestamp = au_timestamp.expect("au in progress");
                     if loss > 0 {
-                        self.discard_au();
-                        if access_unit.timestamp.timestamp == meta.timestamp.timestamp {
+                        if au_timestamp.timestamp == meta.timestamp.timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
-                            self.input_state = if meta.mark {
-                                DepacketizerInputState::PostMark {
+                            if !meta.mark {
+                                self.input_state = DepacketizerInputState::Loss {
                                     timestamp: meta.timestamp,
-                                    loss,
-                                }
-                            } else {
-                                DepacketizerInputState::Loss {
-                                    timestamp: meta.timestamp,
-                                    pkts: loss,
-                                }
-                            };
+                                };
+                            }
                             return Ok(());
                         }
-                        // A suffix of a previous access unit was lost; discard it.
+                        // A suffix of a previous access unit was lost; it's been discarded.
                         // A prefix of the new one may have been lost; try parsing.
-                        AccessUnit::start(&meta, 0, false)
-                    } else if access_unit.timestamp.timestamp != meta.timestamp.timestamp {
-                        if access_unit.in_fu {
+                        self.start_au(meta)
+                    } else if au_timestamp.timestamp != meta.timestamp.timestamp {
+                        if access_unit.fu.is_some() {
                             // Something went wrong: perhaps the end of the last fragmentation unit was dropped
                             // without loss being indicated. Return error, but also process the current packet.
                             r = Err(format!(
                                 "timestamp changed from {} to {} in the middle of a fragmented NAL",
-                                access_unit.timestamp, meta.timestamp
+                                au_timestamp, meta.timestamp
                             ));
-                            self.discard_au();
-                            AccessUnit::start(&meta, 0, false)
+                            self.analyzer.discard_lossy_au();
+                            self.start_au(meta)
                         } else {
                             let last_nal_hdr = self
-                                .nals
-                                .last()
-                                .ok_or("nals should not be empty".to_string())?
-                                .hdr;
+                                .analyzer
+                                .last_nal_hdr()
+                                .ok_or("nals should not be empty".to_string())?;
                             if can_end_au(last_nal_hdr.unit_type()) {
-                                access_unit.end_ctx = meta.ctx;
-                                let frame =
-                                    self.finalize_access_unit(access_unit, "ts change", buf)?;
-                                self.pending.push_back(Ok(frame));
-                                AccessUnit::start(&meta, 0, false)
+                                self.analyzer.finish_au_with(buf, &meta.ctx, handler)?;
+                                self.start_au(meta)
                             } else {
                                 log::debug!(
                                     "Bogus mid-access unit timestamp change after {:?}",
                                     last_nal_hdr
                                 );
-                                access_unit.timestamp.timestamp = meta.timestamp.timestamp;
+                                self.analyzer.set_au_timestamp(meta.timestamp);
                                 access_unit
                             }
                         }
@@ -284,39 +244,21 @@ impl Depacketizer {
                         access_unit
                     }
                 }
-                DepacketizerInputState::PostMark {
-                    timestamp: state_ts,
-                    loss,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
-                    AccessUnit::start(&meta, loss, state_ts.timestamp == meta.timestamp.timestamp)
-                }
-                DepacketizerInputState::Loss {
-                    timestamp,
-                    mut pkts,
-                } => {
-                    debug_assert!(self.nals.is_empty());
-                    debug_assert!(self.pieces.is_empty());
+                DepacketizerInputState::Loss { timestamp } => {
+                    debug_assert!(self.analyzer.is_idle());
                     if meta.timestamp.timestamp == timestamp.timestamp {
-                        pkts += meta.loss;
-                        self.input_state = DepacketizerInputState::Loss { timestamp, pkts };
+                        self.input_state = DepacketizerInputState::Loss { timestamp };
                         return Ok(());
                     }
-                    AccessUnit::start(&meta, pkts, false)
+                    self.start_au(meta)
                 }
             };
 
-        let ctx = meta.ctx;
         let mark = meta.mark;
-        let loss = meta.loss;
         let timestamp = meta.timestamp;
 
         if payload_len < 2 {
             return Err("Short NAL".into());
-        }
-        if self.mark.is_none() {
-            self.mark = Some(pkt.mark());
         }
 
         let payload = pkt.payload();
@@ -327,23 +269,18 @@ impl Depacketizer {
         match u8::from(hdr.unit_type()) {
             0..=47 => {
                 // Single NAL Unit. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.1
-                if access_unit.in_fu {
+                if access_unit.fu.is_some() {
                     return Err(format!(
                         "Non-fragmented NAL {hdr:?} while fragment in progress"
                     ));
                 }
-                let next_piece_idx = self.add_piece(BufRange {
-                    pos: payload_pos + 2,
-                    len: payload_len - 2,
-                })?;
-                self.nals.push(Nal {
-                    hdr,
-                    next_piece_idx,
-                    len: u32::from(payload_len),
-                });
+                self.push_nal(buf, hdr_bytes, payload_pos + 2, payload_len - 2)?;
             }
             48 => {
                 // Aggregation Packet. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.2
+                if access_unit.fu.is_some() {
+                    return Err("AP while fragment in progress".into());
+                }
                 // Skip the 2-byte AP header.
                 let mut payload = payload;
                 payload.advance(2);
@@ -367,17 +304,7 @@ impl Depacketizer {
                     if nal_len < 2 {
                         return Err("Short NAL".into());
                     }
-                    let nal_hdr_bytes = payload.peek_array::<2>();
-                    let nal_hdr = nal::Header::try_from(nal_hdr_bytes).map_err(|e| e.0)?;
-                    let next_piece_idx = self.add_piece(BufRange {
-                        pos: pos + 2,
-                        len: nal_len - 2,
-                    })?;
-                    self.nals.push(Nal {
-                        hdr: nal_hdr,
-                        next_piece_idx,
-                        len: u32::from(nal_len),
-                    });
+                    self.push_nal(buf, payload.peek_array::<2>(), pos + 2, nal_len - 2)?;
                     payload.advance(usize::from(nal_len));
                     pos += u64::from(nal_len);
                     if payload.is_empty() {
@@ -404,11 +331,15 @@ impl Depacketizer {
                 if !end && mark {
                     return Err("FU pkt with MARK && !END".into());
                 }
-                let frag_len = payload_len - 3;
-                let u32_frag_len = u32::from(frag_len);
-                match (start, access_unit.in_fu) {
-                    (true, true) => return Err("FU with start bit while frag in progress".into()),
-                    (true, false) => {
+                let frag = BufRange {
+                    pos: payload_pos + 3,
+                    len: u32::from(payload_len - 3),
+                };
+                match (start, access_unit.fu.take()) {
+                    (true, Some(_)) => {
+                        return Err("FU with start bit while frag in progress".into());
+                    }
+                    (true, None) => {
                         if end && !self.seen_single_fragment_fu {
                             // RFC 7798 section 4.4.3: "the Start bit and End bit MUST NOT both be
                             // set to one in the same FU header". Some cameras violate this by
@@ -421,50 +352,33 @@ impl Depacketizer {
                             );
                             self.seen_single_fragment_fu = true;
                         }
-                        let pieces = self.add_piece(BufRange {
-                            pos: payload_pos + 3,
-                            len: frag_len,
-                        })?;
-                        self.nals.push(Nal {
-                            hdr,
-                            next_piece_idx: if end { pieces } else { u32::MAX },
-                            len: 2 + u32_frag_len,
-                        });
-                        access_unit.in_fu = !end;
+                        self.analyzer
+                            .start_nal(&*hdr, buf, frag.pos, crate::to_usize(frag.len))?;
+                        self.push_fragment(buf, None, end)?;
+                        if !end {
+                            access_unit.fu = Some(hdr);
+                        }
                     }
-                    (false, true) => {
-                        let pieces = self.add_piece(BufRange {
-                            pos: payload_pos + 3,
-                            len: frag_len,
-                        })?;
-                        let nal = self
-                            .nals
-                            .last_mut()
-                            .ok_or("nals non-empty while in fu".to_string())?;
-                        // TODO
-                        if hdr != nal.hdr && !self.seen_inconsistent_fu_nal_hdr {
+                    (false, Some(initial_hdr)) => {
+                        if hdr != initial_hdr && !self.seen_inconsistent_fu_nal_hdr {
                             log::warn!(
                                 "FU has inconsistent NAL header: {:?} then {:?}; will not log about this again for this stream",
-                                nal.hdr,
+                                initial_hdr,
                                 hdr,
                             );
                             self.seen_inconsistent_fu_nal_hdr = true;
                         }
-                        nal.len += u32_frag_len;
-                        if end {
-                            nal.next_piece_idx = pieces;
-                            access_unit.in_fu = false;
-                        } else if mark {
-                            return Err("FU has MARK and no END".into());
+                        self.push_fragment(buf, Some(frag), end)?;
+                        if !end {
+                            access_unit.fu = Some(initial_hdr);
                         }
                     }
-                    (false, false) => {
+                    (false, None) => {
                         if loss > 0 {
-                            self.discard_au();
-                            self.input_state = DepacketizerInputState::Loss {
-                                timestamp,
-                                pkts: loss,
-                            };
+                            // The start of this NAL was lost (and reported).
+                            // Discard the rest of the access unit.
+                            self.analyzer.discard_lossy_au();
+                            self.input_state = DepacketizerInputState::Loss { timestamp };
                             return Ok(());
                         }
                         return Err("FU has start bit unset while no frag in progress".into());
@@ -474,23 +388,21 @@ impl Depacketizer {
             _ => return Err(format!("unexpected/bad nal header {hdr:?}")),
         }
 
+        self.analyzer.stream_with(buf, handler);
         self.input_state = if mark {
             let last_nal_hdr = self
-                .nals
-                .last()
-                .ok_or("nals should not be empty after mark".to_string())?
-                .hdr;
+                .analyzer
+                .last_nal_hdr()
+                .ok_or("nals should not be empty after mark".to_string())?;
             if can_end_au(last_nal_hdr.unit_type()) {
-                access_unit.end_ctx = ctx;
-                let frame = self.finalize_access_unit(access_unit, "mark", buf)?;
-                self.pending.push_back(Ok(frame));
-                DepacketizerInputState::PostMark { timestamp, loss: 0 }
+                self.analyzer.finish_au_with(buf, &meta.ctx, handler)?;
+                DepacketizerInputState::New
             } else {
                 log::debug!(
                     "Bogus mid-access unit timestamp change after {:?}",
                     last_nal_hdr
                 );
-                access_unit.timestamp.timestamp = timestamp.timestamp;
+                self.analyzer.set_au_timestamp(timestamp);
                 DepacketizerInputState::PreMark(access_unit)
             }
         } else {
@@ -499,221 +411,132 @@ impl Depacketizer {
         r
     }
 
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
-        self.pending
-            .pop_front()
-            .map(|r| r.map(CodecItem::VideoFrame))
+    /// Supplies a complete NAL with the given header, whose body is at
+    /// `[pos, pos + len)`.
+    fn push_nal(&mut self, buf: &MarkBuf, hdr: [u8; 2], pos: u64, len: u16) -> Result<(), String> {
+        self.analyzer.start_nal(&hdr, buf, pos, usize::from(len))?;
+        self.push_fragment(buf, None, true)
     }
 
-    /// Adds a piece to `self.pieces`, erroring if it becomes absurdly large.
-    fn add_piece(&mut self, piece: BufRange) -> Result<u32, String> {
-        self.pieces.push(piece);
-        u32::try_from(self.pieces.len()).map_err(|_| "more than u32::MAX pieces!".to_string())
-    }
-
-    /// Logs information about each access unit.
-    /// Currently, "bad" access units (violating certain specification rules)
-    /// are logged at debug priority, and others are logged at trace priority.
-    fn log_access_unit(&self, au: &AccessUnit, reason: &str) {
-        let mut errs = String::new();
-        if au.same_ts_as_prev {
-            errs.push_str("\n* same timestamp as previous access unit");
-        }
-        validate_order(&self.nals, &mut errs);
-        if !errs.is_empty() {
-            let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
-                let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
-            }
-            debug!(
-                "bad access unit (ended by {}) at ts {}\nerrors are:{}\nNALs are:{}",
-                reason, au.timestamp, errs, nals
-            );
-        } else if log_enabled!(log::Level::Trace) {
-            let mut nals = String::new();
-            for (i, nal) in self.nals.iter().enumerate() {
-                let _ = write!(&mut nals, "\n  {}: {:?}", i, nal.hdr);
-            }
-            trace!(
-                "access unit (ended by {}) at ts {}; NALS are:{}",
-                reason, au.timestamp, nals
-            );
-        }
-    }
-
-    fn finalize_access_unit(
+    /// Supplies part of the NAL in progress, ending it if `end`.
+    fn push_fragment(
         &mut self,
-        au: AccessUnit,
-        reason: &str,
         buf: &MarkBuf,
-    ) -> Result<VideoFrame, String> {
-        use super::{ParameterSetInsertion, h26x::Framing};
-
-        let mut piece_idx = 0;
-        let mut retained_len = 0usize;
-
-        // In H.265 terms, this is an IRAP. The coded picture with
-        // `nuh_layer_id == 0` must have only VCLs with `nal_unit_type` in
-        // the range `[BLA_W_LP, RSV_IRAP_VCL23]`.
-        let mut is_random_access_point = true;
-        let is_disposable = false;
-        let mut new_vps = None::<Bytes>;
-        let mut new_sps = None::<Bytes>;
-        let mut new_pps = None::<Bytes>;
-
-        if log_enabled!(log::Level::Debug) {
-            self.log_access_unit(&au, reason);
+        frag: Option<BufRange>,
+        end: bool,
+    ) -> Result<(), String> {
+        if let Some(frag) = frag {
+            self.analyzer
+                .extend_nal(buf, frag.pos, crate::to_usize(frag.len))?;
         }
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            match nal.hdr.unit_type() {
-                nal::UnitType::VpsNut
-                    if self
-                        .parameters
-                        .as_ref()
-                        .map(|p| !nal_matches(&p.vps_nal[..], nal.hdr, nal_pieces, buf))
-                        .unwrap_or(true) =>
-                {
-                    new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
-                }
-                nal::UnitType::SpsNut
-                    if self
-                        .parameters
-                        .as_ref()
-                        .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces, buf))
-                        .unwrap_or(true) =>
-                {
-                    new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
-                }
-                nal::UnitType::PpsNut
-                    if self
-                        .parameters
-                        .as_ref()
-                        .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces, buf))
-                        .unwrap_or(true) =>
-                {
-                    new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
-                }
-                u if matches!(u.unit_type_class(), nal::UnitTypeClass::Vcl { irap: false }) => {
-                    is_random_access_point = false;
-                }
-                _ => {}
-            }
-            // Always strip inline parameter sets; they're handled via
-            // ParameterSetInsertion and the canonical copy in self.parameters.
-            if !matches!(
-                nal.hdr.unit_type(),
-                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
-            ) {
-                retained_len += 4usize + crate::to_usize(nal.len);
-            }
-            piece_idx = next_piece_idx;
+        if end {
+            self.analyzer.finish_nal()?;
         }
+        Ok(())
+    }
+}
 
-        // Update parameters before building the frame, so prepended params
-        // reflect the latest VPS/SPS/PPS.
-        // TODO: simpler if we require all or none to be set?
-        // although only one could be different.
-        let all_new_params = new_vps.is_some() && new_sps.is_some() && new_pps.is_some();
-        let some_new_params = new_vps.is_some() || new_sps.is_some() || new_pps.is_some();
-        let has_new_parameters = if all_new_params || (some_new_params && self.parameters.is_some())
-        {
-            let old_ip = self.parameters.as_ref();
-            let vps_nal = new_vps
-                .as_deref()
-                .unwrap_or_else(|| &old_ip.unwrap().vps_nal);
-            let sps_nal = new_sps
-                .as_deref()
-                .unwrap_or_else(|| &old_ip.unwrap().sps_nal);
-            let pps_nal = new_pps
-                .as_deref()
-                .unwrap_or_else(|| &old_ip.unwrap().pps_nal);
-            let seen_extra_trailing_data =
-                old_ip.map(|o| o.seen_extra_trailing_data).unwrap_or(false);
-            self.parameters = Some(InternalParameters::parse_vps_sps_pps(
-                vps_nal,
-                sps_nal,
-                pps_nal,
-                seen_extra_trailing_data,
-                self.frame_format.h26x_framing,
-            )?);
-            true
-        } else {
-            false
-        };
+impl Depacketizer<crate::PacketContext> {
+    /// Supplies a new packet via the legacy `push`/`pull` interface.
+    ///
+    /// Between any two calls to `push`, the caller must call `pull` until it
+    /// returns `None`.
+    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        if let Some(p) = self.pending.front() {
+            panic!("push with data already pending: {p:?}");
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        let format = self.frame_format;
+        let r = self.push_with(
+            pkt,
+            &mut super::LegacyHandler {
+                pending: &mut pending,
+                meta: &pkt.meta,
+                format,
+            },
+        );
+        self.pending = pending;
+        r
+    }
 
-        // Determine whether to prepend parameter sets.
-        let prepend_params = is_random_access_point
-            && match self.frame_format.parameter_set_insertion {
+    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
+        self.pending.pop_front()
+    }
+}
+
+/// Access to a finished access unit, for [`FrameEnd`].
+pub(crate) struct FrameEndBody<'a> {
+    /// The access unit's data, if accumulated and not yet taken.
+    au: Option<AuData<'a>>,
+    parameters: Option<&'a InternalParameters>,
+    is_random_access_point: bool,
+    has_new_parameters: bool,
+}
+
+struct AuData<'a> {
+    nals: &'a [Nal],
+    pieces: &'a [BufRange],
+    buf: &'a MarkBuf,
+}
+
+impl FrameEndBody<'_> {
+    pub(super) fn parameters(&self) -> Option<ParametersRef<'_>> {
+        self.parameters
+            .map(|p| ParametersRef::Video(&p.generic_parameters))
+    }
+
+    /// Returns the parameter set NALs to prepend to the frame in the given format.
+    fn prepend_params(&self, format: super::FrameFormat) -> Option<[&[u8]; 3]> {
+        use super::ParameterSetInsertion;
+        let prepend = self.is_random_access_point
+            && match format.parameter_set_insertion {
                 ParameterSetInsertion::EachKeyFrame => true,
-                ParameterSetInsertion::OnChange => has_new_parameters,
+                ParameterSetInsertion::OnChange => self.has_new_parameters,
                 ParameterSetInsertion::Never => false,
             };
-        if prepend_params && let Some(ref p) = self.parameters {
-            // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
-            retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+        if !prepend {
+            return None;
         }
+        self.parameters
+            .map(|p| [&p.vps_nal[..], &p.sps_nal[..], &p.pps_nal[..]])
+    }
 
-        let mut data = Vec::with_capacity(retained_len);
+    pub(super) fn data_len(&self, format: super::FrameFormat) -> Option<usize> {
+        let au = self.au.as_ref()?;
+        let params = self.prepend_params(format);
+        Some(super::h26x::frame_len(
+            au.nals,
+            params.as_ref().map_or(&[][..], |p| &p[..]),
+        ))
+    }
 
-        // Prepend parameter sets if requested.
-        if prepend_params && let Some(ref p) = self.parameters {
-            for param_nal in [&p.vps_nal, &p.sps_nal, &p.pps_nal] {
-                let prefix = match self.frame_format.h26x_framing {
-                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
-                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
-                };
-                data.extend_from_slice(&prefix);
-                data.extend_from_slice(param_nal);
-            }
-        }
+    pub(super) fn visit(
+        &self,
+        format: super::FrameFormat,
+        visitor: &mut impl FnMut(&[u8]),
+    ) -> bool {
+        let Some(au) = self.au.as_ref() else {
+            return false;
+        };
+        let params = self.prepend_params(format);
+        super::h26x::visit_frame(
+            au.nals,
+            au.pieces,
+            au.buf,
+            params.as_ref().map_or(&[][..], |p| &p[..]),
+            format.h26x_framing,
+            visitor,
+        );
+        true
+    }
 
-        // Write non-parameter-set NALs with the configured framing.
-        piece_idx = 0;
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-
-            if !matches!(
-                nal.hdr.unit_type(),
-                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
-            ) {
-                let prefix = match self.frame_format.h26x_framing {
-                    Framing::FourByteLength => nal.len.to_be_bytes(),
-                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
-                };
-                data.extend_from_slice(&prefix);
-                data.extend_from_slice(&nal.hdr[..]);
-
-                let mut actual_len = 2;
-                for piece in nal_pieces {
-                    let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
-                    data.extend_from_slice(s1);
-                    data.extend_from_slice(s2);
-                    actual_len += usize::from(piece.len);
-                }
-                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
-            }
-            piece_idx = next_piece_idx;
-        }
-        debug_assert_eq!(retained_len, data.len());
-
-        self.nals.clear();
-        self.pieces.clear();
-        self.mark = None;
-
-        Ok(VideoFrame {
-            has_new_parameters,
-            loss: au.loss,
-            start_ctx: au.start_ctx,
-            end_ctx: au.end_ctx,
-            timestamp: au.timestamp,
-            stream_id: au.stream_id,
-            is_random_access_point,
-            is_disposable,
-            data,
-        })
+    pub(super) fn build(&mut self, format: super::FrameFormat) -> Option<Vec<u8>> {
+        let len = self.data_len(format)?;
+        let mut data = Vec::with_capacity(len);
+        self.visit(format, &mut |chunk| data.extend_from_slice(chunk));
+        debug_assert_eq!(len, data.len());
+        self.au = None;
+        Some(data)
     }
 }
 
@@ -743,55 +566,6 @@ fn can_end_au(nal_unit_type: nal::UnitType) -> bool {
             | nal::UnitType::Unspec54
             | nal::UnitType::Unspec55
     )
-}
-
-impl AccessUnit {
-    fn start(meta: &crate::rtp::PacketMeta, additional_loss: u16, same_ts_as_prev: bool) -> Self {
-        AccessUnit {
-            start_ctx: meta.ctx,
-            end_ctx: meta.ctx,
-            timestamp: meta.timestamp,
-            stream_id: meta.stream_id,
-            in_fu: false,
-
-            // TODO: overflow?
-            loss: meta.loss + additional_loss,
-            same_ts_as_prev,
-        }
-    }
-}
-
-/// Checks NAL unit type ordering against (some of the) rules of H.265 section
-/// 7.4.2.4.4.
-fn validate_order(nals: &[Nal], errs: &mut String) {
-    let mut seen_layer0_vcl = false;
-    for (i, nal) in nals.iter().enumerate() {
-        let l = nal.hdr.nuh_layer_id();
-        let u = nal.hdr.unit_type();
-        if l == 0 && matches!(u.unit_type_class(), nal::UnitTypeClass::Vcl { .. }) {
-            seen_layer0_vcl = true;
-        } else if l == 0 && u == nal::UnitType::AudNut {
-            if i != 0 {
-                let _ = write!(
-                    errs,
-                    "\n* layer-0 access unit delimiter must be first in AU; was preceded by {:?}",
-                    nals[i - 1].hdr
-                );
-            }
-        } else if u == nal::UnitType::EosNut {
-            if !seen_layer0_vcl {
-                let _ = write!(errs, "\n* end of sequence without layer-0 VCL");
-            }
-        } else if u == nal::UnitType::EobNut {
-            #[allow(clippy::collapsible_if)]
-            if i != nals.len() - 1 {
-                errs.push_str("\n* end of bitstream NAL isn't last");
-            }
-        }
-    }
-    if !seen_layer0_vcl {
-        errs.push_str("\n* no layer-0 VCL");
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -983,43 +757,6 @@ impl InternalParameters {
     }
 }
 
-/// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..data]`.
-fn nal_matches(nal: &[u8], hdr: nal::Header, pieces: &[BufRange], buf: &MarkBuf) -> bool {
-    if nal.first_chunk() != Some(&*hdr) {
-        return false;
-    }
-    let mut nal_pos = 2;
-    for piece in pieces {
-        let new_pos = nal_pos + usize::from(piece.len);
-        if nal.len() < new_pos {
-            return false;
-        }
-        let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
-        if s1 != &nal[nal_pos..nal_pos + s1.len()] {
-            return false;
-        }
-        if s2 != &nal[nal_pos + s1.len()..new_pos] {
-            return false;
-        }
-        nal_pos = new_pos;
-    }
-    nal_pos == nal.len()
-}
-
-/// Saves the given NAL to a contiguous `Bytes`.
-fn to_bytes(hdr: nal::Header, len: u32, pieces: &[BufRange], buf: &MarkBuf) -> Bytes {
-    let len = crate::to_usize(len);
-    let mut out = Vec::with_capacity(len);
-    out.extend(&*hdr);
-    for piece in pieces {
-        let (s1, s2) = buf.split(piece.pos, usize::from(piece.len)).slices();
-        out.extend_from_slice(s1);
-        out.extend_from_slice(s2);
-    }
-    debug_assert_eq!(len, out.len());
-    out.into()
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -1033,7 +770,7 @@ mod tests {
     };
 
     fn push_via_buf(
-        d: &mut super::Depacketizer,
+        d: &mut super::Depacketizer<PacketContext>,
         meta: crate::rtp::PacketMeta,
         payload: &[u8],
         buf: &mut MarkBuf,
@@ -1218,7 +955,7 @@ mod tests {
             start: 0,
         };
 
-        let push_pkts = |d: &mut super::Depacketizer, buf: &mut MarkBuf| {
+        let push_pkts = |d: &mut super::Depacketizer<PacketContext>, buf: &mut MarkBuf| {
             // VPS (mark=false: parameter sets can't end an AU).
             {
                 let pkt = ReceivedPacketBuilder {
@@ -1673,7 +1410,7 @@ mod tests {
         };
         let e = {
             let pkt = ReceivedPacketBuilder {
-                // plain PREFIX_SEI packet.
+                // plain TRAIL_R packet.
                 ctx: PacketContext::dummy(),
                 stream_id: 0,
                 timestamp: timestamp1,
@@ -1683,7 +1420,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x4e\x01plain")
+            .build(*b"\x02\x01plain")
             .unwrap();
             push_via_buf(
                 &mut d,
@@ -1700,7 +1437,7 @@ mod tests {
         let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
             panic!()
         };
-        assert_eq!(f.data, *b"\x00\x00\x00\x07\x4e\x01plain");
+        assert_eq!(f.data, *b"\x00\x00\x00\x07\x02\x01plain");
         assert_eq!(d.pull(), None);
     }
 
@@ -1737,5 +1474,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.generic_parameters.pixel_dimensions(), (2304, 1296));
+    }
+
+    #[test]
+    fn events_stream() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, UnitPosition};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        for accumulate in [Accumulate::Yes, Accumulate::No] {
+            let mut h = Recorder::new(accumulate);
+            let push = |d: &mut super::Depacketizer<PacketContext>,
+                        buf: &mut MarkBuf,
+                        seq: u16,
+                        ts: i64,
+                        mark: bool,
+                        payload: &[u8],
+                        h: &mut Recorder| {
+                let meta = crate::rtp::PacketMeta {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp: crate::Timestamp {
+                        timestamp: ts,
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: seq,
+                    mark,
+                    loss: 0,
+                };
+                let pos = buf.end();
+                buf.extend(payload);
+                buf.advance_unparsed(buf.end());
+                d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
+                    .unwrap();
+            };
+
+            // IDR_W_RADL, fragmented.
+            push(&mut d, &mut buf, 0, 0, false, b"\x62\x01\x93start", &mut h);
+            assert_eq!(
+                h.take(),
+                vec![
+                    Event::FrameStart {
+                        loss: 0,
+                        is_random_access_point: true,
+                        is_disposable: false,
+                        has_new_parameters: false,
+                    },
+                    Event::Data(UnitPosition::Start, hex(b"\x26\x01start")),
+                ]
+            );
+            push(&mut d, &mut buf, 1, 0, true, b"\x62\x01\x53 end", &mut h);
+            assert_eq!(
+                h.take(),
+                vec![
+                    Event::Data(UnitPosition::End, hex(b" end")),
+                    Event::FrameEnd {
+                        loss: 0,
+                        is_random_access_point: true,
+                        is_disposable: false,
+                        has_new_parameters: false,
+                        data: (accumulate == Accumulate::Yes)
+                            .then(|| hex(b"\x00\x00\x00\x0b\x26\x01start end")),
+                    },
+                ]
+            );
+            assert!(!d.analyzer.has_mark());
+
+            // TRAIL_R, as a single NAL.
+            push(&mut d, &mut buf, 2, 1, true, b"\x02\x01slice", &mut h);
+            assert_eq!(
+                h.take(),
+                vec![
+                    Event::FrameStart {
+                        loss: 0,
+                        is_random_access_point: false,
+                        is_disposable: false,
+                        has_new_parameters: false,
+                    },
+                    Event::Data(UnitPosition::Complete, hex(b"\x02\x01slice")),
+                    Event::FrameEnd {
+                        loss: 0,
+                        is_random_access_point: false,
+                        is_disposable: false,
+                        has_new_parameters: false,
+                        data: (accumulate == Accumulate::Yes)
+                            .then(|| hex(b"\x00\x00\x00\x07\x02\x01slice")),
+                    },
+                ]
+            );
+        }
     }
 }
