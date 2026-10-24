@@ -3,6 +3,8 @@
 
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use log::{debug, warn};
 
@@ -84,6 +86,7 @@ fn note_stale_live555_data_if_tcp(
     conn_ctx: &crate::ConnectionContext,
     stream_ctx: &StreamContext,
     pkt_ctx: &PacketContext,
+    now: Instant,
 ) {
     if let (
         StreamContext(StreamContextInner::Tcp(stream_ctx)),
@@ -96,6 +99,7 @@ fn note_stale_live555_data_if_tcp(
             conn_ctx,
             stream_ctx.rtp_channel_id,
             msg_ctx,
+            now,
         );
     }
 }
@@ -137,6 +141,7 @@ impl InorderParser {
         timeline: &mut Timeline,
         stream_id: usize,
         header: &PacketHeader,
+        now: Instant,
     ) -> Result<Option<(crate::Timestamp, u16)>, Error> {
         // Skip pt=50 packets, sent by at least Geovision cameras.
         if header.payload_type() == 50 {
@@ -149,7 +154,14 @@ impl InorderParser {
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-            note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
+            note_stale_live555_data_if_tcp(
+                tool,
+                session_options,
+                conn_ctx,
+                stream_ctx,
+                pkt_ctx,
+                now,
+            );
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
                 pkt_ctx: *pkt_ctx,
@@ -243,6 +255,7 @@ impl InorderParser {
         timeline: &mut Timeline,
         stream_id: usize,
         header: &PacketHeader,
+        now: Instant,
     ) -> Result<Option<ReceivedPacketMeta<PacketContext>>, Error> {
         let Some((timestamp, loss)) = self.rtp_validate(
             session_options,
@@ -253,6 +266,7 @@ impl InorderParser {
             timeline,
             stream_id,
             header,
+            now,
         )?
         else {
             return Ok(None);
@@ -278,6 +292,7 @@ impl InorderParser {
         timeline: &mut Timeline,
         stream_id: usize,
         data: Bytes,
+        now: Instant,
     ) -> Result<Option<ReceivedCompoundPacket>, String> {
         let first_pkt = crate::rtcp::ReceivedCompoundPacket::validate(&data[..])?;
         let mut rtp_timestamp = None;
@@ -299,6 +314,7 @@ impl InorderParser {
                             conn_ctx,
                             stream_ctx,
                             pkt_ctx,
+                            now,
                         );
                         return Err(format!(
                             "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
@@ -369,6 +385,7 @@ mod tests {
             &mut timeline,
             0,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(Some(_)) => {}
             o => panic!("unexpected packet 1 result: {o:#?}"),
@@ -386,6 +403,7 @@ mod tests {
             &mut timeline,
             0,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(None) => {}
             o => panic!("unexpected packet 2 result: {o:#?}"),
@@ -414,6 +432,7 @@ mod tests {
             &mut timeline,
             0,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(Some(meta)) => {
                 assert_eq!(meta.timestamp.elapsed(), 0);
@@ -432,6 +451,7 @@ mod tests {
             &mut timeline,
             0,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(None) => {}
             o => panic!("unexpected packet 1 result: {o:#?}"),
@@ -448,6 +468,7 @@ mod tests {
             &mut timeline,
             0,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(Some(meta)) => {
                 // The missing timestamp shouldn't have adjusted time.

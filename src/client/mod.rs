@@ -5,10 +5,10 @@
 //!
 //! [`Session`] does its I/O via tokio. Its protocol logic is also available
 //! without any I/O or runtime, for callers who do their own, as
-//! [`SessionCore`]. The `polling-client` example drives it with plain
-//! non-blocking sockets and a `poll(2)`-style loop. `SessionCore` requires the
-//! `unstable-sans-io` feature and is exempt from semver: it may change in any
-//! release.
+//! [`SessionCore`] and [`TeardownCore`]. The `polling-client` example drives
+//! them with plain non-blocking sockets and a `poll(2)`-style loop. These
+//! require the `unstable-sans-io` feature and are exempt from semver: they may
+//! change in any release.
 
 use std::convert::TryFrom;
 use std::io;
@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 #[cfg(feature = "unstable-sans-io")]
@@ -28,6 +29,8 @@ use self::playing::PlayingCore;
 use self::session_core::{SessionCore, SessionEvent, SetupTransport};
 #[cfg(feature = "unstable-sans-io")]
 pub use self::session_core::{SessionCore, SessionEvent, SetupTransport, UdpTransmit};
+#[cfg(feature = "unstable-sans-io")]
+pub use self::teardown::{TeardownAction, TeardownCore};
 pub use self::timeline::Timeline;
 use crate::inputs::Input as _;
 use crate::rtsp::msg::{self as msg, OwnedMessage};
@@ -35,7 +38,6 @@ use bytes::Bytes;
 use futures::{Future, ready};
 use log::{debug, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use url::Url;
 
 use crate::{Error, ErrorInt, RtspMessageContext, StreamContext};
@@ -65,16 +67,28 @@ const LIVE555_EXPIRATION_SEC: u64 = 65;
 struct StaleSession {
     seqnum: u64,
 
-    /// If this stale session was created from a dropped [`Session`],
-    /// a watch showing the results of the latest `TEARDOWN` attempt, or `None`
-    /// if one hasn't yet concluded.
-    teardown_rx: Option<tokio::sync::watch::Receiver<Option<Result<(), Error>>>>,
+    /// The progress of the `TEARDOWN`, for [`SessionGroup::await_teardown`].
+    teardown: StaleTeardown,
 
     maybe_playing: bool,
     has_tcp: bool,
 
     /// Upper bound of advertised expiration time.
-    expires: tokio::time::Instant,
+    expires: Instant,
+}
+
+/// The progress of a stale session's `TEARDOWN`.
+enum StaleTeardown {
+    /// None is possible: the session was discovered via the live555 bug, so
+    /// its id is unknown.
+    Impossible,
+
+    /// A [`TeardownCore`] is working on it, and no attempt has failed yet.
+    Pending,
+
+    /// A [`TeardownCore`] is working on it (or was dropped), and the latest
+    /// attempt failed.
+    Failed(Error),
 }
 
 /// A group of sessions, currently used only to track stale sessions.
@@ -91,10 +105,12 @@ struct StaleSession {
 /// response nor believes they have reached their expiration time. They are
 /// tracked in two cases:
 ///
-/// 1.  Dropped [`Session`]s if the [`TeardownPolicy`] says to do so
-///     and a valid `SETUP` response has been received.
+/// 1.  Sessions being torn down via a [`TeardownCore`], including dropped
+///     [`Session`]s, if the [`TeardownPolicy`] says to do so and a valid
+///     `SETUP` response has been received.
 ///
-///     A tokio background task is responsible for attempting a `TEARDOWN` and
+///     The `TeardownCore` (for a dropped `Session`, driven by a tokio
+///     background task) is responsible for attempting a `TEARDOWN` and
 ///     cleaning the session after success or expiration.
 ///     [`SessionGroup::await_teardown`] can be used to wait out this process.
 ///
@@ -115,11 +131,20 @@ struct StaleSession {
 ///     These sessions are assumed to expire 65 seconds after discovery, a
 ///     constant taken from old live555 code.
 ///
+/// Expired sessions are forgotten lazily, as the group is examined.
+///
+/// ## Time
+///
+/// Expiration times are [`std::time::Instant`]s, computed from the `now`
+/// arguments supplied to [`SessionCore`] and [`TeardownCore`] (or, for
+/// [`Session`], from tokio's clock). Supply `now` from the same clock to
+/// [`SessionGroup::stale_sessions`].
+///
 /// ## Granularity
 ///
 /// A `SessionGroup` can be of any granularity, but a typical use is to ensure
 /// there are no stale sessions before starting a fresh session (see
-/// [`SessionGroup::stale_sessions`] and [`SessionGroup::await_stale_sessions`]).
+/// [`SessionGroup::stale_sessions`] and `SessionGroup::await_stale_sessions`).
 /// Groups should be sized to match that idea. If connecting to a live555 server
 /// affected by the stale TCP session bug, it might be wise to have one group
 /// per server, so that all such sessions can be drained before initiating new
@@ -129,8 +154,7 @@ struct StaleSession {
 #[derive(Default)]
 pub struct SessionGroup {
     name: Option<String>,
-    sessions: Mutex<SessionGroupInner>,
-    notify: Notify,
+    inner: Mutex<SessionGroupInner>,
 }
 
 #[derive(Default)]
@@ -139,18 +163,25 @@ struct SessionGroupInner {
 
     /// Stale sessions, unordered.
     sessions: Vec<StaleSession>,
+
+    /// Incremented on every change, for [`SessionGroup::changed`].
+    version: u64,
+
+    /// Wakers to wake on the next change.
+    wakers: Vec<std::task::Waker>,
 }
 
 /// The overall status of stale sessions that may be in state `Playing` and
 /// belong to a particular group.
 pub struct StaleSessionStatus {
     /// The maximum expire time of any such sessions.
-    pub max_expires: Option<tokio::time::Instant>,
+    pub max_expires: Option<Instant>,
 
     /// The total number of sessions.
     pub num_sessions: usize,
 
-    /// The `SessionGroupInner::next_seqnum` value as of when this was created.
+    /// The `SessionGroupInner::next_seqnum` value as of when this was
+    /// created, for `SessionGroup::await_stale_sessions`.
     next_seqnum: u64,
 }
 
@@ -178,7 +209,23 @@ impl SessionGroup {
         self.name.clone().unwrap_or_else(|| format!("{:p}", &self))
     }
 
-    /// Returns the status of stale sessions in this group.
+    /// Locks the group, forgetting sessions which have expired as of `now`.
+    fn lock_pruned(&self, now: Instant) -> std::sync::MutexGuard<'_, SessionGroupInner> {
+        let mut l = self.inner.lock().unwrap();
+        let before = l.sessions.len();
+        l.sessions.retain(|s| s.expires > now);
+        if l.sessions.len() != before {
+            log::debug!(
+                "Session group {:?} forgot {} expired sessions",
+                self.debug_id(),
+                before - l.sessions.len()
+            );
+            l.changed();
+        }
+        l
+    }
+
+    /// Returns the status of stale sessions in this group as of `now`.
     ///
     /// Currently this only returns information about sessions which may be in
     /// state `Playing`. That is, ones for which Retina has either sent a
@@ -187,8 +234,8 @@ impl SessionGroup {
     ///
     /// The caller might use this in a loop with `await_stale_sessions` to sleep
     /// until there are no such sessions, logging updates
-    pub fn stale_sessions(&self) -> StaleSessionStatus {
-        let l = self.sessions.lock().unwrap();
+    pub fn stale_sessions(&self, now: Instant) -> StaleSessionStatus {
+        let l = self.lock_pruned(now);
         let playing = l.sessions.iter().filter(|s| s.maybe_playing);
         StaleSessionStatus {
             max_expires: playing.clone().map(|s| s.expires).max(),
@@ -197,12 +244,33 @@ impl SessionGroup {
         }
     }
 
+    /// Returns a future which completes on the next change to the group: a
+    /// session added or removed, or a failed `TEARDOWN` attempt.
+    ///
+    /// This doesn't depend on any particular async runtime. Expiration isn't
+    /// a change; to wait until sessions expire, race this with a sleep until
+    /// [`StaleSessionStatus::max_expires`], then check
+    /// [`SessionGroup::stale_sessions`] again.
+    pub fn changed(&self) -> impl Future<Output = ()> + Send + '_ {
+        let version = self.inner.lock().unwrap().version;
+        std::future::poll_fn(move |cx| {
+            let mut l = self.inner.lock().unwrap();
+            if l.version != version {
+                return Poll::Ready(());
+            }
+            if !l.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                l.wakers.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+    }
+
     /// Waits for a reasonable attempt at `TEARDOWN` on all stale sessions that
     /// exist as of when this method is called, returning an error if any
     /// session's reasonable attempts fail.
     ///
     /// This has no timeout other than the sessions' expiration times. The
-    /// caller can wrap the call in `tokio::time::timeout` for an earlier time.
+    /// caller can wrap the call in a timeout for an earlier time.
     ///
     /// Currently on `Session::drop`, a `TEARDOWN` loop is started in the
     /// background. This method waits for an attempt on an existing connection
@@ -215,37 +283,40 @@ impl SessionGroup {
     /// learn of the existence of the sessions through
     /// [`SessionGroup::stale_sessions`] and sleep until they expire.
     ///
-    /// ## Panics
-    ///
-    /// If the `TEARDOWN` was initiated from a tokio runtime which has since
-    /// shut down.
+    /// This doesn't depend on any particular async runtime, but it relies on
+    /// something driving each session's [`TeardownCore`]. One dropped before
+    /// finishing counts as a failed attempt.
     pub async fn await_teardown(&self) -> Result<(), Error> {
-        let mut watches: Vec<_>;
-        {
-            let l = self.sessions.lock().unwrap();
-            watches = l
-                .sessions
+        let seqnums: Vec<u64> = {
+            let l = self.inner.lock().unwrap();
+            l.sessions
                 .iter()
-                .filter_map(|s| s.teardown_rx.clone())
-                .collect();
-        }
+                .filter(|s| !matches!(s.teardown, StaleTeardown::Impossible))
+                .map(|s| s.seqnum)
+                .collect()
+        };
 
         let mut overall_result = Ok(());
-        for w in &mut watches {
-            let mut r = (*w.borrow_and_update()).clone();
-
-            if r.is_none() {
-                // An attempt hasn't finished yet. Wait for it.
-                w.changed().await.expect(
-                    "teardown Sender shouldn't be dropped; \
-                             ensure the Session's tokio runtime is still alive",
-                );
-                r.clone_from(&*w.borrow())
+        for seqnum in seqnums {
+            loop {
+                let changed = self.changed();
+                let r = {
+                    let l = self.inner.lock().unwrap();
+                    match l.sessions.iter().find(|s| s.seqnum == seqnum) {
+                        // Removed, after success or giving up.
+                        None => Some(Ok(())),
+                        Some(s) => match &s.teardown {
+                            StaleTeardown::Failed(e) => Some(Err(e.clone())),
+                            _ => None,
+                        },
+                    }
+                };
+                if let Some(r) = r {
+                    overall_result = overall_result.and(r);
+                    break;
+                }
+                changed.await;
             }
-
-            // Now an attempt has finished, success or failure.
-            let r = r.expect("teardown result should be populated after change");
-            overall_result = overall_result.and(r);
         }
         overall_result
     }
@@ -253,40 +324,87 @@ impl SessionGroup {
     /// Waits for all of the sessions described by `status` to expire or be torn down.
     pub async fn await_stale_sessions(&self, status: &StaleSessionStatus) {
         loop {
-            let notified = self.notify.notified();
-            {
-                let l = self.sessions.lock().unwrap();
-                let left = l
+            let changed = self.changed();
+            let max_expires = {
+                let now = tokio::time::Instant::now().into_std();
+                let l = self.lock_pruned(now);
+                let mut relevant = l
                     .sessions
                     .iter()
-                    .filter(|s| s.maybe_playing && s.seqnum < status.next_seqnum)
-                    .count();
+                    .filter(|s| s.maybe_playing && s.seqnum < status.next_seqnum);
+                let max_expires = relevant.clone().map(|s| s.expires).max();
                 log::trace!(
                     "Session group {:?} has {} relevant sessions numbered < {}",
                     self.debug_id(),
-                    left,
+                    relevant.by_ref().count(),
                     status.next_seqnum
                 );
-                if left == 0 {
-                    return;
+                match max_expires {
+                    None => return,
+                    Some(e) => e,
                 }
+            };
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(max_expires)) => {},
             }
-            notified.await;
+        }
+    }
+
+    /// Adds a stale session, returning its seqnum.
+    fn add(
+        &self,
+        now: Instant,
+        teardown: StaleTeardown,
+        maybe_playing: bool,
+        has_tcp: bool,
+        expires: Instant,
+    ) -> u64 {
+        let mut l = self.lock_pruned(now);
+        let seqnum = l.next_seqnum;
+        l.next_seqnum += 1;
+        l.sessions.push(StaleSession {
+            seqnum,
+            teardown,
+            maybe_playing,
+            has_tcp,
+            expires,
+        });
+        l.changed();
+        seqnum
+    }
+
+    /// Records a failed `TEARDOWN` attempt for the session with `seqnum`, if
+    /// it's still tracked.
+    fn note_teardown_failure(&self, seqnum: u64, e: Error) {
+        let mut l = self.inner.lock().unwrap();
+        if let Some(s) = l.sessions.iter_mut().find(|s| s.seqnum == seqnum) {
+            s.teardown = StaleTeardown::Failed(e);
+            l.changed();
         }
     }
 
     /// Removes the session with `seqnum` removing true iff it existed. Notifies waiters.
     fn try_remove_seqnum(&self, seqnum: u64) -> bool {
-        let mut l = self.sessions.lock().unwrap();
+        let mut l = self.inner.lock().unwrap();
         let i = l.sessions.iter().position(|s| s.seqnum == seqnum);
         match i {
             Some(i) => {
                 l.sessions.swap_remove(i);
-                drop(l);
-                self.notify.notify_waiters();
+                l.changed();
                 true
             }
             None => false,
+        }
+    }
+}
+
+impl SessionGroupInner {
+    /// Notes a change, waking anyone waiting via [`SessionGroup::changed`].
+    fn changed(&mut self) {
+        self.version += 1;
+        for w in self.wakers.drain(..) {
+            w.wake();
         }
     }
 }
@@ -1454,18 +1572,18 @@ fn poll_request<C: RequestCore>(
     }
 }
 
-/// Handles data on an unassigned RTSP channel.
-///
-/// `seen_unassigned` tracks whether this has happened before on the connection.
+/// Handles data on an unassigned RTSP channel of `conn`.
 fn handle_unassigned_data(
-    conn_ctx: &crate::ConnectionContext,
-    seen_unassigned: &mut bool,
+    conn: &mut conn::ConnCore,
     msg_ctx: RtspMessageContext,
-    options: &SessionOptions,
-    tool: Option<&Tool>,
     channel_id: u8,
     data: Bytes,
+    now: Instant,
 ) -> Result<(), Error> {
+    let conn_ctx = &conn.ctx;
+    let seen_unassigned = &mut conn.seen_unassigned;
+    let options = &conn.options;
+    let tool = conn.tool.as_ref();
     let live555 = match options.unassigned_channel_data {
         UnassignedChannelDataPolicy::Auto
             if tool.map(Tool::has_live555_tcp_bug).unwrap_or(false) =>
@@ -1502,7 +1620,7 @@ fn handle_unassigned_data(
     };
 
     if live555 {
-        note_stale_live555_data(tool, options, conn_ctx, channel_id, &msg_ctx);
+        note_stale_live555_data(tool, options, conn_ctx, channel_id, &msg_ctx, now);
     }
 
     bail!(ErrorInt::RtspUnassignedChannelError {
@@ -1738,6 +1856,7 @@ fn note_stale_live555_data(
     conn_ctx: &crate::ConnectionContext,
     channel_id: u8,
     msg_ctx: &RtspMessageContext,
+    now: Instant,
 ) {
     let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
     if !known_to_have_live555_tcp_bug {
@@ -1759,70 +1878,34 @@ fn note_stale_live555_data(
         }
     };
 
-    // The caller *might* have a better guess than LIVE555_EXPIRATION_SEC via a SETUP response,
-    // but it's also possible for note_stale_live555_data to be called prior to SETUP.
-    let expires =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC);
-    let seqnum;
-    {
-        let mut lock = group.sessions.lock().unwrap();
-        for s in &lock.sessions {
-            if s.has_tcp {
-                // This session plausibly explains the packet.
-                // (We could go so far as to examine the data packet's SSRC to
-                // see if it matches one associated with this session. But
-                // retrying once per expiration is probably good enough.)
-                log::debug!(
-                    "Unexpected RTSP interleaved packet (live555 stale file \
-                     descriptor bug) plausibly explained by known stale \
-                     session {:?}/{}. Not adding a session entry.",
-                    group.debug_id(),
-                    s.seqnum,
-                );
-                return;
-            }
-        }
-        seqnum = lock.next_seqnum;
-        lock.next_seqnum += 1;
+    if let Some(s) = group.lock_pruned(now).sessions.iter().find(|s| s.has_tcp) {
+        // This session plausibly explains the packet.
+        // (We could go so far as to examine the data packet's SSRC to
+        // see if it matches one associated with this session. But
+        // retrying once per expiration is probably good enough.)
         log::debug!(
-            "Unexpected RTSP interleaved packet, presumed due to live555 stale \
-             file descriptor bug; adding stale session {:?}/{} that will \
-             expire in {} seconds.",
+            "Unexpected RTSP interleaved packet (live555 stale file \
+             descriptor bug) plausibly explained by known stale \
+             session {:?}/{}. Not adding a session entry.",
             group.debug_id(),
-            seqnum,
-            LIVE555_EXPIRATION_SEC,
+            s.seqnum,
         );
-        lock.sessions.push(StaleSession {
-            seqnum,
-            expires,
-            teardown_rx: None,
-            has_tcp: true,
-            maybe_playing: true,
-        });
+        return;
     }
 
-    // Spawn a task which removes the stale session at its expiration.
-    // We could instead prune expired entries on stale_session() calls and
-    // set a deadline within await_stale_sessions() calls, which might be
-    // a bit more efficient. But this is simpler given that we already are
-    // spawning tasks for stale sessions created from Session's Drop impl.
-    let group = group.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep_until(expires).await;
-        if !group.try_remove_seqnum(seqnum) {
-            log::warn!(
-                "Unable to find stale live555 file descriptor session {:?}/{} at expiration",
-                group.debug_id(),
-                seqnum
-            );
-        } else {
-            log::debug!(
-                "Stale live555 file descriptor bug session {:?}/{} presumed expired.",
-                group.debug_id(),
-                seqnum
-            );
-        }
-    });
+    // The caller *might* have a better guess than LIVE555_EXPIRATION_SEC via a SETUP response,
+    // but it's also possible for note_stale_live555_data to be called prior to SETUP.
+    // The group forgets the session lazily once it expires.
+    let expires = now + std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC);
+    let seqnum = group.add(now, StaleTeardown::Impossible, true, true, expires);
+    log::debug!(
+        "Unexpected RTSP interleaved packet, presumed due to live555 stale \
+         file descriptor bug; added stale session {:?}/{} that will \
+         expire in {} seconds.",
+        group.debug_id(),
+        seqnum,
+        LIVE555_EXPIRATION_SEC,
+    );
 }
 
 /// An item returned by [`Session<Playing>::next_item`].
@@ -2197,67 +2280,12 @@ impl Drop for SessionInner {
         let Some(core) = self.core.take_setup() else {
             return;
         };
-
-        let flags = core.flags();
-        let has_tcp = (flags & (SessionFlag::TcpStreams as u8)) != 0;
-        let just_try_once = match core.options().teardown {
-            TeardownPolicy::Auto if has_tcp => {
-                // If the server is known to have the live555 bug, try really hard to send a
-                // TEARDOWN before considering the session cleaned up. Otherwise, try once on
-                // the existing connection, primarily in case the server has
-                // this bug but doesn't advertise a buggy version.
-                !core.tool().map(Tool::has_live555_tcp_bug).unwrap_or(false)
-            }
-            TeardownPolicy::Auto | TeardownPolicy::Always => false,
-            TeardownPolicy::Never => return,
-        };
-
-        let (Some(session), Some(base_url)) = (core.session(), core.base_url()) else {
+        // Use tokio's clock, to match the background task's timers.
+        let now = tokio::time::Instant::now().into_std();
+        let Some(teardown) = core.into_teardown(now) else {
             return;
         };
-        let session_id = session.id.clone();
-        let base_url = base_url.clone();
-
-        // For now, assume the whole timeout is left.
-        let expires = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(session.timeout_sec.into());
-
-        // Track the session, if there is a group.
-        let (teardown_tx, teardown_rx) = tokio::sync::watch::channel(None);
-        let seqnum = if let Some(session_group) = core.options().session_group.as_ref() {
-            let mut lock = session_group.sessions.lock().unwrap();
-            let seqnum = lock.next_seqnum;
-            lock.next_seqnum += 1;
-            lock.sessions.push(StaleSession {
-                seqnum,
-                expires,
-                teardown_rx: Some(teardown_rx),
-                has_tcp,
-                maybe_playing: flags & (SessionFlag::MaybePlaying as u8) != 0,
-            });
-            log::debug!(
-                "{:?}/{} tracking TEARDOWN of session id {}",
-                session_group.debug_id(),
-                seqnum,
-                session_id
-            );
-            Some(seqnum)
-        } else {
-            None
-        };
-
-        let (conn_core, ..) = core.into_parts();
-        tokio::spawn(teardown::background_teardown(
-            seqnum,
-            base_url,
-            session_id,
-            flags & (SessionFlag::Backchannel as u8) != 0,
-            just_try_once,
-            conn_core,
-            self.conn.take(),
-            teardown_tx,
-            expires,
-        ));
+        tokio::spawn(teardown::background_teardown(teardown, self.conn.take()));
     }
 }
 
@@ -2322,6 +2350,11 @@ mod tests {
     use futures::{SinkExt as _, StreamExt as _};
     use session_core::HOLE_PUNCH_RTCP;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// Returns tokio's notion of now, which is paused in some tests.
+    fn tokio_now() -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
 
     /// Cross-platform, tokio equivalent of `socketpair(2)`.
     async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
@@ -2636,7 +2669,7 @@ mod tests {
         // This server advertises an ancient version of live555, so Retina
         // sends a TEARDOWN even with TCP.
 
-        let stale_sessions = group.stale_sessions();
+        let stale_sessions = group.stale_sessions(tokio_now());
         assert_eq!(stale_sessions.num_sessions, 1);
 
         // Resume real time for the TEARDOWN exchange. With paused time,
@@ -2654,7 +2687,7 @@ mod tests {
             ),
         );
         tokio::time::pause();
-        assert_eq!(group.stale_sessions().num_sessions, 0);
+        assert_eq!(group.stale_sessions(tokio_now()).num_sessions, 0);
     }
 
     /// Borrowed packets via `Session::next_item`, pushed to a caller-owned
@@ -2833,14 +2866,14 @@ mod tests {
         // This server advertises an ancient version of live555, so Retina
         // sends a TEARDOWN even with TCP.
         server.close().await.unwrap();
-        let stale_sessions = group.stale_sessions();
+        let stale_sessions = group.stale_sessions(tokio_now());
         assert_eq!(stale_sessions.num_sessions, 1);
 
         // Even if repeated attempts fail, the stale session will go away on timeout.
         // The "60" in the assert below is the RFC-defined default timeout when
         // none is specified in the SETUP response.
         group.await_stale_sessions(&stale_sessions).await;
-        assert_eq!(group.stale_sessions().num_sessions, 0);
+        assert_eq!(group.stale_sessions(tokio_now()).num_sessions, 0);
 
         // elapsed is not zero because tokio advances the time unnecessarily, grr.
         // https://github.com/tokio-rs/tokio/issues/3108
@@ -2884,12 +2917,12 @@ mod tests {
             async { server.send(bogus_rtp).await.unwrap() },
         );
 
-        let stale_sessions = group.stale_sessions();
+        let stale_sessions = group.stale_sessions(tokio_now());
         assert_eq!(stale_sessions.num_sessions, 1);
 
         group.await_stale_sessions(&stale_sessions).await;
         let elapsed = tokio::time::Instant::now() - start;
-        assert_eq!(group.stale_sessions().num_sessions, 0);
+        assert_eq!(group.stale_sessions(tokio_now()).num_sessions, 0);
 
         assert!(
             elapsed >= std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC),
@@ -4420,7 +4453,7 @@ mod tests {
         // There's probably a more elegant way to test this, but here goes.
         fn assert_send<T: Send>(_: T) {}
         let group = SessionGroup::default();
-        let stale_sessions = group.stale_sessions();
+        let stale_sessions = group.stale_sessions(tokio_now());
         assert_send(group.await_stale_sessions(&stale_sessions));
     }
 }

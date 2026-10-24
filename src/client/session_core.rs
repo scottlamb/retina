@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use log::{debug, trace, warn};
@@ -18,10 +18,11 @@ use super::channel_mapping::ChannelType;
 use super::conn::{ConnCore, ResponseMode};
 use super::parse::{self, SessionHeader};
 use super::playing::{PlayingCore, PlayingStream};
+use super::teardown::TeardownCore;
 use super::{
     InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions, Presentation, SessionFlag,
     SessionIdPolicy, SessionOptions, Stream, StreamDirection, StreamState, StreamStateInit,
-    Timeline, Tool, receiver_report, rtp,
+    TeardownPolicy, Timeline, Tool, receiver_report, rtp,
 };
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
@@ -167,10 +168,6 @@ impl SetupCore {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (ConnCore, Option<Presentation>, Option<SessionHeader>, u8) {
-        (self.conn, self.presentation, self.session, self.flags)
-    }
-
     /// Returns a context for the RTSP connection, e.g. for error messages.
     #[inline]
     pub(crate) fn conn_ctx(&self) -> &ConnectionContext {
@@ -235,22 +232,6 @@ impl SetupCore {
     /// Returns a packet to send on a UDP stream's socket, if any.
     pub(crate) fn poll_transmit_udp(&mut self) -> Option<UdpTransmit> {
         self.transmit_udp.pop_front()
-    }
-
-    pub(crate) fn session(&self) -> Option<&SessionHeader> {
-        self.session.as_ref()
-    }
-
-    pub(crate) fn flags(&self) -> u8 {
-        self.flags
-    }
-
-    pub(crate) fn options(&self) -> &SessionOptions {
-        &self.conn.options
-    }
-
-    pub(crate) fn base_url(&self) -> Option<&Url> {
-        self.presentation.as_ref().map(|p| &p.base_url)
     }
 
     fn start(&mut self, mode: ResponseMode, op: Op, req: OwnedMessage) -> Result<(), Error> {
@@ -463,6 +444,71 @@ impl SetupCore {
     /// Interleaved data and unrelated responses are ignored until the
     /// `TEARDOWN` response arrives.
     pub(crate) fn teardown(&mut self) -> Result<(), Error> {
+        let req = self.teardown_request()?;
+        self.start(ResponseMode::Teardown, Op::Teardown, req)
+    }
+
+    /// Switches to a [`TeardownCore`], per the [`TeardownPolicy`], or returns
+    /// `None` if there's nothing to do.
+    ///
+    /// Tracks the session in its [`super::SessionGroup`], if any.
+    pub(crate) fn into_teardown(self, now: Instant) -> Option<TeardownCore> {
+        let has_tcp = (self.flags & (SessionFlag::TcpStreams as u8)) != 0;
+        let just_try_once = match self.conn.options.teardown {
+            TeardownPolicy::Auto if has_tcp => {
+                // If the server is known to have the live555 bug, try really
+                // hard to send a TEARDOWN before considering the session
+                // cleaned up. Otherwise, try once on the existing connection,
+                // primarily in case the server has this bug but doesn't
+                // advertise a buggy version.
+                !self.tool().is_some_and(Tool::has_live555_tcp_bug)
+            }
+            TeardownPolicy::Auto | TeardownPolicy::Always => false,
+            TeardownPolicy::Never => return None,
+        };
+        let req = self.teardown_request().ok()?;
+        let session = self.session.as_ref().expect("teardown_request checked");
+        let base_url = self
+            .presentation
+            .as_ref()
+            .expect("teardown_request checked")
+            .base_url
+            .clone();
+
+        // For now, assume the whole timeout is left.
+        let expires = now + Duration::from_secs(session.timeout_sec.into());
+        let tracked = self.conn.options.session_group.clone().map(|group| {
+            let seqnum = group.add(
+                now,
+                super::StaleTeardown::Pending,
+                (self.flags & (SessionFlag::MaybePlaying as u8)) != 0,
+                has_tcp,
+                expires,
+            );
+            debug!(
+                "{:?}/{} tracking TEARDOWN of session id {}",
+                group.debug_id(),
+                seqnum,
+                &*session.id
+            );
+            (group, seqnum)
+        });
+        let session_id = session.id.clone();
+        Some(TeardownCore::new(
+            self.conn,
+            req,
+            session_id,
+            base_url,
+            just_try_once,
+            expires,
+            tracked,
+            now,
+        ))
+    }
+
+    /// Returns a `TEARDOWN` request for the session, minus the headers
+    /// [`ConnCore::send`] adds.
+    fn teardown_request(&self) -> Result<OwnedMessage, Error> {
         let (Some(presentation), Some(session)) = (&self.presentation, &self.session) else {
             bail!(ErrorInt::FailedPrecondition(
                 "no session to tear down".into()
@@ -476,15 +522,14 @@ impl SetupCore {
             // example `TEARDOWN` carries it too.
             headers.insert(msg::HeaderName::REQUIRE, super::backchannel_require());
         }
-        let req = OwnedMessage::Request {
+        Ok(OwnedMessage::Request {
             head: msg::Request {
                 method: msg::Method::TEARDOWN,
                 request_uri: Some(presentation.base_url.clone()),
                 headers,
             },
             body: Bytes::new(),
-        };
-        self.start(ResponseMode::Teardown, Op::Teardown, req)
+        })
     }
 
     /// Processes received data, returning the request which completed, if any.
@@ -902,6 +947,23 @@ impl SessionCore {
         }
     }
 
+    /// Consumes the session, returning a [`TeardownCore`] to end it on the
+    /// server per [`SessionOptions::teardown`], or `None` if there's nothing to
+    /// do: the policy is [`super::TeardownPolicy::Never`], or no `SETUP` has
+    /// succeeded.
+    ///
+    /// This is what a dropped [`super::Session`] does in the background. It
+    /// can follow a failed request, or interrupt one in progress. If the
+    /// session has a [`super::SessionGroup`], it's tracked there until the
+    /// `TeardownCore` finishes.
+    pub fn into_teardown(self, now: Instant) -> Option<TeardownCore> {
+        match self.0 {
+            Phase::Setup(c) => c.into_teardown(now),
+            Phase::Playing(c) => c.into_setup().into_teardown(now),
+            Phase::Switching => None,
+        }
+    }
+
     /// Returns true iff `PLAY` has succeeded (and the session hasn't since been
     /// torn down).
     #[inline]
@@ -1069,6 +1131,10 @@ impl SessionCore {
     /// playing, the session stops: [`SessionCore::poll_item`] returns nothing
     /// more. Interleaved data and unrelated responses are ignored until the
     /// `TEARDOWN` response arrives via [`SessionCore::poll_event`].
+    ///
+    /// This is a single attempt, regardless of [`super::TeardownPolicy`]. To
+    /// retry as a dropped [`super::Session`] does, use
+    /// [`SessionCore::into_teardown`] instead.
     pub fn teardown(&mut self) -> Result<(), Error> {
         if let Phase::Playing(_) = self.0 {
             let Phase::Playing(c) = std::mem::replace(&mut self.0, Phase::Switching) else {
@@ -1255,7 +1321,11 @@ pub(crate) const HOLE_PUNCH_RTCP: [u8; 8] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::teardown::TeardownAction;
     use crate::client::{Credentials, PlayingItem};
+    use std::sync::Arc;
+
+    const EXISTING_CONN_TIMEOUT_FOR_TEST: Duration = Duration::from_secs(5);
 
     fn new_core(options: SessionOptions) -> SessionCore {
         crate::testutil::init_logging();
@@ -1273,10 +1343,15 @@ mod tests {
     /// Returns the single request the core wants to send, marking it written.
     fn transmitted(core: &mut SessionCore) -> msg::Request {
         let (a, b) = core.transmit_buf();
-        assert!(!a.is_empty(), "should transmit");
         let data = [a, b].concat();
         core.advance_transmit(data.len());
-        let mut input = &data[..];
+        parse_request(&data)
+    }
+
+    /// Parses `data`, which should be exactly one request.
+    fn parse_request(data: &[u8]) -> msg::Request {
+        assert!(!data.is_empty(), "should transmit");
+        let mut input = data;
         let (msg, _) = crate::rtsp::parse::Parser::default()
             .feed(&mut input)
             .unwrap()
@@ -1293,6 +1368,13 @@ mod tests {
     fn respond(core: &mut SessionCore, method: msg::Method, raw: &'static [u8]) -> msg::Request {
         let req = transmitted(core);
         assert_eq!(req.method, method);
+        core.read_buf().extend(&response_to(&req, raw));
+        req
+    }
+
+    /// Returns the response in `raw` to `req`, with its `CSeq` changed to
+    /// match.
+    fn response_to(req: &msg::Request, raw: &'static [u8]) -> Vec<u8> {
         let (mut head, body) = crate::testutil::response(raw);
         head.headers.insert(
             msg::HeaderName::CSEQ,
@@ -1302,8 +1384,253 @@ mod tests {
         OwnedMessage::Response { head, body }
             .write(&mut data)
             .unwrap();
-        core.read_buf().extend(&data);
+        data
+    }
+
+    /// Returns a core playing stream 0 via TCP, with the given test data.
+    fn playing(
+        options: SessionOptions,
+        describe: &'static [u8],
+        setup: &'static [u8],
+        play: &'static [u8],
+        now: Instant,
+    ) -> SessionCore {
+        let mut core = new_core(options);
+        core.describe(url()).unwrap();
+        respond(&mut core, msg::Method::DESCRIBE, describe);
+        core.poll_event(now).unwrap().unwrap();
+        core.setup(0, SetupTransport::Tcp).unwrap();
+        respond(&mut core, msg::Method::SETUP, setup);
+        core.poll_event(now).unwrap().unwrap();
+        core.play(PlayOptions::default()).unwrap();
+        respond(&mut core, msg::Method::PLAY, play);
+        assert!(matches!(
+            core.poll_event(now),
+            Some(Ok(SessionEvent::Playing))
+        ));
+        core
+    }
+
+    /// Returns a core playing a Reolink camera, which advertises a live555
+    /// version with the stale TCP session bug.
+    fn playing_reolink(options: SessionOptions, now: Instant) -> SessionCore {
+        playing(
+            options,
+            include_bytes!("testdata/reolink_describe.txt"),
+            include_bytes!("testdata/reolink_setup.txt"),
+            include_bytes!("testdata/reolink_play.txt"),
+            now,
+        )
+    }
+
+    /// Returns the single request the teardown core wants to send, marking it
+    /// written.
+    fn teardown_transmitted(td: &mut TeardownCore) -> msg::Request {
+        let (a, b) = td.transmit_buf();
+        let data = [a, b].concat();
+        td.advance_transmit(data.len());
+        let req = parse_request(&data);
+        assert_eq!(req.method, msg::Method::TEARDOWN);
         req
+    }
+
+    fn server_addrs() -> (SocketAddr, SocketAddr) {
+        (
+            "192.168.1.210:40001".parse().unwrap(),
+            "192.168.5.206:554".parse().unwrap(),
+        )
+    }
+
+    /// Returns the outcome of `SessionGroup::await_teardown` if it's ready.
+    fn await_teardown_now(group: &super::super::SessionGroup) -> Option<Result<(), Error>> {
+        use futures::FutureExt as _;
+        group.await_teardown().now_or_never()
+    }
+
+    /// The first `TEARDOWN` goes on the session's connection, after bytes
+    /// not yet written, and succeeds.
+    #[test]
+    fn teardown_on_existing_conn() {
+        let group = Arc::new(super::super::SessionGroup::default());
+        let t0 = Instant::now();
+        let core = playing_reolink(SessionOptions::default().session_group(group.clone()), t0);
+        assert_eq!(group.stale_sessions(t0).num_sessions, 0);
+        let mut td = core.into_teardown(t0).unwrap();
+        let status = group.stale_sessions(t0);
+        assert_eq!(status.num_sessions, 1);
+        assert_eq!(status.max_expires, Some(t0 + Duration::from_secs(60)));
+        assert_eq!(td.expires(), t0 + Duration::from_secs(60));
+        assert!(await_teardown_now(&group).is_none());
+
+        let TeardownAction::Io { deadline } = td.poll(t0) else {
+            panic!("expected Io");
+        };
+        assert_eq!(deadline, t0 + EXISTING_CONN_TIMEOUT_FOR_TEST);
+        let req = teardown_transmitted(&mut td);
+        assert_eq!(req.headers.get("Session").unwrap().to_string(), "F8F8E425");
+        assert_eq!(req.headers.get("CSeq").unwrap().to_string(), "4");
+        assert!(matches!(td.poll(t0), TeardownAction::Io { .. }));
+
+        // Interleaved data and the response arrive.
+        let mut data = Vec::new();
+        OwnedMessage::Data {
+            channel_id: 0,
+            body: Bytes::from_static(b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8"),
+        }
+        .write(&mut data)
+        .unwrap();
+        data.extend(response_to(
+            &req,
+            include_bytes!("testdata/reolink_teardown.txt"),
+        ));
+        td.read_buf().extend(&data);
+        assert!(matches!(td.poll(t0), TeardownAction::Done));
+        assert!(matches!(td.poll(t0), TeardownAction::Done));
+        assert_eq!(group.stale_sessions(t0).num_sessions, 0);
+        assert!(matches!(await_teardown_now(&group), Some(Ok(()))));
+    }
+
+    /// With the live555 bug, failed attempts are retried on fresh
+    /// connections, backing off with growing timeouts.
+    #[test]
+    fn teardown_retries_on_fresh_conns() {
+        let group = Arc::new(super::super::SessionGroup::default());
+        let t0 = Instant::now();
+        let core = playing_reolink(SessionOptions::default().session_group(group.clone()), t0);
+        let mut td = core.into_teardown(t0).unwrap();
+        assert!(matches!(td.poll(t0), TeardownAction::Io { .. }));
+
+        // The server closes the session's connection. A fresh one is due
+        // right away. That failure isn't reported to the group.
+        td.handle_eof();
+        let TeardownAction::Connect { deadline } = td.poll(t0) else {
+            panic!("expected Connect");
+        };
+        assert_eq!(deadline, t0 + Duration::from_secs(1));
+        assert!(await_teardown_now(&group).is_none());
+        assert!(td.transmit_buf().0.is_empty());
+
+        // Attempt 1 fails quickly, so the next waits for its deadline.
+        let (local, peer) = server_addrs();
+        td.connected(local, peer, t0);
+        let req = teardown_transmitted(&mut td);
+        assert_eq!(req.headers.get("CSeq").unwrap().to_string(), "1");
+        td.handle_io_error(std::io::ErrorKind::ConnectionReset.into(), t0);
+        let e = await_teardown_now(&group).unwrap().unwrap_err();
+        assert!(e.to_string().contains("connection reset"), "{e}");
+        assert!(matches!(
+            td.poll(t0),
+            TeardownAction::Wait { until } if until == t0 + Duration::from_secs(1)
+        ));
+
+        // Attempt 2 times out while connecting; attempt 3 starts right away.
+        let t1 = t0 + Duration::from_secs(1);
+        let TeardownAction::Connect { deadline } = td.poll(t1) else {
+            panic!("expected Connect");
+        };
+        assert_eq!(deadline, t1 + Duration::from_secs(2));
+        let t2 = deadline;
+        let TeardownAction::Connect { deadline } = td.poll(t2) else {
+            panic!("expected Connect");
+        };
+        assert_eq!(deadline, t2 + Duration::from_secs(4));
+
+        // Attempt 3 succeeds.
+        td.connected(local, peer, t2);
+        let req = teardown_transmitted(&mut td);
+        td.read_buf().extend(&response_to(
+            &req,
+            include_bytes!("testdata/reolink_teardown.txt"),
+        ));
+        assert!(matches!(td.poll(t2), TeardownAction::Done));
+        assert_eq!(group.stale_sessions(t2).num_sessions, 0);
+        assert!(matches!(await_teardown_now(&group), Some(Ok(()))));
+    }
+
+    /// Without the live555 bug, a TCP session gets one attempt, on its own
+    /// connection.
+    #[test]
+    fn teardown_tcp_tries_once() {
+        let group = Arc::new(super::super::SessionGroup::default());
+        let t0 = Instant::now();
+        let core = playing(
+            SessionOptions::default().session_group(group.clone()),
+            include_bytes!("testdata/hikvision_describe.txt"),
+            include_bytes!("testdata/hikvision_setup.txt"),
+            include_bytes!("testdata/hikvision_play.txt"),
+            t0,
+        );
+        let mut td = core.into_teardown(t0).unwrap();
+        let TeardownAction::Io { deadline } = td.poll(t0) else {
+            panic!("expected Io");
+        };
+        teardown_transmitted(&mut td);
+        assert!(matches!(td.poll(deadline), TeardownAction::Done));
+        assert_eq!(group.stale_sessions(deadline).num_sessions, 0);
+        assert!(matches!(await_teardown_now(&group), Some(Ok(()))));
+    }
+
+    /// Retries stop at the session's expiration, when the group forgets it.
+    #[test]
+    fn teardown_expires() {
+        let group = Arc::new(super::super::SessionGroup::default());
+        let t0 = Instant::now();
+        let core = playing_reolink(
+            SessionOptions::default()
+                .session_group(group.clone())
+                .teardown(TeardownPolicy::Always),
+            t0,
+        );
+        let mut td = core.into_teardown(t0).unwrap();
+        let expires = td.expires();
+        let mut now = t0;
+        let mut attempts = 0;
+        loop {
+            match td.poll(now) {
+                TeardownAction::Io { deadline } | TeardownAction::Connect { deadline } => {
+                    assert!(deadline <= expires);
+                    attempts += 1;
+                    now = deadline;
+                }
+                TeardownAction::Wait { until } => now = until,
+                TeardownAction::Done => break,
+            }
+        }
+        assert_eq!(now, expires);
+        // 5 s on the existing connection, then fresh connection attempts of 1,
+        // 2, 4, 8, 16, 16, and (cut short by the 60 s timeout) 16 s.
+        assert_eq!(attempts, 8);
+        assert_eq!(group.stale_sessions(now).num_sessions, 0);
+        assert!(matches!(await_teardown_now(&group), Some(Ok(()))));
+    }
+
+    /// Dropping a teardown core early counts as failure, and the session stays
+    /// tracked until it expires.
+    #[test]
+    fn teardown_abandoned() {
+        let group = Arc::new(super::super::SessionGroup::default());
+        let t0 = Instant::now();
+        let core = playing_reolink(SessionOptions::default().session_group(group.clone()), t0);
+        let td = core.into_teardown(t0).unwrap();
+        let expires = td.expires();
+        drop(td);
+        assert!(matches!(await_teardown_now(&group), Some(Err(_))));
+        assert_eq!(group.stale_sessions(t0).num_sessions, 1);
+        assert_eq!(group.stale_sessions(expires).num_sessions, 0);
+    }
+
+    /// Nothing to tear down without `SETUP`, or with `TeardownPolicy::Never`.
+    #[test]
+    fn teardown_unneeded() {
+        let t0 = Instant::now();
+        let mut core = new_core(SessionOptions::default());
+        core.describe(url()).unwrap();
+        assert!(core.into_teardown(t0).is_none());
+        let core = playing_reolink(
+            SessionOptions::default().teardown(TeardownPolicy::Never),
+            t0,
+        );
+        assert!(core.into_teardown(t0).is_none());
     }
 
     /// Drives a TCP session through `DESCRIBE`, `SETUP`, `PLAY`, a packet,

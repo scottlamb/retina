@@ -15,6 +15,18 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   BREAKING: `client::SessionGroup` no longer depends on tokio.
+    `SessionGroup::stale_sessions` takes a `now: std::time::Instant`, and
+    `StaleSessionStatus::max_expires` is a `std::time::Instant`. Expired
+    sessions are forgotten lazily rather than via spawned tasks.
+    `SessionGroup::await_teardown` works with any async runtime (and no
+    longer panics if the tokio runtime has shut down), as does the new
+    `SessionGroup::changed`.
+*   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
+    `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
+    does, per `client::TeardownPolicy` and tracked in the session's
+    `SessionGroup`, until success or the session's expiration. A dropped
+    `Session` now uses it internally.
 
 ## `v0.4.21` (2026-10-04)
 

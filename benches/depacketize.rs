@@ -118,6 +118,7 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
             &mut timelines[stream_id],
             stream_id,
             &header,
+            std::time::Instant::now(),
         ) {
             Ok(Some(meta)) => meta,
             _ => unreachable!(),

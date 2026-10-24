@@ -356,7 +356,13 @@ impl PlayingCore {
                 Err(e) => return Some(Err(e)),
                 Ok(Some(msg)) => match msg.msg {
                     msg::Message::Data(d) => {
-                        match self.handle_data(&msg.ctx, d.channel_id, msg.body_pos, d.body_len) {
+                        match self.handle_data(
+                            &msg.ctx,
+                            d.channel_id,
+                            msg.body_pos,
+                            d.body_len,
+                            now,
+                        ) {
                             Err(e) => return Some(Err(e)),
                             Ok(None) => continue,
                             Ok(Some(item)) => item,
@@ -735,18 +741,11 @@ impl PlayingCore {
         channel_id: u8,
         body_pos: u64,
         body_len: u16,
+        now: Instant,
     ) -> Result<Option<StreamItem>, Error> {
         let Some(m) = self.conn.channels.lookup(channel_id) else {
             let body = self.conn.reader.body_bytes(body_pos, u32::from(body_len));
-            super::handle_unassigned_data(
-                &self.conn.ctx,
-                &mut self.conn.seen_unassigned,
-                *msg_ctx,
-                &self.conn.options,
-                self.conn.tool.as_ref(),
-                channel_id,
-                body,
-            )?;
+            super::handle_unassigned_data(&mut self.conn, *msg_ctx, channel_id, body, now)?;
             return Ok(None);
         };
         Ok(Some(StreamItem {
@@ -814,6 +813,7 @@ impl PlayingCore {
                     &mut stream.timeline,
                     item.stream_i,
                     &header,
+                    now,
                 )?
                 else {
                     return Ok(None);
@@ -840,6 +840,7 @@ impl PlayingCore {
                     &mut stream.timeline,
                     item.stream_i,
                     body,
+                    now,
                 ) {
                     Ok(p) => {
                         // Note sender reports for the LSR and DLSR fields of

@@ -292,15 +292,9 @@ impl ConnCore {
                         continue;
                     }
                     let body = self.reader.body_bytes(msg.body_pos, msg.body_len);
-                    if let Err(e) = super::handle_unassigned_data(
-                        &self.ctx,
-                        &mut self.seen_unassigned,
-                        msg_ctx,
-                        &self.options,
-                        self.tool.as_ref(),
-                        d.channel_id,
-                        body,
-                    ) {
+                    if let Err(e) =
+                        super::handle_unassigned_data(self, msg_ctx, d.channel_id, body, now)
+                    {
                         return Some(Err(e));
                     }
                     continue;
