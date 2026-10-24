@@ -5,18 +5,14 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use bytes::Bytes;
-
 use crate::buf::PacketRef;
-use crate::codec::DepacketizeError;
 
-use super::AudioParameters;
+use super::{AudioFrameRef, AudioParameters, Handler};
 
 const FIXED_CLOCK_RATE: u32 = 8_000;
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    pending: Option<super::AudioFrame>,
     parameters: AudioParameters,
 }
 
@@ -29,7 +25,6 @@ impl Depacketizer {
             ));
         }
         Ok(Self {
-            pending: None,
             parameters: AudioParameters {
                 rfc6381_codec: None,
                 frame_length: NonZeroU32::new(240),
@@ -56,32 +51,33 @@ impl Depacketizer {
         actual_hdr_bits == expected_hdr_bits
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        assert!(self.pending.is_none());
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with<Ctx>(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
         let (s1, s2) = pkt.payload().slices();
-        let mut payload = Vec::with_capacity(crate::to_usize(pkt.payload_len()));
-        payload.extend_from_slice(s1);
-        payload.extend_from_slice(s2);
-        if !Self::validate(&payload) {
+        let joined;
+        let payload = if s2.is_empty() {
+            s1
+        } else {
+            joined = [s1, s2].concat();
+            &joined[..]
+        };
+        if !Self::validate(payload) {
             return Err(format!(
                 "Invalid G.723 packet: {:#?}",
-                crate::hex::LimitedHex::new(&payload, 64),
+                crate::hex::LimitedHex::new(payload, 64),
             ));
         }
-        self.pending = Some(super::AudioFrame {
-            ctx: pkt.meta.ctx,
-            loss: pkt.meta.loss,
-            stream_id: pkt.meta.stream_id,
+        handler.audio_frame(&AudioFrameRef {
+            ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length: NonZeroU32::new(240).unwrap(),
-            data: Bytes::from(payload),
+            loss: pkt.meta.loss,
+            data: payload,
         });
         Ok(())
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
-        self.pending
-            .take()
-            .map(|f| Ok(super::CodecItem::AudioFrame(f)))
     }
 }

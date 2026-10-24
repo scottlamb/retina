@@ -10,12 +10,9 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use bytes::Bytes;
-
 use crate::buf::PacketRef;
-use crate::codec::DepacketizeError;
 
-use super::AudioParameters;
+use super::{AudioFrameRef, AudioParameters, Handler};
 
 /// The RTP clock rate of Opus, whatever rate the stream was encoded at, as in
 /// [RFC 7587 section 4.1](https://datatracker.ietf.org/doc/html/rfc7587#section-4.1).
@@ -48,7 +45,6 @@ fn samples_in_packet(packet: &[u8]) -> Option<NonZeroU32> {
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    pending: Option<super::AudioFrame>,
     parameters: AudioParameters,
 }
 
@@ -61,7 +57,6 @@ impl Depacketizer {
             ));
         }
         Ok(Self {
-            pending: None,
             parameters: AudioParameters {
                 rfc6381_codec: Some("Opus".to_owned()),
                 frame_length: None, // variable
@@ -78,33 +73,34 @@ impl Depacketizer {
         Some(super::ParametersRef::Audio(&self.parameters))
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        assert!(self.pending.is_none());
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with<Ctx>(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
         let (s1, s2) = pkt.payload().slices();
-        let mut payload = Vec::with_capacity(crate::to_usize(pkt.payload_len()));
-        payload.extend_from_slice(s1);
-        payload.extend_from_slice(s2);
-        let frame_length = samples_in_packet(&payload).ok_or_else(|| {
+        let joined;
+        let payload = if s2.is_empty() {
+            s1
+        } else {
+            joined = [s1, s2].concat();
+            &joined[..]
+        };
+        let frame_length = samples_in_packet(payload).ok_or_else(|| {
             format!(
                 "Invalid Opus packet: {:#?}",
-                crate::hex::LimitedHex::new(&payload, 64),
+                crate::hex::LimitedHex::new(payload, 64),
             )
         })?;
-        self.pending = Some(super::AudioFrame {
-            ctx: pkt.meta.ctx,
-            loss: pkt.meta.loss,
-            stream_id: pkt.meta.stream_id,
+        handler.audio_frame(&AudioFrameRef {
+            ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length,
-            data: Bytes::from(payload),
+            loss: pkt.meta.loss,
+            data: payload,
         });
         Ok(())
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
-        self.pending
-            .take()
-            .map(|f| Ok(super::CodecItem::AudioFrame(f)))
     }
 }
 
@@ -112,7 +108,26 @@ impl Depacketizer {
 mod tests {
     use super::*;
     use crate::buf::{MarkBuf, PacketRef};
-    use crate::{PacketContext, codec::CodecItem, rtp::ReceivedPacketBuilder};
+    use crate::codec::{Accumulate, FrameStart};
+    use crate::{PacketContext, rtp::ReceivedPacketBuilder};
+
+    /// Records audio frames as `(timestamp, frame_length, data)`.
+    #[derive(Default)]
+    struct Frames(Vec<(crate::Timestamp, u32, Vec<u8>)>);
+
+    impl Handler<PacketContext> for Frames {
+        fn frame_start(&mut self, _: &FrameStart<'_, PacketContext>) -> Accumulate {
+            unreachable!()
+        }
+
+        fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
+            self.0.push((
+                frame.timestamp,
+                frame.frame_length.get(),
+                frame.data.to_vec(),
+            ));
+        }
+    }
 
     /// A packet of `config` with the given frame count code and following bytes.
     fn packet(config: u8, code: u8, rest: &[u8]) -> Vec<u8> {
@@ -127,7 +142,12 @@ mod tests {
         start: 0,
     };
 
-    fn push(d: &mut Depacketizer, buf: &mut MarkBuf, payload: &[u8]) -> Result<(), String> {
+    fn push(
+        d: &mut Depacketizer,
+        buf: &mut MarkBuf,
+        payload: &[u8],
+        h: &mut Frames,
+    ) -> Result<(), String> {
         let pkt = ReceivedPacketBuilder {
             ctx: PacketContext::dummy(),
             stream_id: 0,
@@ -144,7 +164,7 @@ mod tests {
         buf.extend(pkt.payload());
         buf.advance_unparsed(buf.end());
         let meta = crate::rtp::PacketMeta::from_received(&pkt);
-        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16))
+        d.push_with(&PacketRef::new(meta, buf, pos, payload.len() as u16), h)
     }
 
     #[test]
@@ -212,15 +232,10 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let payload = packet(31, 0, &[1, 2, 3]);
 
-        push(&mut d, &mut buf, &payload).unwrap();
+        let mut h = Frames::default();
+        push(&mut d, &mut buf, &payload, &mut h).unwrap();
 
-        let Some(Ok(CodecItem::AudioFrame(frame))) = d.pull() else {
-            panic!("expected an audio frame");
-        };
-        assert_eq!(&frame.data[..], &payload[..]);
-        assert_eq!(frame.frame_length.get(), 960);
-        assert_eq!(frame.timestamp, TIMESTAMP);
-        assert!(d.pull().is_none());
+        assert_eq!(h.0, [(TIMESTAMP, 960, payload)]);
     }
 
     #[test]
@@ -228,10 +243,11 @@ mod tests {
         let mut d = Depacketizer::new(48_000, None).unwrap();
         let mut buf = MarkBuf::new(65536);
 
-        let e = push(&mut d, &mut buf, &packet(31, 3, &[0])).unwrap_err();
+        let mut h = Frames::default();
+        let e = push(&mut d, &mut buf, &packet(31, 3, &[0]), &mut h).unwrap_err();
 
         assert!(e.starts_with("Invalid Opus packet"), "{e}");
-        assert!(d.pull().is_none());
+        assert!(h.0.is_empty());
     }
 
     #[test]

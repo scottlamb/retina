@@ -288,19 +288,20 @@ pub struct FrameEnd<'a, Ctx> {
 pub(crate) enum FrameBody<'a> {
     #[cfg(feature = "h264")]
     H264(super::h264::FrameEndBody<'a>),
+
     #[cfg(feature = "h265")]
     H265(super::h265::FrameEndBody<'a>),
 
-    /// Uninhabited; keeps `'a` in use when no codec is enabled.
-    #[cfg(not(any(feature = "h264", feature = "h265")))]
-    Never(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
+    /// A frame which the depacketizer assembled itself, in a fixed format.
+    Owned {
+        /// The data, if accumulated and not yet taken.
+        data: Option<Vec<u8>>,
+        parameters: Option<ParametersRef<'a>>,
+    },
 }
 
-// Without H.264 or H.265, there are no frame bodies.
-#[cfg_attr(
-    not(any(feature = "h264", feature = "h265")),
-    allow(unused_variables, unreachable_code)
-)]
+// Only the H.26x codecs use `format`.
+#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
 impl<Ctx> FrameEnd<'_, Ctx> {
     /// Returns the frame's timestamp.
     #[inline]
@@ -364,8 +365,7 @@ impl<Ctx> FrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.parameters(),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.parameters(),
-            #[cfg(not(any(feature = "h264", feature = "h265")))]
-            FrameBody::Never(n, _) => match *n {},
+            FrameBody::Owned { parameters, .. } => parameters.clone(),
         }
     }
 
@@ -377,8 +377,7 @@ impl<Ctx> FrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.data_len(format),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.data_len(format),
-            #[cfg(not(any(feature = "h264", feature = "h265")))]
-            FrameBody::Never(n, _) => match *n {},
+            FrameBody::Owned { data, .. } => data.as_ref().map(Vec::len),
         }
     }
 
@@ -387,15 +386,14 @@ impl<Ctx> FrameEnd<'_, Ctx> {
     /// Returns `None` if [`Handler::frame_start`] didn't return
     /// [`Accumulate::Yes`] or if this has already been called for this frame.
     pub fn complete_frame(&mut self, format: FrameFormat) -> Option<CompleteFrame> {
-        let data: Option<Vec<u8>> = match &mut self.body {
+        match &mut self.body {
             #[cfg(feature = "h264")]
             FrameBody::H264(b) => b.build(format),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.build(format),
-            #[cfg(not(any(feature = "h264", feature = "h265")))]
-            FrameBody::Never(n, _) => match *n {},
-        };
-        data.map(|data| CompleteFrame { data })
+            FrameBody::Owned { data, .. } => data.take(),
+        }
+        .map(|data| CompleteFrame { data })
     }
 
     /// Visits the accumulated frame data in the given format without
@@ -409,8 +407,13 @@ impl<Ctx> FrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.visit(format, visitor),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.visit(format, visitor),
-            #[cfg(not(any(feature = "h264", feature = "h265")))]
-            FrameBody::Never(n, _) => match *n {},
+            FrameBody::Owned { data, .. } => match data {
+                Some(d) => {
+                    visitor(d);
+                    true
+                }
+                None => false,
+            },
         }
     }
 }

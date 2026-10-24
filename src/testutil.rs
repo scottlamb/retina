@@ -110,7 +110,7 @@ impl DepacketizeBuf {
             self.0.advance_end(len);
         }
         self.0.advance_unparsed(self.0.end());
-        d.push(&crate::buf::PacketRef::new(meta, &self.0, pos, len as u16))
+        d.push_legacy(&crate::buf::PacketRef::new(meta, &self.0, pos, len as u16))
     }
 }
 
