@@ -11,19 +11,16 @@
 // Docs link to items behind the unstable features, which are missing or
 // private without them. CI checks links with all features enabled.
 #![cfg_attr(
-    not(feature = "unstable-send"),
+    not(all(feature = "unstable-sans-io", feature = "unstable-send")),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
 // I prefer to use from_str_radix(..., 10) to explicitly note the base.
 #![allow(clippy::from_str_radix_10)]
 
-use log::trace;
-use rand::Rng;
 use rtsp::msg::Message;
 use std::fmt::{Debug, Display};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
-use std::ops::Range;
 use std::time::{Instant, SystemTime};
 
 pub mod buf;
@@ -60,6 +57,12 @@ pub mod codec;
 #[doc(hidden)]
 pub mod rtsp;
 mod tokio;
+mod udp_pair;
+
+#[cfg(feature = "unstable-sans-io")]
+pub use udp_pair::UdpPair;
+#[cfg(not(feature = "unstable-sans-io"))]
+pub(crate) use udp_pair::UdpPair;
 
 use error::ErrorInt;
 
@@ -516,63 +519,6 @@ impl Display for PacketContext {
     }
 }
 
-/// A pair of local UDP sockets used for RTP and RTCP transmission.
-///
-/// The RTP port is always even, and the RTCP port is always the following (odd) integer.
-struct UdpPair {
-    rtp_port: u16,
-    rtp_socket: UdpSocket,
-    rtcp_socket: UdpSocket,
-}
-
-impl UdpPair {
-    fn for_ip(ip_addr: IpAddr) -> Result<Self, std::io::Error> {
-        const MAX_TRIES: usize = 10;
-        const ALLOWED_RTP_RANGE: Range<u16> = 5000..65000; // stolen from ffmpeg's defaults.
-        let mut rng = rand::thread_rng();
-        for i in 0..MAX_TRIES {
-            let rtp_port = rng.gen_range(ALLOWED_RTP_RANGE) & !0b1;
-            debug_assert!(ALLOWED_RTP_RANGE.contains(&rtp_port));
-            let rtp_addr = SocketAddr::new(ip_addr, rtp_port);
-            let rtp_socket = match UdpSocket::bind(rtp_addr) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    trace!(
-                        "Try {}/{}: unable to bind RTP addr {:?}",
-                        i, MAX_TRIES, rtp_addr
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let rtcp_addr = SocketAddr::new(ip_addr, rtp_port + 1);
-            let rtcp_socket = match UdpSocket::bind(rtcp_addr) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    trace!(
-                        "Try {}/{}: unable to bind RTCP addr {:?}",
-                        i, MAX_TRIES, rtcp_addr
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            return Ok(Self {
-                rtp_port,
-                rtp_socket,
-                rtcp_socket,
-            });
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!(
-                "Unable to find even/odd pair in {}:{}..{} after {} tries",
-                ip_addr, ALLOWED_RTP_RANGE.start, ALLOWED_RTP_RANGE.end, MAX_TRIES
-            ),
-        ))
-    }
-}
-
 // Let's assume pointers are either 32-bit or 64-bit so we can do the following
 // infallible conversions.
 #[cfg(any(feature = "h264", feature = "h265"))]
@@ -591,16 +537,9 @@ fn to_u64(v: usize) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     use super::*;
-
-    #[test]
-    fn local_udp_pair() {
-        // Just test that it succeeds.
-        UdpPair::for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
-    }
 
     #[test]
     fn ntp_system_time_round_trip() {

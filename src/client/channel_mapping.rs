@@ -5,6 +5,8 @@
 
 use std::num::NonZeroU8;
 
+/// Whether a packet is RTP or RTCP, e.g. which of a UDP stream's two sockets
+/// it was received on or should be sent on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChannelType {
     Rtp,
