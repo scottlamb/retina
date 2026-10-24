@@ -49,7 +49,7 @@ pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, su
 ///
 /// # Annex B handling
 ///
-/// Some servers erroneously include Annex B byte streams where a single NAL
+/// Some senders erroneously include Annex B byte streams where a single NAL
 /// unit is expected. This means they use Annex B "start codes" (`00 00 01`
 /// sequences, which are not allowed within a NAL) to separate NALs. This
 /// depacketizer allows Annex B byte streams in the following places

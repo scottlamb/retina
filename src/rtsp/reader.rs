@@ -109,7 +109,7 @@ impl Reader {
     ///
     /// This copies the data out, so it's for cold paths: RTSP message bodies
     /// and RTCP packets. RTP packets are lent out directly from the ring
-    /// buffer; see [`crate::client::RtpPacket`].
+    /// buffer (e.g. as [`crate::client::RtpPacket`]).
     pub(crate) fn body_bytes(&self, body_pos: u64, body_len: u32) -> bytes::Bytes {
         bytes::Bytes::from(self.buf.split(body_pos, body_len as usize).to_vec())
     }
