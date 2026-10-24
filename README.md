@@ -18,15 +18,15 @@ Progress:
     *   [x] digest authentication.
     *   [x] RTP over TCP via RTSP interleaved channels.
     *   [x] RTP over UDP (experimental).
-    *   *   [ ] re-order buffer. (Out-of-order packets are dropped now.)
+    *   *   [x] re-order buffer.
     *   [x] RTSP/1.0.
     *   [ ] RTSP/2.0.
     *   [ ] SRTP.
     *   [ ] ONVIF backchannel support (for sending audio).
     *   [ ] ONVIF replay mode.
     *   [x] receiving RTCP Sender Reports (currently only uses the timestamp)
-    *   [ ] sending RTCP Receiver Reports
-*   [ ] server support
+    *   [x] sending RTCP Receiver Reports
+*   [ ] server support (experimental, behind the `unstable-server` feature)
 *   I/O modes
     *   [x] async with tokio
     *   [ ] async-std
@@ -49,6 +49,8 @@ Progress:
         *   [x] [RFC 3551](https://datatracker.ietf.org/doc/html/rfc3551)
             codecs: G.711, G.723, L8/L16
     *   [x] application: ONVIF metadata
+*   codec packetization (experimental, behind the `unstable-send` feature)
+    *   [x] video: H.264, H.265
 *   [ ] clean, stable API. (See [#47](https://github.com/scottlamb/retina/issues/47).)
 *   quality errors
 *   *   [x] detailed error description text.

@@ -246,7 +246,7 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
 
     /// Overrides the parameters for this frame and later ones.
     ///
-    /// This is useful to "fix" a camera's parameters, such as adding missing
+    /// This is useful to "fix" the sender's parameters, such as adding missing
     /// pixel aspect ratio information to the SPS VUI, or bitstream
     /// restrictions which reduce decode latency. See
     /// [`VideoParameters::from_h264_parameter_sets`].

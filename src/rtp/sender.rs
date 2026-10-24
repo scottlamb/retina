@@ -10,9 +10,8 @@ use super::PacketHeader;
 /// Assigns sequence numbers to payloads (such as [`crate::codec::Payload`]s)
 /// and maps their timestamps, yielding [`OutgoingPacketRef`]s. Like the receive
 /// side, it owns no packet storage: the caller copies each packet wherever
-/// it's going, e.g. into a connection's send buffer. The counterpart on the
-/// receive side is the validation a [`crate::client`] session does before
-/// handing packets to a depacketizer.
+/// it's going, e.g. into a connection's send buffer. The counterparts on the
+/// receive side are [`super::Reorderer`] and [`super::Receiver`].
 ///
 /// When sending one source to several destinations (e.g. a server answering
 /// `PLAY` from several clients, as in the `proxy` example), give each

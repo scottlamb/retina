@@ -53,8 +53,8 @@ impl ReorderOptions {
         }
     }
 
-    /// Sets the first sequence number to return, e.g. from the `PLAY`
-    /// response's `RTP-Info` header.
+    /// Sets the first sequence number to return, e.g. (for a client receiving
+    /// via `PLAY`) from the `PLAY` response's `RTP-Info` header.
     ///
     /// By default, the reorderer waits up to [`ReorderOptions::max_delay`]
     /// before returning the first packet, in case packets with earlier

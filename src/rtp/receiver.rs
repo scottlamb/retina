@@ -48,8 +48,9 @@ impl Default for ReceiverOptions {
 }
 
 impl ReceiverOptions {
-    /// Sets the expected SSRC, e.g. from the `SETUP` response's `Transport`
-    /// header. By default, the receiver learns the SSRC from the first packet.
+    /// Sets the expected SSRC, e.g. (for a client receiving via `PLAY`) from
+    /// the `SETUP` response's `Transport` header. By default, the receiver
+    /// learns the SSRC from the first packet.
     #[inline]
     pub fn ssrc(self, ssrc: u32) -> Self {
         Self {
@@ -58,9 +59,9 @@ impl ReceiverOptions {
         }
     }
 
-    /// Sets the expected first sequence number, e.g. from the `PLAY`
-    /// response's `RTP-Info` header. By default, the receiver learns it from
-    /// the first packet.
+    /// Sets the expected first sequence number, e.g. (for a client receiving
+    /// via `PLAY`) from the `PLAY` response's `RTP-Info` header. By default,
+    /// the receiver learns it from the first packet.
     #[inline]
     pub fn initial_sequence_number(self, seq: u16) -> Self {
         Self {
@@ -69,9 +70,10 @@ impl ReceiverOptions {
         }
     }
 
-    /// Sets the RTP timestamp which is time 0 in normal play time, e.g. from
-    /// the `PLAY` response's `RTP-Info` header. By default, this is the first
-    /// packet's (or sender report's) timestamp.
+    /// Sets the RTP timestamp which is time 0 in normal play time, e.g. (for a
+    /// client receiving via `PLAY`) from the `PLAY` response's `RTP-Info`
+    /// header. By default, this is the first packet's (or sender report's)
+    /// timestamp.
     #[inline]
     pub fn initial_rtptime(self, rtptime: u32) -> Self {
         Self {

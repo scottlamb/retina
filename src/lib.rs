@@ -3,8 +3,10 @@
 
 //! High-level RTSP library.
 //!
-//! Currently this is useful for clients; it will be extended to support
-//! servers and proxies.
+//! The [`client`] module is the most mature. The [`codec`], [`rtp`], and
+//! [`rtcp`] modules are usable on their own, by clients, servers, and proxies
+//! alike. An RTSP server (`server`) and the send side of [`codec`] and [`rtp`]
+//! are available under unstable features.
 
 #![forbid(clippy::print_stderr, clippy::print_stdout)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -92,16 +94,19 @@ struct ReceivedMessage {
 ///
 /// This couples together three pieces of information:
 ///
-/// *   The stream's starting time. In client use, this is often as received in the RTSP
-///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`].
+/// *   The stream's starting time, as a 32-bit RTP timestamp. When receiving, this is often
+///     as stated in the RTSP `RTP-Info` header (see [`crate::rtp::ReceiverOptions::initial_rtptime`]
+///     and [`crate::client::InitialTimestampPolicy`]); otherwise it's the first packet's (or
+///     sender report's) timestamp. When sending, the caller chooses it.
 ///     According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial
 ///     value of the timestamp SHOULD be random".
 ///
 /// *   The codec-specific clock rate.
 ///
-/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
-///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
-///     than `i32::MAX` from previous timestamps are treated as backwards jumps. It's allowed for
+/// *   The timestamp as an `i64`. When receiving, its top bits are inferred from wraparounds
+///     of 32-bit RTP timestamps: [`crate::rtp::Receiver`] treats timestamps that differ by more
+///     than `i32::MAX` from previous timestamps as backwards jumps. When sending, the caller
+///     chooses it, and [`crate::rtp::Sender`] maps it to a 32-bit RTP timestamp. It's allowed for
 ///     a timestamp to indicate a time *before* the stream's starting point.
 ///
 /// In combination, these allow conversion to "normal play time" (NPT): seconds since start of
@@ -109,13 +114,14 @@ struct ReceivedMessage {
 ///
 /// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
-/// many RTP servers violate this. The Retina client allows such violations unless
-/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
+/// many RTP senders violate this. [`crate::rtp::Receiver`] allows such violations unless
+/// [`crate::rtp::ReceiverOptions::max_forward_jump_secs`] (or, in the client,
+/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`]) says otherwise.
 ///
-/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
-/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return
-/// error in these cases. This should rarely cause problems. It'd take ~2^32 packets (~4 billion)
-/// to advance the time this far forward or backward even with a hostile server.
+/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` or
+/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. [`crate::rtp::Receiver`]
+/// will return error in these cases. This should rarely cause problems. It'd take ~2^32 packets
+/// (~4 billion) to advance the time this far forward or backward even with a hostile sender.
 ///
 /// The [`Display`] and [`Debug`] implementations currently display:
 /// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a
@@ -130,7 +136,7 @@ pub struct Timestamp {
     /// The codec-specified clock rate, in Hz. Must be non-zero.
     clock_rate: NonZeroU32,
 
-    /// The stream's starting time, as specified in the RTSP `RTP-Info` header.
+    /// The stream's starting time; see the type-level docs.
     start: u32,
 }
 
@@ -350,8 +356,6 @@ impl ConnectionContext {
 
 impl Display for ConnectionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO: this current hardcodes the assumption we are the client.
-        // Change if/when adding server code.
         write!(
             f,
             "{}(me)->{}@{}",
@@ -461,7 +465,6 @@ pub struct TcpStreamContext {
 
 impl Display for UdpStreamContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO: this assumes we are the client. Revisit when adding server support.
         write!(
             f,
             "{}:{}-{}(me) -> {}:{}-{}",

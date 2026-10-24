@@ -263,9 +263,11 @@ pub enum ParameterSetInsertion {
 
 /// Reference to parameters which describe a stream.
 ///
-/// Parameters are often, but not always, available immediately
-/// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
-/// always be available after the first frame.
+/// On the receive side, parameters are often, but not always, available from
+/// the SDP media description before any packets arrive (e.g. after `DESCRIBE`
+/// via [`crate::client::Stream::parameters`]). They should always be available
+/// from the depacketizer after the first frame. On the send side, the caller
+/// supplies them; see [`VideoPacketizer::set_parameters`].
 ///
 /// Video streams' parameters may change mid-stream; if so, the frame which
 /// changed them will have [`VideoFrameEnd::has_new_parameters`] set, and
@@ -310,9 +312,11 @@ impl From<ParametersRef<'_>> for Parameters {
 
 /// Parameters which describe a video stream.
 ///
-/// A video stream's parameters are often, but not always, available immediately
-/// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
-/// always be available after the first frame.
+/// On the receive side, a video stream's parameters are often, but not always,
+/// available from the SDP media description before any packets arrive (e.g.
+/// after `DESCRIBE` via [`crate::client::Stream::parameters`]). They should
+/// always be available from the depacketizer after the first frame. On the send
+/// side, the caller supplies them; see [`VideoPacketizer::set_parameters`].
 ///
 /// Video streams' parameters may change mid-stream; if so, the frame which
 /// changed them will have [`VideoFrameEnd::has_new_parameters`] set, and
@@ -350,7 +354,7 @@ pub struct AllPixelDimensions {
 impl VideoParameters {
     /// Returns parameters for the given H.264 parameter sets.
     ///
-    /// It's sometimes useful to "fix" a server's parameters, e.g.:
+    /// It's sometimes useful to "fix" a video source's parameters, e.g.:
     ///
     /// * adding missing pixel aspect ratio information to the SPS VUI so that
     ///   anamorphic video is displayed at the correct aspect ratio.
@@ -507,8 +511,6 @@ impl VideoParameters {
     /// packetize this codec.
     ///
     /// Currently H.264 and H.265 are supported.
-    ///
-    /// This requires the `unstable-send` feature.
     #[cfg(feature = "unstable-send")]
     pub fn payload_format(&self) -> Option<PayloadFormat> {
         packetize::payload_format(self)
@@ -1200,9 +1202,10 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
 /// An RTP payload format, as described by an SDP media description: its media
 /// type, and its `rtpmap` and `fmtp` attributes.
 ///
-/// A [`Depacketizer`] is created from one (see
-/// [`crate::client::Stream::payload_format`]), and a [`VideoPacketizer`]
-/// describes its output with one (see [`VideoPacketizer::payload_format`]).
+/// A [`Depacketizer`] is created from one (e.g. from a remote SDP via
+/// [`crate::client::Stream::payload_format`], or via [`PayloadFormat::new`]),
+/// and a [`VideoPacketizer`] describes its output with one (see
+/// [`VideoPacketizer::payload_format`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadFormat {
     media: Cow<'static, str>,

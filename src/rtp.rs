@@ -42,7 +42,9 @@ impl std::error::Error for ParseError {}
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor
 /// methods for the individual fields. It can be obtained via
-/// [`PacketHeader::validate`] or [`crate::client::RtpPacket::header`].
+/// [`PacketHeader::validate`], or from a packet handled elsewhere in Retina,
+/// e.g. [`Reordered::header`], [`OutgoingPacketRef::header`], or
+/// [`crate::client::RtpPacket::header`].
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PacketHeader(
     /// ```text
