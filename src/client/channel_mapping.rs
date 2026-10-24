@@ -35,7 +35,7 @@ pub struct ChannelMapping {
 ///
 /// These assumptions let us keep the full mapping with little space and an
 /// efficient lookup operation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ChannelMappings(smallvec::SmallVec<[Option<NonZeroU8>; 16]>);
 
 impl ChannelMappings {

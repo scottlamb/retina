@@ -40,9 +40,9 @@ exchange.
   * If your test should complete immediately, it's okay to use real rather
     than mocked time.
   * Consider refactoring the UDP codepath to use mocks like TCP.
-  * As a last resort, test code can temporarily remove timers (put a `None`
-    in `Option<Pin<Box<Sleep>>>`) or replace them with ones that have never
-    been polled.
+  * As a last resort, test code can move the deadlines in a session's
+    sans-I/O core (e.g. `PlayingCore::set_keepalive_deadline`). The session's
+    timer follows the core's `poll_timeout` on its next poll.
 * **Don't expect same-deadline timers to be ordered.** tokio does not
   guarantee this. If you write a test that sleeps until the instant a
   keepalive timer is due and expects it to have fired, your test will be
@@ -53,3 +53,7 @@ exchange.
   use `assert_eq!` rather than expecting a range.
 * **Handle timers as in production.** Prefer showing the code works with
   e.g. keepalives rather than disabling them.
+* **Prefer testing sans-I/O cores directly.** A core such as
+  `client::playing::PlayingCore` takes the current time as an argument and
+  has no timers of its own, so its tests pass explicit `Instant`s and don't
+  need paused time at all.
