@@ -375,7 +375,9 @@ impl VideoParameters {
     pub fn from_h264_parameter_sets<'a>(
         sets: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, Error> {
-        h264::parameters_from_unordered_sets(sets).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+        h26x::Codec::H264
+            .parameters_from_unordered_sets(sets)
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
     }
 
     /// Returns parameters for the given H.265 parameter sets.
@@ -386,7 +388,9 @@ impl VideoParameters {
     pub fn from_h265_parameter_sets<'a>(
         sets: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, Error> {
-        h265::parameters_from_unordered_sets(sets).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+        h26x::Codec::H265
+            .parameters_from_unordered_sets(sets)
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
     }
 
     /// Returns a codec description in

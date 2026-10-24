@@ -23,29 +23,10 @@ use crate::codec::{LossReason, VideoHandler, VideoParameters};
 use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
 
-/// Returns parameters for the given VPS, SPS, and PPS, in any order.
-///
-/// Currently requires exactly one of each.
-pub(super) fn parameters_from_unordered_sets<'s>(
-    sets: impl IntoIterator<Item = &'s [u8]>,
-) -> Result<VideoParameters, String> {
-    let mut ordered: [Option<&[u8]>; 3] = [None; 3];
-    for set in sets {
-        let hex = crate::hex::LimitedHex::new(set, 64);
-        let i = match set.first().map(|h| (h >> 1) & 0b11_1111) {
-            Some(32) => 0,
-            Some(33) => 1,
-            Some(34) => 2,
-            _ => return Err(format!("not a parameter set: {hex}")),
-        };
-        if ordered[i].replace(set).is_some() {
-            return Err(format!(
-                "multiple parameter sets of the same type are currently unsupported: {hex}"
-            ));
-        }
-    }
-    let [Some(vps), Some(sps), Some(pps)] = ordered else {
-        return Err("expected a VPS, an SPS, and a PPS".to_owned());
+/// Returns parameters for the given VPS, SPS, and PPS, in that order.
+pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+    let &[vps, sps, pps] = sets else {
+        unreachable!("expected VPS, SPS, and PPS");
     };
     InternalParameters::parse_vps_sps_pps(vps, sps, pps, true).map(|p| p.generic_parameters)
 }
@@ -853,10 +834,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
     }
 
     fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String> {
-        let &[vps, sps, pps] = sets else {
-            unreachable!("expected VPS, SPS, and PPS");
-        };
-        InternalParameters::parse_vps_sps_pps(vps, sps, pps, true).map(|p| p.generic_parameters)
+        parameters_from_sets(sets)
     }
 
     fn payload_format(_parameters: &VideoParameters, sets: &[Bytes]) -> super::PayloadFormat {

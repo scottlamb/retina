@@ -23,28 +23,10 @@ use super::VideoParameters;
 mod analyzer;
 pub(crate) use analyzer::Analyzer;
 
-/// Returns parameters for the given SPS and PPS, in any order.
-///
-/// Currently requires exactly one of each.
-pub(super) fn parameters_from_unordered_sets<'s>(
-    sets: impl IntoIterator<Item = &'s [u8]>,
-) -> Result<VideoParameters, String> {
-    let mut ordered: [Option<&[u8]>; 2] = [None; 2];
-    for set in sets {
-        let hex = crate::hex::LimitedHex::new(set, 64);
-        let i = match set.first().map(|h| h & 0b1_1111) {
-            Some(7) => 0,
-            Some(8) => 1,
-            _ => return Err(format!("not a parameter set: {hex}")),
-        };
-        if ordered[i].replace(set).is_some() {
-            return Err(format!(
-                "multiple parameter sets of the same type are currently unsupported: {hex}"
-            ));
-        }
-    }
-    let [Some(sps), Some(pps)] = ordered else {
-        return Err("expected an SPS and a PPS".to_owned());
+/// Returns parameters for the given SPS and PPS, in that order.
+pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, String> {
+    let &[sps, pps] = sets else {
+        unreachable!("expected SPS and PPS");
     };
     InternalParameters::parse_sps_and_pps(sps, pps, true).map(|p| p.generic_parameters)
 }
@@ -1092,10 +1074,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
     }
 
     fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String> {
-        let &[sps, pps] = sets else {
-            unreachable!("expected SPS and PPS");
-        };
-        InternalParameters::parse_sps_and_pps(sps, pps, true).map(|p| p.generic_parameters)
+        parameters_from_sets(sets)
     }
 
     fn payload_format(parameters: &VideoParameters, sets: &[Bytes]) -> super::PayloadFormat {

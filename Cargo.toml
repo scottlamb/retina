@@ -79,3 +79,7 @@ required-features = ["h264", "unstable-send"]
 [[test]]
 name = "repacketize_h265"
 required-features = ["h265", "unstable-send"]
+
+[[test]]
+name = "open_gop"
+required-features = ["h264", "unstable-send"]
