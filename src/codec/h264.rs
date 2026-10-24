@@ -737,7 +737,8 @@ impl Depacketizer {
 
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
-        let mut is_random_access_point = true;
+        let mut has_non_idr_slice = false;
+        let mut has_recovery_point = false;
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
@@ -767,10 +768,13 @@ impl Depacketizer {
                 {
                     new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces, buf));
                 }
+                UnitType::SEI if !has_recovery_point => {
+                    has_recovery_point = has_recovery_point_sei(nal_pieces, buf);
+                }
                 UnitType::SliceDataPartitionALayer
                 | UnitType::SliceDataPartitionBLayer
                 | UnitType::SliceDataPartitionCLayer
-                | UnitType::SliceLayerWithoutPartitioningNonIdr => is_random_access_point = false,
+                | UnitType::SliceLayerWithoutPartitioningNonIdr => has_non_idr_slice = true,
                 _ => {}
             }
             if nal.hdr.nal_ref_idc() != 0 {
@@ -786,6 +790,9 @@ impl Depacketizer {
             }
             piece_idx = next_piece_idx;
         }
+
+        // An IDR picture or an open GOP's I picture (see `has_recovery_point_sei`).
+        let is_random_access_point = !has_non_idr_slice || has_recovery_point;
 
         // Update parameters before building the frame, so prepended params
         // reflect the latest SPS/PPS.
@@ -890,6 +897,38 @@ impl Depacketizer {
             is_disposable,
             data,
         })
+    }
+}
+
+/// Returns true if the given SEI NAL unit (as pieces excluding the header)
+/// contains a recovery point SEI message with `recovery_frame_cnt == 0`.
+///
+/// H.264 section D.2.8: this means the picture is a random access point whose
+/// output (and that of all following pictures in output order) is correct
+/// when decoding starts here. Encoders such as `libx264` with `open-gop=1`
+/// use this on the non-IDR I pictures that start each GOP. Leading pictures
+/// may still reference pictures before it. Non-zero values indicate gradual
+/// decoding refresh, which is not treated as a random access point.
+fn has_recovery_point_sei(pieces: &[BufRange], buf: &MarkBuf) -> bool {
+    use h264_reader::nal::sei::{HeaderType, SeiReader, recovery_point::RecoveryPoint};
+    use h264_reader::rbsp::ByteReader;
+    let rbsp = ByteReader::without_skip(super::h26x::PiecesReader::new(buf, pieces));
+    let mut scratch = Vec::new();
+    let mut r = SeiReader::from_rbsp_bytes(rbsp, &mut scratch);
+    loop {
+        match r.next() {
+            Ok(Some(msg)) if msg.payload_type == HeaderType::RecoveryPoint => {
+                return matches!(
+                    RecoveryPoint::read(&msg),
+                    Ok(RecoveryPoint {
+                        recovery_frame_cnt: 0,
+                        ..
+                    })
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return false,
+        }
     }
 }
 
@@ -3369,5 +3408,156 @@ mod tests {
         );
         assert!(frame.is_random_access_point());
         assert_eq!(d.pull(), None);
+    }
+
+    /// Tests that a non-IDR picture with a recovery point SEI message with
+    /// `recovery_frame_cnt == 0` (as in `libx264`'s `open-gop=1` output) is a
+    /// random access point, and so gets the parameter sets prepended in
+    /// `SIMPLE` mode. This matches H.265 CRA pictures.
+    #[test]
+    fn recovery_point_random_access() {
+        init_logging();
+        let sps_nal = b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+                        \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84";
+        let pps_nal = b"\x68\xee\x3c\x80";
+
+        // recovery_point: recovery_frame_cnt=0, exact_match_flag=1,
+        // broken_link_flag=0, changing_slice_group_idc=0.
+        let rp0_sei = &b"\x06\x06\x01\xc4\x80"[..];
+        // As above but recovery_frame_cnt=2 (gradual decoding refresh).
+        let rp2_sei = &b"\x06\x06\x01\x71\x80"[..];
+        // Reserved payload type 229, as in `depacketize_sei_with_mark`.
+        let other_sei = &b"\x06\xe5\x01\xa7\x80"[..];
+        let idr = &b"\x65idr"[..];
+        let non_idr = &b"\x41non_idr"[..];
+
+        for (nals, want_rap) in [
+            (&[idr][..], true),
+            (&[non_idr][..], false),
+            (&[rp0_sei, non_idr][..], true),
+            (&[other_sei, rp0_sei, non_idr][..], true),
+            (&[rp2_sei, non_idr][..], false),
+            (&[other_sei, non_idr][..], false),
+        ] {
+            let mut buf = MarkBuf::new(65536);
+            let mut d = super::Depacketizer::new(
+                90_000,
+                Some(
+                    "packetization-mode=1;profile-level-id=4d002a;\
+                      sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+                ),
+            )
+            .unwrap();
+            d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+            for (i, nal) in nals.iter().enumerate() {
+                let pkt = ReceivedPacketBuilder {
+                    ctx: crate::PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp: crate::Timestamp {
+                        timestamp: 0,
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: i as u16,
+                    loss: 0,
+                    mark: i == nals.len() - 1,
+                    payload_type: 96,
+                }
+                .build(nal.iter().copied())
+                .unwrap();
+                push_via_buf(
+                    &mut d,
+                    crate::rtp::PacketMeta::from_received(&pkt),
+                    pkt.payload(),
+                    &mut buf,
+                )
+                .unwrap();
+            }
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            assert_eq!(frame.is_random_access_point(), want_rap, "{nals:02x?}");
+            let mut expected = Vec::new();
+            let param_nals: &[&[u8]] = if want_rap { &[sps_nal, pps_nal] } else { &[] };
+            for nal in param_nals.iter().chain(nals) {
+                expected.extend_from_slice(&super::super::h26x::ANNEX_B_START_CODE);
+                expected.extend_from_slice(nal);
+            }
+            assert_eq_hex!(frame.data(), &expected);
+        }
+    }
+
+    /// Tests finding a recovery point SEI message in a NAL fragmented via
+    /// FU-A, with an `emulation_prevention_three_byte` straddling the fragment
+    /// boundary.
+    #[test]
+    fn recovery_point_fu_a() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(
+            90_000,
+            Some(
+                "packetization-mode=1;profile-level-id=4d002a;\
+                  sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+            ),
+        )
+        .unwrap();
+
+        // SEI NAL: reserved payload type 229 with RBSP payload `00 00 01`
+        // (escaped as `00 00 03 01`), then the recovery point message as in
+        // `recovery_point_random_access`, then trailing bits. If the escape is
+        // mishandled, the recovery point message isn't found.
+        let sei_nal = b"\x06\xe5\x03\x00\x00\x03\x01\x06\x01\xc4\x80";
+        let non_idr = b"\x41non_idr";
+        for (i, payload) in [
+            &b"\x1c\x86\xe5\x03\x00\x00"[..], // FU-A start: indicator, header, data.
+            &b"\x1c\x46\x03\x01\x06\x01\xc4\x80"[..], // FU-A end.
+            &non_idr[..],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pkt = ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp: crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number: i as u16,
+                loss: 0,
+                mark: i == 2,
+                payload_type: 96,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+            .unwrap();
+        }
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("{o:#?}"),
+        };
+        // The default `ParameterSetInsertion::OnChange` prepends the initial
+        // parameters to the first random access point.
+        let sps_nal = b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+                        \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84";
+        let pps_nal = b"\x68\xee\x3c\x80";
+        let mut expected = Vec::new();
+        for nal in [&sps_nal[..], &pps_nal[..], &sei_nal[..], &non_idr[..]] {
+            expected.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+            expected.extend_from_slice(nal);
+        }
+        assert_eq_hex!(frame.data(), &expected);
+        assert!(frame.is_random_access_point());
     }
 }
