@@ -37,6 +37,10 @@ unstable-sans-io = []
 # without regard to semver.
 unstable-send = []
 
+# Exposes the RTSP server (`server`), which implies `unstable-send`. It's
+# experimental: it may change in any release, without regard to semver.
+unstable-server = ["unstable-send"]
+
 # Exposes the receive side beneath the client: `rtp::Receiver`, which sorts an
 # RTP session's packets by source, chooses a source to play, and reorders its
 # packets, for callers feeding depacketizers from their own receive path. It's

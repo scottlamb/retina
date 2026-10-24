@@ -14,7 +14,7 @@
     not(all(
         feature = "tokio",
         feature = "unstable-sans-io",
-        feature = "unstable-send"
+        feature = "unstable-server"
     )),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
@@ -49,9 +49,10 @@ macro_rules! bail {
 
 /// Wraps the supplied `ErrorInt` in an `Error`.
 ///
-/// `Error` resolves at the call site: `client::Error` or the private
-/// `crate::error::Error` used by code it shares. Both are tuple structs around
-/// an `Arc<ErrorInt>`, and the latter converts to the former via `From`.
+/// `Error` resolves at the call site: `client::Error`, `server::Error`, or
+/// the private `crate::error::Error` used by code they share. All three are
+/// tuple structs around an `Arc<ErrorInt>`, and the latter converts to the
+/// others via `From`.
 macro_rules! wrap {
     ($e:expr) => {
         Error(std::sync::Arc::new($e))
@@ -65,6 +66,8 @@ pub mod rtp;
 //mod error;
 #[doc(hidden)]
 pub mod rtsp;
+#[cfg(feature = "unstable-server")]
+pub mod server;
 #[cfg(feature = "tokio")]
 mod tokio;
 #[cfg(any(feature = "tokio", feature = "unstable-sans-io"))]
