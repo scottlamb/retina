@@ -500,7 +500,7 @@ impl MarkBuf {
     }
 
     /// Returns the current capacity, which is always a power of two.
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "h264", feature = "h265", feature = "tokio")))]
     pub(crate) fn capacity(&self) -> usize {
         self.ring.capacity()
     }

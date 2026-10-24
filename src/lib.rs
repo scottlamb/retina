@@ -11,7 +11,11 @@
 // Docs link to items behind the unstable features, which are missing or
 // private without them. CI checks links with all features enabled.
 #![cfg_attr(
-    not(all(feature = "unstable-sans-io", feature = "unstable-send")),
+    not(all(
+        feature = "tokio",
+        feature = "unstable-sans-io",
+        feature = "unstable-send"
+    )),
     allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
 )]
 // I prefer to use from_str_radix(..., 10) to explicitly note the base.
@@ -56,13 +60,14 @@ pub mod codec;
 //mod error;
 #[doc(hidden)]
 pub mod rtsp;
+#[cfg(feature = "tokio")]
 mod tokio;
+#[cfg(any(feature = "tokio", feature = "unstable-sans-io"))]
 mod udp_pair;
 
 #[cfg(feature = "unstable-sans-io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-sans-io")))]
 pub use udp_pair::UdpPair;
-#[cfg(not(feature = "unstable-sans-io"))]
-pub(crate) use udp_pair::UdpPair;
 
 use error::ErrorInt;
 
