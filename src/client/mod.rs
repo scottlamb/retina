@@ -616,6 +616,7 @@ pub struct SessionOptions {
     unassigned_channel_data: UnassignedChannelDataPolicy,
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
+    max_retained_bytes: Option<usize>,
     receiver_reports: ReceiverReportPolicy,
     #[cfg(feature = "tokio")]
     bind_addr: Option<std::net::IpAddr>,
@@ -896,6 +897,28 @@ impl SessionOptions {
     pub fn max_message_size(mut self, max_message_size: usize) -> Self {
         self.max_message_size = Some(max_message_size);
         self
+    }
+
+    /// Limits the bytes each of the session's receive buffers retains for
+    /// depacketizers' in-progress frames; see
+    /// [`crate::buf::MarkBuf::set_max_retained`].
+    ///
+    /// A depacketizer whose data is discarded reports
+    /// [`crate::codec::LossReason::Evicted`] and resynchronizes at the next
+    /// frame boundary. This bounds memory even when a single frame is
+    /// enormous, or when a stream receives no packets for a long time while
+    /// sharing a buffer with others, as RTSP interleaved (TCP) streams may.
+    /// [`crate::codec::VideoDepacketizer::set_max_frame_bytes`] limits each
+    /// frame more precisely; set this limit well above it.
+    ///
+    /// There's no limit by default.
+    pub fn max_retained_bytes(mut self, max_retained_bytes: usize) -> Self {
+        self.max_retained_bytes = Some(max_retained_bytes);
+        self
+    }
+
+    pub(crate) fn get_max_retained_bytes(&self) -> usize {
+        self.max_retained_bytes.unwrap_or(usize::MAX)
     }
 
     /// Sets the policy for sending RTCP receiver reports.

@@ -597,6 +597,29 @@ pub enum LossReason {
     /// It discards any in-progress frame and resynchronizes at the next frame
     /// boundary.
     Corrupt(Corruption),
+
+    /// The in-progress frame exceeded the depacketizer's limit; see
+    /// [`super::VideoDepacketizer::set_max_frame_bytes`].
+    ///
+    /// The depacketizer discards it and resynchronizes at the next frame
+    /// boundary.
+    #[non_exhaustive]
+    TooLarge {
+        /// The limit which was exceeded.
+        limit: usize,
+    },
+
+    /// The buffer discarded data the depacketizer was retaining for its
+    /// in-progress frame, because the buffer exceeded its limit; see
+    /// [`crate::buf::MarkBuf::set_max_retained`].
+    ///
+    /// On a shared buffer, such as a session's RTSP interleaved (TCP)
+    /// streams, this can happen to a frame which is small itself but whose
+    /// stream has received no packets while others have filled the buffer.
+    ///
+    /// The depacketizer discards the frame and resynchronizes at the next
+    /// frame boundary.
+    Evicted,
 }
 
 /// Details of corrupt data, as reported by [`LossReason::Corrupt`].

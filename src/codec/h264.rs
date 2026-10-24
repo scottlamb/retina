@@ -88,6 +88,9 @@ pub(crate) struct Depacketizer<Ctx> {
     /// FU-A, forbidden by RFC 6184 section 5.8).
     seen_single_fragment_fu_a: bool,
 
+    /// See [`super::VideoDepacketizer::set_max_frame_bytes`].
+    max_frame_bytes: usize,
+
     /// The format used by the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
     test_format: super::FrameFormat,
@@ -101,6 +104,10 @@ type Nal = super::h26x::Nal<NalHeader>;
 struct AccessUnit {
     /// FU-A fragmentation unit state, if any.
     fu_a: Option<FuA>,
+
+    /// Payload bytes retained since the access unit started or the analyzer
+    /// last released its data, for [`Depacketizer::max_frame_bytes`].
+    retained: usize,
 }
 
 #[derive(Debug)]
@@ -116,7 +123,7 @@ enum DepacketizerInputState {
     New,
 
     /// Ignoring the remainder of an access unit with the given timestamp,
-    /// because of interior packet loss.
+    /// because of interior packet loss or another problem already reported.
     Loss { timestamp: crate::Timestamp },
 
     /// Currently processing an access unit.
@@ -204,9 +211,14 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             analyzer: Analyzer::with_internal_parameters(parameters),
             seen_inconsistent_fu_a_nal_hdr: false,
             seen_single_fragment_fu_a: false,
+            max_frame_bytes: usize::MAX,
             #[cfg(test)]
             test_format: Default::default(),
         })
+    }
+
+    pub(super) fn set_max_frame_bytes(&mut self, max_frame_bytes: usize) {
+        self.max_frame_bytes = max_frame_bytes;
     }
 
     /// Sets the format used by the test-only `push_collect`/`pull` interface.
@@ -228,7 +240,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Starts an access unit with the given packet.
     fn start_au(&mut self, meta: &crate::rtp::ReceivedPacketMeta<Ctx>) -> AccessUnit {
         self.analyzer.start_au(meta.timestamp, meta.ctx.clone());
-        AccessUnit { fu_a: None }
+        AccessUnit {
+            fu_a: None,
+            retained: 0,
+        }
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
@@ -265,11 +280,19 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let buf = pkt.buf();
 
         // Reporting loss discards any access unit in progress, so first note
-        // its timestamp.
+        // its timestamp and whether it was evicted.
         let au_timestamp = self.analyzer.au_timestamp();
+        let evicted = self.analyzer.is_evicted()
+            || matches!(&self.input_state, DepacketizerInputState::PreMark(AccessUnit {
+                fu_a: Some(fu_a),
+                ..
+            }) if fu_a.scanner.is_evicted());
         let loss = meta.continuity.loss_count();
         if let Some(reason) = super::packet_loss_reason(meta.continuity) {
             self.analyzer.loss(&meta.ctx, reason, handler);
+        }
+        if evicted {
+            self.analyzer.loss(&meta.ctx, LossReason::Evicted, handler);
         }
 
         let mut access_unit =
@@ -277,7 +300,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 DepacketizerInputState::New => self.start_au(meta),
                 DepacketizerInputState::PreMark(access_unit) => {
                     let au_timestamp = au_timestamp.expect("au in progress");
-                    if loss > 0 {
+                    if loss > 0 || evicted {
                         if au_timestamp.timestamp == meta.timestamp.timestamp {
                             // Loss within this access unit. Ignore until mark or new timestamp.
                             if !meta.mark {
@@ -340,6 +363,21 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
         if payload_len == 0 {
             return Err("Empty NAL".into());
+        }
+
+        access_unit.retained += usize::from(payload_len);
+        if access_unit.retained > self.max_frame_bytes {
+            self.analyzer.loss(
+                &meta.ctx,
+                LossReason::TooLarge {
+                    limit: self.max_frame_bytes,
+                },
+                handler,
+            );
+            if !mark {
+                self.input_state = DepacketizerInputState::Loss { timestamp };
+            }
+            return Ok(());
         }
 
         // Pin the payload data in the ring buffer, allowing for reordering.
@@ -499,6 +537,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
         // Start the frame if possible and deliver its data so far.
         self.analyzer.stream_with(buf, handler);
+        if !self.analyzer.has_mark() {
+            access_unit.retained = 0;
+        }
         self.input_state = if mark {
             match self.analyzer.last_nal_hdr() {
                 Some(hdr) if can_end_au(hdr.nal_unit_type()) => {

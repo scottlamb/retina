@@ -672,6 +672,17 @@ impl<A: U8Array> AnnexBScanner<A> {
             _ => None,
         }
     }
+
+    /// Returns true if the buffer has discarded deferred data.
+    pub(super) fn is_evicted(&self) -> bool {
+        matches!(
+            self,
+            AnnexBScanner::Mid(Mid {
+                deferred: Some(d),
+                ..
+            }) if d.mark.is_revoked()
+        )
+    }
 }
 
 impl<A: U8Array> Default for AnnexBScanner<A> {
@@ -1021,6 +1032,7 @@ mod tests {
         a.stream_with(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab");
         assert!(!a.has_mark(), "the analyzer released what it delivered");
+        assert!(!scanner.is_evicted());
 
         // Reclaim space, as further input would.
         append(&mut buf, &[0xff; 64]);
@@ -1028,6 +1040,20 @@ mod tests {
         scanner.scan(&buf, pos, 3, true, pos, &mut a).unwrap();
         a.stream_with(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab\x00\x00\x03cd");
+
+        // The scanner's mark can be revoked like any other.
+        let mut scanner = AnnexBScanner::Pre {
+            cur: [0x41],
+            bytes_read: 1,
+        };
+        a.finish_au_with(&buf, &(), &mut h);
+        a.start_au(ts, ());
+        let pos = append(&mut buf, b"\x9a\x00");
+        scanner.scan(&buf, pos, 2, false, pos, &mut a).unwrap();
+        buf.set_max_retained(8);
+        append(&mut buf, &[0xff; 64]);
+        append(&mut buf, &[0xff; 64]); // reclaims before appending.
+        assert!(scanner.is_evicted());
     }
 
     /// Deferred zeros from fragments supplied out of buffer order (as via

@@ -26,8 +26,6 @@ use crate::{Timestamp, codec::AllPixelDimensions};
 use super::{Accumulate, FrameBody, Position, VideoData, VideoFrameEnd, VideoFrameStart};
 use super::{VideoHandler, VideoParameters};
 
-const MAX_FRAME_LEN: usize = 2_000_000;
-
 #[rustfmt::skip]
 const ZIGZAG : [usize; 64] = [
     0, 1, 8, 16, 9, 2, 3, 10,
@@ -307,6 +305,9 @@ pub struct Depacketizer<Ctx> {
     pending: super::testutil::Pending,
 
     parameters: Option<VideoParameters>,
+
+    /// See [`super::VideoDepacketizer::set_max_frame_bytes`].
+    max_frame_bytes: usize,
 }
 
 impl<Ctx: Clone> Depacketizer<Ctx> {
@@ -318,7 +319,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             pending: Default::default(),
             qtables: vec![None; 255],
             parameters: None,
+            max_frame_bytes: usize::MAX,
         }
+    }
+
+    pub(super) fn set_max_frame_bytes(&mut self, max_frame_bytes: usize) {
+        self.max_frame_bytes = max_frame_bytes;
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
@@ -585,9 +591,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             }
         }
 
-        if self.data.len() > MAX_FRAME_LEN {
+        if self.data.len() > self.max_frame_bytes {
             self.metadata = None;
             self.data.clear();
+            handler.loss(&super::Loss {
+                ctx,
+                reason: super::LossReason::TooLarge {
+                    limit: self.max_frame_bytes,
+                },
+            });
         }
 
         Ok(())

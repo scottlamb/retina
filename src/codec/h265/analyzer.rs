@@ -360,8 +360,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// it after each NAL unit or fragment delivers events with lower latency,
     /// and with [`Accumulate::No`] releases the buffer data supplied so far.
     pub(crate) fn stream_with<H: VideoHandler<Ctx>>(&mut self, buf: &MarkBuf, handler: &mut H) {
-        if self.au.is_none() {
+        let Some(au) = self.au.as_ref() else {
             return;
+        };
+        if self.is_evicted() {
+            let ctx = au.start_ctx.clone();
+            return self.loss(&ctx, LossReason::Evicted, handler);
         }
         let mut decodability = self.decodability;
         self.stream_inner(
@@ -394,7 +398,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     ) {
         let mut au = self.au.take().expect("finish_au without start_au");
         self.prev_timestamp = Some(au.timestamp);
-        let r = if au.in_progress.is_some() {
+        let r = if self.is_evicted() {
+            Err(LossReason::Evicted)
+        } else if au.in_progress.is_some() {
             Err(LossReason::Corrupt(Corruption::new(
                 "access unit ended in the middle of a NAL unit",
             )))
@@ -482,8 +488,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         self.au.as_ref().map(|au| au.timestamp)
     }
 
+    /// Returns true if the buffer has discarded data pinned for this access unit.
+    pub(crate) fn is_evicted(&self) -> bool {
+        self.mark.as_ref().is_some_and(Mark::is_revoked)
+    }
+
     /// Returns true if buffer data is pinned.
-    #[cfg(test)]
     pub(crate) fn has_mark(&self) -> bool {
         self.mark.is_some()
     }

@@ -36,7 +36,7 @@ fn run(options: ReorderOptions, packets: &[(Vec<u8>, PacketHeader)]) {
         buf.extend(raw);
         buf.advance_unparsed(buf.end());
         std::hint::black_box(r.push(&buf, *header, pos, now, ()));
-        while let Some(p) = r.pop(now) {
+        while let Some(p) = r.pop(&buf, now) {
             std::hint::black_box(p.pin_pos);
         }
     }

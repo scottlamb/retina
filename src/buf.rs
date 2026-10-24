@@ -59,6 +59,7 @@
 
 pub use crate::inputs::Split;
 use crate::to_u64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A reference to a byte range within a [`MarkBuf`].
@@ -317,12 +318,18 @@ impl std::fmt::Debug for RingBuf {
 #[derive(Debug)]
 struct MarkRegistry {
     marks: Mutex<Vec<u64>>,
+
+    /// Marks before this position have been revoked, and their data discarded;
+    /// see [`MarkBuf::set_max_retained`]. Only increases, and only while
+    /// `marks` is locked.
+    revoked_below: AtomicU64,
 }
 
 impl MarkRegistry {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             marks: Mutex::new(Vec::new()),
+            revoked_below: AtomicU64::new(0),
         })
     }
 
@@ -336,9 +343,10 @@ impl MarkRegistry {
         let mut marks = self.marks.lock().unwrap();
         if let Ok(i) = marks.binary_search(&pos) {
             marks.remove(i);
-        } else {
+        } else if pos >= self.revoked_below.load(Ordering::Relaxed) {
             panic!("Mark::drop: no mark at position {pos}");
         }
+        // Otherwise, `revoke_below` already removed it.
     }
 
     fn move_forward(&self, from: u64, to: u64) {
@@ -349,6 +357,15 @@ impl MarkRegistry {
         let j = marks.partition_point(|&m| m <= to);
         marks[i..j].rotate_left(1);
         marks[j - 1] = to;
+    }
+
+    /// Revokes all marks before `floor`, returning how many there were.
+    fn revoke_below(&self, floor: u64) -> usize {
+        let mut marks = self.marks.lock().unwrap();
+        let n = marks.partition_point(|&m| m < floor);
+        marks.drain(..n);
+        self.revoked_below.fetch_max(floor, Ordering::Release);
+        n
     }
 
     fn earliest(&self) -> Option<u64> {
@@ -373,6 +390,17 @@ impl Mark {
         self.pos
     }
 
+    /// Returns true if the buffer has discarded this mark's data, because it
+    /// exceeded [`MarkBuf::set_max_retained`].
+    ///
+    /// Revocation happens only when the buffer is filled, which needs
+    /// `&mut MarkBuf`, so a holder of `&MarkBuf` can check this once and rely
+    /// on the answer while it holds that borrow.
+    #[inline]
+    pub fn is_revoked(&self) -> bool {
+        self.pos < self.registry.revoked_below.load(Ordering::Acquire)
+    }
+
     /// Moves this mark forward to `pos`, releasing the data before it.
     ///
     /// `pos` must not be beyond [`MarkBuf::unparsed`], as with
@@ -380,13 +408,15 @@ impl Mark {
     ///
     /// # Panics
     ///
-    /// Panics if `pos` is before the mark's current position.
+    /// Panics if `pos` is before the mark's current position, or if the mark
+    /// has been revoked: its data may have been discarded.
     pub fn move_forward(&mut self, pos: u64) {
         assert!(
             pos >= self.pos,
             "move_forward({pos}): before current position {}",
             self.pos
         );
+        assert!(!self.is_revoked(), "move_forward({pos}): mark revoked");
         self.registry.move_forward(self.pos, pos);
         self.pos = pos;
     }
@@ -446,6 +476,11 @@ impl std::fmt::Debug for Mark {
 /// their own buffer.) Depacketizers release their marks when a frame ends or
 /// is abandoned, and when they're dropped.
 ///
+/// [`MarkBuf::set_max_retained`] bounds this. When reclaiming space finds more
+/// than that many bytes retained, it discards the oldest anyway and *revokes*
+/// the marks that pinned them. A depacketizer notices on its next packet,
+/// abandoning its frame with [`crate::codec::LossReason::Evicted`].
+///
 /// # Contract
 ///
 /// Depacketizers only mark bytes which the caller has already parsed: marks
@@ -459,6 +494,9 @@ pub struct MarkBuf {
     ring: RingBuf,
     registry: Arc<MarkRegistry>,
     unparsed: u64,
+
+    /// See [`MarkBuf::set_max_retained`].
+    max_retained: u64,
 }
 
 impl MarkBuf {
@@ -470,7 +508,25 @@ impl MarkBuf {
             ring: RingBuf::new(capacity),
             registry: MarkRegistry::new(),
             unparsed: 0,
+            max_retained: u64::MAX,
         }
+    }
+
+    /// Limits the bytes retained before [`MarkBuf::unparsed`] for marks.
+    ///
+    /// When reclaiming space (as [`MarkBuf::spare_capacity`] and
+    /// [`MarkBuf::extend`] do), any bytes more than `max_retained` before
+    /// `unparsed()` are discarded even if marked, and the marks that pinned
+    /// them are revoked. Depacketizers holding a revoked mark abandon their
+    /// in-progress frame on their next packet, reporting
+    /// [`crate::codec::LossReason::Evicted`].
+    ///
+    /// Unparsed bytes never count toward or are discarded by this limit; the
+    /// buffer still grows as needed to hold them.
+    ///
+    /// There's no limit by default.
+    pub fn set_max_retained(&mut self, max_retained: usize) {
+        self.max_retained = to_u64(max_retained);
     }
 
     /// Returns the stream position of the first unparsed byte.
@@ -593,13 +649,27 @@ impl MarkBuf {
         self.ring.advance_end(n);
     }
 
-    /// Reclaims space behind the oldest mark (or unparsed position).
+    /// Reclaims space behind the oldest mark (or unparsed position), revoking
+    /// marks beyond [`MarkBuf::set_max_retained`].
     ///
     /// Relies on the [`MarkBuf`] invariant that no mark is beyond `unparsed`,
     /// so `floor <= unparsed` and this never discards unparsed data.
     fn reclaim(&mut self) {
-        let floor = self.registry.earliest().unwrap_or(self.unparsed);
+        let mut floor = self.registry.earliest().unwrap_or(self.unparsed);
         debug_assert!(floor <= self.unparsed);
+        let min_floor = self.unparsed.saturating_sub(self.max_retained);
+        if floor < min_floor {
+            let n = self.registry.revoke_below(min_floor);
+            log::debug!(
+                "revoking {n} mark(s) retaining {} bytes; limit is {}",
+                self.unparsed - floor,
+                self.max_retained,
+            );
+            // Discard only what's beyond the limit, so the holder of a
+            // revoked mark can still mark data after `min_floor` before the
+            // next reclaim.
+            floor = min_floor;
+        }
         self.ring.advance_to(floor);
     }
 
@@ -886,6 +956,65 @@ mod tests {
         buf.advance_unparsed(6);
         assert_eq!(buf.unparsed_len(), 5);
         assert_eq!(buf.unparsed_split().slices(), (&b"world"[..], &b""[..]));
+    }
+
+    /// Bytes beyond `max_retained` are discarded at the next fill, revoking
+    /// the marks that pinned them but no others.
+    #[test]
+    fn max_retained_revokes_old_marks() {
+        let mut buf = MarkBuf::new(16);
+        buf.set_max_retained(8);
+        buf.extend(b"0123456789");
+        buf.advance_unparsed(1);
+        let old = buf.add_mark_at(0);
+        buf.advance_unparsed(6);
+        let young = buf.add_mark_at(4);
+
+        // 6 bytes retained: within the limit.
+        buf.extend(b"");
+        assert!(!old.is_revoked());
+        assert_eq!(buf.start(), 0);
+
+        // 10 retained: discard to 2 before `unparsed`, revoking `old` only.
+        buf.advance_unparsed(10);
+        buf.extend(b"abc");
+        assert!(old.is_revoked());
+        assert!(!young.is_revoked());
+        assert_eq!(buf.start(), 2);
+        assert_eq!(buf.split(2, 8).slices(), (&b"23456789"[..], &b""[..]));
+
+        // The next fill reclaims up to `young`.
+        buf.extend(b"");
+        assert_eq!(buf.start(), 4);
+
+        // A mark added after revocation, at a position before `revoked_below`
+        // can't exist, so dropping in any order works.
+        drop(young);
+        drop(old);
+        let m = buf.add_mark();
+        assert!(!m.is_revoked());
+    }
+
+    /// Unparsed bytes are never discarded, even past `max_retained`.
+    #[test]
+    fn max_retained_keeps_unparsed() {
+        let mut buf = MarkBuf::new(16);
+        buf.set_max_retained(2);
+        buf.extend(b"0123456789");
+        let m = buf.add_mark_at(0);
+        buf.extend(b"abc");
+        assert!(!m.is_revoked());
+        assert_eq!(buf.unparsed_len(), 13);
+        buf.advance_unparsed(8);
+        buf.extend(b"");
+        // It discards only what's beyond the limit...
+        assert!(m.is_revoked());
+        assert_eq!(buf.start(), 6);
+        assert_eq!(buf.unparsed_len(), 5);
+
+        // ...then, with no marks remaining, all parsed bytes at the next fill.
+        buf.extend(b"");
+        assert_eq!(buf.start(), 8);
     }
 
     /// Mimics the TCP read path: repeated `spare_capacity`/`advance_end`/

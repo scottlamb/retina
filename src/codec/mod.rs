@@ -981,6 +981,31 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         }
     }
 
+    /// Limits the bytes retained for an in-progress frame.
+    ///
+    /// When a frame grows beyond this, the depacketizer discards it, reports
+    /// [`LossReason::TooLarge`] to [`VideoHandler::loss`], and skips the rest
+    /// of it, resynchronizing at the next frame boundary.
+    ///
+    /// For H.264 and H.265, this counts RTP payload bytes the depacketizer
+    /// retains in the [`crate::buf::MarkBuf`]. That's the whole frame if the
+    /// handler returns [`Accumulate::Yes`] from [`VideoHandler::frame_start`].
+    /// With [`Accumulate::No`], it's the data before `frame_start` (such as
+    /// parameter sets and SEI), plus at most about a packet after it, so only
+    /// that part is limited.
+    ///
+    /// There's no limit by default. A [`crate::buf::MarkBuf`] limit set via
+    /// [`crate::buf::MarkBuf::set_max_retained`] bounds memory regardless.
+    pub fn set_max_frame_bytes(&mut self, max_frame_bytes: usize) {
+        match &mut self.inner {
+            #[cfg(feature = "h264")]
+            VideoInner::H264(d) => d.set_max_frame_bytes(max_frame_bytes),
+            #[cfg(feature = "h265")]
+            VideoInner::H265(d) => d.set_max_frame_bytes(max_frame_bytes),
+            VideoInner::Jpeg(d) => d.set_max_frame_bytes(max_frame_bytes),
+        }
+    }
+
     /// Returns the current parameters, if known.
     ///
     /// These may change as frames arrive; see
@@ -1745,6 +1770,154 @@ mod tests {
             vec![Event::Loss(LossReason::PacketLoss { packets: 2 })]
         );
         push(&mut d, &mut buf, (4, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    #[cfg(any(feature = "h264", feature = "h265"))]
+    fn with_max_frame_bytes(
+        mut d: Depacketizer<crate::PacketContext>,
+        max_frame_bytes: usize,
+    ) -> Depacketizer<crate::PacketContext> {
+        let Depacketizer::Video(v) = &mut d else {
+            panic!("expected a video depacketizer");
+        };
+        v.set_max_frame_bytes(max_frame_bytes);
+        d
+    }
+
+    /// A frame which grows past the limit is abandoned, and the rest of it is
+    /// skipped.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn h264_too_large() {
+        crate::testutil::init_logging();
+        let mut d = with_max_frame_bytes(h264(), 16);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        h.take();
+        push(
+            &mut d,
+            &mut buf,
+            (1, 0, false, 0),
+            b"\x7c\x05middle!!",
+            &mut h,
+        );
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::TooLarge { limit: 16 })]
+        );
+        push(&mut d, &mut buf, (2, 0, true, 0), b"\x7c\x45end", &mut h);
+        assert_eq!(h.take(), vec![]);
+        push(&mut d, &mut buf, (3, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    /// Under `Accumulate::No`, the limit covers data before `frame_start`...
+    #[test]
+    #[cfg(feature = "h264")]
+    fn h264_too_large_before_frame_start() {
+        crate::testutil::init_logging();
+        let mut d = with_max_frame_bytes(h264(), 16);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::No);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x06sei-data", &mut h);
+        assert_eq!(h.take(), vec![]);
+        push(&mut d, &mut buf, (1, 0, false, 0), b"\x06sei-data", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::TooLarge { limit: 16 })]
+        );
+    }
+
+    /// ...but not data after it, which isn't retained.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn h264_streaming_unlimited_after_frame_start() {
+        crate::testutil::init_logging();
+        let mut d = with_max_frame_bytes(h264(), 16);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::No);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        for seq in 1..10 {
+            push(
+                &mut d,
+                &mut buf,
+                (seq, 0, false, 0),
+                b"\x7c\x05middle!!",
+                &mut h,
+            );
+        }
+        push(&mut d, &mut buf, (10, 0, true, 0), b"\x7c\x45end", &mut h);
+        let events = h.take();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Loss(_))),
+            "{events:#?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Event::FrameEnd { data: None, .. })),
+            "{events:#?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "h265")]
+    fn h265_too_large() {
+        crate::testutil::init_logging();
+        let mut d = with_max_frame_bytes(
+            Depacketizer::new(&PayloadFormat::new("video", "h265", 90_000)).unwrap(),
+            20,
+        );
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        // Prefix SEI NALs (type 39).
+        push(
+            &mut d,
+            &mut buf,
+            (0, 0, false, 0),
+            b"\x4e\x01sei-data",
+            &mut h,
+        );
+        assert_eq!(h.take(), vec![]);
+        push(
+            &mut d,
+            &mut buf,
+            (1, 0, false, 0),
+            b"\x4e\x01sei-data-2",
+            &mut h,
+        );
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::TooLarge { limit: 20 })]
+        );
+    }
+
+    /// The case `MarkBuf::set_max_retained` is for: a stream with a small
+    /// in-progress frame stops receiving packets while another stream shares
+    /// its buffer. The buffer discards the frame's data rather than growing
+    /// without bound, and the depacketizer abandons the frame rather than
+    /// reading discarded data.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn h264_evicted() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(64);
+        buf.set_max_retained(256);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        h.take();
+
+        // Another stream's packets.
+        for _ in 0..16 {
+            buf.extend(&[0u8; 32]);
+            buf.advance_unparsed(buf.end());
+        }
+        assert!(buf.capacity() <= 1024, "{}", buf.capacity());
+
+        push(&mut d, &mut buf, (1, 0, true, 0), b"\x7c\x45end", &mut h);
+        assert_eq!(h.take(), vec![Event::Loss(LossReason::Evicted)]);
+        push(&mut d, &mut buf, (2, 1, true, 0), b"\x65slice", &mut h);
         assert_eq!(h.take(), idr_frame());
     }
 

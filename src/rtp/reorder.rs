@@ -132,6 +132,11 @@ pub struct ReorderCounters {
 
     /// Missing packets given up on.
     pub skipped: u64,
+
+    /// Held packets discarded because the buffer revoked their data; see
+    /// [`crate::buf::MarkBuf::set_max_retained`]. Like missing packets, these
+    /// are also counted in `skipped` when given up on.
+    pub evicted: u64,
 }
 
 struct Held<T> {
@@ -322,7 +327,7 @@ impl<T> Reorderer<T> {
         now: Instant,
         item: T,
     ) -> Pushed {
-        self.release();
+        self.release(buf);
         assert!(
             pos >= buf.start() && pos <= buf.unparsed(),
             "push({pos}): must be within [{}, {}]",
@@ -452,10 +457,11 @@ impl<T> Reorderer<T> {
     /// [`ReorderOptions::max_delay`] or more than
     /// [`ReorderOptions::max_packets`] are held.
     ///
-    /// The returned packet's data stays pinned until the next call to `push`
-    /// or `pop`, so the caller can build a [`crate::rtp::ReceivedPacketRef`] to it.
-    pub fn pop(&mut self, now: Instant) -> Option<Reordered<T>> {
-        self.release();
+    /// `buf` must be the buffer passed to [`Reorderer::push`]. The returned
+    /// packet's data stays pinned until the next call to `push` or `pop`, so
+    /// the caller can build a [`crate::rtp::ReceivedPacketRef`] to it.
+    pub fn pop(&mut self, buf: &MarkBuf, now: Instant) -> Option<Reordered<T>> {
+        self.release(buf);
         let (slot, restarted) = match self.ready.pop_front() {
             Some(s) => (s, false),
             None => {
@@ -485,16 +491,37 @@ impl<T> Reorderer<T> {
         })
     }
 
-    /// Releases the packet last returned by `pop`.
-    fn release(&mut self) {
-        match self.release_to.take() {
+    /// Releases the packet last returned by `pop`, and discards held packets
+    /// whose data the buffer has discarded after revoking `mark`.
+    fn release(&mut self, buf: &MarkBuf) {
+        let release_to = self.release_to.take();
+        let Some(mark) = &mut self.mark else {
+            return;
+        };
+        if mark.is_revoked() {
+            // The buffer discards data only before its new start, so held
+            // packets from there on can be pinned again. Positions never
+            // decrease in push order, so the discarded packets come first.
+            let start = buf.start();
+            while let Some(p) = self.packets.front() {
+                match p {
+                    Some(h) if h.pos >= start => break,
+                    Some(_) => self.counters.evicted += 1,
+                    None => {}
+                }
+                self.packets.pop_front();
+                self.first_id += 1;
+            }
+            let first_id = self.first_id;
+            self.ready.retain(|s| s.id >= first_id);
+            self.held.retain(|s| s.id >= first_id);
+            self.mark = self.earliest().map(|h| buf.add_mark_at(h.pos));
+            return;
+        }
+        match release_to {
             None => {}
             Some(None) => self.mark = None,
-            Some(Some(pos)) => self
-                .mark
-                .as_mut()
-                .expect("mark is held while packets are")
-                .move_forward(pos),
+            Some(Some(pos)) => mark.move_forward(pos),
         }
     }
 
@@ -551,7 +578,7 @@ mod tests {
         /// Pops all due packets, returning their sequence numbers.
         fn pop(&mut self, at_ms: u64) -> Vec<u16> {
             let t = self.t0 + Duration::from_millis(at_ms);
-            std::iter::from_fn(|| self.r.pop(t))
+            std::iter::from_fn(|| self.r.pop(&self.buf, t))
                 .map(|p| p.header.sequence_number())
                 .collect()
         }
@@ -677,11 +704,11 @@ mod tests {
         // sequence's held packets are returned first.
         assert_eq!(f.push(11, 61).0, Pushed::Held);
         let t = f.t0 + Duration::from_millis(61);
-        let p = f.r.pop(t).unwrap();
+        let p = f.r.pop(&f.buf, t).unwrap();
         assert_eq!((p.header.sequence_number(), p.restarted), (1004, false));
-        let p = f.r.pop(t).unwrap();
+        let p = f.r.pop(&f.buf, t).unwrap();
         assert_eq!((p.header.sequence_number(), p.restarted), (11, true));
-        assert!(f.r.pop(t).is_none());
+        assert!(f.r.pop(&f.buf, t).is_none());
 
         // Then the new sequence continues normally.
         f.push(12, 62);
@@ -718,6 +745,29 @@ mod tests {
         assert_eq!(f.pop(60), [1, 2]);
     }
 
+    /// A held packet whose data the buffer revokes is discarded, not returned.
+    #[test]
+    fn evicted() {
+        let mut f = Fixture::new(ReorderOptions::default());
+        f.buf.set_max_retained(30); // each packet is 13 bytes.
+        f.push(1, 0);
+        assert_eq!(f.pop(50), [1]);
+        f.push(3, 60); // held at 13, waiting for 2.
+        f.push(4, 60); // 26
+        f.push(5, 60); // 39
+        f.push(6, 60); // 52; reclaiming before this revokes 3's mark.
+        assert_eq!(f.pop(60), []);
+        assert_eq!(f.pop(110), [4, 5, 6]);
+        assert_eq!(
+            f.r.counters(),
+            ReorderCounters {
+                evicted: 1,
+                skipped: 2,
+                ..Default::default()
+            }
+        );
+    }
+
     /// A packet pushed with an earlier time than one held is treated as
     /// arriving with it.
     #[test]
@@ -750,11 +800,11 @@ mod tests {
         let (_, pos3) = f.push(3, 0);
         assert!(pos2 < pos1 && pos1 < pos3);
         let t = f.t0 + DELAY;
-        let p = f.r.pop(t).unwrap();
+        let p = f.r.pop(&f.buf, t).unwrap();
         assert_eq!((p.header.sequence_number(), p.pin_pos), (1, pos2));
-        let p = f.r.pop(t).unwrap();
+        let p = f.r.pop(&f.buf, t).unwrap();
         assert_eq!((p.header.sequence_number(), p.pin_pos), (2, pos2));
-        let p = f.r.pop(t).unwrap();
+        let p = f.r.pop(&f.buf, t).unwrap();
         assert_eq!((p.header.sequence_number(), p.pin_pos), (3, pos3));
     }
 
@@ -814,7 +864,7 @@ mod tests {
             assert_eq!(r.push(buf, header, pos, t0, payload), Pushed::Held);
         };
         let mut drain = |buf: &MarkBuf, r: &mut Reorderer<std::ops::Range<u64>>, now| {
-            while let Some(p) = r.pop(now) {
+            while let Some(p) = r.pop(buf, now) {
                 let meta = receiver.rtp((), &p.header).unwrap();
                 let len = u16::try_from(p.item.end - p.item.start).unwrap();
                 let pkt =
@@ -911,7 +961,7 @@ mod tests {
                 assert_eq!(r.push(buf, header, pos, t0, payload), Pushed::Held);
             };
             let mut drain = |buf: &MarkBuf, r: &mut Reorderer<std::ops::Range<u64>>, now| {
-                while let Some(p) = r.pop(now) {
+                while let Some(p) = r.pop(buf, now) {
                     let meta = receiver.rtp((), &p.header).unwrap();
                     let len = u16::try_from(p.item.end - p.item.start).unwrap();
                     let pkt = ReceivedPacketRef::new(meta, buf, p.item.start, len)

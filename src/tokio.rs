@@ -112,7 +112,7 @@ impl Connection {
     /// Adds a reader, so this connection can be used via its `Stream` impl.
     #[cfg(test)]
     pub(crate) fn with_reader(mut self, max_message_size: usize) -> Self {
-        self.reader = Some(Reader::new(max_message_size));
+        self.reader = Some(Reader::new(max_message_size, usize::MAX));
         self
     }
 
