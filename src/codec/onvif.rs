@@ -54,6 +54,10 @@ impl Depacketizer {
         }
     }
 
+    pub(super) fn drop_partial_frame(&mut self) {
+        self.state = State::Idle;
+    }
+
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Message(&self.parameters))
     }

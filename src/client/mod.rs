@@ -460,6 +460,47 @@ impl std::str::FromStr for UnknownRtcpSsrcPolicy {
     }
 }
 
+/// Policy for handling an RTP packet whose `ssrc` differs from the stream's.
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
+pub enum UnknownRtpSsrcPolicy {
+    /// Default policy: currently same as `AbortSession`.
+    #[default]
+    #[display("default")]
+    Default,
+
+    /// Abort the session on encountering an unknown `ssrc`.
+    #[display("abort-session")]
+    AbortSession,
+
+    /// Treat the new `ssrc` as a replacement for the old one, as when a
+    /// server restarts its encoder mid-session.
+    ///
+    /// The stream continues from the new `ssrc`'s packets: its first packet
+    /// reports no loss, its timestamps continue from the stream's current
+    /// time, and a partial frame from the old `ssrc` is dropped. Don't use this
+    /// with servers which interleave packets from several `ssrc`s on one
+    /// stream; each change drops a partial frame.
+    #[display("follow-new-ssrc")]
+    FollowNewSsrc,
+}
+
+impl std::str::FromStr for UnknownRtpSsrcPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "default" => UnknownRtpSsrcPolicy::Default,
+            "abort-session" => UnknownRtpSsrcPolicy::AbortSession,
+            "follow-new-ssrc" => UnknownRtpSsrcPolicy::FollowNewSsrc,
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad UnknownRtpSsrcPolicy {s}; \
+                 expected default, abort-session, or follow-new-ssrc"
+            ))),
+        })
+    }
+}
+
 /// Returns an appropriate keepalive interval for `session`.
 ///
 /// This generally uses half the session timeout. However, it's capped in case
@@ -833,6 +874,7 @@ pub struct PlayOptions {
     initial_seq: InitialSequenceNumberPolicy,
     enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
     unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy,
+    unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
 }
 
 impl PlayOptions {
@@ -854,6 +896,13 @@ impl PlayOptions {
     pub fn unknown_rtcp_ssrc(self, unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy) -> Self {
         Self {
             unknown_rtcp_ssrc,
+            ..self
+        }
+    }
+
+    pub fn unknown_rtp_ssrc(self, unknown_rtp_ssrc: UnknownRtpSsrcPolicy) -> Self {
+        Self {
+            unknown_rtp_ssrc,
             ..self
         }
     }
@@ -2258,6 +2307,7 @@ impl Session<Described> {
                             ssrc,
                             initial_seq,
                             policy.unknown_rtcp_ssrc,
+                            policy.unknown_rtp_ssrc,
                         ),
                         ctx,
                         udp_sockets,

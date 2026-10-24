@@ -38,11 +38,13 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             None,
             Some(1),
             retina::client::UnknownRtcpSsrcPolicy::Default,
+            retina::client::UnknownRtpSsrcPolicy::Default,
         ),
         InorderParser::new(
             None,
             Some(1),
             retina::client::UnknownRtcpSsrcPolicy::Default,
+            retina::client::UnknownRtpSsrcPolicy::Default,
         ),
     ];
     let mut depacketizers = [

@@ -359,6 +359,11 @@ impl Depacketizer {
         self.mark = None;
     }
 
+    pub(super) fn drop_partial_frame(&mut self) {
+        self.discard_au();
+        self.input_state = DepacketizerInputState::New;
+    }
+
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters
             .as_ref()

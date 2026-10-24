@@ -530,6 +530,11 @@ impl Depacketizer {
             .map(|f| Ok(super::CodecItem::VideoFrame(f)))
     }
 
+    pub(super) fn drop_partial_frame(&mut self) {
+        self.metadata = None;
+        self.data.clear();
+    }
+
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters.as_ref().map(super::ParametersRef::Video)
     }

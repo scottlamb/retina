@@ -535,6 +535,10 @@ impl Depacketizer {
         ]
     }
 
+    pub(super) fn drop_partial_frame(&mut self) {
+        self.state = DepacketizerState::default();
+    }
+
     pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Audio(&self.config.parameters))
     }

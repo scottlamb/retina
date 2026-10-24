@@ -14,7 +14,7 @@ use crate::{
     StreamContextInner,
 };
 
-use super::{SessionOptions, Timeline, UnknownRtcpSsrcPolicy};
+use super::{SessionOptions, Timeline, UnknownRtcpSsrcPolicy, UnknownRtpSsrcPolicy};
 
 /// Describes how Retina formed its initial expectation for the stream's `ssrc` or `seq`.
 #[derive(Copy, Clone, Debug)]
@@ -61,8 +61,9 @@ struct Seq {
 /// although it'd be possible to discard the incorrect SSRC instead.
 ///
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
-/// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
-/// not sure it will ever come up with IP cameras.
+/// can change mid-session with a RTCP BYE message. Some servers change it when
+/// restarting their encoder, with or without a BYE. [`UnknownRtpSsrcPolicy::FollowNewSsrc`]
+/// continues the stream from the new SSRC.
 #[doc(hidden)] // pub only for the benchmarks; not a stable API.
 #[derive(Debug)]
 pub struct InorderParser {
@@ -77,6 +78,8 @@ pub struct InorderParser {
 
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
+
+    unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -106,6 +109,7 @@ impl InorderParser {
         ssrc: Option<u32>,
         next_seq: Option<u16>,
         unknown_rtcp_session: UnknownRtcpSsrcPolicy,
+        unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
     ) -> Self {
         Self {
             ssrc: ssrc.map(|ssrc| Ssrc {
@@ -120,6 +124,7 @@ impl InorderParser {
             seen_rtcp_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
+            unknown_rtp_ssrc,
         }
     }
 
@@ -147,9 +152,23 @@ impl InorderParser {
 
         let sequence_number = header.sequence_number();
         let ssrc = header.ssrc();
-        let loss =
-            sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
+        let ssrc_changed = matches!(self.ssrc, Some(s) if s.ssrc != ssrc);
+        if ssrc_changed && matches!(self.unknown_rtp_ssrc, UnknownRtpSsrcPolicy::FollowNewSsrc) {
+            log::info!(
+                "following ssrc change to {:08x} after {} RTP pkts + {} RTCP pkts; was expecting ssrc={:?} seq={:?}",
+                ssrc,
+                self.seen_rtp_packets,
+                self.seen_rtcp_packets,
+                self.ssrc,
+                self.seq,
+            );
+            self.ssrc = Some(Ssrc {
+                init: InitialExpectation::RtpPacket,
+                ssrc,
+            });
+            self.seq = None;
+            timeline.continue_at(header.timestamp());
+        } else if ssrc_changed {
             note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -169,6 +188,8 @@ impl InorderParser {
                 ssrc,
             });
         }
+        let loss =
+            sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if loss > 0x80_00 {
             if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
                 bail!(ErrorInt::RtpPacketError {
@@ -506,6 +527,7 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::num::NonZeroU32;
 
     use crate::client::UdpStreamContext;
 
@@ -518,7 +540,12 @@ mod tests {
     #[test]
     fn geovision_pt50_packet() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let mut parser = InorderParser::new(
+            Some(0xd25614e),
+            None,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::Default,
+        );
         let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
@@ -623,7 +650,12 @@ mod tests {
     #[test]
     fn out_of_order() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let mut parser = InorderParser::new(
+            Some(0xd25614e),
+            None,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::Default,
+        );
         let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
             local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -683,5 +715,76 @@ mod tests {
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    fn push_rtp(
+        parser: &mut InorderParser,
+        timeline: &mut Timeline,
+        ssrc: u32,
+        sequence_number: u16,
+        timestamp: u32,
+    ) -> Result<Option<PacketMeta>, Error> {
+        let pkt =
+            crate::rtp::build_raw_rtp(sequence_number, timestamp, 96, ssrc, true, *b"pkt").unwrap();
+        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+        parser.rtp(
+            &SessionOptions::default(),
+            &StreamContext::dummy(),
+            None,
+            &ConnectionContext::dummy(),
+            &PacketContext::dummy(),
+            timeline,
+            0,
+            &header,
+        )
+    }
+
+    #[test]
+    fn ssrc_change_aborts_by_default() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(
+            None,
+            None,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::Default,
+        );
+        push_rtp(&mut parser, &mut timeline, 0x1111, 10, 1_000)
+            .unwrap()
+            .unwrap();
+        let e = push_rtp(&mut parser, &mut timeline, 0x2222, 11, 4_000).unwrap_err();
+        assert!(e.to_string().contains("wrong ssrc"), "{e}");
+    }
+
+    #[test]
+    fn ssrc_change_followed() {
+        let mut timeline = Timeline::new(None, 90_000, NonZeroU32::new(10)).unwrap();
+        let mut parser = InorderParser::new(
+            None,
+            None,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::FollowNewSsrc,
+        );
+        push_rtp(&mut parser, &mut timeline, 0x1111, 10, 1_000)
+            .unwrap()
+            .unwrap();
+        let old = push_rtp(&mut parser, &mut timeline, 0x1111, 11, 4_000)
+            .unwrap()
+            .unwrap();
+
+        // The new ssrc's sequence numbers and timestamps start lower than the
+        // old ones, which would otherwise be an out-of-order packet and a
+        // backward time jump.
+        let first = push_rtp(&mut parser, &mut timeline, 0x2222, 5, 500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.ssrc, 0x2222);
+        assert_eq!(first.loss, 0);
+        assert_eq!(first.timestamp.elapsed(), old.timestamp.elapsed());
+
+        let second = push_rtp(&mut parser, &mut timeline, 0x2222, 6, 3_500)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.loss, 0);
+        assert_eq!(second.timestamp.elapsed(), old.timestamp.elapsed() + 3_000);
     }
 }

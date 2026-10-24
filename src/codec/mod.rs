@@ -811,7 +811,12 @@ impl std::fmt::Debug for VideoFrame {
 /// This interface unstable and for internal use; it's exposed for direct fuzzing and benchmarking.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct Depacketizer(DepacketizerInner);
+pub struct Depacketizer {
+    inner: DepacketizerInner,
+
+    /// The `ssrc` of the most recently pushed packet.
+    ssrc: Option<u32>,
+}
 
 #[derive(Debug)]
 enum DepacketizerInner {
@@ -850,7 +855,7 @@ impl Depacketizer {
 
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
-        Ok(Depacketizer(match (media, encoding_name) {
+        Ok(Self::from_inner(match (media, encoding_name) {
             ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
                 clock_rate,
                 format_specific_params,
@@ -917,8 +922,12 @@ impl Depacketizer {
         }))
     }
 
+    fn from_inner(inner: DepacketizerInner) -> Self {
+        Depacketizer { inner, ssrc: None }
+    }
+
     pub fn check_invariants(&self) {
-        match &self.0 {
+        match &self.inner {
             DepacketizerInner::Aac(_) => {}
             DepacketizerInner::G723(_) => {}
             DepacketizerInner::H264(d) => d.check_invariants(),
@@ -936,7 +945,7 @@ impl Depacketizer {
     /// set insertion. No-op for codecs that don't use these settings.
     #[doc(hidden)]
     pub fn set_frame_format(&mut self, format: FrameFormat) {
-        match &mut self.0 {
+        match &mut self.inner {
             DepacketizerInner::Aac(d) => d.set_frame_format(format),
             DepacketizerInner::H264(d) => d.set_frame_format(format),
             #[cfg(feature = "h265")]
@@ -953,7 +962,7 @@ impl Depacketizer {
     /// whether the depacketizer returns parameters as of the most recently pulled or the upcoming
     /// frame.
     pub fn parameters(&self) -> Option<ParametersRef<'_>> {
-        match &self.0 {
+        match &self.inner {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
             DepacketizerInner::H264(d) => d.parameters(),
@@ -970,8 +979,15 @@ impl Depacketizer {
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `None`. The later
     /// `push` call may panic or drop data if this expectation is violated.
+    ///
+    /// A packet with a different `ssrc` than the previous one drops any
+    /// partially assembled frame, as its remaining packets won't arrive.
     pub(crate) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        match &mut self.0 {
+        if self.ssrc.is_some_and(|ssrc| ssrc != pkt.meta.ssrc) {
+            self.drop_partial_frame();
+        }
+        self.ssrc = Some(pkt.meta.ssrc);
+        match &mut self.inner {
             DepacketizerInner::Aac(d) => d.push(pkt),
             DepacketizerInner::G723(d) => d.push(pkt),
             DepacketizerInner::H264(d) => d.push(pkt),
@@ -983,12 +999,25 @@ impl Depacketizer {
         }
     }
 
+    fn drop_partial_frame(&mut self) {
+        match &mut self.inner {
+            DepacketizerInner::Aac(d) => d.drop_partial_frame(),
+            DepacketizerInner::H264(d) => d.drop_partial_frame(),
+            #[cfg(feature = "h265")]
+            DepacketizerInner::H265(d) => d.drop_partial_frame(),
+            DepacketizerInner::Onvif(d) => d.drop_partial_frame(),
+            DepacketizerInner::Jpeg(d) => d.drop_partial_frame(),
+            // These hold no data between `pull` and the next `push`.
+            DepacketizerInner::G723(_) | DepacketizerInner::SimpleAudio(_) => {}
+        }
+    }
+
     /// Retrieves a completed frame from the depacketizer.
     ///
     /// Some packetization formats support aggregating multiple frames into one packet, so a single
     /// `push` call may cause `pull` to return `Some(...))` more than once.
     pub fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
-        match &mut self.0 {
+        match &mut self.inner {
             DepacketizerInner::Aac(d) => d.pull(),
             DepacketizerInner::G723(d) => d.pull(),
             DepacketizerInner::H264(d) => d.pull(),
@@ -1049,5 +1078,56 @@ mod tests {
         ] {
             log::info!("{name:-40} {size:4}");
         }
+    }
+
+    #[test]
+    fn ssrc_change_drops_partial_frame() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new(
+            "video",
+            "h264",
+            90_000,
+            None,
+            Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg=="),
+        )
+        .unwrap();
+        d.set_frame_format(FrameFormat {
+            parameter_set_insertion: ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        let mut buf = crate::testutil::DepacketizeBuf::new(65536);
+        let timestamp = crate::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+        let mut push = |ssrc, sequence_number, mark, payload: &[u8]| {
+            let pkt = crate::rtp::ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc,
+                sequence_number,
+                loss: 0,
+                mark,
+                payload_type: 96,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            buf.push(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+            )
+        };
+
+        // FU-A start of a non-IDR slice which the old ssrc never finishes.
+        push(1, 10, false, b"\x7c\x81old fu-a start").unwrap();
+        // A complete non-IDR slice from the new ssrc, at the same timestamp.
+        push(2, 500, true, b"\x01new slice").unwrap();
+        match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => {
+                assert_eq!(frame.data(), b"\x00\x00\x00\x0a\x01new slice");
+                assert_eq!(frame.loss(), 0);
+            }
+            o => panic!("unexpected pull result: {o:#?}"),
+        }
+        assert!(d.pull().is_none());
     }
 }

@@ -9,6 +9,13 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   add `PlayOptions::unknown_rtp_ssrc`. With
+    `UnknownRtpSsrcPolicy::FollowNewSsrc`, a stream whose RTP packets switch to
+    a new SSRC mid-session continues from the new SSRC instead of failing with
+    `wrong ssrc`, as GStreamer's `rtspsrc` does. The first packet of the new
+    SSRC reports no loss, timestamps continue from the stream's current time,
+    and the old SSRC's partial frame is dropped. The default still aborts the
+    session.
 
 ## `v0.4.21` (2026-10-04)
 

@@ -17,6 +17,9 @@ pub struct Timeline {
     clock_rate: NonZeroU32,
     start: Option<u32>,
 
+    /// Added to each incoming RTP timestamp; see [`Timeline::continue_at`].
+    rtp_timestamp_offset: u32,
+
     /// The maximum forward jump to allow, in clock rate units.
     /// If this is absent, don't do any enforcement of sane time units.
     max_forward_jump: Option<NonZeroI32>,
@@ -46,6 +49,7 @@ impl Timeline {
         Ok(Timeline {
             timestamp: i64::from(start.unwrap_or(0)),
             start,
+            rtp_timestamp_offset: 0,
             clock_rate,
             max_forward_jump,
             max_forward_jump_secs: enforce_with_max_forward_jump_secs
@@ -84,7 +88,19 @@ impl Timeline {
         Ok(self.ts_and_delta(rtp_timestamp)?.0)
     }
 
+    /// Places `rtp_timestamp` at the timeline's current position and takes
+    /// later RTP timestamps relative to it.
+    ///
+    /// This is useful when the RTP timestamps restart from an unrelated base,
+    /// as on an SSRC change. Does nothing if no timestamp has been placed yet.
+    pub fn continue_at(&mut self, rtp_timestamp: u32) {
+        if self.start.is_some() {
+            self.rtp_timestamp_offset = (self.timestamp as u32).wrapping_sub(rtp_timestamp);
+        }
+    }
+
     fn ts_and_delta(&mut self, rtp_timestamp: u32) -> Result<(Timestamp, i32), String> {
+        let rtp_timestamp = rtp_timestamp.wrapping_add(self.rtp_timestamp_offset);
         let start = match self.start {
             None => {
                 self.start = Some(rtp_timestamp);
