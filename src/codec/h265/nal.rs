@@ -285,13 +285,13 @@ impl Sps {
     pub fn from_bits<R: BitRead>(mut r: R) -> Result<Self, Error> {
         // See T.REC H.265 section 7.3.2.2.1, seq_parameter_set_rbsp.
         r.skip(4, "sps_video_parameter_set_id")?;
-        let sps_max_sub_layers_minus1: u8 = r.read(3, "sps_max_sub_layers_minus1")?;
+        let sps_max_sub_layers_minus1: u8 = r.read::<3, _>("sps_max_sub_layers_minus1")?;
         if sps_max_sub_layers_minus1 > 6 {
             return Err(Error(
                 "sps_max_sub_layers_minus1 must be in [0, 6]".to_owned(),
             ));
         }
-        let sps_temporal_id_nesting_flag = r.read_bool("sps_temporal_id_nesting_flag")?;
+        let sps_temporal_id_nesting_flag = r.read_bit("sps_temporal_id_nesting_flag")?;
         let profile_tier_level =
             ProfileTierLevel::from_bits(&mut r, true, sps_max_sub_layers_minus1)?;
         let _ = r.read_ue("sps_seq_parameter_set_id")?;
@@ -300,10 +300,10 @@ impl Sps {
             return Err(Error("chroma_format_idc must be in [0, 3]".to_owned()));
         }
         let chroma_format_idc = chroma_format_idc as u8;
-        let _ = chroma_format_idc == 3 && r.read_bool("separate_colour_plane_flag")?;
+        let _ = chroma_format_idc == 3 && r.read_bit("separate_colour_plane_flag")?;
         let pic_width_in_luma_samples = r.read_ue("pic_width_in_luma_samples")?;
         let pic_height_in_luma_samples = r.read_ue("pic_height_in_luma_samples")?;
-        let conformance_window = if r.read_bool("conformance_window_flag")? {
+        let conformance_window = if r.read_bit("conformance_window_flag")? {
             Some(ConformanceWindow::from_bits(&mut r)?)
         } else {
             None
@@ -322,7 +322,7 @@ impl Sps {
         let bit_depth_chroma_minus8 = bit_depth_chroma_minus8 as u8;
         let log2_max_pic_order_cnt_lsb_minus4 = r.read_ue("log2_max_pic_order_cnt_lsb_minus4")?;
         let sps_sub_layer_ordering_info_present_flag =
-            r.read_bool("sps_sub_layer_ordering_info_present_flag")?;
+            r.read_bit("sps_sub_layer_ordering_info_present_flag")?;
         {
             let start = if sps_sub_layer_ordering_info_present_flag {
                 0
@@ -353,17 +353,17 @@ impl Sps {
         let _ = r.read_ue("log2_diff_max_min_luma_transform_block_size")?;
         let _ = r.read_ue("max_transform_hierarchy_depth_inter")?;
         let _ = r.read_ue("max_transform_hierarchy_depth_intra")?;
-        let scaling_list_enabled_flag = r.read_bool("scaling_list_enabled_flag")?;
+        let scaling_list_enabled_flag = r.read_bit("scaling_list_enabled_flag")?;
         if scaling_list_enabled_flag {
             let sps_scaling_list_data_present_flag =
-                r.read_bool("sps_scaling_list_data_present_flag")?;
+                r.read_bit("sps_scaling_list_data_present_flag")?;
             if sps_scaling_list_data_present_flag {
                 let _scaling_list_data = ScalingListData::from_bits(&mut r)?;
             }
         }
-        let _ = r.read_bool("amp_enabled_flag")?;
-        let _ = r.read_bool("sample_adaptive_offset_enabled_flag")?;
-        let pcm_enabled_flag = r.read_bool("pcm_enabled_flag")?;
+        let _ = r.read_bit("amp_enabled_flag")?;
+        let _ = r.read_bit("sample_adaptive_offset_enabled_flag")?;
+        let pcm_enabled_flag = r.read_bit("pcm_enabled_flag")?;
         if pcm_enabled_flag {
             r.skip(4, "pcm_sample_bit_depth_luma_minus1")?;
             r.skip(4, "pcm_sample_bit_depth_chroma_minus1")?;
@@ -371,7 +371,7 @@ impl Sps {
                 r.read_ue("log2_min_pcm_luma_coding_block_size_minus3")?;
             let _log2_diff_max_min_pcm_luma_coding_block_size =
                 r.read_ue("log2_diff_max_min_pcm_luma_coding_block_size")?;
-            let _pcm_loop_filter_disabled_flag = r.read_bool("pcm_loop_filter_disabled_flag")?;
+            let _pcm_loop_filter_disabled_flag = r.read_bit("pcm_loop_filter_disabled_flag")?;
         }
         let num_short_term_ref_pic_sets = r.read_ue("num_short_term_ref_pic_sets")?;
         if num_short_term_ref_pic_sets > 64 {
@@ -384,7 +384,7 @@ impl Sps {
             let next = ShortTermRefPicSet::from_bits(&mut r, short_term_pic_ref_sets.last())?;
             short_term_pic_ref_sets.push(next);
         }
-        let long_term_ref_pics_present_flag = r.read_bool("long_term_ref_pics_present_flag")?;
+        let long_term_ref_pics_present_flag = r.read_bit("long_term_ref_pics_present_flag")?;
         if long_term_ref_pics_present_flag {
             let num_long_term_ref_pics_sps = r.read_ue("num_long_term_ref_pics_sps")?;
             for _i in 0..num_long_term_ref_pics_sps {
@@ -392,23 +392,23 @@ impl Sps {
                     log2_max_pic_order_cnt_lsb_minus4 + 4,
                     "lt_ref_pic_poc_lsb_sps",
                 )?;
-                let _used_by_curr_pic_lt_sps_flag = r.read_bool("used_by_curr_pic_lt_sps_flag")?;
+                let _used_by_curr_pic_lt_sps_flag = r.read_bit("used_by_curr_pic_lt_sps_flag")?;
             }
         }
-        let _ = r.read_bool("sps_temporal_mvp_enabled_flag")?;
-        let _ = r.read_bool("strong_intra_smoothing_enabled_flag")?;
-        let vui = if r.read_bool("vui_parameters_present_flag")? {
+        let _ = r.read_bit("sps_temporal_mvp_enabled_flag")?;
+        let _ = r.read_bit("strong_intra_smoothing_enabled_flag")?;
+        let vui = if r.read_bit("vui_parameters_present_flag")? {
             Some(VuiParameters::from_bits(&mut r, sps_max_sub_layers_minus1)?)
         } else {
             None
         };
-        let sps_extension_flag = r.read_bool("sps_extension_flag")?;
+        let sps_extension_flag = r.read_bit("sps_extension_flag")?;
         if sps_extension_flag {
-            let sps_range_extension_flag = r.read_bool("sps_range_extension_flag")?;
-            let sps_multilayer_extension_flag = r.read_bool("sps_multilayer_extension_flag")?;
-            let sps_3d_extension_flag = r.read_bool("sps_3d_extension_flag")?;
-            let sps_scc_extension_flag = r.read_bool("sps_scc_extension_flag")?;
-            let sps_extension_4bits: u8 = r.read(4, "sps_extension_4bits")?;
+            let sps_range_extension_flag = r.read_bit("sps_range_extension_flag")?;
+            let sps_multilayer_extension_flag = r.read_bit("sps_multilayer_extension_flag")?;
+            let sps_3d_extension_flag = r.read_bit("sps_3d_extension_flag")?;
+            let sps_scc_extension_flag = r.read_bit("sps_scc_extension_flag")?;
+            let sps_extension_4bits: u8 = r.read::<4, _>("sps_extension_4bits")?;
             if sps_range_extension_flag {
                 // H.265 section 7.3.2.2.2, `sps_range_extension`.
                 r.skip(9, "sps_range_extension")?;
@@ -439,10 +439,10 @@ impl Sps {
             if sps_scc_extension_flag {
                 // H.265 section 7.3.2.2.3, `sps_scc_extension`.
                 r.skip(1, "sps_curr_pic_ref_enabled_flag")?;
-                if r.read_bool("palette_mode_enabled_flag")? {
+                if r.read_bit("palette_mode_enabled_flag")? {
                     let _ = r.read_ue("palette_max_size");
                     let _ = r.read_ue("delta_palette_max_predictor_size")?;
-                    if r.read_bool("sps_palette_predictor_initializers_present_flag")? {
+                    if r.read_bit("sps_palette_predictor_initializers_present_flag")? {
                         let _ = r.read_ue("sps_num_palette_predictor_initializers_minus1")?;
                     }
                 }
@@ -703,7 +703,7 @@ impl ProfileTierLevel {
         } else {
             None
         };
-        let general_level_idc: u8 = r.read(8, "general_level_idc")?;
+        let general_level_idc: u8 = r.read::<8, _>("general_level_idc")?;
         if sps_max_sub_layers_minus1 > 0 {
             let sub_layer_present_flags: u16 = r.read_to("sub_layer_present_flags")?;
             for i in 0..sps_max_sub_layers_minus1 {
@@ -746,35 +746,35 @@ impl Pps {
         let _pps_pic_parameter_set_id = r.read_ue("pps_pic_parameter_set_id")?;
         let _pps_seq_parameter_set_id = r.read_ue("pps_seq_parameter_set_id")?;
         let _dependent_slice_segments_enabled_flag =
-            r.read_bool("dependent_slice_segments_enabled_flag")?;
-        let _output_flag_present_flag = r.read_bool("output_flag_present_flag")?;
-        let _num_extra_slice_header_bits: u8 = r.read(3, "num_extra_slice_header_bits")?;
-        let _sign_data_hiding_enabled_flag = r.read_bool("sign_data_hiding_enabled_flag")?;
-        let _cabac_init_present_flag = r.read_bool("cabac_init_present_flag")?;
+            r.read_bit("dependent_slice_segments_enabled_flag")?;
+        let _output_flag_present_flag = r.read_bit("output_flag_present_flag")?;
+        let _num_extra_slice_header_bits: u8 = r.read::<3, _>("num_extra_slice_header_bits")?;
+        let _sign_data_hiding_enabled_flag = r.read_bit("sign_data_hiding_enabled_flag")?;
+        let _cabac_init_present_flag = r.read_bit("cabac_init_present_flag")?;
         let _num_ref_idx_l0_default_active_minus1 =
             r.read_ue("num_ref_idx_l0_default_active_minus1")?;
         let _num_ref_idx_l1_default_active_minus1 =
             r.read_ue("num_ref_idx_l1_default_active_minus1")?;
         let _init_qp_minus26 = r.read_se("init_qp_minus26")?;
-        let _constrained_intra_pred_flag = r.read_bool("constrained_intra_pred_flag")?;
-        let _transform_skip_enabled_flag = r.read_bool("transform_skip_enabled_flag")?;
-        let cu_qp_delta_enabled_flag = r.read_bool("cu_qp_delta_enabled_flag")?;
+        let _constrained_intra_pred_flag = r.read_bit("constrained_intra_pred_flag")?;
+        let _transform_skip_enabled_flag = r.read_bit("transform_skip_enabled_flag")?;
+        let cu_qp_delta_enabled_flag = r.read_bit("cu_qp_delta_enabled_flag")?;
         if cu_qp_delta_enabled_flag {
             let _diff_cu_qp_delta_depth = r.read_ue("diff_cu_qp_delta_depth")?;
         }
         let _pps_cb_qp_offset = r.read_se("pps_cb_qp_offset")?;
         let _pps_cr_qp_offset = r.read_se("pps_cr_qp_offset")?;
         let _pps_slice_chroma_qp_offsets_present_flag =
-            r.read_bool("pps_slice_chroma_qp_offsets_present_flag")?;
-        let _weighted_pred_flag = r.read_bool("weighted_pred_flag")?;
-        let _weighted_bipred_flag = r.read_bool("weighted_bipred_flag")?;
-        let _transquant_bypass_enabled_flag = r.read_bool("transquant_bypass_enabled_flag")?;
-        let tiles_enabled_flag = r.read_bool("tiles_enabled_flag")?;
-        let entropy_coding_sync_enabled_flag = r.read_bool("entropy_coding_sync_enabled_flag")?;
+            r.read_bit("pps_slice_chroma_qp_offsets_present_flag")?;
+        let _weighted_pred_flag = r.read_bit("weighted_pred_flag")?;
+        let _weighted_bipred_flag = r.read_bit("weighted_bipred_flag")?;
+        let _transquant_bypass_enabled_flag = r.read_bit("transquant_bypass_enabled_flag")?;
+        let tiles_enabled_flag = r.read_bit("tiles_enabled_flag")?;
+        let entropy_coding_sync_enabled_flag = r.read_bit("entropy_coding_sync_enabled_flag")?;
         if tiles_enabled_flag {
             let _num_tile_columns_minus1 = r.read_ue("num_tile_columns_minus1")?;
             let _num_tile_rows_minus1 = r.read_ue("num_tile_rows_minus1")?;
-            let uniform_spacing_flag = r.read_bool("uniform_spacing_flag")?;
+            let uniform_spacing_flag = r.read_bit("uniform_spacing_flag")?;
             if !uniform_spacing_flag {
                 for _i in 0.._num_tile_columns_minus1 {
                     let _column_width_minus1 = r.read_ue("column_width_minus1")?;
@@ -784,38 +784,38 @@ impl Pps {
                 }
             }
             let _loop_filter_across_tiles_enabled_flag =
-                r.read_bool("loop_filter_across_tiles_enabled_flag")?;
+                r.read_bit("loop_filter_across_tiles_enabled_flag")?;
         }
         let _pps_loop_filter_across_slices_enabled_flag =
-            r.read_bool("pps_loop_filter_across_slices_enabled_flag")?;
+            r.read_bit("pps_loop_filter_across_slices_enabled_flag")?;
         let deblocking_filter_control_present_flag =
-            r.read_bool("deblocking_filter_control_present_flag")?;
+            r.read_bit("deblocking_filter_control_present_flag")?;
         if deblocking_filter_control_present_flag {
             let _deblocking_filter_override_enabled_flag =
-                r.read_bool("deblocking_filter_override_enabled_flag")?;
+                r.read_bit("deblocking_filter_override_enabled_flag")?;
             let pps_deblocking_filter_disabled_flag =
-                r.read_bool("pps_deblocking_filter_disabled_flag")?;
+                r.read_bit("pps_deblocking_filter_disabled_flag")?;
             if !pps_deblocking_filter_disabled_flag {
                 let _pps_beta_offset_div2 = r.read_se("pps_beta_offset_div2")?;
                 let _pps_tc_offset_div2 = r.read_se("pps_tc_offset_div2")?;
             }
         }
         let pps_scaling_list_data_present_flag =
-            r.read_bool("pps_scaling_list_data_present_flag")?;
+            r.read_bit("pps_scaling_list_data_present_flag")?;
         if pps_scaling_list_data_present_flag {
             let _scaling_list_data = ScalingListData::from_bits(&mut r)?;
         }
-        let _lists_modification_present_flag = r.read_bool("lists_modification_present_flag")?;
+        let _lists_modification_present_flag = r.read_bit("lists_modification_present_flag")?;
         let _log2_parallel_merge_level_minus2 = r.read_ue("log2_parallel_merge_level_minus2")?;
         let _slice_segment_header_extension_present_flag =
-            r.read_bool("slice_segment_header_extension_present_flag")?;
-        let pps_extension_present_flag = r.read_bool("pps_extension_present_flag")?;
+            r.read_bit("slice_segment_header_extension_present_flag")?;
+        let pps_extension_present_flag = r.read_bit("pps_extension_present_flag")?;
         if pps_extension_present_flag {
-            let pps_range_extension_flag = r.read_bool("pps_range_extension_flag")?;
-            let pps_multilayer_extension_flag = r.read_bool("pps_multilayer_extension_flag")?;
-            let pps_3d_extension_flag = r.read_bool("pps_3d_extension_flag")?;
-            let pps_scc_extension_flag = r.read_bool("pps_scc_extension_flag")?;
-            let pps_extension_4bits: u8 = r.read(4, "pps_extension_4bits")?;
+            let pps_range_extension_flag = r.read_bit("pps_range_extension_flag")?;
+            let pps_multilayer_extension_flag = r.read_bit("pps_multilayer_extension_flag")?;
+            let pps_3d_extension_flag = r.read_bit("pps_3d_extension_flag")?;
+            let pps_scc_extension_flag = r.read_bit("pps_scc_extension_flag")?;
+            let pps_extension_4bits: u8 = r.read::<4, _>("pps_extension_4bits")?;
             if pps_range_extension_flag {
                 return Err(Error("pps_range_extension_flag unimplemented".to_owned()));
             }
@@ -859,7 +859,7 @@ impl ScalingListData {
         for size_id in 0..4 {
             let num_matrices = if size_id == 3 { 2 } else { 6 };
             for _ in 0..num_matrices {
-                if !r.read_bool("scaling_list_pred_mode_flag")? {
+                if !r.read_bit("scaling_list_pred_mode_flag")? {
                     let _ = r.read_ue("scaling_list_pred_matrix_id_delta")?;
                 } else {
                     let coef_num = std::cmp::min(64, 1 << (4 + (size_id << 1)));
@@ -903,7 +903,7 @@ impl ShortTermRefPicSet {
         // TODO: use `let_chains` after they're stable.
         // <https://github.com/rust-lang/rust/pull/132833>
         let inter_ref_pic_set_prediction_flag =
-            prev.is_some() && r.read_bool("inter_ref_pic_set_prediction_flag")?;
+            prev.is_some() && r.read_bit("inter_ref_pic_set_prediction_flag")?;
         if inter_ref_pic_set_prediction_flag {
             // Note: currently this supports the `st_ref_pic_set` embedded in
             // the `sps` only; the `slice_segment_header` variant is not
@@ -913,7 +913,7 @@ impl ShortTermRefPicSet {
                 prev.expect("`inter_ref_pic_set_prediction_flag` implies `prev.is_some()`");
             let num_ref_rps_delta_pocs =
                 to_usize(ref_rps.num_negative_pics + ref_rps.num_positive_pics);
-            let delta_rps_sign = r.read_bool("delta_rps_sign")?;
+            let delta_rps_sign = r.read_bit("delta_rps_sign")?;
             let abs_delta_rps_minus1 = r.read_ue("abs_delta_rps_minus1")?;
             if abs_delta_rps_minus1 >= 1 << 15 {
                 return Err(Error(
@@ -925,9 +925,9 @@ impl ShortTermRefPicSet {
             // "When use_delta_flag[ j ] is not present, its value is inferred to be equal to 1."
             let mut use_delta_flag = [true; { MAX_SHORT_TERM_REF_PICS + 1 }];
             for f in use_delta_flag.iter_mut().take(num_ref_rps_delta_pocs + 1) {
-                let used_by_curr_pic_flag = r.read_bool("used_by_curr_pic_flag")?;
+                let used_by_curr_pic_flag = r.read_bit("used_by_curr_pic_flag")?;
                 if !used_by_curr_pic_flag {
-                    *f = r.read_bool("use_delta_flag")?;
+                    *f = r.read_bit("use_delta_flag")?;
                 }
             }
 
@@ -1029,13 +1029,13 @@ impl ShortTermRefPicSet {
             for d in delta_poc_s0.iter_mut() {
                 dpoc -= read_delta_poc(r, "delta_poc_s0_minus1")?; // apply H.265 (7-67) / (7-69)
                 *d = dpoc;
-                let _ = r.read_bool("used_by_curr_pic_s0_flag")?;
+                let _ = r.read_bit("used_by_curr_pic_s0_flag")?;
             }
             dpoc = 0;
             for d in delta_poc_s1.iter_mut() {
                 dpoc += read_delta_poc(r, "delta_poc_s1_minus1")?; // apply H.265 (7-68) / (7-70)
                 *d = dpoc;
-                let _ = r.read_bool("used_by_curr_pic_s1_flag")?;
+                let _ = r.read_bit("used_by_curr_pic_s1_flag")?;
             }
             Ok(Self {
                 delta_poc,
@@ -1108,9 +1108,9 @@ pub enum AspectRatioInfo {
 }
 impl AspectRatioInfo {
     fn from_bits<R: BitRead>(r: &mut R) -> Result<Option<AspectRatioInfo>, BitReaderError> {
-        let aspect_ratio_info_present_flag = r.read_bool("aspect_ratio_info_present_flag")?;
+        let aspect_ratio_info_present_flag = r.read_bit("aspect_ratio_info_present_flag")?;
         Ok(if aspect_ratio_info_present_flag {
-            let aspect_ratio_idc = r.read(8, "aspect_ratio_idc")?;
+            let aspect_ratio_idc = r.read::<8, _>("aspect_ratio_idc")?;
             Some(match aspect_ratio_idc {
                 0 => AspectRatioInfo::Unspecified,
                 1 => AspectRatioInfo::Ratio1_1,
@@ -1129,9 +1129,10 @@ impl AspectRatioInfo {
                 14 => AspectRatioInfo::Ratio4_3,
                 15 => AspectRatioInfo::Ratio3_2,
                 16 => AspectRatioInfo::Ratio2_1,
-                255 => {
-                    AspectRatioInfo::Extended(r.read(16, "sar_width")?, r.read(16, "sar_height")?)
-                }
+                255 => AspectRatioInfo::Extended(
+                    r.read::<16, _>("sar_width")?,
+                    r.read::<16, _>("sar_height")?,
+                ),
                 _ => AspectRatioInfo::Reserved(aspect_ratio_idc),
             })
         } else {
@@ -1186,44 +1187,44 @@ impl VuiParameters {
     pub fn from_bits<R: BitRead>(r: &mut R, sps_max_sub_layers_minus1: u8) -> Result<Self, Error> {
         // See T.REC H.265 section E.2.1, vui_parameters.
         let aspect_ratio = AspectRatioInfo::from_bits(r)?;
-        let overscan_info_present_flag = r.read_bool("overscan_info_present_flag")?;
+        let overscan_info_present_flag = r.read_bit("overscan_info_present_flag")?;
         if overscan_info_present_flag {
-            let _overscan_appropriate_flag = r.read_bool("overscan_appropriate_flag")?;
+            let _overscan_appropriate_flag = r.read_bit("overscan_appropriate_flag")?;
         }
-        let video_signal_type_present_flag = r.read_bool("video_signal_type_present_flag")?;
+        let video_signal_type_present_flag = r.read_bit("video_signal_type_present_flag")?;
         if video_signal_type_present_flag {
             r.skip(3, "video_format")?;
-            let _video_full_range_flag = r.read_bool("video_full_range_flag")?;
-            let colour_description_present_flag = r.read_bool("colour_description_present_flag")?;
+            let _video_full_range_flag = r.read_bit("video_full_range_flag")?;
+            let colour_description_present_flag = r.read_bit("colour_description_present_flag")?;
             if colour_description_present_flag {
                 r.skip(8, "colour_primaries")?;
                 r.skip(8, "transfer_characteristics")?;
                 r.skip(8, "matrix_coeffs")?;
             }
         }
-        let chroma_loc_info_present_flag = r.read_bool("chroma_loc_info_present_flag")?;
+        let chroma_loc_info_present_flag = r.read_bit("chroma_loc_info_present_flag")?;
         if chroma_loc_info_present_flag {
             let _chroma_sample_loc_type_top_field =
                 r.read_ue("chroma_sample_loc_type_top_field")?;
             let _chroma_sample_loc_type_bottom_field =
                 r.read_ue("chroma_sample_loc_type_bottom_field")?;
         }
-        let _neutral_chroma_indication_flag = r.read_bool("neutral_chroma_indication_flag")?;
-        let _field_seq_flag = r.read_bool("field_seq_flag")?;
-        let _frame_field_info_present_flag = r.read_bool("frame_field_info_present_flag")?;
-        let default_display_window_flag = r.read_bool("default_display_window_flag")?;
+        let _neutral_chroma_indication_flag = r.read_bit("neutral_chroma_indication_flag")?;
+        let _field_seq_flag = r.read_bit("field_seq_flag")?;
+        let _frame_field_info_present_flag = r.read_bit("frame_field_info_present_flag")?;
+        let default_display_window_flag = r.read_bit("default_display_window_flag")?;
         if default_display_window_flag {
             let _def_disp_win_left_offset = r.read_ue("def_disp_win_left_offset")?;
             let _def_disp_win_right_offset = r.read_ue("def_disp_win_right_offset")?;
             let _def_disp_win_top_offset = r.read_ue("def_disp_win_top_offset")?;
             let _def_disp_win_bottom_offset = r.read_ue("def_disp_win_bottom_offset")?;
         }
-        let timing_info = if r.read_bool("vui_timing_info_present_flag")? {
+        let timing_info = if r.read_bit("vui_timing_info_present_flag")? {
             Some(VuiTimingInfo::from_bits(r, sps_max_sub_layers_minus1)?)
         } else {
             None
         };
-        let bitstream_restriction = if r.read_bool("bitstream_restriction_flag")? {
+        let bitstream_restriction = if r.read_bit("bitstream_restriction_flag")? {
             Some(BitstreamRestriction::from_bits(r)?)
         } else {
             None
@@ -1257,10 +1258,10 @@ struct BitstreamRestriction {
 
 impl BitstreamRestriction {
     fn from_bits<R: BitRead>(r: &mut R) -> Result<Self, Error> {
-        let _tiles_fixed_structure_flag = r.read_bool("tiles_fixed_structure_flag")?;
+        let _tiles_fixed_structure_flag = r.read_bit("tiles_fixed_structure_flag")?;
         let _motion_vectors_over_pic_boundaries_flag =
-            r.read_bool("motion_vectors_over_pic_boundaries_flag")?;
-        let _restricted_ref_pic_lists_flag = r.read_bool("restricted_ref_pic_lists_flag")?;
+            r.read_bit("motion_vectors_over_pic_boundaries_flag")?;
+        let _restricted_ref_pic_lists_flag = r.read_bit("restricted_ref_pic_lists_flag")?;
         let min_spatial_segmentation_idc = r.read_ue("min_spatial_segmentation_idc")?;
         if min_spatial_segmentation_idc >= 4096 {
             return Err(Error(
@@ -1287,19 +1288,19 @@ pub struct VuiTimingInfo {
 
 impl VuiTimingInfo {
     pub fn from_bits<R: BitRead>(r: &mut R, sps_max_sub_layers_minus1: u8) -> Result<Self, Error> {
-        let num_units_in_tick = r.read(32, "vui_num_units_in_tick")?;
-        let time_scale = r.read(32, "vui_time_scale")?;
-        if r.read_bool("vui_poc_proportional_to_timing_flag")? {
+        let num_units_in_tick = r.read::<32, _>("vui_num_units_in_tick")?;
+        let time_scale = r.read::<32, _>("vui_time_scale")?;
+        if r.read_bit("vui_poc_proportional_to_timing_flag")? {
             let _ = r.read_ue("vui_num_ticks_poc_diff_one_minus1")?;
         }
-        let hrd_parameters_present_flag = r.read_bool("vui_hrd_parameters_present_flag")?;
+        let hrd_parameters_present_flag = r.read_bit("vui_hrd_parameters_present_flag")?;
         if hrd_parameters_present_flag {
             let mut subpic_params_present = false;
-            let nal_params_present = r.read_bool("nal_params_present")?;
-            let vcl_params_present = r.read_bool("vcl_params_present")?;
+            let nal_params_present = r.read_bit("nal_params_present")?;
+            let vcl_params_present = r.read_bit("vcl_params_present")?;
 
             if nal_params_present || vcl_params_present {
-                subpic_params_present = r.read_bool("subpic_params_present")?;
+                subpic_params_present = r.read_bit("subpic_params_present")?;
 
                 if subpic_params_present {
                     r.skip(8, "tick_divisor_minus2")?;
@@ -1323,16 +1324,16 @@ impl VuiTimingInfo {
             for _ in 0..=sps_max_sub_layers_minus1 {
                 let mut low_delay = false;
                 let mut nb_cpb = 1;
-                let mut fixed_rate = r.read_bool("fixed_pic_rate_general_flag")?;
+                let mut fixed_rate = r.read_bit("fixed_pic_rate_general_flag")?;
 
                 if !fixed_rate {
-                    fixed_rate = r.read_bool("fixed_pic_rate_within_cvs_flag")?;
+                    fixed_rate = r.read_bit("fixed_pic_rate_within_cvs_flag")?;
                 }
 
                 if fixed_rate {
                     r.read_ue("elemental_duration_in_tc_minus1")?;
                 } else {
-                    low_delay = r.read_bool("low_delay")?;
+                    low_delay = r.read_bit("low_delay")?;
                 }
 
                 if !low_delay {
@@ -1351,7 +1352,7 @@ impl VuiTimingInfo {
                                 r.read_ue("bit_rate_du_value_minus1")?;
                         }
 
-                        let _ = r.read_bool("cbr_flag")?;
+                        let _ = r.read_bit("cbr_flag")?;
                     }
                 }
 
@@ -1408,19 +1409,28 @@ mod tests {
             Ok(res)
         }
 
-        fn read_bool(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
-            let res = self.0.read_bool(name)?;
-            log::debug!("read_bool: {} -> {}", name, res);
+        fn read_bit(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
+            let res = self.0.read_bit(name)?;
+            log::debug!("read_bit: {} -> {}", name, res);
             Ok(res)
         }
 
-        fn read<U: h264_reader::rbsp::Numeric>(
+        fn read<const BITS: u32, I: h264_reader::rbsp::Integer>(
+            &mut self,
+            name: &'static str,
+        ) -> Result<I, BitReaderError> {
+            let res = self.0.read::<BITS, I>(name)?;
+            log::debug!("read: {}({}) -> {:?}", name, BITS, res);
+            Ok(res)
+        }
+
+        fn read_var<I: h264_reader::rbsp::Integer>(
             &mut self,
             bit_count: u32,
             name: &'static str,
-        ) -> Result<U, BitReaderError> {
-            let res = self.0.read(bit_count, name)?;
-            log::debug!("read: {}({}) -> {:?}", name, bit_count, res);
+        ) -> Result<I, BitReaderError> {
+            let res = self.0.read_var(bit_count, name)?;
+            log::debug!("read_var: {}({}) -> {:?}", name, bit_count, res);
             Ok(res)
         }
 
@@ -1437,6 +1447,10 @@ mod tests {
             self.0.skip(bit_count, name)?;
             log::debug!("skip: {}({})", name, bit_count);
             Ok(())
+        }
+
+        fn byte_aligned(&self) -> bool {
+            self.0.byte_aligned()
         }
 
         fn has_more_rbsp_data(&mut self, name: &'static str) -> Result<bool, BitReaderError> {

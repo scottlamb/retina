@@ -43,8 +43,8 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         self.inner.read_se(name)
     }
 
-    fn read_bool(&mut self, name: &'static str) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_bool(name)
+    fn read_bit(&mut self, name: &'static str) -> Result<bool, h264_reader::rbsp::BitReaderError> {
+        self.inner.read_bit(name)
     }
 
     fn skip(
@@ -55,12 +55,19 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         self.inner.skip(bit_count, name)
     }
 
-    fn read<U: h264_reader::rbsp::Numeric>(
+    fn read<const BITS: u32, I: h264_reader::rbsp::Integer>(
+        &mut self,
+        name: &'static str,
+    ) -> Result<I, h264_reader::rbsp::BitReaderError> {
+        self.inner.read::<BITS, I>(name)
+    }
+
+    fn read_var<I: h264_reader::rbsp::Integer>(
         &mut self,
         bit_count: u32,
         name: &'static str,
-    ) -> Result<U, h264_reader::rbsp::BitReaderError> {
-        self.inner.read(bit_count, name)
+    ) -> Result<I, h264_reader::rbsp::BitReaderError> {
+        self.inner.read_var(bit_count, name)
     }
 
     fn read_to<V: h264_reader::rbsp::Primitive>(
@@ -68,6 +75,10 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         name: &'static str,
     ) -> Result<V, h264_reader::rbsp::BitReaderError> {
         self.inner.read_to(name)
+    }
+
+    fn byte_aligned(&self) -> bool {
+        self.inner.byte_aligned()
     }
 
     fn has_more_rbsp_data(
