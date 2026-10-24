@@ -9,10 +9,9 @@ use std::num::NonZeroU32;
 use bytes::Bytes;
 
 use crate::codec::{
-    Accumulate, AudioFrameRef, AudioHandler, Depacketizer, FrameFormat, Loss, LossReason,
-    MessageFrameRef, MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
+    Accumulate, AudioFrameRef, AudioHandler, FrameFormat, Loss, LossReason, MessageFrameRef,
+    MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
-use crate::rtp::ReceivedPacketRef;
 
 /// An item yielded from [`crate::client::Demuxed`]'s [`futures::stream::Stream`] impl.
 #[derive(Debug, PartialEq, Eq)]
@@ -172,7 +171,7 @@ impl VideoFrame {
 
     /// Returns true if this frame set new video parameters.
     ///
-    /// The parameters can be obtained via [`crate::client::Stream::parameters`].
+    /// The parameters can be obtained via [`crate::client::Demuxed::parameters`].
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
         self.has_new_parameters
@@ -372,23 +371,4 @@ impl MessageHandler<crate::PacketContext> for LegacyHandler<'_> {
     fn loss(&mut self, loss: &Loss<'_, crate::PacketContext>) {
         self.corrupt(loss);
     }
-}
-
-/// Supplies a new packet, queueing resulting items for `Demuxed`.
-pub(crate) fn push_legacy(
-    d: &mut Depacketizer<crate::PacketContext>,
-    pkt: &ReceivedPacketRef<'_, crate::PacketContext>,
-    stream_id: usize,
-    format: FrameFormat,
-    pending: &mut VecDeque<Result<CodecItem, DepacketizeError>>,
-) -> Result<(), String> {
-    d.push_with(
-        pkt,
-        &mut LegacyHandler {
-            pending,
-            meta: &pkt.meta,
-            stream_id,
-            format,
-        },
-    )
 }

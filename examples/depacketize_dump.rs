@@ -25,9 +25,8 @@ use std::num::NonZeroU32;
 
 use retina::buf::MarkBuf;
 use retina::codec::{
-    Accumulate, AudioDepacketizer, AudioFrameRef, AudioHandler, Loss, MessageDepacketizer,
-    MessageFrameRef, MessageHandler, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart,
-    VideoHandler,
+    Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
+    PayloadFormat, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 use retina::rtp::ReceivedPacketRef;
 use retina::rtp::{PacketHeader, ReceivedPacketMeta};
@@ -105,41 +104,6 @@ impl MessageHandler<Ctx> for Printer {
     }
 }
 
-/// A depacketizer of any media type, chosen from the SDP media type.
-enum AnyDepacketizer {
-    Video(VideoDepacketizer<Ctx>),
-    Audio(AudioDepacketizer<Ctx>),
-    Message(MessageDepacketizer<Ctx>),
-}
-
-impl AnyDepacketizer {
-    fn new(
-        media: &str,
-        encoding_name: &str,
-        clock_rate: u32,
-        format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
-        match media {
-            "video" => VideoDepacketizer::new(encoding_name, clock_rate, format_specific_params)
-                .map(Self::Video),
-            "audio" => {
-                AudioDepacketizer::new(encoding_name, clock_rate, None, format_specific_params)
-                    .map(Self::Audio)
-            }
-            "application" => MessageDepacketizer::new(encoding_name).map(Self::Message),
-            _ => Err(format!("unsupported media type {media}")),
-        }
-    }
-
-    fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut Printer) {
-        match self {
-            Self::Video(d) => d.push(pkt, handler),
-            Self::Audio(d) => d.push(pkt, handler),
-            Self::Message(d) => d.push(pkt, handler),
-        }
-    }
-}
-
 fn print_loss(loss: &Loss<'_, Ctx>) {
     println!("loss at offset {}: {:?}", loss.ctx(), loss.reason());
 }
@@ -190,12 +154,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut file = std::fs::File::open(&args[1])?;
     let channel: u8 = args[2].parse()?;
     let clock_rate: u32 = args[5].parse()?;
-    let mut depacketizer = AnyDepacketizer::new(
-        &args[3],
-        &args[4],
-        clock_rate,
-        args.get(6).map(String::as_str),
-    )?;
+    let mut format = PayloadFormat::new(args[3].clone(), args[4].clone(), clock_rate);
+    if let Some(fmtp) = args.get(6) {
+        format = format.with_fmtp(fmtp.clone());
+    }
+    let mut depacketizer = Depacketizer::<Ctx>::new(&format)?;
     let mut rtp = RtpState {
         clock_rate: NonZeroU32::new(clock_rate).ok_or("clock rate must be non-zero")?,
         start: 0,
@@ -249,7 +212,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pkt_pos + u64::from(payload.start),
                 payload.end - payload.start,
             );
-            depacketizer.push(&pkt, &mut handler);
+            match &mut depacketizer {
+                Depacketizer::Video(d) => d.push(&pkt, &mut handler),
+                Depacketizer::Audio(d) => d.push(&pkt, &mut handler),
+                Depacketizer::Message(d) => d.push(&pkt, &mut handler),
+                _ => {} // a media type this example doesn't know about.
+            }
         }
     }
     if buf.unparsed_len() > 0 {

@@ -9,6 +9,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use std::borrow::Cow;
 use std::num::NonZeroU8;
 use std::num::{NonZeroU16, NonZeroU32};
 
@@ -102,7 +103,7 @@ macro_rules! write_mpeg4_descriptor {
 }
 
 pub mod aac;
-mod events;
+pub(crate) mod events;
 pub(crate) mod g723;
 #[cfg(any(feature = "h264", feature = "h265"))]
 pub mod h26x;
@@ -232,8 +233,9 @@ pub enum ParameterSetInsertion {
 /// always be available after the first frame.
 ///
 /// Video streams' parameters may change mid-stream; if so, the frame which
-/// changed them will have `VideoFrame::new_parameters` set, and subsequent
-/// calls to [`crate::client::Stream::parameters`] will return the new value.
+/// changed them will have [`VideoFrameEnd::has_new_parameters`] set, and
+/// [`VideoFrameEnd::parameters`] and [`Depacketizer::parameters`] will
+/// return the new value.
 ///
 /// Currently audio and message streams' parameters never change mid-stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -243,15 +245,44 @@ pub enum ParametersRef<'a> {
     Message(&'a MessageParameters),
 }
 
+/// Owned parameters which describe a stream; see [`ParametersRef`].
+#[derive(Clone, Debug)]
+pub(crate) enum Parameters {
+    Video(VideoParameters),
+    Audio(AudioParameters),
+    Message(MessageParameters),
+}
+
+impl Parameters {
+    pub(crate) fn as_ref(&self) -> ParametersRef<'_> {
+        match self {
+            Self::Video(p) => ParametersRef::Video(p),
+            Self::Audio(p) => ParametersRef::Audio(p),
+            Self::Message(p) => ParametersRef::Message(p),
+        }
+    }
+}
+
+impl From<ParametersRef<'_>> for Parameters {
+    fn from(p: ParametersRef<'_>) -> Self {
+        match p {
+            ParametersRef::Video(p) => Self::Video(p.clone()),
+            ParametersRef::Audio(p) => Self::Audio(p.clone()),
+            ParametersRef::Message(p) => Self::Message(p.clone()),
+        }
+    }
+}
+
 /// Parameters which describe a video stream.
 ///
 /// A video stream's parameters are often, but not always, available immediately
 /// after `DESCRIBE` via [`crate::client::Stream::parameters`]. They should
-/// always be available after the first frame. They may change mid-stream.
+/// always be available after the first frame.
 ///
 /// Video streams' parameters may change mid-stream; if so, the frame which
-/// changed them will have `VideoFrame::new_parameters` set, and subsequent
-/// calls to [`crate::client::Stream::parameters`] will return the new value.
+/// changed them will have [`VideoFrameEnd::has_new_parameters`] set, and
+/// [`VideoFrameEnd::parameters`] and [`VideoDepacketizer::parameters`] will
+/// return the new value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoParameters {
     all_pixel_dimensions: AllPixelDimensions,
@@ -791,8 +822,17 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// lowercase.
     ///
     /// Returns an error if the format is unsupported or the parameters are invalid.
-    #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
     pub fn new(
+        encoding_name: &str,
+        clock_rate: u32,
+        format_specific_params: Option<&str>,
+    ) -> Result<Self, Error> {
+        Self::new_inner(encoding_name, clock_rate, format_specific_params)
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+    }
+
+    #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
+    fn new_inner(
         encoding_name: &str,
         clock_rate: u32,
         format_specific_params: Option<&str>,
@@ -929,6 +969,16 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
         clock_rate: u32,
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
+    ) -> Result<Self, Error> {
+        Self::new_inner(encoding_name, clock_rate, channels, format_specific_params)
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+    }
+
+    fn new_inner(
+        encoding_name: &str,
+        clock_rate: u32,
+        channels: Option<NonZeroU16>,
+        format_specific_params: Option<&str>,
     ) -> Result<Self, String> {
         let simple = |bits_per_sample| {
             AudioInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
@@ -1008,18 +1058,16 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     /// and is expected to be lowercase.
     ///
     /// Returns an error if the format is unsupported.
-    pub fn new(encoding_name: &str) -> Result<Self, String> {
+    pub fn new(encoding_name: &str) -> Result<Self, Error> {
         use onvif::CompressionType;
         let compression_type = match encoding_name {
             "vnd.onvif.metadata" => CompressionType::Uncompressed,
             "vnd.onvif.metadata.gzip" => CompressionType::GzipCompressed,
             "vnd.onvif.metadata.exi.onvif" => CompressionType::ExiDefault,
             "vnd.onvif.metadata.exi.ext" => CompressionType::ExiInBand,
-            _ => {
-                return Err(format!(
-                    "no message depacketizer for encoding_name {encoding_name}"
-                ));
-            }
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "no message depacketizer for encoding_name {encoding_name}"
+            ))),
         };
         Ok(Self(Box::new(onvif::Depacketizer::new(compression_type))))
     }
@@ -1053,11 +1101,101 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     }
 }
 
-/// A video, audio, or message depacketizer, chosen from an SDP media description.
+/// An RTP payload format, as described by an SDP media description: its media
+/// type, and its `rtpmap` and `fmtp` attributes.
 ///
-/// Used by [`crate::client`] sessions, which don't know the media type statically.
+/// A [`Depacketizer`] is created from one; see
+/// [`crate::client::Stream::payload_format`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadFormat {
+    media: Cow<'static, str>,
+    encoding_name: Cow<'static, str>,
+    clock_rate: u32,
+    channels: Option<NonZeroU16>,
+    fmtp: Option<String>,
+}
+
+impl PayloadFormat {
+    /// Creates a payload format with the given media type (e.g. `video`),
+    /// encoding name (e.g. `H264`), and clock rate in Hz.
+    pub fn new(
+        media: impl Into<Cow<'static, str>>,
+        encoding_name: impl Into<Cow<'static, str>>,
+        clock_rate: u32,
+    ) -> Self {
+        Self {
+            media: media.into(),
+            encoding_name: encoding_name.into(),
+            clock_rate,
+            channels: None,
+            fmtp: None,
+        }
+    }
+
+    /// Sets the number of channels from the `rtpmap` attribute, for audio.
+    #[inline]
+    pub fn with_channels(self, channels: NonZeroU16) -> Self {
+        Self {
+            channels: Some(channels),
+            ..self
+        }
+    }
+
+    /// Sets the format-specific parameters from the `fmtp` attribute.
+    #[inline]
+    pub fn with_fmtp(self, fmtp: impl Into<String>) -> Self {
+        Self {
+            fmtp: Some(fmtp.into()),
+            ..self
+        }
+    }
+
+    /// Returns the SDP media type, e.g. `video`.
+    #[inline]
+    pub fn media(&self) -> &str {
+        &self.media
+    }
+
+    /// Returns the encoding name from the `rtpmap` attribute, e.g. `H264`.
+    #[inline]
+    pub fn encoding_name(&self) -> &str {
+        &self.encoding_name
+    }
+
+    /// Returns the clock rate from the `rtpmap` attribute, in Hz.
+    #[inline]
+    pub fn clock_rate(&self) -> u32 {
+        self.clock_rate
+    }
+
+    /// Returns the number of channels from the `rtpmap` attribute, if
+    /// specified.
+    #[inline]
+    pub fn channels(&self) -> Option<NonZeroU16> {
+        self.channels
+    }
+
+    /// Returns the format-specific parameters from the `fmtp` attribute, if
+    /// any.
+    #[inline]
+    pub fn fmtp(&self) -> Option<&str> {
+        self.fmtp.as_deref()
+    }
+}
+
+/// A video, audio, or message depacketizer, chosen from an SDP media
+/// description.
+///
+/// This is for callers which don't know the media type statically, such as
+/// [`crate::client`] sessions; see
+/// [`crate::client::Stream::new_depacketizer`]. It delivers events to a
+/// handler which implements all of [`VideoHandler`], [`AudioHandler`], and
+/// [`MessageHandler`]. The latter two have default implementations of all
+/// methods, so a handler which only expects video can implement them with
+/// empty `impl` blocks.
 #[derive(Debug)]
-pub(crate) enum Depacketizer<Ctx> {
+#[non_exhaustive]
+pub enum Depacketizer<Ctx> {
     Video(VideoDepacketizer<Ctx>),
     Audio(AudioDepacketizer<Ctx>),
     Message(MessageDepacketizer<Ctx>),
@@ -1066,38 +1204,32 @@ pub(crate) enum Depacketizer<Ctx> {
 impl<Ctx: Clone> Depacketizer<Ctx> {
     /// Creates a depacketizer for the given RTP payload format.
     ///
-    /// Arguments are as in the SDP media description: `media` is the media
-    /// type (e.g. `video`) and the rest are from the `rtpmap` and `fmtp`
-    /// attributes. `encoding_name` is expected to be lowercase.
+    /// The media type and encoding name are matched case-insensitively.
     ///
     /// Returns an error if the format is unsupported or the parameters are invalid.
-    pub(crate) fn new(
-        media: &str,
-        encoding_name: &str,
-        clock_rate: u32,
-        channels: Option<NonZeroU16>,
-        format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
+        let media = format.media.to_ascii_lowercase();
+        let encoding_name = format.encoding_name.to_ascii_lowercase();
+        let clock_rate = format.clock_rate;
+        let fmtp = format.fmtp.as_deref();
+
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
-        let r = match (media, encoding_name) {
+        match (&*media, &*encoding_name) {
             // JPEG's registered media type is `video` (RFC 2435), but some
             // servers say `image`.
             ("video", _) | ("image", "jpeg") => {
-                VideoDepacketizer::new(encoding_name, clock_rate, format_specific_params)
-                    .map(Self::Video)
+                VideoDepacketizer::new(&encoding_name, clock_rate, fmtp).map(Self::Video)
             }
             ("audio", _) => {
-                AudioDepacketizer::new(encoding_name, clock_rate, channels, format_specific_params)
+                AudioDepacketizer::new(&encoding_name, clock_rate, format.channels, fmtp)
                     .map(Self::Audio)
             }
-            ("application", _) => MessageDepacketizer::new(encoding_name).map(Self::Message),
-            _ => Err(format!("no depacketizer for media {media}")),
-        };
-        if let Err(e) = &r {
-            log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}: {e}");
+            ("application", _) => MessageDepacketizer::new(&encoding_name).map(Self::Message),
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "no depacketizer for media {media}"
+            ))),
         }
-        r
     }
 
     #[cfg(test)]
@@ -1109,8 +1241,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
     /// Returns the current codec parameters, if known.
     ///
-    /// See documentation at [`crate::client::Stream::parameters`].
-    pub(crate) fn parameters(&self) -> Option<ParametersRef<'_>> {
+    /// Video parameters may change as frames arrive; see [`ParametersRef`].
+    pub fn parameters(&self) -> Option<ParametersRef<'_>> {
         match self {
             Self::Video(d) => d.parameters().map(ParametersRef::Video),
             Self::Audio(d) => Some(ParametersRef::Audio(d.parameters())),
@@ -1118,8 +1250,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
     }
 
-    /// As in [`VideoDepacketizer::push`].
-    #[cfg_attr(not(test), allow(dead_code))] // TODO: used by `Session::poll_handle`.
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// This is test-only: a public equivalent would need a handler bound
+    /// naming every media type, which a new variant would break. Callers
+    /// match on the variant and use its `push` instead.
+    #[cfg(test)]
     pub(crate) fn push(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
@@ -1186,16 +1322,10 @@ mod tests {
 
     #[cfg(feature = "h264")]
     fn h264() -> Depacketizer<crate::PacketContext> {
-        Depacketizer::new(
-            "video",
-            "h264",
-            90_000,
-            None,
-            Some(
-                "packetization-mode=1;profile-level-id=4d002a;\
-                 sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
-            ),
-        )
+        Depacketizer::new(&PayloadFormat::new("video", "h264", 90_000).with_fmtp(
+            "packetization-mode=1;profile-level-id=4d002a;\
+             sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+        ))
         .unwrap()
     }
 
@@ -1396,7 +1526,7 @@ mod tests {
         }
 
         crate::testutil::init_logging();
-        let mut d = Depacketizer::new("video", "h265", 90_000, None, None).unwrap();
+        let mut d = Depacketizer::new(&PayloadFormat::new("video", "h265", 90_000)).unwrap();
         let mut buf = MarkBuf::new(65536);
         let mut h = H::default();
         let mut push = |seq: u16, ts: i64, loss: u16, payload: &[u8], h: &mut H| {
@@ -1458,7 +1588,7 @@ mod tests {
     #[test]
     fn jpeg_discards_incomplete_frames() {
         crate::testutil::init_logging();
-        let mut d = Depacketizer::new("video", "jpeg", 90_000, None, None).unwrap();
+        let mut d = Depacketizer::new(&PayloadFormat::new("video", "jpeg", 90_000)).unwrap();
         let mut buf = MarkBuf::new(65536);
         let mut h = Recorder::new(Accumulate::No);
 
@@ -1614,7 +1744,7 @@ mod tests {
     #[test]
     fn audio_events() {
         crate::testutil::init_logging();
-        let mut d = Depacketizer::new("audio", "pcmu", 8_000, None, None).unwrap();
+        let mut d = Depacketizer::new(&PayloadFormat::new("audio", "pcmu", 8_000)).unwrap();
         let mut buf = MarkBuf::new(65536);
         let mut h = Recorder::new(Accumulate::Yes);
         push(&mut d, &mut buf, (0, 0, true, 0), b"abcd", &mut h);
@@ -1633,14 +1763,12 @@ mod tests {
     fn aac_corrupt() {
         crate::testutil::init_logging();
         let mut d = Depacketizer::new(
-            "audio",
-            "mpeg4-generic",
-            12_000,
-            NonZeroU16::new(2),
-            Some(
-                "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
-                 indexdeltalength=3;config=1490",
-            ),
+            &PayloadFormat::new("audio", "mpeg4-generic", 12_000)
+                .with_channels(NonZeroU16::new(2).unwrap())
+                .with_fmtp(
+                    "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                     indexdeltalength=3;config=1490",
+                ),
         )
         .unwrap();
         let mut buf = MarkBuf::new(65536);
@@ -1662,8 +1790,12 @@ mod tests {
     #[test]
     fn message_events() {
         crate::testutil::init_logging();
-        let mut d =
-            Depacketizer::new("application", "vnd.onvif.metadata", 90_000, None, None).unwrap();
+        let mut d = Depacketizer::new(&PayloadFormat::new(
+            "application",
+            "vnd.onvif.metadata",
+            90_000,
+        ))
+        .unwrap();
         let mut buf = MarkBuf::new(65536);
         let mut h = Recorder::new(Accumulate::Yes);
         push(&mut d, &mut buf, (0, 0, false, 0), b"<a>", &mut h);
@@ -1745,23 +1877,30 @@ mod tests {
             (0, "audio", "mpeg4-generic", 12_000, BUNNY_AAC_FMTP),
         ] {
             let new = || {
-                Depacketizer::new(media, encoding, clock_rate, NonZeroU16::new(2), Some(fmtp))
-                    .unwrap()
+                Depacketizer::new(
+                    &PayloadFormat::new(media, encoding, clock_rate)
+                        .with_channels(NonZeroU16::new(2).unwrap())
+                        .with_fmtp(fmtp),
+                )
+                .unwrap()
             };
 
-            // Legacy.
+            // Legacy, as used by `Demuxed`.
             let mut legacy = new();
             let mut legacy_frames = Vec::new();
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
                 let mut pending = VecDeque::new();
-                crate::client::push_legacy(
-                    &mut legacy,
-                    &ReceivedPacketRef::new(meta, buf, pos, len),
-                    0,
-                    FrameFormat::default(),
-                    &mut pending,
-                )
-                .unwrap();
+                legacy
+                    .push_with(
+                        &ReceivedPacketRef::new(meta, buf, pos, len),
+                        &mut crate::client::LegacyHandler {
+                            pending: &mut pending,
+                            meta: &meta,
+                            stream_id: 0,
+                            format: FrameFormat::default(),
+                        },
+                    )
+                    .unwrap();
                 for item in pending {
                     legacy_frames.push(match item.unwrap() {
                         CodecItem::VideoFrame(f) => f.into_data(),
@@ -1817,7 +1956,8 @@ mod tests {
     /// As in 0.4.x, JPEG is accepted with media type `image` as well as `video`.
     #[test]
     fn jpeg_image_media_type() {
-        let d = Depacketizer::<crate::PacketContext>::new("image", "jpeg", 90_000, None, None);
+        let d =
+            Depacketizer::<crate::PacketContext>::new(&PayloadFormat::new("image", "jpeg", 90_000));
         assert!(matches!(d, Ok(Depacketizer::Video(_))));
     }
 

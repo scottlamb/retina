@@ -376,12 +376,29 @@ fn parse_media(
     }
 
     let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
+    let mut format =
+        crate::codec::PayloadFormat::new(media.to_string(), encoding_name.to_string(), clock_rate);
+    if let Some(c) = channels {
+        format = format.with_channels(c);
+    }
+    if let Some(f) = fmtp {
+        format = format.with_fmtp(f);
+    }
     let depacketizer = match direction {
         StreamDirection::Receiving => {
-            crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp)
+            let d = crate::codec::Depacketizer::new(&format).map_err(|e| e.to_string());
+            if let Err(e) = &d {
+                log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}: {e}");
+            }
+            d
         }
         StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
     };
+    let parameters = depacketizer
+        .as_ref()
+        .ok()
+        .and_then(|d| d.parameters())
+        .map(crate::codec::Parameters::from);
 
     Ok(Stream {
         frame_format: Default::default(),
@@ -389,6 +406,8 @@ fn parse_media(
         encoding_name,
         clock_rate_hz: clock_rate,
         rtp_payload_type,
+        fmtp: fmtp.map(Into::into),
+        parameters,
         depacketizer,
         control,
         channels,
