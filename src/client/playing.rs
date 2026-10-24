@@ -590,34 +590,34 @@ impl PlayingCore {
     }
 
     /// Moves the keepalive deadline; follow by resetting the driver's timer.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn set_keepalive_deadline(&mut self, deadline: Instant) {
         self.keepalive.deadline = deadline;
     }
 
     /// Pretends an `OPTIONS` response advertised `GET_PARAMETER` and
     /// `SET_PARAMETER`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn set_parameter_methods_supported(&mut self) {
         self.keepalive.get_parameter_supported = true;
         self.keepalive.set_parameter_supported = true;
     }
 
     /// Returns the state of the current keepalive request.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn keepalive_state(&self) -> KeepaliveState {
         self.keepalive.state
     }
 
     /// Returns the receiver report state, iff reports are enabled. Follow a
     /// change to `due` by resetting the driver's timer.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn reports_mut(&mut self) -> Option<&mut Reports> {
         self.reports.as_mut()
     }
 
     /// Returns true if any stream keeps reception statistics.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn has_reception_stats(&self) -> bool {
         self.streams
             .iter()

@@ -296,7 +296,7 @@ impl Sink<OwnedMessage> for Connection {
     }
 }
 
-/// tokio-specific version of [`crate::UdpPair`].
+/// tokio-specific version of [`crate::udp_pair::UdpPair`].
 pub(crate) struct UdpPair {
     pub(crate) rtp_port: u16,
     pub(crate) rtp_socket: UdpSocket,
@@ -305,7 +305,7 @@ pub(crate) struct UdpPair {
 
 impl UdpPair {
     pub(crate) fn for_ip(ip_addr: std::net::IpAddr) -> Result<Self, std::io::Error> {
-        let inner = crate::UdpPair::for_ip(ip_addr)?;
+        let inner = crate::udp_pair::UdpPair::for_ip(ip_addr)?;
         inner.rtp_socket.set_nonblocking(true)?;
         inner.rtcp_socket.set_nonblocking(true)?;
         Ok(Self {

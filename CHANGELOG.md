@@ -15,6 +15,11 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   BREAKING: add a `tokio` feature (enabled by default) for the tokio-based
+    client: `client::Session`, `client::SessionGroup::await_stale_sessions`,
+    and `client::SessionOptions::bind`. With it disabled, Retina doesn't
+    depend on tokio; callers of the sans-I/O `client::SessionCore` can use
+    `default-features = false`.
 *   BREAKING: `client::SessionGroup` no longer depends on tokio.
     `SessionGroup::stale_sessions` takes a `now: std::time::Instant`, and
     `StaleSessionStatus::max_expires` is a `std::time::Instant`. Expired

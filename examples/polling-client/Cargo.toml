@@ -11,6 +11,6 @@ clap = { version = "4.1.4", features = ["derive"] }
 log = "0.4.8"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 polling = "3.11.0"
-retina = { path = "../../", features = ["unstable-sans-io"] }
+retina = { path = "../../", default-features = false, features = ["h264", "h265", "unstable-sans-io"] }
 socket2 = "0.5"
 url = "2.2.1"

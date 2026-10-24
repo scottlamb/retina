@@ -16,9 +16,14 @@ include = ["src/**/*", "benches", "Cargo.toml"]
 rust-version = "1.88"
 
 [features]
-default = ["h264", "h265"]
+default = ["h264", "h265", "tokio"]
 h264 = ["dep:h264-reader"]
 h265 = ["dep:h264-reader"]
+
+# Exposes the tokio-based client (`client::Session`). Without it, the client is
+# usable only via the sans-I/O `client::SessionCore` and `client::TeardownCore`
+# (see `unstable-sans-io`), and Retina doesn't depend on tokio.
+tokio = ["dep:futures", "dep:socket2", "dep:tokio"]
 
 # Exposes the sans-I/O client (`client::SessionCore`) API. It's experimental:
 # it may change in any release, without regard to semver.
@@ -43,7 +48,7 @@ base64 = "0.22.0"
 bitstream-io = "4.9"
 bytes = "1.10"
 derive_more = { version = "2", features = ["debug", "display", "error", "from"] }
-futures = "0.3.14"
+futures = { version = "0.3.14", optional = true }
 h264-reader = { version = "0.9.0", optional = true }
 hex = "0.4.3"
 http-auth = "0.1.2"
@@ -54,12 +59,13 @@ pretty-hex = "0.4.0"
 rand = "0.8.3"
 sdp-types = "0.2.0"
 smallvec = { version = "1.6.1", features = ["union"] }
-socket2 = "0.5"
-tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"] }
+socket2 = { version = "0.5", optional = true }
+tokio = { version = "1.13.0", features = ["macros", "net", "rt", "sync", "time"], optional = true }
 url = "2.2.1"
 
 [dev-dependencies]
 criterion = { version = "0.7.0", features = ["async_tokio"] }
+futures = "0.3.14"
 mylog = { git = "https://github.com/scottlamb/mylog" }
 pretty_assertions = "1.4.1"
 tokio = { version = "1.5.0", features = ["io-util", "macros", "rt-multi-thread", "test-util"] }
@@ -70,7 +76,7 @@ debug = true
 [[bench]]
 name = "client"
 harness = false
-required-features = ["h264", "unstable-send"]
+required-features = ["h264", "tokio", "unstable-send"]
 
 [[bench]]
 name = "depacketize"

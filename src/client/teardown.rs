@@ -173,6 +173,7 @@ impl TeardownCore {
         self.expires
     }
 
+    #[cfg(feature = "tokio")]
     pub(super) fn options(&self) -> &super::SessionOptions {
         &self.conn.options
     }
@@ -417,6 +418,7 @@ impl Drop for TeardownCore {
 
 /// Drives `core` to completion in the background, starting with `conn` (the
 /// session's connection).
+#[cfg(feature = "tokio")]
 pub(super) async fn background_teardown(
     mut core: TeardownCore,
     mut conn: Option<crate::tokio::Connection>,
@@ -471,6 +473,7 @@ pub(super) async fn background_teardown(
 
 /// Writes what `core` has to write to `conn`, and returns once something has
 /// been read.
+#[cfg(feature = "tokio")]
 fn poll_io(
     cx: &mut std::task::Context<'_>,
     conn: &mut crate::tokio::Connection,

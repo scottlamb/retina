@@ -499,7 +499,7 @@ impl MarkBuf {
     }
 
     /// Returns the current capacity, which is always a power of two.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn capacity(&self) -> usize {
         self.ring.capacity()
     }

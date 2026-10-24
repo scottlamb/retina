@@ -3,27 +3,41 @@
 
 //! RTSP client: connect to a server via [`Session`].
 //!
-//! [`Session`] does its I/O via tokio. Its protocol logic is also available
-//! without any I/O or runtime, for callers who do their own, as
-//! [`SessionCore`] and [`TeardownCore`]. The `polling-client` example drives
-//! them with plain non-blocking sockets and a `poll(2)`-style loop. These
-//! require the `unstable-sans-io` feature and are exempt from semver: they may
-//! change in any release.
+//! [`Session`] does its I/O via tokio, and requires the `tokio` feature
+//! (enabled by default). Its protocol logic is also available without any I/O
+//! or runtime, for callers who do their own, as [`SessionCore`] and
+//! [`TeardownCore`]. The `polling-client` example drives them with plain
+//! non-blocking sockets and a `poll(2)`-style loop. These require the
+//! `unstable-sans-io` feature and are exempt from semver: they may change in
+//! any release.
+
+// Without either feature, nothing drives the protocol logic.
+#![cfg_attr(
+    not(any(feature = "tokio", feature = "unstable-sans-io")),
+    allow(dead_code, unused_imports)
+)]
 
 use std::convert::TryFrom;
+#[cfg(feature = "tokio")]
 use std::io;
+#[cfg(feature = "tokio")]
 use std::mem::MaybeUninit;
+#[cfg(feature = "tokio")]
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "tokio")]
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
-use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
+use std::{fmt::Debug, num::NonZeroU16};
 
 #[cfg(feature = "unstable-sans-io")]
 pub use self::channel_mapping::ChannelType;
 #[cfg(not(feature = "unstable-sans-io"))]
 use self::channel_mapping::ChannelType;
+#[cfg(feature = "tokio")]
 use self::playing::PlayingCore;
 #[cfg(not(feature = "unstable-sans-io"))]
 use self::session_core::{SessionCore, SessionEvent, SetupTransport};
@@ -35,8 +49,11 @@ pub use self::timeline::Timeline;
 use crate::inputs::Input as _;
 use crate::rtsp::msg::{self as msg, OwnedMessage};
 use bytes::Bytes;
-use futures::{Future, ready};
+#[cfg(feature = "tokio")]
 use log::{debug, warn};
+#[cfg(feature = "tokio")]
+use std::task::ready;
+#[cfg(feature = "tokio")]
 use tokio::net::UdpSocket;
 use url::Url;
 
@@ -182,6 +199,7 @@ pub struct StaleSessionStatus {
 
     /// The `SessionGroupInner::next_seqnum` value as of when this was
     /// created, for `SessionGroup::await_stale_sessions`.
+    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     next_seqnum: u64,
 }
 
@@ -322,6 +340,7 @@ impl SessionGroup {
     }
 
     /// Waits for all of the sessions described by `status` to expire or be torn down.
+    #[cfg(feature = "tokio")]
     pub async fn await_stale_sessions(&self, status: &StaleSessionStatus) {
         loop {
             let changed = self.changed();
@@ -602,6 +621,7 @@ pub struct SessionOptions {
     session_id: SessionIdPolicy,
     max_message_size: Option<usize>,
     receiver_reports: ReceiverReportPolicy,
+    #[cfg(feature = "tokio")]
     bind_addr: Option<std::net::IpAddr>,
     backchannel: bool,
 }
@@ -815,6 +835,7 @@ impl SessionOptions {
     /// transport) to this local address. Useful when the host has several local addresses and the
     /// OS would otherwise pick a source address the server has no route back to (e.g. a link-local
     /// address beside a routable one). The port is chosen by the OS.
+    #[cfg(feature = "tokio")]
     pub fn bind(mut self, bind_addr: Option<std::net::IpAddr>) -> Self {
         self.bind_addr = bind_addr;
         self
@@ -1178,11 +1199,13 @@ impl Stream {
     }
 }
 
+#[cfg(feature = "tokio")]
 struct UdpSockets {
     rtp: UdpSocket,
     rtcp: UdpSocket,
 }
 
+#[cfg(feature = "tokio")]
 impl UdpSockets {
     fn socket(&self, channel_type: ChannelType) -> &UdpSocket {
         match channel_type {
@@ -1323,17 +1346,22 @@ pub struct Credentials {
 /// `DESCRIBE` changes the connection's state such that another one will fail,
 /// before assigning a session id. Thus [Session] represents something more like
 /// an RTSP connection than an RTSP session.
+#[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub trait State {}
 
 /// Initial state after a `DESCRIBE`; use via `Session<Described>`.
+#[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub struct Described(());
+#[cfg(feature = "tokio")]
 impl State for Described {}
 
 /// State after a `PLAY`; use via `Session<Playing>`.
+#[cfg(feature = "tokio")]
 #[doc(hidden)]
 pub struct Playing(());
+#[cfg(feature = "tokio")]
 impl State for Playing {}
 
 /// An RTSP session.
@@ -1360,8 +1388,10 @@ impl State for Playing {}
 /// All `Session` operations are currently expected to be performed from
 /// "within" a tokio runtime with both time and I/O resource drivers enabled.
 /// Operations may panic or fail otherwise.
+#[cfg(feature = "tokio")]
 pub struct Session<S: State>(Box<SessionInner>, S);
 
+#[cfg(feature = "tokio")]
 struct SessionInner {
     /// The RTSP connection, used only for I/O. Currently there's expected to
     /// always be one, even while playing a RTP/AVP/UDP session. The only
@@ -1384,6 +1414,7 @@ struct SessionInner {
     udp_next_poll_i: usize,
 }
 
+#[cfg(feature = "tokio")]
 impl SessionInner {
     fn playing_core(&mut self) -> &mut PlayingCore {
         self.core
@@ -1442,6 +1473,7 @@ fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
         .ok_or_else(|| format!("Must specify host in rtsp url {}", url))
 }
 
+#[cfg(feature = "tokio")]
 /// Connects to the server named in `url`.
 async fn connect(url: &Url, options: &SessionOptions) -> Result<crate::tokio::Connection, Error> {
     let host = validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
@@ -1452,11 +1484,13 @@ async fn connect(url: &Url, options: &SessionOptions) -> Result<crate::tokio::Co
 }
 
 /// A sans-I/O core's buffer of bytes to write; see [`poll_write_transmit`].
+#[cfg(feature = "tokio")]
 trait TransmitCore {
     fn transmit_buf(&self) -> (&[u8], &[u8]);
     fn advance_transmit(&mut self, n: usize);
 }
 
+#[cfg(feature = "tokio")]
 impl TransmitCore for SessionCore {
     fn transmit_buf(&self) -> (&[u8], &[u8]) {
         SessionCore::transmit_buf(self)
@@ -1466,6 +1500,7 @@ impl TransmitCore for SessionCore {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl TransmitCore for conn::ConnCore {
     fn transmit_buf(&self) -> (&[u8], &[u8]) {
         conn::ConnCore::transmit_buf(self)
@@ -1475,6 +1510,7 @@ impl TransmitCore for conn::ConnCore {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl TransmitCore for PlayingCore {
     fn transmit_buf(&self) -> (&[u8], &[u8]) {
         PlayingCore::transmit_buf(self)
@@ -1484,6 +1520,7 @@ impl TransmitCore for PlayingCore {
     }
 }
 
+#[cfg(feature = "tokio")]
 /// Writes from `core`'s transmit buffer to `conn` until it's empty.
 fn poll_write_transmit(
     cx: &mut std::task::Context<'_>,
@@ -1501,6 +1538,7 @@ fn poll_write_transmit(
 }
 
 /// A sans-I/O core which completes one request at a time; see [`poll_request`].
+#[cfg(feature = "tokio")]
 trait RequestCore: TransmitCore {
     type Output;
     fn read_buf(&mut self) -> &mut crate::buf::MarkBuf;
@@ -1509,6 +1547,7 @@ trait RequestCore: TransmitCore {
     fn poll_done(&mut self, now: std::time::Instant) -> Option<Result<Self::Output, Error>>;
 }
 
+#[cfg(feature = "tokio")]
 impl RequestCore for SessionCore {
     type Output = SessionEvent;
     fn read_buf(&mut self) -> &mut crate::buf::MarkBuf {
@@ -1525,6 +1564,7 @@ impl RequestCore for SessionCore {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl RequestCore for conn::ConnCore {
     type Output = conn::Response;
     fn read_buf(&mut self) -> &mut crate::buf::MarkBuf {
@@ -1541,6 +1581,7 @@ impl RequestCore for conn::ConnCore {
     }
 }
 
+#[cfg(feature = "tokio")]
 /// Does I/O on `conn` until `core`'s outstanding request completes.
 ///
 /// The caller must have started a request, so that EOF ends it.
@@ -1681,6 +1722,7 @@ fn fill_req(
 
 const DEFAULT_USER_AGENT: &str = concat!("retina_", env!("CARGO_PKG_VERSION"));
 
+#[cfg(feature = "tokio")]
 impl<S: State> Session<S> {
     /// Returns the available streams as described by the server.
     pub fn streams(&self) -> &[Stream] {
@@ -1703,6 +1745,7 @@ impl<S: State> Session<S> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl Session<Described> {
     /// Creates a new session from a `DESCRIBE` request on the given URL.
     ///
@@ -1835,6 +1878,7 @@ impl Session<Described> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl SessionInner {
     /// Does I/O until the session core's request completes.
     async fn drive(&mut self) -> Result<SessionEvent, Error> {
@@ -1992,6 +2036,7 @@ impl std::fmt::Debug for RtpPacket<'_> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl Session<Playing> {
     /// Polls for the next RTP or RTCP packet.
     ///
@@ -2275,6 +2320,7 @@ impl Session<Playing> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl Drop for SessionInner {
     fn drop(&mut self) {
         let Some(core) = self.core.take_setup() else {
@@ -2289,7 +2335,7 @@ impl Drop for SessionInner {
     }
 }
 
-#[cfg(feature = "unstable-send")]
+#[cfg(all(feature = "tokio", feature = "unstable-send"))]
 impl Session<Playing> {
     /// Queues an RTP packet on a [`StreamDirection::Sending`] stream (ONVIF
     /// backchannel).
@@ -2342,7 +2388,7 @@ impl Session<Playing> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::rtsp::msg::StatusCode;

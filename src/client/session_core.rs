@@ -911,6 +911,7 @@ impl SessionCore {
         Self(Phase::Setup(SetupCore::new(local_addr, peer_addr, options)))
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn from_conn(conn: ConnCore) -> Self {
         Self(Phase::Setup(SetupCore::from_conn(conn)))
     }
@@ -939,6 +940,7 @@ impl SessionCore {
     }
 
     /// Takes the state needed for a `TEARDOWN`, leaving this core unusable.
+    #[cfg(feature = "tokio")]
     pub(crate) fn take_setup(&mut self) -> Option<SetupCore> {
         match std::mem::replace(&mut self.0, Phase::Switching) {
             Phase::Setup(c) => Some(c),
