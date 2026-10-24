@@ -4,6 +4,7 @@
 //! RTSP client examples.
 
 mod backchannel;
+mod demux;
 mod info;
 mod jpeg;
 mod mp4;

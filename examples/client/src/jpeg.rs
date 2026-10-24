@@ -9,9 +9,11 @@ use std::{num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
-use futures::{Future, StreamExt};
+use futures::Future;
 use log::info;
-use retina::client::{CodecItem, SetupOptions};
+use retina::client::SetupOptions;
+
+use crate::demux::{Demuxer, Item};
 
 #[derive(Parser)]
 pub struct Opts {
@@ -57,8 +59,8 @@ async fn write_jpeg(
                 .initial_timestamp(opts.initial_timestamp)
                 .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
         )
-        .await?
-        .demuxed()?;
+        .await?;
+    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::default())?;
 
     std::fs::create_dir_all(&opts.out_dir)?;
 
@@ -75,15 +77,15 @@ async fn write_jpeg(
 
     loop {
         tokio::select! {
-            pkt = session.next() => {
-                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
-                    CodecItem::VideoFrame(f) => {
+            item = demuxer.next(&mut session) => {
+                match item?.ok_or_else(|| anyhow!("EOF"))? {
+                    Item::Video(f) => {
                         let out_path = opts.out_dir.join(format!("{frame_count:05}.jpeg"));
-                        std::fs::write(out_path, f.data())?;
+                        std::fs::write(out_path, f.data)?;
 
                         frame_count += 1;
                     },
-                    CodecItem::Rtcp(rtcp) => {
+                    Item::Rtcp(rtcp) => {
                         if let (Some(t), Some(Ok(Some(sr)))) = (rtcp.rtp_timestamp(), rtcp.pkts().next().map(retina::rtcp::PacketRef::as_sender_report)) {
                             println!("{}: SR ts={}", t, sr.ntp_timestamp());
                         }

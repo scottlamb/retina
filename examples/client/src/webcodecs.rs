@@ -11,9 +11,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures::{StreamExt as _, stream::FuturesUnordered};
 use log::{debug, info};
-use retina::{client::SetupOptions, client::VideoFrame, codec::VideoParameters};
+use retina::{client::SetupOptions, codec::VideoParameters};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+
+use crate::demux::{Demuxer, Item, VideoFrame};
 
 #[derive(Parser)]
 pub struct Opts {
@@ -122,35 +124,32 @@ fn make_parameters_msg(parameters: &VideoParameters) -> axum::extract::ws::Messa
 fn make_frame_msg(frame: &VideoFrame) -> axum::extract::ws::Message {
     let mut out = BytesMut::new();
     out.put_u8(1);
-    out.put_i64(frame.timestamp().elapsed() * 1000 / 90); // XXX: shouldn't assume 90 kHz units.
-    out.put_u8(frame.is_random_access_point().into());
-    out.put_slice(frame.data());
+    out.put_i64(frame.timestamp.elapsed() * 1000 / 90); // XXX: shouldn't assume 90 kHz units.
+    out.put_u8(frame.is_random_access_point.into());
+    out.put_slice(&frame.data);
     axum::extract::ws::Message::Binary(out.freeze())
 }
 
 /// Receives frames from the RTSP server and sends them to `frames_tx`.
 async fn receive_frames(
-    mut session: retina::client::Demuxed,
+    mut session: retina::client::Session<retina::client::Playing>,
     frames_tx: tokio::sync::broadcast::Sender<FrameItem>,
 ) -> Result<(), Error> {
+    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::MP4)?;
     let mut next_frame_num = 0;
     let mut cur_parameters = None;
-    while let Some(item) = session.next().await {
-        if let retina::client::CodecItem::VideoFrame(frame) = item? {
-            let stream_params = session.parameters(frame.stream_id());
+    while let Some(item) = demuxer.next(&mut session).await? {
+        if let Item::Video(frame) = item {
             let parameters = if let Some(cur_parameters) = cur_parameters.as_ref()
-                && !frame.has_new_parameters()
+                && !frame.has_new_parameters
             {
                 cur_parameters
-            } else if let Some((last_id, _)) = &cur_parameters {
-                let Some(retina::codec::ParametersRef::Video(p)) = stream_params else {
-                    unreachable!()
-                };
-                debug!("broadcasting parameter {}", last_id + 1);
-                cur_parameters.insert((last_id + 1, make_parameters_msg(p)))
-            } else if let Some(retina::codec::ParametersRef::Video(p)) = stream_params {
-                debug!("broadcasting parameter 0");
-                cur_parameters.insert((0, make_parameters_msg(p)))
+            } else if let Some(p) = frame.parameters.as_deref() {
+                let id = cur_parameters
+                    .as_ref()
+                    .map_or(0, |(last_id, _)| last_id + 1);
+                debug!("broadcasting parameter {id}");
+                cur_parameters.insert((id, make_parameters_msg(p)))
             } else {
                 continue; // wait for initial parameters.
             };
@@ -158,7 +157,7 @@ async fn receive_frames(
             next_frame_num += 1;
             let _ = frames_tx.send(FrameItem {
                 parameters_id: parameters.0,
-                key_frame: frame.is_random_access_point(),
+                key_frame: frame.is_random_access_point,
                 parameters_update_msg: parameters.1.clone(),
                 frame_msg: make_frame_msg(&frame),
             });
@@ -309,15 +308,9 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         bail!("No suitable video stream found");
     };
     session
-        .setup(
-            video_stream_i,
-            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
-        )
+        .setup(video_stream_i, SetupOptions::default())
         .await?;
-    let session = session
-        .play(retina::client::PlayOptions::default())
-        .await?
-        .demuxed()?;
+    let session = session.play(retina::client::PlayOptions::default()).await?;
 
     let listener = TcpListener::bind(&opts.bind_addr).await?;
     let scheme = if opts.tls { "https" } else { "http" };

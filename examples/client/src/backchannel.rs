@@ -9,9 +9,9 @@ use std::time::Duration;
 use anyhow::{Error, anyhow, bail};
 use bytes::Bytes;
 use clap::Parser;
-use futures::{SinkExt as _, StreamExt as _};
+use futures::SinkExt as _;
 use log::{error, info};
-use retina::client::{PacketItem, SessionGroup, SetupOptions, StreamDirection};
+use retina::client::{PlayingItem, SessionGroup, SetupOptions, StreamDirection};
 use retina::rtp::SendingPacket;
 
 /// G.711 samples per packet: 20 ms at 8 kHz, the default packetization
@@ -94,8 +94,8 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
                 session.send(pkt).await?;
                 timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
             },
-            item = session.next() => {
-                if let PacketItem::Rtcp(rtcp) = item.ok_or_else(|| anyhow!("EOF"))?? {
+            item = session.next_item() => {
+                if let PlayingItem::Rtcp(rtcp) = item.ok_or_else(|| anyhow!("EOF"))?? {
                     info!("RTCP from server: {rtcp:?}");
                 }
             },

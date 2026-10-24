@@ -5,9 +5,12 @@ extern crate ffmpeg_next as ffmpeg;
 
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
-use futures::StreamExt;
-use log::{error, info};
-use retina::client::{CodecItem, SetupOptions, VideoFrame};
+use log::{error, info, warn};
+use retina::PacketContext;
+use retina::client::{PlayingItem, SetupOptions};
+use retina::codec::{
+    Accumulate, Depacketizer, FrameFormat, Loss, VideoFrameEnd, VideoFrameStart, VideoHandler,
+};
 use std::{fs::File, io::Write, path::Path, str::FromStr, sync::Arc};
 
 /// Decodes video streams using ffmpeg, writing them into `frame<i>.ppm` images.
@@ -64,6 +67,27 @@ async fn main() {
     }
 }
 
+/// Collects complete frames, formatted for ffmpeg.
+#[derive(Default)]
+struct Frames(Vec<Vec<u8>>);
+
+impl VideoHandler<PacketContext> for Frames {
+    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+        Accumulate::Yes
+    }
+
+    fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
+        let data = frame_end
+            .complete_frame(FrameFormat::SIMPLE)
+            .expect("frame_start requested accumulation");
+        self.0.push(data);
+    }
+
+    fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
+        warn!("loss: {:?}", loss.reason());
+    }
+}
+
 struct Processor {
     decoder: ffmpeg::codec::decoder::Video,
     scaler: Option<ffmpeg::software::scaling::Context>,
@@ -89,10 +113,9 @@ impl Processor {
     }
 
     /// Returns Ok(false) if max_frames was reached.
-    fn send_frame(&mut self, f: VideoFrame) -> Result<bool, Error> {
+    fn send_frame(&mut self, data: &[u8]) -> Result<bool, Error> {
         info!("sending frame {} to ffmpeg", self.encoded_frame_i);
-        let data = f.into_data();
-        let pkt = ffmpeg::codec::packet::Packet::copy(&data);
+        let pkt = ffmpeg::codec::packet::Packet::copy(data);
         self.decoder.send_packet(&pkt)?;
         self.encoded_frame_i += 1;
         self.receive_frames()
@@ -222,25 +245,30 @@ async fn run() -> Result<(), Error> {
     session
         .setup(
             video_stream_i,
-            SetupOptions::default()
-                .transport(opts.transport.clone())
-                .frame_format(retina::codec::FrameFormat::SIMPLE),
+            SetupOptions::default().transport(opts.transport.clone()),
         )
         .await?;
+    let Depacketizer::Video(mut depacketizer) = session.streams()[video_stream_i]
+        .new_depacketizer()
+        .map_err(|e| anyhow!(e))?
+    else {
+        bail!("expected a video depacketizer");
+    };
 
-    let mut session = session
-        .play(retina::client::PlayOptions::default())
-        .await?
-        .demuxed()?;
+    let mut session = session.play(retina::client::PlayOptions::default()).await?;
 
     let mut processor = Processor::new(ffmpeg_codec_id, opts.max_frames)?;
-    loop {
+    let mut frames = Frames::default();
+    'outer: loop {
         tokio::select! {
-            item = session.next() => {
+            item = session.next_item() => {
                 match item {
-                    Some(Ok(CodecItem::VideoFrame(f))) => {
-                        if !processor.send_frame(f)? {
-                            break;
+                    Some(Ok(PlayingItem::Rtp(pkt))) => {
+                        depacketizer.push(pkt.packet(), &mut frames);
+                        for f in frames.0.drain(..) {
+                            if !processor.send_frame(&f)? {
+                                break 'outer;
+                            }
                         }
                     },
                     Some(Ok(_)) => {},

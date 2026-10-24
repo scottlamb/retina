@@ -3,10 +3,15 @@
 
 use anyhow::{Error, bail};
 use base64::{Engine as _, engine::general_purpose};
+use bytes::BytesMut;
 use clap::Parser;
-use futures::StreamExt;
 use log::{error, info, warn};
-use retina::client::{CodecItem, SetupOptions};
+use retina::PacketContext;
+use retina::client::{PlayingItem, SetupOptions};
+use retina::codec::{
+    Accumulate, Depacketizer, Loss, VideoData, VideoDepacketizer, VideoFrameEnd, VideoFrameStart,
+    VideoHandler, VideoParametersCodec,
+};
 use std::{str::FromStr, sync::Arc};
 use webrtc::{
     api::{APIBuilder, interceptor_registry::register_default_interceptors},
@@ -96,6 +101,60 @@ struct Frame {
     annexb_data: bytes::Bytes,
 }
 
+/// Assembles Annex B frames from an upstream stream's streaming events.
+///
+/// Rather than having Retina accumulate each frame and then copy it, this
+/// appends each NAL unit to `buf` as it arrives, applying its own framing.
+struct UpstreamHandler {
+    stream_id: usize,
+    buf: BytesMut,
+    tx: tokio::sync::broadcast::Sender<Frame>,
+}
+
+impl VideoHandler<PacketContext> for UpstreamHandler {
+    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, PacketContext>) -> Accumulate {
+        self.buf.clear();
+
+        // Browsers need parameter sets in-band before each key frame.
+        if frame_start.is_random_access_point()
+            && let Some(p) = frame_start.parameters()
+        {
+            let nals: &[&[u8]] = match p.codec_params() {
+                VideoParametersCodec::H264 { sps, pps } => &[sps, pps],
+                VideoParametersCodec::H265 { vps, sps, pps } => &[vps, sps, pps],
+                _ => &[],
+            };
+            for nal in nals {
+                self.buf
+                    .extend_from_slice(&retina::codec::h26x::ANNEX_B_START_CODE);
+                self.buf.extend_from_slice(nal);
+            }
+        }
+        Accumulate::No
+    }
+
+    fn data(&mut self, data: &VideoData<'_>) {
+        if data.position.is_first() {
+            self.buf
+                .extend_from_slice(&retina::codec::h26x::ANNEX_B_START_CODE);
+        }
+        for d in data.data {
+            self.buf.extend_from_slice(d);
+        }
+    }
+
+    fn frame_end(&mut self, _frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
+        let _ = self.tx.send(Frame {
+            stream_id: self.stream_id,
+            annexb_data: self.buf.split().freeze(),
+        });
+    }
+
+    fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
+        warn!("upstream loss: {:?}", loss.reason());
+    }
+}
+
 async fn run() -> Result<(), Error> {
     let opts = Opts::parse();
     let creds = match (opts.username, opts.password) {
@@ -159,12 +218,12 @@ async fn run() -> Result<(), Error> {
         // This could work in a few different ways:
         //
         // 1. Pass RTP packets from upstream to downstream unmodified. (From
-        //    retina::client::Session's Stream impl to
+        //    retina::client::Session::next_item to
         //    webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRtp.)
         //    This only works if the upstream and downstream agree on an
         //    acceptable MTU.
         // 2. Pass whole frames (aka samples or H.264 access units). (From
-        //    retina::client::Demuxed's Stream impl to
+        //    a retina::codec::VideoDepacketizer to
         //    webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample.)
         //    This introduces a slight lag if it takes a long time to receive a
         //    complete frame from upstream.
@@ -206,12 +265,7 @@ async fn run() -> Result<(), Error> {
         .filter_map(|(i, track)| track.as_ref().map(|_| i))
     {
         upstream_session
-            .setup(
-                i,
-                SetupOptions::default()
-                    .transport(opts.transport.clone())
-                    .frame_format(retina::codec::FrameFormat::SIMPLE),
-            )
+            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
             .await?;
     }
 
@@ -226,19 +280,36 @@ async fn run() -> Result<(), Error> {
     // [*] some cameras drop the TCP connection when their send buffers fill.
     // Others truncate the current packet, which causes Retina to fail shortly
     // afterward with "framing error".
+    let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
+    let mut upstream_streams: Vec<Option<(VideoDepacketizer<PacketContext>, UpstreamHandler)>> =
+        Vec::new();
+    for (i, track) in tracks.iter().enumerate() {
+        if track.is_none() {
+            upstream_streams.push(None);
+            continue;
+        }
+        let depacketizer = match upstream_session.streams()[i].new_depacketizer() {
+            Ok(Depacketizer::Video(d)) => d,
+            Ok(_) => bail!("stream {i}: expected a video depacketizer"),
+            Err(e) => bail!("stream {i}: {e}"),
+        };
+        let handler = UpstreamHandler {
+            stream_id: i,
+            buf: BytesMut::new(),
+            tx: upstream_frames_tx.clone(),
+        };
+        upstream_streams.push(Some((depacketizer, handler)));
+    }
     let mut upstream_session = upstream_session
         .play(retina::client::PlayOptions::default())
-        .await?
-        .demuxed()?;
-    let (upstream_frames_tx, mut upstream_frames_rx) = tokio::sync::broadcast::channel(16);
+        .await?;
     tokio::spawn(async move {
-        while let Some(item) = upstream_session.next().await {
+        while let Some(item) = upstream_session.next_item().await {
             match item {
-                Ok(CodecItem::VideoFrame(f)) => {
-                    let _ = upstream_frames_tx.send(Frame {
-                        stream_id: f.stream_id(),
-                        annexb_data: f.into_data().into(),
-                    });
+                Ok(PlayingItem::Rtp(pkt)) => {
+                    if let Some((d, h)) = &mut upstream_streams[pkt.stream_id()] {
+                        d.push(pkt.packet(), h);
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
