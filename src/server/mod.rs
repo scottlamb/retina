@@ -9,7 +9,7 @@
 //! (interleaved) transport is supported so far.
 //!
 //! Sending media is up to the caller: see [`crate::codec::VideoPacketizer`]
-//! and [`crate::rtp::Sender`].
+//! and [`crate::rtp::Sender`]. The `proxy` example ties these together.
 //!
 //! This API is a prototype, exempt from semver, and likely to change in any
 //! release.
