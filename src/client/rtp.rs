@@ -381,7 +381,7 @@ pub(crate) struct Sender {
     /// next RTP packet.
     ///
     /// Reports follow the receiver reports' schedule; see
-    /// [`super::receiver_report::regular_interval`].
+    /// [`crate::rtcp::report_interval`].
     ///
     /// The first report follows the first RTP packet without delay: [RFC 3550
     /// section 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2)
@@ -394,10 +394,8 @@ pub(crate) struct Sender {
 
 impl Sender {
     pub(crate) fn new(payload_type: u8, clock_rate_hz: u32) -> Self {
-        use base64::Engine as _;
         use rand::Rng as _;
         let mut rng = rand::thread_rng();
-        let cname_bytes: [u8; 12] = rng.r#gen();
         Self {
             ssrc: rng.r#gen(),
             next_seq: rng.r#gen(),
@@ -408,11 +406,7 @@ impl Sender {
             packet_count: 0,
             octet_count: 0,
             next_report: None,
-
-            // RFC 7022 section 4.2 recommends a random 96-bit CNAME, base64-encoded.
-            cname: base64::engine::general_purpose::STANDARD
-                .encode(cname_bytes)
-                .into_boxed_str(),
+            cname: crate::rtcp::random_cname().into_boxed_str(),
         }
     }
 
@@ -495,9 +489,13 @@ impl Sender {
         out.extend_from_slice(&self.packet_count.to_be_bytes());
         out.extend_from_slice(&self.octet_count.to_be_bytes());
 
-        super::receiver_report::write_sdes_cname(self.ssrc, &self.cname, out);
-        self.next_report =
-            Some(now + super::receiver_report::regular_interval(&mut rand::thread_rng()));
+        crate::rtcp::write_sdes_cname(self.ssrc, &self.cname, out);
+        self.next_report = Some(
+            now + crate::rtcp::report_interval(
+                crate::rtcp::MIN_REPORT_INTERVAL,
+                &mut rand::thread_rng(),
+            ),
+        );
     }
 }
 

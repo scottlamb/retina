@@ -3395,7 +3395,7 @@ mod tests {
                     is_disposable: false,
                     has_new_parameters: false,
                 },
-                Event::Data(crate::codec::UnitPosition::Complete, hex(b"\x65slice")),
+                Event::Data(crate::codec::Position::Complete, hex(b"\x65slice")),
                 Event::FrameEnd {
                     is_random_access_point: true,
                     is_disposable: false,

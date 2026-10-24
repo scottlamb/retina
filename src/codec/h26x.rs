@@ -7,8 +7,11 @@
 #![cfg_attr(not(all(feature = "h264", feature = "h265")), allow(dead_code))]
 
 use crate::buf::{BufRange, Mark, MarkBuf};
-use crate::codec::{UnitPosition, VideoData, VideoHandler};
+use crate::codec::{Position, VideoData, VideoHandler};
 use crate::inputs::Input as _;
+
+#[cfg(feature = "unstable-send")]
+pub(crate) mod packetizer;
 
 mod analyzer;
 pub(crate) use analyzer::NalAnalyzer;
@@ -30,6 +33,115 @@ pub enum Framing {
     /// Annex B start codes (`00 00 00 01`) for both packet data and extra data.
     AnnexB,
 }
+
+/// Iterates over the NAL units of framed H.264 or H.265 data, as produced
+/// with [`Framing`].
+///
+/// Each item is a NAL unit's start (that of its start code, including any
+/// `zero_byte`, or its length prefix) and the range of its body (header
+/// included). Annex B NAL units which are empty are skipped, as are leading
+/// zero bytes and `trailing_zero_8bits`.
+///
+/// The data is validated by [`NalUnits::new`], so iteration can't fail.
+#[derive(Clone, Debug)]
+pub(crate) struct NalUnits<'a> {
+    framing: Framing,
+    data: &'a [u8],
+
+    /// For Annex B, the position of the next 3-byte start code, if any; for
+    /// a 4-byte length, the position of the next length prefix.
+    pos: Option<usize>,
+}
+
+/// Finds Annex B start codes; built once, as building takes a little work.
+static START_CODE_FINDER: std::sync::OnceLock<memchr::memmem::Finder<'static>> =
+    std::sync::OnceLock::new();
+
+/// Returns the position of the next 3-byte Annex B start code at or after `from`.
+fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
+    START_CODE_FINDER
+        .get_or_init(|| memchr::memmem::Finder::new(&[0, 0, 1]))
+        .find(&data[from..])
+        .map(|p| from + p)
+}
+
+impl<'a> NalUnits<'a> {
+    /// Validates `data` and returns an iterator over its NAL units.
+    ///
+    /// Returns an error if Annex B data doesn't begin with a start code (after
+    /// any zero bytes), or 4-byte length data has a truncated or empty NAL
+    /// unit.
+    pub(crate) fn new(framing: Framing, data: &'a [u8]) -> Result<Self, String> {
+        let pos = match framing {
+            Framing::AnnexB => {
+                let pos = find_start_code(data, 0);
+                if !data[..pos.unwrap_or(data.len())].iter().all(|&b| b == 0) {
+                    return Err("Annex B data doesn't begin with a start code".into());
+                }
+                pos
+            }
+            Framing::FourByteLength => {
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let Some((len, after)) = rest.split_first_chunk::<4>() else {
+                        return Err("truncated NAL length".into());
+                    };
+                    let len = crate::to_usize(u32::from_be_bytes(*len));
+                    if len == 0 {
+                        return Err("empty NAL".into());
+                    }
+                    let Some(after) = after.get(len..) else {
+                        return Err(format!(
+                            "NAL length {len} exceeds remaining {} bytes",
+                            after.len()
+                        ));
+                    };
+                    rest = after;
+                }
+                (!data.is_empty()).then_some(0)
+            }
+        };
+        Ok(Self { framing, data, pos })
+    }
+}
+
+impl Iterator for NalUnits<'_> {
+    type Item = (usize, std::ops::Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let p = self.pos?;
+            match self.framing {
+                Framing::AnnexB => {
+                    let body_start = p + 3;
+                    self.pos = find_start_code(self.data, body_start);
+                    let mut end = self.pos.unwrap_or(self.data.len());
+                    while end > body_start && self.data[end - 1] == 0 {
+                        end -= 1; // trailing_zero_8bits or the next start code's zero_byte.
+                    }
+                    if end == body_start {
+                        continue; // an empty NAL unit.
+                    }
+                    let start = if p > 0 && self.data[p - 1] == 0 {
+                        p - 1
+                    } else {
+                        p
+                    };
+                    return Some((start, body_start..end));
+                }
+                Framing::FourByteLength => {
+                    // `new` validated the lengths.
+                    let len = u32::from_be_bytes(self.data[p..p + 4].try_into().unwrap());
+                    let body = p + 4..p + 4 + crate::to_usize(len);
+                    self.pos = (body.end < self.data.len()).then_some(body.end);
+                    return Some((p, body));
+                }
+            }
+        }
+    }
+}
+
+impl std::iter::FusedIterator for NalUnits<'_> {}
 
 /// Returns the given parameter set NALs, each preceded by [`ANNEX_B_START_CODE`].
 pub(super) fn annex_b_parameter_sets(nals: &[&[u8]]) -> bytes::Bytes {
@@ -269,7 +381,7 @@ pub(super) fn deliver<Ctx>(
     for piece in pieces {
         if n + 2 > MAX_SLICES {
             handler.data(&VideoData {
-                position: UnitPosition::new(first, false),
+                position: Position::new(first, false),
                 data: &slices[..n],
             });
             first = false;
@@ -284,7 +396,7 @@ pub(super) fn deliver<Ctx>(
         }
     }
     handler.data(&VideoData {
-        position: UnitPosition::new(first, last),
+        position: Position::new(first, last),
         data: &slices[..n],
     });
 }
@@ -706,9 +818,41 @@ pub(super) fn pin(mark: &mut Option<Mark>, buf: &MarkBuf, pos: u64) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use super::*;
+
+    fn nals(framing: Framing, data: &[u8]) -> Result<Vec<(usize, &[u8])>, String> {
+        Ok(NalUnits::new(framing, data)?
+            .map(|(start, body)| (start, &data[body]))
+            .collect())
+    }
+
+    #[test]
+    fn annex_b_nal_units() {
+        // Leading zeros, 4- and 3-byte start codes, an empty NAL unit, and
+        // trailing zeros.
+        let data =
+            b"\x00\x00\x00\x00\x01\x65a\x00\x00\x01\x41bc\x00\x00\x00\x01\x00\x00\x01\x41d\x00\x00";
+        assert_eq!(
+            nals(Framing::AnnexB, data).unwrap(),
+            [(1, &b"\x65a"[..]), (7, b"\x41bc"), (17, b"\x41d")]
+        );
+        assert_eq!(nals(Framing::AnnexB, b"").unwrap(), []);
+        assert_eq!(nals(Framing::AnnexB, b"\x00\x00").unwrap(), []);
+        assert!(nals(Framing::AnnexB, b"\x65a\x00\x00\x01\x41b").is_err());
+    }
+
+    #[test]
+    fn four_byte_length_nal_units() {
+        let data = b"\x00\x00\x00\x02\x65a\x00\x00\x00\x03\x41bc";
+        assert_eq!(
+            nals(Framing::FourByteLength, data).unwrap(),
+            [(0, &b"\x65a"[..]), (6, b"\x41bc")]
+        );
+        assert_eq!(nals(Framing::FourByteLength, b"").unwrap(), []);
+        assert!(nals(Framing::FourByteLength, b"\x00\x00\x00").is_err()); // truncated length.
+        assert!(nals(Framing::FourByteLength, b"\x00\x00\x00\x02\x65").is_err()); // truncated body.
+        assert!(nals(Framing::FourByteLength, b"\x00\x00\x00\x00").is_err()); // empty.
+    }
 
     /// Collects frame data, streaming.
     #[cfg(feature = "h264")]
@@ -793,8 +937,10 @@ mod tests {
 
     /// Tests [`PiecesReader`] with a piece that wraps around the ring buffer
     /// and an `emulation_prevention_three_byte` split across pieces.
+    #[cfg(any(feature = "h264", feature = "h265"))]
     #[test]
     fn pieces_reader_wrap() {
+        use std::io::Read as _;
         let mut buf = MarkBuf::new(8);
         assert_eq!(buf.capacity(), 8);
         buf.extend(b"junkjk");

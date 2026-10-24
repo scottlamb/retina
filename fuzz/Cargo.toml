@@ -21,7 +21,7 @@ mylog = { git = "https://github.com/scottlamb/mylog" }
 
 [dependencies.retina]
 path = ".."
-features = ["h264", "h265"]
+features = ["h264", "h265", "unstable-send"]
 
 [[bin]]
 name = "depacketize_h264"
@@ -38,6 +38,12 @@ doc = false
 [[bin]]
 name = "roundtrip_h264"
 path = "fuzz_targets/roundtrip_h264.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip_h265"
+path = "fuzz_targets/roundtrip_h265.rs"
 test = false
 doc = false
 

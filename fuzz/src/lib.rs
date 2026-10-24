@@ -26,7 +26,7 @@ pub fn init_logging() {
 
 use retina::buf::MarkBuf;
 use retina::codec::{
-    Accumulate, FrameFormat, Loss, LossReason, UnitPosition, VideoData, VideoDepacketizer,
+    Accumulate, FrameFormat, Loss, LossReason, Position, VideoData, VideoDepacketizer,
     VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 use retina::rtp::ReceivedPacketRef;
@@ -107,7 +107,7 @@ impl VideoHandler<u64> for CheckingHandler {
             let len = u32::try_from(self.streamed.len() - start - 4).unwrap();
             self.streamed[start..start + 4].copy_from_slice(&len.to_be_bytes());
         }
-        if matches!(data.position, UnitPosition::Complete | UnitPosition::Start) {
+        if matches!(data.position, Position::Complete | Position::Start) {
             assert!(!data.is_empty(), "first chunk should include header");
         }
     }

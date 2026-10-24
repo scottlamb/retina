@@ -286,12 +286,12 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
 /// within its codec unit so the handler can apply its own framing. For example:
 ///
 /// * For Annex B output, write `00 00 00 01` before each
-///   [`UnitPosition::Complete`] or [`UnitPosition::Start`] chunk.
+///   [`Position::Complete`] or [`Position::Start`] chunk.
 /// * For length-prefixed output, buffer the unit until a
-///   [`UnitPosition::Complete`] or [`UnitPosition::End`] chunk, then write its
+///   [`Position::Complete`] or [`Position::End`] chunk, then write its
 ///   length and contents.
 ///
-/// For [`UnitPosition::Complete`] and [`UnitPosition::Start`], the data begins
+/// For [`Position::Complete`] and [`Position::Start`], the data begins
 /// with the codec unit's header (e.g. the H.264 NAL header byte).
 ///
 /// H.264 and H.265 parameter set NAL units (VPS, SPS, PPS) are omitted. They
@@ -300,7 +300,11 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
 #[derive(Debug)]
 pub struct VideoData<'a> {
     /// The position of this chunk within its codec unit.
-    pub position: UnitPosition,
+    ///
+    /// This says nothing about the chunk's position within its frame. Frames
+    /// begin with [`VideoHandler::frame_start`] and end with
+    /// [`VideoHandler::frame_end`].
+    pub position: Position,
 
     /// The chunk's bytes, as a sequence of slices to be concatenated.
     ///
@@ -323,45 +327,52 @@ impl VideoData<'_> {
     }
 }
 
-/// The position of a [`VideoData`] chunk within its codec unit.
+/// The position of a chunk within whatever encloses it.
+///
+/// What that is depends on where it's used:
+///
+/// *   [`VideoData::position`] and [`super::VideoPacketizer::push_unit`]: a
+///     chunk of data within its codec unit (e.g. H.264 NAL unit). A frame
+///     may have many codec units; frame boundaries are marked separately.
+/// *   [`super::Payload::position`]: an RTP payload within its frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnitPosition {
-    /// The entire unit, in one chunk.
+pub enum Position {
+    /// The whole thing, in one chunk.
     Complete,
 
-    /// The first chunk of a unit that continues in later chunks.
+    /// The first chunk of something that continues in later chunks.
     Start,
 
-    /// An interior chunk of a unit.
+    /// An interior chunk.
     Middle,
 
-    /// The final chunk of a unit. May be empty.
+    /// The final chunk. For [`VideoData`], this may be empty.
     End,
 }
 
-impl UnitPosition {
+impl Position {
     /// Returns the position of a chunk given whether it's the first and/or last chunk.
     #[inline]
     #[cfg(any(feature = "h264", feature = "h265"))]
     pub(crate) fn new(first: bool, last: bool) -> Self {
         match (first, last) {
-            (true, true) => UnitPosition::Complete,
-            (true, false) => UnitPosition::Start,
-            (false, false) => UnitPosition::Middle,
-            (false, true) => UnitPosition::End,
+            (true, true) => Position::Complete,
+            (true, false) => Position::Start,
+            (false, false) => Position::Middle,
+            (false, true) => Position::End,
         }
     }
 
-    /// Returns true if this chunk begins its unit.
+    /// Returns true if this is the first chunk.
     #[inline]
     pub fn is_first(self) -> bool {
-        matches!(self, UnitPosition::Complete | UnitPosition::Start)
+        matches!(self, Position::Complete | Position::Start)
     }
 
-    /// Returns true if this chunk ends its unit.
+    /// Returns true if this is the last chunk.
     #[inline]
     pub fn is_last(self) -> bool {
-        matches!(self, UnitPosition::Complete | UnitPosition::End)
+        matches!(self, Position::Complete | Position::End)
     }
 }
 
@@ -696,7 +707,7 @@ pub(crate) mod testutil {
             is_disposable: bool,
             has_new_parameters: bool,
         },
-        Data(UnitPosition, crate::testutil::HexDebug),
+        Data(Position, crate::testutil::HexDebug),
         FrameEnd {
             is_random_access_point: bool,
             is_disposable: bool,

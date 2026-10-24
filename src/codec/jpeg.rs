@@ -23,7 +23,7 @@ use crate::rtp::ReceivedPacketRef;
 
 use crate::{Timestamp, codec::AllPixelDimensions};
 
-use super::{Accumulate, FrameBody, UnitPosition, VideoData, VideoFrameEnd, VideoFrameStart};
+use super::{Accumulate, FrameBody, Position, VideoData, VideoFrameEnd, VideoFrameStart};
 use super::{VideoHandler, VideoParameters};
 
 const MAX_FRAME_LEN: usize = 2_000_000;
@@ -549,7 +549,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 param_override: None,
             });
             handler.data(&VideoData {
-                position: UnitPosition::Complete,
+                position: Position::Complete,
                 data: &[&self.data],
             });
             let data = match accumulate {

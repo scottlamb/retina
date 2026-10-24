@@ -7,6 +7,13 @@
 //! servers and proxies.
 
 #![forbid(clippy::print_stderr, clippy::print_stdout)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// Docs link to items behind the unstable features, which are missing or
+// private without them. CI checks links with all features enabled.
+#![cfg_attr(
+    not(feature = "unstable-send"),
+    allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)
+)]
 // I prefer to use from_str_radix(..., 10) to explicitly note the base.
 #![allow(clippy::from_str_radix_10)]
 

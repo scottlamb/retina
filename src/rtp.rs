@@ -11,6 +11,12 @@ use bytes::Bytes;
 use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
 
+#[cfg(feature = "unstable-send")]
+mod sender;
+
+#[cfg(feature = "unstable-send")]
+pub use sender::{OutgoingPacketRef, Sender, SenderOptions, SenderSink};
+
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor
@@ -89,6 +95,12 @@ impl PacketHeader {
             len
         };
         Ok((header, payload_start..payload_end))
+    }
+
+    /// Returns the raw 12-byte header.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; Self::LEN as usize] {
+        &self.0
     }
 
     #[inline]
@@ -330,7 +342,7 @@ impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
 }
 
 /// Builds a raw RTP packet with the given header fields and payload.
-#[cfg_attr(not(feature = "h264"), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
     sequence_number: u16,
     timestamp: u32,

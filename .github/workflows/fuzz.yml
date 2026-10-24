@@ -38,6 +38,7 @@ jobs:
           - target: depacketize_jpeg
           - target: h265_nal
           - target: roundtrip_h264
+          - target: roundtrip_h265
           - target: roundtrip_rtsp_message
             seeds: ../src/rtsp/testdata ../src/client/testdata
     env:
