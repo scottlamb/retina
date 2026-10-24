@@ -16,6 +16,89 @@ pub(crate) mod packetizer;
 mod analyzer;
 pub(crate) use analyzer::NalAnalyzer;
 
+/// H.264 or H.265, for code shared between them.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Codec {
+    #[cfg(feature = "h264")]
+    H264,
+    #[cfg(feature = "h265")]
+    H265,
+}
+
+impl Codec {
+    const fn num_sets(self) -> usize {
+        match self {
+            #[cfg(feature = "h264")]
+            Codec::H264 => 2,
+            #[cfg(feature = "h265")]
+            Codec::H265 => 3,
+        }
+    }
+
+    /// Returns the index of a parameter set NAL unit, in the order
+    /// [`Codec::parameters`] expects, or `None` if `nal` isn't a parameter set.
+    fn set_index(self, nal: &[u8]) -> Option<usize> {
+        match self {
+            #[cfg(feature = "h264")]
+            Codec::H264 => match nal.first()? & 0b1_1111 {
+                7 => Some(0),
+                8 => Some(1),
+                _ => None,
+            },
+            #[cfg(feature = "h265")]
+            Codec::H265 => match nal.get(..2)?[0] >> 1 & 0b11_1111 {
+                32 => Some(0),
+                33 => Some(1),
+                34 => Some(2),
+                _ => None,
+            },
+        }
+    }
+
+    fn parameters(self, sets: &[&[u8]]) -> Result<crate::codec::VideoParameters, String> {
+        match self {
+            #[cfg(feature = "h264")]
+            Codec::H264 => crate::codec::h264::parameters_from_sets(sets),
+            #[cfg(feature = "h265")]
+            Codec::H265 => crate::codec::h265::parameters_from_sets(sets),
+        }
+    }
+
+    /// Returns parameters for the given parameter sets, in any order.
+    ///
+    /// Currently requires exactly one of each type.
+    pub(crate) fn parameters_from_unordered_sets<'s>(
+        self,
+        sets: impl IntoIterator<Item = &'s [u8]>,
+    ) -> Result<crate::codec::VideoParameters, String> {
+        let mut ordered: [Option<&[u8]>; 3] = [None; 3];
+        for set in sets {
+            let hex = crate::hex::LimitedHex::new(set, 64);
+            let Some(i) = self.set_index(set) else {
+                return Err(format!("not a parameter set: {hex}"));
+            };
+            if ordered[i].replace(set).is_some() {
+                return Err(format!(
+                    "multiple parameter sets of the same type are currently unsupported: {hex}"
+                ));
+            }
+        }
+        let ordered = &ordered[..self.num_sets()];
+        let Some(sets) = ordered.iter().copied().collect::<Option<Vec<_>>>() else {
+            return Err(format!(
+                "expected {}",
+                match self {
+                    #[cfg(feature = "h264")]
+                    Codec::H264 => "an SPS and a PPS",
+                    #[cfg(feature = "h265")]
+                    Codec::H265 => "a VPS, an SPS, and a PPS",
+                }
+            ));
+        };
+        self.parameters(&sets)
+    }
+}
+
 /// Annex B start code with the `zero_byte` prefix, as added by [`Framing::AnnexB`].
 ///
 /// The `zero_byte` is mandatory before parameter sets (SPS, PPS, VPS) and before the first NAL
