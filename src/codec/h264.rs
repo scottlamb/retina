@@ -387,6 +387,8 @@ impl Depacketizer {
             panic!("push with data already pending: {p:?}");
         }
 
+        // A stream joined mid-NAL has no earlier packet to count the loss from.
+        let joining = matches!(self.input_state, DepacketizerInputState::New);
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -629,7 +631,7 @@ impl Depacketizer {
                         }
                     }
                     (false, None) => {
-                        if loss > 0 {
+                        if loss > 0 || joining {
                             self.discard_au();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
@@ -2963,6 +2965,40 @@ mod tests {
             &b"\x00\x00\x00\x24\x21start of non-idra wild sps appeared"
         );
         assert!(d.seen_inconsistent_fu_a_nal_hdr);
+    }
+    /// Tests that a stream joined mid-NAL drops the partial access unit.
+    #[test]
+    fn join_mid_fu_a() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        let meta = |timestamp, sequence_number| crate::rtp::PacketMeta {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark: true,
+        };
+        // FU-A end fragment (S=0 E=1, non-IDR slice) as the first packet.
+        push_via_buf(&mut d, meta(0, 0), b"\x7c\x41tail", &mut buf).unwrap();
+        assert_eq!(d.pull(), None);
+        // The next access unit comes through.
+        push_via_buf(&mut d, meta(3000, 1), b"\x01next", &mut buf).unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x05\x01next");
     }
 
     /// Tests that a FU-A with both S and E bits set is treated as a complete NAL
