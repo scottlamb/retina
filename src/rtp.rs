@@ -9,9 +9,14 @@ use std::ops::Range;
 use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
 
+mod receiver;
 #[cfg(feature = "unstable-send")]
 mod sender;
+mod timeline;
 
+pub use receiver::{
+    OutOfOrder, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
+};
 #[cfg(feature = "unstable-send")]
 pub use sender::{OutgoingPacketRef, Sender, SenderOptions, SenderSink};
 

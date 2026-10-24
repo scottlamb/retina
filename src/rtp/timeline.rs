@@ -9,10 +9,9 @@ use crate::Timestamp;
 const MAX_FORWARD_TIME_JUMP_SECS: u32 = 10;
 
 /// Creates [Timestamp]s (which don't wrap and can be converted to NPT aka normal play time)
-/// from 32-bit (wrapping) RTP timestamps. Unstable, exposed for benchmark.
-#[doc(hidden)]
+/// from 32-bit (wrapping) RTP timestamps.
 #[derive(Debug)]
-pub struct Timeline {
+pub(crate) struct Timeline {
     timestamp: i64,
     clock_rate: NonZeroU32,
     start: Option<u32>,
@@ -27,7 +26,7 @@ pub struct Timeline {
 
 impl Timeline {
     /// Creates a new timeline, erroring on crazy clock rates.
-    pub fn new(
+    pub(crate) fn new(
         start: Option<u32>,
         clock_rate: u32,
         enforce_with_max_forward_jump_secs: Option<NonZeroU32>,
@@ -58,7 +57,7 @@ impl Timeline {
     ///
     /// If enforcement was enabled, this produces a monotonically increasing
     /// [Timestamp], erroring on excessive or backward time jumps.
-    pub fn advance_to(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
+    pub(crate) fn advance_to(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
         let (timestamp, delta) = self.ts_and_delta(rtp_timestamp)?;
         if matches!(self.max_forward_jump, Some(j) if !(0..j.get()).contains(&delta)) {
             return Err(format!(
@@ -80,7 +79,7 @@ impl Timeline {
     ///
     /// This is useful for RTP timestamps in RTCP packets. They commonly refer
     /// to time slightly before the most timestamp of the matching RTP stream.
-    pub fn place(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
+    pub(crate) fn place(&mut self, rtp_timestamp: u32) -> Result<Timestamp, String> {
         Ok(self.ts_and_delta(rtp_timestamp)?.0)
     }
 

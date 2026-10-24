@@ -21,7 +21,6 @@
 //! ```
 
 use std::io::{IoSliceMut, Read};
-use std::num::NonZeroU32;
 
 use retina::buf::MarkBuf;
 use retina::codec::{
@@ -29,7 +28,7 @@ use retina::codec::{
     PayloadFormat, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
 use retina::rtp::ReceivedPacketRef;
-use retina::rtp::{PacketHeader, ReceivedPacketMeta};
+use retina::rtp::{PacketHeader, Receiver, ReceiverOptions};
 
 /// The packet context: the packet's byte offset within the file.
 type Ctx = u64;
@@ -108,40 +107,6 @@ fn print_loss(loss: &Loss<'_, Ctx>) {
     println!("loss at offset {}: {:?}", loss.ctx(), loss.reason());
 }
 
-/// Tracks RTP sequence numbers and extends 32-bit RTP timestamps.
-///
-/// A real caller might also check the SSRC and enforce sane timestamp jumps.
-struct RtpState {
-    clock_rate: NonZeroU32,
-
-    /// The first packet's timestamp, which is time 0 in normal play time.
-    start: u32,
-
-    /// The previous packet's sequence number, raw timestamp, and extended timestamp.
-    prev: Option<(u16, u32, i64)>,
-}
-
-impl RtpState {
-    /// Returns the extended timestamp and number of lost packets.
-    fn update(&mut self, header: &PacketHeader) -> (retina::Timestamp, u16) {
-        let (seq, raw) = (header.sequence_number(), header.timestamp());
-        let (extended, loss) = match self.prev {
-            None => {
-                self.start = raw;
-                (i64::from(raw), 0)
-            }
-            Some((prev_seq, prev_raw, prev_extended)) => (
-                prev_extended + i64::from(raw.wrapping_sub(prev_raw) as i32),
-                seq.wrapping_sub(prev_seq).wrapping_sub(1),
-            ),
-        };
-        self.prev = Some((seq, raw, extended));
-        let timestamp = retina::Timestamp::new(extended, self.clock_rate, self.start)
-            .expect("timestamp should be valid");
-        (timestamp, loss)
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if !(6..=7).contains(&args.len()) {
@@ -159,11 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format = format.with_fmtp(fmtp.clone());
     }
     let mut depacketizer = Depacketizer::<Ctx>::new(&format)?;
-    let mut rtp = RtpState {
-        clock_rate: NonZeroU32::new(clock_rate).ok_or("clock rate must be non-zero")?,
-        start: 0,
-        prev: None,
-    };
+    let mut receiver = Receiver::new(clock_rate, ReceiverOptions::default())?;
     let mut handler = Printer::default();
 
     // Stream positions in `buf` count from the first byte written, so they're
@@ -197,15 +158,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let (header, payload) = PacketHeader::validate(buf.split(pkt_pos, len.into()))
                 .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
-            let (timestamp, loss) = rtp.update(&header);
-            let meta = ReceivedPacketMeta::new(
-                offset,
-                timestamp,
-                header.sequence_number(),
-                header.ssrc(),
-                header.mark(),
-                loss,
-            );
+            let meta = receiver
+                .rtp(offset, &header)
+                .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?
+                .expect("OutOfOrder::Error never drops");
             let pkt = ReceivedPacketRef::new(
                 meta,
                 &buf,

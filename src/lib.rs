@@ -33,8 +33,6 @@ mod hex;
 #[doc(hidden)]
 pub mod inputs;
 mod mostly_ascii;
-pub mod rtcp;
-pub mod rtp;
 
 /// This is exposed for the fuzz tests. It is not a stable interface.
 #[doc(hidden)]
@@ -57,6 +55,8 @@ macro_rules! wrap {
 
 pub mod client;
 pub mod codec;
+pub mod rtcp;
+pub mod rtp;
 //mod error;
 #[doc(hidden)]
 pub mod rtsp;
