@@ -20,6 +20,7 @@
     *   `client::Error` for `Session::{describe, setup, play, next_item,
         poll_next_item, queue_rtcp}`, `SessionGroup::await_teardown`,
         and `SessionCore`. It keeps `status_code()`.
+    *   `server::Error` for `ConnectionCore::{poll_event, read_error}`.
     *   `codec::Error`, with a `kind()` of `codec::ErrorKind::Unsupported` or
         `codec::ErrorKind::Invalid`, for `Depacketizer::new`,
         `{Video,Audio,Message}Depacketizer::new`,
@@ -44,8 +45,8 @@
 *   BREAKING: add a `tokio` feature (enabled by default) for the tokio-based
     client: `client::Session`, `client::SessionGroup::await_stale_sessions`,
     and `client::SessionOptions::bind`. With it disabled, Retina doesn't
-    depend on tokio; callers of the sans-I/O `client::SessionCore` can use
-    `default-features = false`.
+    depend on tokio; callers of the sans-I/O `client::SessionCore` and
+    `server::ConnectionCore` can use `default-features = false`.
 *   BREAKING: `client::SessionGroup` no longer depends on tokio.
     `SessionGroup::stale_sessions` takes a `now: std::time::Instant`, and
     `StaleSessionStatus::max_expires` is a `std::time::Instant`. Expired

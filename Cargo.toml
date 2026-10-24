@@ -37,6 +37,10 @@ unstable-sans-io = []
 # without regard to semver.
 unstable-send = []
 
+# Exposes the RTSP server (`server`), which implies `unstable-send`. It's
+# experimental: it may change in any release, without regard to semver.
+unstable-server = ["unstable-send"]
+
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
 # To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features

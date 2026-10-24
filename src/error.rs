@@ -6,11 +6,10 @@ use std::sync::Arc;
 use crate::{ConnectionContext, PacketContext, RtspMessageContext, StreamContext, WallTime};
 use bytes::Bytes;
 
-/// The error produced by `bail!` and `wrap!`, shared by the client and the
-/// modules it uses.
+/// The error produced by `bail!` and `wrap!`, shared by the client and server.
 ///
 /// This is private; each public API converts it to its module's error type
-/// (such as `client::Error`) via `From`.
+/// (`client::Error` or `server::Error`) via `From`.
 #[derive(Clone, derive_more::Debug, derive_more::Display)]
 #[display("{_0}")]
 #[debug("{_0:?}")]
