@@ -830,7 +830,11 @@ impl SetupCore {
                 receiver,
                 policy: rtp::StreamPolicy::new(policy.unknown_rtcp_ssrc),
                 ctx,
-                udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
+                udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| {
+                    let mut buf = MarkBuf::new(65536);
+                    buf.set_max_retained(self.conn.options.get_max_retained_bytes());
+                    buf
+                }),
                 reports: self.conn.options.receiver_reports.enabled(),
                 sending: false,
             });

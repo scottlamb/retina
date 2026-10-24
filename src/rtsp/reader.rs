@@ -31,14 +31,18 @@ impl Default for Reader {
 }
 
 impl Reader {
-    /// Returns a reader which rejects messages larger than `max_message_size`;
-    /// see [`crate::rtsp::parse::ParserBuilder::max_message_size`].
-    pub(crate) fn new(max_message_size: usize) -> Self {
+    /// Returns a reader which rejects messages larger than `max_message_size`
+    /// (see [`crate::rtsp::parse::ParserBuilder::max_message_size`]) and
+    /// whose buffer retains at most `max_retained` bytes for marks (see
+    /// [`MarkBuf::set_max_retained`]).
+    pub(crate) fn new(max_message_size: usize, max_retained: usize) -> Self {
+        let mut buf = MarkBuf::new(DEFAULT_READ_CAPACITY);
+        buf.set_max_retained(max_retained);
         Self {
             parser: crate::rtsp::parse::Parser::builder()
                 .max_message_size(max_message_size)
                 .build(),
-            buf: MarkBuf::new(DEFAULT_READ_CAPACITY),
+            buf,
         }
     }
 

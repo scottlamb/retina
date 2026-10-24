@@ -105,7 +105,10 @@ impl ConnCore {
     pub(crate) fn new(ctx: ConnectionContext, options: SessionOptions) -> Self {
         Self {
             ctx,
-            reader: Reader::new(options.get_max_message_size()),
+            reader: Reader::new(
+                options.get_max_message_size(),
+                options.get_max_retained_bytes(),
+            ),
             eof: false,
             options,
             requested_auth: None,

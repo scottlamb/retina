@@ -973,22 +973,22 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        fixture_with(SessionOptions::default(), None)
+        fixture_with(SessionOptions::default(), true)
     }
 
-    /// As [`fixture`], with the given options and authentication state.
-    fn fixture_with(
-        options: SessionOptions,
-        requested_auth: Option<http_auth::PasswordClient>,
-    ) -> Fixture {
+    /// As [`fixture`], but with the given options, and with the audio stream
+    /// set up via TCP on channels 2–3 unless `audio_udp`.
+    fn fixture_with(options: SessionOptions, audio_udp: bool) -> Fixture {
         crate::testutil::init_logging();
         let (resp, body) =
             crate::testutil::response(include_bytes!("testdata/reolink_describe.txt"));
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
         let presentation = parse::parse_describe(url, &resp, &body, false).unwrap();
         let mut conn = ConnCore::new(ConnectionContext::dummy(), options);
-        conn.requested_auth = requested_auth;
         conn.channels.assign(0, 0).unwrap();
+        if !audio_udp {
+            conn.channels.assign(2, 1).unwrap();
+        }
         for _ in 1..5 {
             conn.fill_req(&mut OwnedMessage::Request {
                 head: msg::Request {
@@ -1012,7 +1012,7 @@ mod tests {
         };
         let streams = [
             new_stream(&presentation.streams[0], false),
-            new_stream(&presentation.streams[1], true),
+            new_stream(&presentation.streams[1], audio_udp),
         ];
         let t0 = Instant::now();
         let core = PlayingCore::new(
@@ -1059,12 +1059,24 @@ mod tests {
 
     /// Returns an interleaved data message holding an RTP packet.
     fn interleaved(channel_id: u8, sequence_number: u16, payload: &[u8]) -> Vec<u8> {
+        interleaved_with_mark(channel_id, sequence_number, true, payload)
+    }
+
+    fn interleaved_with_mark(
+        channel_id: u8,
+        sequence_number: u16,
+        mark: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        // The fixture's streams' payload types, from `reolink_describe.txt`:
+        // video on channels 0–1, audio (if set up via TCP) on 2–3.
+        let payload_type = if channel_id < 2 { 96 } else { 97 };
         let pkt = crate::rtp::build_raw_rtp(
             sequence_number,
             0,
-            96,
+            payload_type,
             0xdcc4a0d8,
-            true,
+            mark,
             payload.iter().copied(),
         )
         .unwrap();
@@ -1127,16 +1139,17 @@ mod tests {
 
     /// A session authenticating with digest, as Axis cameras do after setup.
     fn auth_fixture() -> Fixture {
-        fixture_with(
+        let mut f = fixture_with(
             SessionOptions::default().creds(Some(crate::client::Credentials {
                 username: "admin".to_owned(),
                 password: "secret".to_owned(),
             })),
-            Some(
-                http_auth::PasswordClient::try_from(r#"Digest realm="cam", nonce="nonce-0""#)
-                    .unwrap(),
-            ),
-        )
+            true,
+        );
+        f.core.conn.requested_auth = Some(
+            http_auth::PasswordClient::try_from(r#"Digest realm="cam", nonce="nonce-0""#).unwrap(),
+        );
+        f
     }
 
     /// Refuses keepalive `cseq` with `401` and a challenge carrying `nonce`.
@@ -1330,6 +1343,55 @@ mod tests {
             (counters.late, counters.strays, counters.restarts),
             (1, 1, 1)
         );
+    }
+
+    /// Over TCP, a video stream with a small frame in progress goes quiet
+    /// while audio keeps arriving on the same connection. The shared buffer
+    /// stays bounded, and the video depacketizer reports the eviction.
+    #[cfg(feature = "h264")]
+    #[test]
+    fn tcp_stalled_stream_evicted() {
+        use crate::codec::events::testutil::{Event, Recorder};
+        use crate::codec::{Accumulate, LossReason};
+        let Fixture { mut core, t0 } = fixture_with(
+            SessionOptions::default().max_retained_bytes(16 << 10),
+            false,
+        );
+        let mut video = core.streams()[0].new_depacketizer().unwrap();
+        let crate::codec::Depacketizer::Video(video) = &mut video else {
+            panic!("expected video");
+        };
+        let mut h = Recorder::new(Accumulate::Yes);
+        let mut push_video = |core: &mut PlayingCore, msg: &[u8], h: &mut Recorder| {
+            core.read_buf().extend(msg);
+            match core.poll_item(t0) {
+                Some(Ok(PlayingItem::Rtp(p))) => {
+                    assert_eq!(p.stream_id(), 0);
+                    video.push(p.packet(), h);
+                }
+                o => panic!("unexpected item: {o:#?}"),
+            }
+        };
+        push_video(
+            &mut core,
+            &interleaved_with_mark(0, 1, false, b"\x7c\x85start"),
+            &mut h,
+        );
+        h.take();
+        for seq in 0..1000 {
+            core.read_buf().extend(&interleaved(2, seq, &[0; 1000]));
+            match core.poll_item(t0) {
+                Some(Ok(PlayingItem::Rtp(p))) => assert_eq!(p.stream_id(), 1),
+                o => panic!("unexpected item: {o:#?}"),
+            }
+        }
+        assert!(
+            core.conn.reader.buf().capacity() <= 64 << 10,
+            "{}",
+            core.conn.reader.buf().capacity()
+        );
+        push_video(&mut core, &interleaved(0, 2, b"\x7c\x45end"), &mut h);
+        assert_eq!(h.take(), vec![Event::Loss(LossReason::Evicted)]);
     }
 
     #[test]

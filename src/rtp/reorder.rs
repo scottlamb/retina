@@ -21,7 +21,10 @@ use crate::buf::{Mark, MarkBuf};
 /// packets with earlier sequence numbers arrive. A packet which arrives after
 /// a later one was returned is dropped.
 ///
-/// This bounds how long and how many packets are held.
+/// This bounds how long and how many packets are held. The buffer space they
+/// pin is bounded separately, by the buffer's limit (see
+/// [`crate::client::SessionOptions::max_retained_bytes`]); held packets whose
+/// data that limit reclaims are given up on as lost.
 ///
 /// This is `#[non_exhaustive]` so that options can be added later; construct
 /// it via [`ReorderOptions::default`] and the builder methods.
@@ -135,6 +138,11 @@ pub struct ReorderCounters {
 
     /// Missing packets given up on.
     pub skipped: u64,
+
+    /// Held packets discarded because the buffer revoked their data; see
+    /// [`crate::buf::MarkBuf::set_max_retained`]. Like missing packets, these
+    /// are also counted in `skipped` when given up on.
+    pub evicted: u64,
 }
 
 struct Held<T> {
@@ -531,12 +539,33 @@ impl<T> Reorderer<T> {
         })
     }
 
-    /// Releases the packet last returned by `pop`.
-    fn release(&mut self, _buf: &MarkBuf) {
+    /// Releases the packet last returned by `pop`, and discards held packets
+    /// whose data the buffer has discarded after revoking `mark`.
+    fn release(&mut self, buf: &MarkBuf) {
         let release_to = self.release_to.take();
         let Some(mark) = &mut self.mark else {
             return;
         };
+        if mark.is_revoked() {
+            // The buffer discards data only before its new start, so held
+            // packets from there on can be pinned again. Positions never
+            // decrease in push order, so the discarded packets come first.
+            let start = buf.start();
+            while let Some(p) = self.packets.front() {
+                match p {
+                    Some(h) if h.pos >= start => break,
+                    Some(_) => self.counters.evicted += 1,
+                    None => {}
+                }
+                self.packets.pop_front();
+                self.first_id += 1;
+            }
+            let first_id = self.first_id;
+            self.ready.retain(|s| s.id >= first_id);
+            self.held.retain(|s| s.id >= first_id);
+            self.mark = self.earliest().map(|h| buf.add_mark_at(h.pos));
+            return;
+        }
         match release_to {
             None => {}
             Some(None) => self.mark = None,
@@ -806,6 +835,29 @@ mod tests {
         f.push(2, 60);
         f.push(1, 60);
         assert_eq!(f.pop(60), [1, 2]);
+    }
+
+    /// A held packet whose data the buffer revokes is discarded, not returned.
+    #[test]
+    fn evicted() {
+        let mut f = Fixture::new(ReorderOptions::default());
+        f.buf.set_max_retained(30); // each packet is 13 bytes.
+        f.push(1, 0);
+        assert_eq!(f.pop(50), [1]);
+        f.push(3, 60); // held at 13, waiting for 2.
+        f.push(4, 60); // 26
+        f.push(5, 60); // 39
+        f.push(6, 60); // 52; reclaiming before this revokes 3's mark.
+        assert_eq!(f.pop(60), []);
+        assert_eq!(f.pop(110), [4, 5, 6]);
+        assert_eq!(
+            f.r.counters(),
+            ReorderCounters {
+                evicted: 1,
+                skipped: 2,
+                ..Default::default()
+            }
+        );
     }
 
     /// A packet pushed with an earlier time than one held is treated as

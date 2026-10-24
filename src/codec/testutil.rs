@@ -152,6 +152,9 @@ impl<'a> Collector<'a> {
             LossReason::PacketLoss { packets } => self.pending.loss += packets,
             LossReason::Discontinuity => self.pending.loss += 1,
             LossReason::Corrupt(c) => self.pending.items.push_back(Err(c.to_string())),
+            reason @ (LossReason::TooLarge { .. } | LossReason::Evicted) => {
+                self.pending.items.push_back(Err(format!("{reason:?}")))
+            }
         }
     }
 

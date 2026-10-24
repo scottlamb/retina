@@ -289,7 +289,7 @@ pub struct ReceptionReport {
 /// Counts of packets a [`Receiver`] discarded or gave up on, and of other
 /// events.
 ///
-/// `late` through `lost` are for the selected source only.
+/// `late` through `evicted` are for the selected source only.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReceiverCounters {
@@ -307,6 +307,11 @@ pub struct ReceiverCounters {
 
     /// Missing packets given up on.
     pub lost: u64,
+
+    /// Held packets discarded because the buffer revoked their data; see
+    /// [`crate::buf::MarkBuf::set_max_retained`]. Like missing packets, these
+    /// are also counted in `lost` when given up on.
+    pub evicted: u64,
 
     /// Packets discarded as [`Pushed::Filtered`].
     pub filtered: u64,
@@ -536,6 +541,7 @@ impl<T> Receiver<T> {
             c.strays = r.strays;
             c.restarts = r.restarts;
             c.lost = r.skipped;
+            c.evicted = r.evicted;
         }
         c
     }
