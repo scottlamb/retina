@@ -13,8 +13,8 @@ use super::{AuData, FrameEndBody, InternalParameters, Nal, is_non_idr_slice, is_
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, PiecesReader, check_range};
 use crate::codec::{
-    Accumulate, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason, VideoFrameEnd,
-    VideoFrameStart, VideoHandler, VideoParameters,
+    Accumulate, Corruption, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason,
+    VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
 };
 
 /// Analyzes H.264 access units (frames), regardless of how they're transported.
@@ -57,8 +57,8 @@ pub struct Analyzer<Ctx> {
 
     decodability: DecodabilityState,
 
-    /// Packets lost since the last access unit started.
-    lost: u16,
+    /// True if input was lost since the last access unit started.
+    lost: bool,
 
     /// The timestamp of the previous access unit, if any, for logging.
     prev_timestamp: Option<crate::Timestamp>,
@@ -71,9 +71,9 @@ struct AuState<Ctx> {
     /// The context of the access unit's first input unit (such as a packet).
     start_ctx: Ctx,
 
-    /// Packets lost as this access unit was starting. If non-zero, it may be
+    /// True if data was lost just before this access unit, so it may be
     /// missing its beginning.
-    loss: u16,
+    after_loss: bool,
 
     /// True if this access unit has the same timestamp as the previous one,
     /// which is noted when logging bad access units.
@@ -348,7 +348,7 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         self.au = Some(AuState {
             timestamp,
             start_ctx: ctx,
-            loss: std::mem::take(&mut self.lost),
+            after_loss: std::mem::take(&mut self.lost),
             same_ts_as_prev: self
                 .prev_timestamp
                 .is_some_and(|p| p.timestamp == timestamp.timestamp),
@@ -450,9 +450,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     ///
     /// `end_ctx` will be supplied as [`VideoFrameEnd::end_ctx`]. If the access
     /// unit is invalid (for example, it has an invalid parameter set, or a NAL
-    /// unit is still in progress), discards it and returns an error instead
-    /// of finishing the frame. An access unit without slices produces no
-    /// events.
+    /// unit is still in progress), reports [`LossReason::Corrupt`] to
+    /// [`VideoHandler::loss`] instead of finishing the frame. An access unit
+    /// without slices produces no events.
     ///
     /// # Panics
     ///
@@ -462,11 +462,13 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         buf: &MarkBuf,
         end_ctx: &Ctx,
         handler: &mut H,
-    ) -> Result<(), String> {
+    ) {
         let mut au = self.au.take().expect("finish_au without start_au");
         self.prev_timestamp = Some(au.timestamp);
         let r = if au.in_progress.is_some() {
-            Err("access unit ended in the middle of a NAL unit".to_owned())
+            Err(LossReason::Corrupt(Corruption::new(
+                "access unit ended in the middle of a NAL unit",
+            )))
         } else {
             let mut decodability = self.decodability;
             let r = self.finalize(
@@ -479,10 +481,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 },
             );
             self.decodability = decodability;
-            r
+            r.map_err(|e| LossReason::Corrupt(Corruption::new(e)))
         };
         self.discard_au();
-        r
+        if let Err(reason) = r {
+            self.loss(end_ctx, reason, handler);
+        }
     }
 
     /// Changes the current access unit's timestamp, if any, affecting only
@@ -504,7 +508,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             nals: Vec::new(),
             au: None,
             decodability: DecodabilityState::default(),
-            lost: 0,
+            lost: false,
             prev_timestamp: None,
         }
     }
@@ -512,17 +516,14 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// Reports lost or unusable input, such as
     /// [`LossReason::PacketLoss`].
     ///
-    /// Discards any in-progress access unit. Lost packets are counted toward
-    /// the next one, which may be missing its beginning.
+    /// Discards any in-progress access unit and notes that the next one may
+    /// be missing its beginning.
     pub(crate) fn loss<H: VideoHandler<Ctx>>(
         &mut self,
         ctx: &Ctx,
         reason: LossReason,
         handler: &mut H,
     ) {
-        if let LossReason::PacketLoss { packets } = reason {
-            self.lost = self.lost.saturating_add(packets);
-        }
         self.loss_without_report();
         DecodabilityTracker {
             state: &mut self.decodability,
@@ -531,18 +532,20 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         .loss(&Loss { ctx, reason });
     }
 
-    /// Discards the access unit in progress, without reporting it, after loss
-    /// or an error the caller reports.
+    /// Discards the access unit in progress, which follows loss already
+    /// reported, without reporting it. The next access unit also follows loss.
     pub(crate) fn discard_lossy_au(&mut self) {
         self.loss_without_report();
     }
 
-    /// Discards any access unit in progress.
+    /// Discards any access unit in progress, noting that the next one may be
+    /// missing its beginning.
     fn loss_without_report(&mut self) {
         if let Some(au) = self.au.as_ref() {
             self.prev_timestamp = Some(au.timestamp);
         }
         self.discard_au();
+        self.lost = true;
     }
 
     /// Returns the current access unit's timestamp, if any.
@@ -709,7 +712,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 .ok();
         }
         let is_rasl = au.meta.leading.as_ref().is_some_and(|l| l.is_rasl);
-        let missing_prefix = au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true);
+        let missing_prefix = au.after_loss && au.meta.first_vcl_starts_picture != Some(true);
         let accumulate = match au.started {
             Some(a) => a,
             None => handler.frame_start(&VideoFrameStart {
@@ -734,7 +737,6 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx,
-            loss: au.loss,
             is_random_access_point: au.meta.is_random_access_point(),
             is_disposable: au.meta.is_disposable,
             has_new_parameters,
@@ -1078,7 +1080,7 @@ impl AuView<'_> {
         au.started = Some(
             handler.frame_start(&VideoFrameStart {
                 is_decodable: true,
-                missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
+                missing_prefix: au.after_loss && au.meta.first_vcl_starts_picture != Some(true),
                 is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
@@ -1395,7 +1397,7 @@ mod tests {
         a.stream_with(&buf, &mut e);
         assert_eq!(e.0, [data(false, true, f3)]);
         e.0.clear();
-        a.finish_au_with(&buf, &0, &mut e).unwrap();
+        a.finish_au_with(&buf, &0, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1410,7 +1412,7 @@ mod tests {
         assert_eq!(e.0[0], Event::Start);
         assert_eq!(e.0[1..], [data(true, true, &big)]);
         e.0.clear();
-        a.finish_au_with(&buf, &1, &mut e).unwrap();
+        a.finish_au_with(&buf, &1, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1430,7 +1432,7 @@ mod tests {
         assert_eq!(e.0[0], Event::Start);
         assert_chunks(&e.0[1..], &big);
         e.0.clear();
-        a.finish_au_with(&buf, &2, &mut e).unwrap();
+        a.finish_au_with(&buf, &2, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1438,8 +1440,8 @@ mod tests {
         a.start_au(ts(), 3);
         let pos = append_data(&mut buf, &big[1..10]);
         a.start_nal(&big[..1], &buf, pos, 10 - 1).unwrap();
-        a.finish_au_with(&buf, &3, &mut e).unwrap_err();
-        assert_eq!(e.0, []);
+        a.finish_au_with(&buf, &3, &mut e);
+        assert_eq!(e.0, [Event::Loss]);
         assert!(a.is_idle());
     }
 }

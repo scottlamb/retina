@@ -319,7 +319,6 @@ pub struct VideoFrameEnd<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) start_ctx: &'a Ctx,
     pub(crate) end_ctx: &'a Ctx,
-    pub(crate) loss: u16,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
@@ -379,13 +378,6 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
         self.end_ctx
     }
 
-    /// Returns the number of lost RTP packets before this frame, for
-    /// `Demuxed`. Handlers learn of loss via [`VideoHandler::loss`].
-    #[inline]
-    pub(crate) fn loss(&self) -> u16 {
-        self.loss
-    }
-
     /// Returns if this is a "random access point (RAP)" picture: one where
     /// decoding can start, as it can be decoded without any other.
     ///
@@ -442,9 +434,6 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
     /// case isn't detected: if packets carrying new parameter sets are lost
     /// immediately before a random access point whose slices all arrive, the
     /// frame is reported decodable, but a decoder will use stale parameters.
-    ///
-    /// This is only tracked by [`super::VideoDepacketizer::push`]; it's always
-    /// true in other contexts, such as within [`crate::client::Demuxed`].
     #[inline]
     pub fn is_decodable(&self) -> bool {
         self.is_decodable
@@ -567,7 +556,6 @@ pub struct AudioFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) frame_length: NonZeroU32,
-    pub(crate) loss: u16,
 
     /// The raw frame data.
     pub(crate) data: &'a [u8],
@@ -595,13 +583,6 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
         self.frame_length
     }
 
-    /// Returns the number of lost RTP packets before this frame, for
-    /// `Demuxed`. Handlers learn of loss via [`AudioHandler::loss`].
-    #[inline]
-    pub(crate) fn loss(&self) -> u16 {
-        self.loss
-    }
-
     /// Returns the frame data in the given format.
     ///
     /// This borrows the depacketizer's data unless the format requires adding
@@ -626,7 +607,6 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
 pub struct MessageFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
     pub(crate) timestamp: crate::Timestamp,
-    pub(crate) loss: u16,
     pub(crate) data: &'a [u8],
 }
 
@@ -641,13 +621,6 @@ impl<Ctx> MessageFrameRef<'_, Ctx> {
     #[inline]
     pub fn timestamp(&self) -> crate::Timestamp {
         self.timestamp
-    }
-
-    /// Returns the number of lost RTP packets before this message, for
-    /// `Demuxed`. Handlers learn of loss via [`MessageHandler::loss`].
-    #[inline]
-    pub(crate) fn loss(&self) -> u16 {
-        self.loss
     }
 
     /// Returns the message data.
@@ -672,7 +645,6 @@ pub(crate) mod testutil {
         },
         Data(UnitPosition, crate::testutil::HexDebug),
         FrameEnd {
-            loss: u16,
             is_random_access_point: bool,
             is_disposable: bool,
             has_new_parameters: bool,
@@ -769,7 +741,6 @@ pub(crate) mod testutil {
                 );
             }
             self.events.push(Event::FrameEnd {
-                loss: frame_end.loss(),
                 is_random_access_point: frame_end.is_random_access_point(),
                 is_disposable: frame_end.is_disposable(),
                 has_new_parameters: frame_end.has_new_parameters(),

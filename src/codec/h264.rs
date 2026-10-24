@@ -4,8 +4,6 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
 //! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::convert::TryFrom;
 
 use base64::Engine as _;
@@ -16,14 +14,11 @@ use log::debug;
 
 use crate::Error;
 use crate::buf::{BufRange, MarkBuf};
-#[cfg(test)]
-use crate::client::{CodecItem, DepacketizeError};
 use crate::codec::{AllPixelDimensions, LossReason, VideoHandler};
 use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
 use crate::{
     Timestamp,
-    client::{ReceivedPacket, ReceivedPacketBuilder},
     codec::h26x::{NalAnalyzer as _, TolerantBitReader},
 };
 
@@ -96,9 +91,9 @@ pub fn parameters_from_sps_and_pps(
 pub(crate) struct Depacketizer<Ctx> {
     input_state: DepacketizerInputState,
 
-    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
-    pending: VecDeque<Result<CodecItem, DepacketizeError>>,
+    pending: super::testutil::Pending,
 
     /// The transport-independent layer, which holds the current access unit's
     /// NALs (in state `PreMark`) and the stream's parameters.
@@ -112,7 +107,7 @@ pub(crate) struct Depacketizer<Ctx> {
     /// FU-A, forbidden by RFC 6184 section 5.8).
     seen_single_fragment_fu_a: bool,
 
-    /// The format used by the test-only `push`/`pull` interface.
+    /// The format used by the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
     test_format: super::FrameFormat,
 }
@@ -224,7 +219,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
             #[cfg(test)]
-            pending: VecDeque::with_capacity(1),
+            pending: Default::default(),
             analyzer: Analyzer::with_internal_parameters(parameters),
             seen_inconsistent_fu_a_nal_hdr: false,
             seen_single_fragment_fu_a: false,
@@ -233,7 +228,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         })
     }
 
-    /// Sets the format used by the test-only `push`/`pull` interface.
+    /// Sets the format used by the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
     fn set_frame_format(&mut self, format: super::FrameFormat) {
         self.test_format = format;
@@ -256,37 +251,25 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    ///
-    /// Returns errors detected as the packet arrives, for the legacy
-    /// interface, rather than reporting them via [`VideoHandler::loss`];
-    /// [`Depacketizer::report_corrupt`] reports them.
-    pub(super) fn push_with(
+    pub(super) fn push(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
-    ) -> Result<(), String> {
-        let r = self.push_inner(pkt, handler);
-
-        // Several error paths within `push_inner` just use the `?` operator to bail out with
-        // `input_state` at `New` when they encounter a problem mid-access unit. Restore
-        // the invariant so the caller can try to recover after error.
-        if !matches!(self.input_state, DepacketizerInputState::PreMark(_)) {
-            self.analyzer.discard_lossy_au();
-        }
-        r
-    }
-
-    /// Reports an error returned by [`Depacketizer::push_with`].
-    pub(super) fn report_corrupt(
-        &mut self,
-        ctx: &Ctx,
-        description: String,
-        handler: &mut impl VideoHandler<Ctx>,
     ) {
-        self.analyzer.loss(
-            ctx,
-            LossReason::Corrupt(super::Corruption::new(description)),
-            handler,
+        if let Err(description) = self.push_inner(pkt, handler) {
+            // Several error paths within `push_inner` just use the `?`
+            // operator to bail out with `input_state` at `New` when they
+            // encounter a problem mid-access unit. Discard it and report.
+            self.input_state = DepacketizerInputState::New;
+            self.analyzer.loss(
+                &pkt.meta.ctx,
+                LossReason::Corrupt(super::Corruption::new(description)),
+                handler,
+            );
+        }
+        debug_assert!(
+            matches!(self.input_state, DepacketizerInputState::PreMark(_))
+                || self.analyzer.is_idle()
         );
     }
 
@@ -340,7 +323,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         } else {
                             match self.analyzer.last_nal_hdr() {
                                 Some(hdr) if can_end_au(hdr.nal_unit_type()) => {
-                                    self.analyzer.finish_au_with(buf, &meta.ctx, handler)?;
+                                    self.analyzer.finish_au_with(buf, &meta.ctx, handler);
                                     self.start_au(meta)
                                 }
                                 Some(hdr) => {
@@ -526,7 +509,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         self.input_state = if mark {
             match self.analyzer.last_nal_hdr() {
                 Some(hdr) if can_end_au(hdr.nal_unit_type()) => {
-                    self.analyzer.finish_au_with(buf, &meta.ctx, handler)?;
+                    self.analyzer.finish_au_with(buf, &meta.ctx, handler);
                     DepacketizerInputState::New
                 }
                 Some(hdr) => {
@@ -562,31 +545,18 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
-    /// Supplies a new packet via the legacy `push`/`pull` interface.
+    /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
     ///
-    /// Between any two calls to `push`, the caller must call `pull` until it
-    /// returns `None`.
-    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let format = self.test_format;
-        let r = self.push_with(
-            pkt,
-            &mut crate::client::LegacyHandler {
-                pending: &mut pending,
-                meta: &pkt.meta,
-                stream_id: 0,
-                format,
-            },
-        );
+        pending.push_reporting_loss(self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
-    fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
-        self.pending.pop_front()
+    fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
+        self.pending.pull()
     }
 }
 
@@ -1048,7 +1018,6 @@ impl InternalParameters {
 pub struct Packetizer {
     max_payload_size: u16,
     next_sequence_number: u16,
-    stream_id: usize,
     ssrc: u32,
     payload_type: u8,
     state: PacketizerState,
@@ -1057,7 +1026,6 @@ pub struct Packetizer {
 impl Packetizer {
     pub fn new(
         max_payload_size: u16,
-        stream_id: usize,
         initial_sequence_number: u16,
         payload_type: u8,
         ssrc: u32,
@@ -1068,7 +1036,6 @@ impl Packetizer {
         }
         Ok(Self {
             max_payload_size,
-            stream_id,
             next_sequence_number: initial_sequence_number,
             ssrc,
             payload_type,
@@ -1082,8 +1049,9 @@ impl Packetizer {
         Ok(())
     }
 
+    /// Returns the next raw RTP packet, if any.
     // TODO: better error type?
-    pub fn pull(&mut self) -> Result<Option<ReceivedPacket>, String> {
+    pub fn pull(&mut self) -> Result<Option<Bytes>, String> {
         let max_payload_size = usize::from(self.max_payload_size);
         match std::mem::replace(&mut self.state, PacketizerState::Idle) {
             PacketizerState::Idle => Ok(None),
@@ -1121,18 +1089,7 @@ impl Packetizer {
                     let payload = [fu_indicator, fu_header]
                         .into_iter()
                         .chain(data[..max_payload_size - 2].iter().copied());
-                    // TODO: ctx and channel_id are placeholders.
-                    let pkt = ReceivedPacketBuilder {
-                        ctx: crate::PacketContext::dummy(),
-                        stream_id: self.stream_id,
-                        timestamp,
-                        ssrc: self.ssrc,
-                        sequence_number,
-                        loss: 0,
-                        mark: false,
-                        payload_type: self.payload_type,
-                    }
-                    .build(payload)?;
+                    let pkt = self.build(sequence_number, timestamp, false, payload)?;
                     data.advance(max_payload_size - 2);
                     self.state = PacketizerState::InFragment {
                         timestamp,
@@ -1153,19 +1110,7 @@ impl Packetizer {
                     };
                     false
                 };
-                Ok(Some(
-                    ReceivedPacketBuilder {
-                        ctx: crate::PacketContext::dummy(),
-                        stream_id: self.stream_id,
-                        timestamp,
-                        ssrc: self.ssrc,
-                        sequence_number,
-                        loss: 0,
-                        mark,
-                        payload_type: self.payload_type,
-                    }
-                    .build(data)?,
-                ))
+                Ok(Some(self.build(sequence_number, timestamp, mark, data)?))
             }
             PacketizerState::InFragment {
                 timestamp,
@@ -1207,22 +1152,31 @@ impl Packetizer {
                         self.state = PacketizerState::HaveData { timestamp, data };
                     }
                 }
-                // TODO: placeholders.
-                Ok(Some(
-                    ReceivedPacketBuilder {
-                        ctx: crate::PacketContext::dummy(),
-                        stream_id: self.stream_id,
-                        timestamp,
-                        ssrc: self.ssrc,
-                        sequence_number,
-                        loss: 0,
-                        mark,
-                        payload_type: self.payload_type,
-                    }
-                    .build(payload)?,
-                ))
+                Ok(Some(self.build(
+                    sequence_number,
+                    timestamp,
+                    mark,
+                    payload,
+                )?))
             }
         }
+    }
+
+    fn build(
+        &self,
+        sequence_number: u16,
+        timestamp: Timestamp,
+        mark: bool,
+        payload: impl IntoIterator<Item = u8>,
+    ) -> Result<Bytes, &'static str> {
+        crate::rtp::build_raw_rtp(
+            sequence_number,
+            timestamp.timestamp as u32,
+            self.payload_type,
+            self.ssrc,
+            mark,
+            payload,
+        )
     }
 }
 
@@ -1255,30 +1209,12 @@ mod tests {
     use bytes::Bytes;
 
     use crate::buf::MarkBuf;
-    use crate::client::CodecItem;
-    use crate::client::ReceivedPacketBuilder;
+    use crate::codec::testutil::Item;
     use crate::rtp::ReceivedPacketRef;
+    use crate::testutil::TestPacket;
     use crate::testutil::{assert_eq_hex, assert_eq_hexes, init_logging};
 
     use super::*;
-
-    /// Helper: writes payload into `buf`, then pushes to depacketizer.
-    fn push_via_buf(
-        d: &mut Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
-        payload: &[u8],
-        buf: &mut MarkBuf,
-    ) -> Result<(), String> {
-        let pos = buf.end();
-        buf.extend(payload);
-        buf.advance_unparsed(buf.end());
-        d.push(&ReceivedPacketRef::new(
-            meta,
-            buf,
-            pos,
-            payload.len() as u16,
-        ))
-    }
 
     /*
      * This test requires
@@ -1321,7 +1257,7 @@ mod tests {
                     if let Some(f) = d.pull().unwrap() {
                         assert!(frame.is_none());
                         frame = Some(match f {
-                            CodecItem::VideoFrame(f) => f,
+                            Item::Video(f) => f,
                             _ => panic!(),
                         });
                     } else {
@@ -1349,10 +1285,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // plain SEI packet.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1360,22 +1295,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(b"\x06plain".iter().copied())
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, b"\x06plain".iter().copied());
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // STAP-A packet.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1383,22 +1310,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x18\x00\x09\x06stap-a 1\x00\x09\x06stap-a 2");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet (non-IDR slice, type 1), start.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1406,22 +1325,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x81fu-a start, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x81fu-a start, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, middle.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 3,
@@ -1429,22 +1340,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x01fu-a middle, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x01fu-a middle, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, end.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 4,
@@ -1452,18 +1355,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x41fu-a end")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x41fu-a end");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(
@@ -1496,10 +1392,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet (non-IDR slice, type 1, reserved bit set), start.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1507,22 +1402,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\xa1fu-a start, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\xa1fu-a start, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, middle.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 3,
@@ -1530,22 +1417,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x21fu-a middle, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x21fu-a middle, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, end.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 4,
@@ -1553,18 +1432,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x61fu-a end")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x61fu-a end");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(
@@ -1592,10 +1464,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // SPS with (incorrect) mark
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts1,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1603,22 +1474,17 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50",
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // PPS
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts1,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1626,26 +1492,18 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x68\xee\x3c\xb0")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xee\x3c\xb0");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // Slice layer without partitioning IDR.
                 // This has a different timestamp than the SPS and PPS, even though
                 // RFC 6184 section 5.1 says that "the timestamp must match that of
                 // the primary coded picture of the access unit and that the marker
                 // bit can only be set on the final packet of the access unit.""
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts2,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1653,18 +1511,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x65slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(
@@ -1695,11 +1546,10 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // Slice layer without partitioning non-IDR, representing the
                 // last frame of the previous GOP.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts1,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1707,27 +1557,19 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x01slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x01slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x01slice");
         assert_eq!(frame.timestamp, ts1);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // SPS with (incorrect) timestamp matching last frame.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts1,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1735,22 +1577,17 @@ mod tests {
                 mark: false, // correctly has no mark, unlike first SPS in stream.
                 payload_type: 0,
             }
-            .build(*b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x2f\xf9\x50",
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // PPS, again with timestamp matching last frame.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts1,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1758,22 +1595,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x68\xee\x3c\xb0")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xee\x3c\xb0");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // Slice layer without partitioning IDR. Now correct timestamp.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts2,
                 ssrc: 0,
                 sequence_number: 3,
@@ -1781,18 +1610,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x65slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(
@@ -1821,30 +1643,23 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder { // new SPS.
+            let pkt = TestPacket { // new SPS.
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
             timestamp,
             ssrc: 0,
             sequence_number: 0,
             loss: 0,
             mark: false,
             payload_type: 0,
-        }.build(*b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10").unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
-            .unwrap()
+        }
+            .write(&mut buf, *b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10");
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // same PPS again.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1852,22 +1667,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x68\xee\x3c\x80")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xee\x3c\x80");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // dummy slice NAL to end the AU.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1875,22 +1682,15 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x65slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
 
         // By codec::Depacketizer::parameters's contract, it's unspecified what the depacketizer
         // parameters are set to between push and pull.
 
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
 
@@ -1952,33 +1752,24 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
             // SPS
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
             timestamp,
             ssrc: 0,
             sequence_number: 0,
             loss: 0,
             mark: false,
             payload_type: 0,
-        }.build(
-            *b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20",
-        ).unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
-            .unwrap()
+        }
+            .write(&mut buf, *b"\x67\x4d\x00\x28\xe9\x00\xf0\x04\x4f\xcb\x08\x00\x00\x1f\x48\x00\x07\x54\xe0\x20");
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // PPS
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1986,22 +1777,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x68\xea\x8f\x20")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xea\x8f\x20");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // IDR slice
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -2009,18 +1792,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x65idr slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65idr slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert!(frame.has_new_parameters);
@@ -2043,33 +1819,24 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
             // SPS
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
             timestamp,
             ssrc: 0,
             sequence_number: 0,
             loss: 0,
             mark: false,
             payload_type: 0,
-        }.build(
-            *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x3d\xa1\x00\x00\x04\xf6\x00\x00\x63\x38\x04\x04",
-        ).unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
-            .unwrap()
+        }
+            .write(&mut buf, *b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x3d\xa1\x00\x00\x04\xf6\x00\x00\x63\x38\x04\x04");
+            d.push_collect(&pkt)
         }
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // PPS
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -2077,22 +1844,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x68\xee\x3c\xb0")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xee\x3c\xb0");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // IDR slice
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -2100,18 +1859,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x65idr slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65idr slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert!(frame.has_new_parameters);
@@ -2185,9 +1937,8 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2195,17 +1946,10 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(ANNEX_B_NALS)
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, ANNEX_B_NALS);
+            d.push_collect(&pkt);
         }
-        .unwrap();
-        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+        let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(frame.data(), &PREFIXED_NALS);
@@ -2244,9 +1988,8 @@ mod tests {
                 first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
                 println!("  pushing first pkt");
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 0,
@@ -2254,16 +1997,9 @@ mod tests {
                         mark: false,
                         payload_type: 0,
                     }
-                    .build(first_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, first_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
@@ -2274,9 +2010,8 @@ mod tests {
                     );
                     println!("  pushing middle pkt");
                     {
-                        let pkt = ReceivedPacketBuilder {
+                        let pkt = TestPacket {
                             ctx: crate::PacketContext::dummy(),
-                            stream_id: 0,
                             timestamp,
                             ssrc: 0,
                             sequence_number: 1,
@@ -2284,16 +2019,9 @@ mod tests {
                             mark: false,
                             payload_type: 0,
                         }
-                        .build(middle_pkt)
-                        .unwrap();
-                        push_via_buf(
-                            &mut d,
-                            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                            pkt.payload(),
-                            &mut buf,
-                        )
+                        .write(&mut buf, middle_pkt);
+                        d.push_collect(&pkt);
                     }
-                    .unwrap();
                     assert_eq!(d.pull(), None);
                 }
                 let mut last_pkt =
@@ -2303,9 +2031,8 @@ mod tests {
                 last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len + middle_pkt_len..]);
                 println!("  pushing last pkt");
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 2,
@@ -2313,18 +2040,11 @@ mod tests {
                         mark: true,
                         payload_type: 0,
                     }
-                    .build(last_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, last_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 println!("  pulling");
-                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!();
                 };
                 assert_eq_hex!(frame.data(), &PREFIXED_NALS);
@@ -2369,9 +2089,8 @@ mod tests {
                 first_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b1000_0000);
                 first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 0,
@@ -2379,25 +2098,17 @@ mod tests {
                         mark: false,
                         payload_type: 0,
                     }
-                    .build(first_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, first_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 let mut last_pkt = Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len + 2);
                 last_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28);
                 last_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0100_0000);
                 last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len..]);
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 1,
@@ -2405,17 +2116,10 @@ mod tests {
                         mark: true,
                         payload_type: 0,
                     }
-                    .build(last_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, last_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
-                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!(
                         "wrap_offset={wrap_offset}, first_pkt_len={first_pkt_len}: \
                          expected VideoFrame"
@@ -2441,9 +2145,8 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2451,17 +2154,10 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(ANNEX_B_NALS)
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, ANNEX_B_NALS);
+            d.push_collect(&pkt);
         }
-        .unwrap();
-        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+        let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
@@ -2493,9 +2189,8 @@ mod tests {
                 first_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b1000_0000); // start
                 first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 0,
@@ -2503,16 +2198,9 @@ mod tests {
                         mark: false,
                         payload_type: 0,
                     }
-                    .build(first_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, first_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
                 assert_eq!(d.pull(), None);
                 if middle_pkt_len > 0 {
                     let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
@@ -2522,9 +2210,8 @@ mod tests {
                         &ANNEX_B_NALS[first_pkt_len..first_pkt_len + middle_pkt_len],
                     );
                     {
-                        let pkt = ReceivedPacketBuilder {
+                        let pkt = TestPacket {
                             ctx: crate::PacketContext::dummy(),
-                            stream_id: 0,
                             timestamp,
                             ssrc: 0,
                             sequence_number: 1,
@@ -2532,16 +2219,9 @@ mod tests {
                             mark: false,
                             payload_type: 0,
                         }
-                        .build(middle_pkt)
-                        .unwrap();
-                        push_via_buf(
-                            &mut d,
-                            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                            pkt.payload(),
-                            &mut buf,
-                        )
+                        .write(&mut buf, middle_pkt);
+                        d.push_collect(&pkt);
                     }
-                    .unwrap();
                     assert_eq!(d.pull(), None);
                 }
                 let mut last_pkt =
@@ -2550,9 +2230,8 @@ mod tests {
                 last_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0100_0000); // end
                 last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len + middle_pkt_len..]);
                 {
-                    let pkt = ReceivedPacketBuilder {
+                    let pkt = TestPacket {
                         ctx: crate::PacketContext::dummy(),
-                        stream_id: 0,
                         timestamp,
                         ssrc: 0,
                         sequence_number: 2,
@@ -2560,17 +2239,10 @@ mod tests {
                         mark: true,
                         payload_type: 0,
                     }
-                    .build(last_pkt)
-                    .unwrap();
-                    push_via_buf(
-                        &mut d,
-                        crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                        pkt.payload(),
-                        &mut buf,
-                    )
+                    .write(&mut buf, last_pkt);
+                    d.push_collect(&pkt);
                 }
-                .unwrap();
-                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                let Some(Ok(Item::Video(frame))) = d.pull() else {
                     panic!();
                 };
                 assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
@@ -2594,9 +2266,8 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2604,17 +2275,10 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(ANNEX_B_NALS)
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, ANNEX_B_NALS);
+            d.push_collect(&pkt);
         }
-        .unwrap();
-        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+        let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(frame.data(), &ANNEX_B_NALS_SIMPLE);
@@ -2631,10 +2295,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A start fragment
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2642,23 +2305,15 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x3c\x81start of non-idr")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x3c\x81start of non-idr");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, end.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -2666,18 +2321,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x3c\x47a wild sps appeared")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x3c\x47a wild sps appeared");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         // assert!(push_result.is_err());
-        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+        let Some(Ok(Item::Video(frame))) = d.pull() else {
             panic!();
         };
         assert_eq_hex!(
@@ -2708,23 +2356,20 @@ mod tests {
         // FU-A with S=1 E=1 type=1 (non-IDR slice) — FU header 0xc1,
         // as observed in the wild.
         // FU indicator \x7c = F=0 NRI=3 type=28.
-        push_via_buf(
-            &mut d,
-            crate::rtp::ReceivedPacketMeta {
-                ctx: crate::PacketContext::dummy(),
-                timestamp,
-                ssrc: 0,
-                sequence_number: 0,
-                loss: 0,
-                mark: true,
-            },
-            b"\x7c\xc1small nal",
-            &mut buf,
-        )
-        .unwrap();
+        let pkt = TestPacket {
+            ctx: crate::PacketContext::dummy(),
+            timestamp,
+            ssrc: 0,
+            sequence_number: 0,
+            loss: 0,
+            mark: true,
+            payload_type: 0,
+        }
+        .write(&mut buf, *b"\x7c\xc1small nal");
+        d.push_collect(&pkt);
         assert!(d.seen_single_fragment_fu_a);
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result: {o:?}"),
         };
         // Reconstructed NAL: NRI=3 (from indicator) | type=1 (from FU hdr)
@@ -2749,10 +2394,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet (non-IDR slice, type 1), start (with data).
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2760,22 +2404,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x81start, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x81start, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, middle (empty payload after header).
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -2783,22 +2419,14 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x01")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x01");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, end (with data).
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -2806,18 +2434,11 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x41end")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x41end");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x61start, end");
@@ -2887,10 +2508,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // FU-A packet, start.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: timestamp0,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2898,16 +2518,9 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x86fu-a start, ")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x7c\x86fu-a start, ");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         let timestamp1 = crate::Timestamp {
             timestamp: 1,
@@ -2915,10 +2528,9 @@ mod tests {
             start: 0,
         };
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // plain non-IDR slice packet.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: timestamp1,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2926,24 +2538,17 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x01plain")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x01plain");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         match d.pull() {
             Some(Err(e)) => assert_eq!(
-                e.description,
+                e,
                 "timestamp changed from 0 (mod-2^32: 0), npt 0.000 to 1 (mod-2^32: 1), npt 0.000 in the middle of a fragmented NAL"
             ),
             _ => panic!(),
         }
-        let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
+        let Some(Ok(Item::Video(f))) = d.pull() else {
             panic!()
         };
         assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x01plain");
@@ -2981,9 +2586,8 @@ mod tests {
 
         // SPS with (incorrect) mark.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -2991,26 +2595,19 @@ mod tests {
                 mark: true,
                 payload_type: 96,
             }
-            .build(
+            .write(
+                &mut buf,
                 *b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
                        \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
-            )
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // PPS with (incorrect) mark.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -3018,23 +2615,15 @@ mod tests {
                 mark: true,
                 payload_type: 96,
             }
-            .build(*b"\x68\xee\x3c\x80")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x68\xee\x3c\x80");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // SEI (reserved payload type 229) with (incorrect) mark.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -3042,23 +2631,15 @@ mod tests {
                 mark: true,
                 payload_type: 96,
             }
-            .build(*b"\x06\xe5\x01\xa7\x80")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x06\xe5\x01\xa7\x80");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // IDR slice with mark (correct this time).
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 3,
@@ -3066,18 +2647,11 @@ mod tests {
                 mark: true,
                 payload_type: 96,
             }
-            .build(*b"\x65slice")
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
+            .write(&mut buf, *b"\x65slice");
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("unexpected pull result {o:#?}"),
         };
         assert_eq_hex!(
@@ -3132,9 +2706,8 @@ mod tests {
             .unwrap();
             d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
             for (i, nal) in nals.iter().enumerate() {
-                let pkt = ReceivedPacketBuilder {
+                let pkt = TestPacket {
                     ctx: crate::PacketContext::dummy(),
-                    stream_id: 0,
                     timestamp: crate::Timestamp {
                         timestamp: 0,
                         clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -3146,18 +2719,11 @@ mod tests {
                     mark: i == nals.len() - 1,
                     payload_type: 96,
                 }
-                .build(nal.iter().copied())
-                .unwrap();
-                push_via_buf(
-                    &mut d,
-                    crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                    pkt.payload(),
-                    &mut buf,
-                )
-                .unwrap();
+                .write(&mut buf, nal.iter().copied());
+                d.push_collect(&pkt);
             }
             let frame = match d.pull() {
-                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                Some(Ok(Item::Video(frame))) => frame,
                 o => panic!("{o:#?}"),
             };
             assert_eq!(frame.is_random_access_point(), want_rap, "{nals:02x?}");
@@ -3201,9 +2767,8 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: crate::Timestamp {
                     timestamp: 0,
                     clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -3215,18 +2780,11 @@ mod tests {
                 mark: i == 2,
                 payload_type: 96,
             }
-            .build(payload.iter().copied())
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
-            .unwrap();
+            .write(&mut buf, payload.iter().copied());
+            d.push_collect(&pkt);
         }
         let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            Some(Ok(Item::Video(frame))) => frame,
             o => panic!("{o:#?}"),
         };
         // The default `ParameterSetInsertion::OnChange` prepends the initial
@@ -3254,7 +2812,7 @@ mod tests {
         loss: u16,
         payload: &[u8],
         h: &mut crate::codec::events::testutil::Recorder,
-    ) -> Result<(), String> {
+    ) {
         let meta = crate::rtp::ReceivedPacketMeta {
             ctx: crate::PacketContext::dummy(),
             timestamp: crate::Timestamp {
@@ -3270,10 +2828,8 @@ mod tests {
         let pos = buf.end();
         buf.extend(payload);
         buf.advance_unparsed(buf.end());
-        d.push_with(
-            &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
-            h,
-        )
+        let pkt = ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16);
+        d.push(&pkt, h)
     }
 
     const EVENTS_FMTP: &str = "packetization-mode=1;profile-level-id=4d002a;\
@@ -3287,7 +2843,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06plain", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06plain", &mut h);
         push_events(
             &mut d,
             &mut buf,
@@ -3297,9 +2853,8 @@ mod tests {
             0,
             b"\x7c\x85fu-a start, ",
             &mut h,
-        )
-        .unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x7c\x45fu-a end", &mut h).unwrap();
+        );
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x7c\x45fu-a end", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3312,7 +2867,6 @@ mod tests {
                 Event::Data(UnitPosition::Start, hex(b"\x65fu-a start, ")),
                 Event::Data(UnitPosition::End, hex(b"fu-a end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3324,8 +2878,8 @@ mod tests {
         );
 
         // A disposable, non-IDR frame ended by a timestamp change.
-        push_events(&mut d, &mut buf, 3, 1, false, 0, b"\x01slice", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 4, 2, false, 0, b"\x01next", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 3, 1, false, 0, b"\x01slice", &mut h);
+        push_events(&mut d, &mut buf, 4, 2, false, 0, b"\x01next", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3336,7 +2890,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x01slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: true,
                     has_new_parameters: false,
@@ -3361,7 +2914,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::No);
-        push_events(&mut d, &mut buf, 0, 0, true, 0, b"\x65slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, true, 0, b"\x65slice", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3372,7 +2925,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3390,7 +2942,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3402,7 +2954,7 @@ mod tests {
                 Event::Data(UnitPosition::Start, hex(b"\x65start")),
             ]
         );
-        push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 1, true, 0, b"\x41slice", &mut h);
         let events = h.take();
         assert!(
             matches!(&events[..], [Event::Loss(LossReason::Corrupt { .. }), ..]),
@@ -3418,7 +2970,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3438,9 +2989,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06sei", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x06sei", &mut h);
         assert_eq!(h.take(), vec![]);
-        push_events(&mut d, &mut buf, 1, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 0, false, 0, b"\x65slice 1", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3453,13 +3004,12 @@ mod tests {
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 1")),
             ]
         );
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3491,7 +3041,7 @@ mod tests {
             stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
             stap_a.extend_from_slice(nal);
         }
-        push_events(&mut d, &mut buf, 0, 0, false, 0, &stap_a, &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, &stap_a, &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3507,13 +3057,12 @@ mod tests {
             !d.analyzer.has_mark(),
             "data should be released once delivered"
         );
-        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x65slice 2", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3541,8 +3090,7 @@ mod tests {
             0,
             b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
             &mut h,
-        )
-        .unwrap();
+        );
         push_events(
             &mut d,
             &mut buf,
@@ -3552,9 +3100,8 @@ mod tests {
             0,
             b"\x68\xee\x3c\x80",
             &mut h,
-        )
-        .unwrap();
-        push_events(&mut d, &mut buf, 2, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        );
+        push_events(&mut d, &mut buf, 2, 0, false, 0, b"\x7c\x85start", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3567,13 +3114,12 @@ mod tests {
             ]
         );
         assert!(d.parameters().is_none());
-        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x7c\x45 end", &mut h);
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::End, hex(b" end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: true,
@@ -3594,9 +3140,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice 1", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x06sei", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice 1", &mut h);
+        push_events(&mut d, &mut buf, 1, 0, true, 0, b"\x06sei", &mut h);
+        push_events(&mut d, &mut buf, 2, 0, true, 0, b"\x65slice 2", &mut h);
         let events = h.take();
         assert_eq!(
             events,
@@ -3610,7 +3156,6 @@ mod tests {
                 Event::Data(UnitPosition::Complete, hex(b"\x06sei")),
                 Event::Data(UnitPosition::Complete, hex(b"\x65slice 2")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3631,7 +3176,7 @@ mod tests {
         let mut buf = MarkBuf::new(64);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::No);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
         for i in 1..100 {
             push_events(
                 &mut d,
@@ -3642,22 +3187,20 @@ mod tests {
                 0,
                 b"\x7c\x05 middle.......",
                 &mut h,
-            )
-            .unwrap();
+            );
             assert!(!d.analyzer.has_mark());
             assert_eq!(
                 h.take().last(),
                 Some(&Event::Data(UnitPosition::Middle, hex(b" middle.......")))
             );
         }
-        push_events(&mut d, &mut buf, 100, 0, true, 0, b"\x7c\x45 end", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 100, 0, true, 0, b"\x7c\x45 end", &mut h);
         assert_eq!(buf.capacity(), 64, "buffer should not have grown");
         assert_eq!(
             h.take(),
             vec![
                 Event::Data(UnitPosition::End, hex(b" end")),
                 Event::FrameEnd {
-                    loss: 0,
                     is_random_access_point: true,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -3676,9 +3219,9 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
         let mut h = Recorder::new(Accumulate::Yes);
-        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 2, 0, true, 1, b"\x7c\x45 end", &mut h).unwrap();
-        push_events(&mut d, &mut buf, 3, 1, true, 0, b"\x41slice", &mut h).unwrap();
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x7c\x85start", &mut h);
+        push_events(&mut d, &mut buf, 2, 0, true, 1, b"\x7c\x45 end", &mut h);
+        push_events(&mut d, &mut buf, 3, 1, true, 0, b"\x41slice", &mut h);
         assert_eq!(
             h.take(),
             vec![
@@ -3696,7 +3239,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
-                    loss: 1,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,

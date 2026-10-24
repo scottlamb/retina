@@ -14,8 +14,8 @@ use crate::inputs::Input;
 /// Fixed RTP packet header (no CSRCs, payload, or extensions).
 ///
 /// This is a thin wrapper around the raw 12-byte header, with accessor
-/// methods for the individual fields. It can be constructed on-the-fly
-/// from a [`crate::client::ReceivedPacket`] or via [`PacketHeader::validate`].
+/// methods for the individual fields. It can be obtained via
+/// [`PacketHeader::validate`] or [`crate::client::RtpPacket::header`].
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PacketHeader(
     /// ```text
@@ -132,7 +132,7 @@ impl std::fmt::Debug for PacketHeader {
 /// An RTP packet to send, as accepted by the [`futures::Sink`] impl on
 /// [`Session<Playing>`](crate::client::Session).
 ///
-/// This is the sending counterpart of [`crate::client::ReceivedPacket`], without the
+/// This is the sending counterpart of [`crate::client::RtpPacket`], without the
 /// received-packet context. The caller supplies the payload and timing;
 /// Retina fills in the rest of the RTP header: the SSRC, the sequence number,
 /// and the payload type, [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type).
@@ -327,6 +327,33 @@ impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
     pub(crate) fn buf(&self) -> &'a MarkBuf {
         self.buf
     }
+}
+
+/// Builds a raw RTP packet with the given header fields and payload.
+#[cfg_attr(not(feature = "h264"), allow(dead_code))]
+pub(crate) fn build_raw_rtp<P: IntoIterator<Item = u8>>(
+    sequence_number: u16,
+    timestamp: u32,
+    payload_type: u8,
+    ssrc: u32,
+    mark: bool,
+    payload: P,
+) -> Result<bytes::Bytes, &'static str> {
+    if payload_type >= 0x80 {
+        return Err("payload type too large");
+    }
+    let data: bytes::Bytes = [
+        2 << 6, // version=2, no padding, no extensions, no CSRCs.
+        if mark { 0b1000_0000 } else { 0 } | payload_type,
+    ]
+    .into_iter()
+    .chain(sequence_number.to_be_bytes())
+    .chain(timestamp.to_be_bytes())
+    .chain(ssrc.to_be_bytes())
+    .chain(payload)
+    .collect();
+    let _ = u16::try_from(data.len()).map_err(|_| "payload too long")?;
+    Ok(data)
 }
 
 #[cfg(test)]

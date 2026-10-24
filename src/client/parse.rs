@@ -384,31 +384,24 @@ fn parse_media(
     if let Some(f) = fmtp {
         format = format.with_fmtp(f);
     }
-    let depacketizer = match direction {
-        StreamDirection::Receiving => {
-            let d = crate::codec::Depacketizer::new(&format).map_err(|e| e.to_string());
-            if let Err(e) = &d {
+    let parameters = match direction {
+        StreamDirection::Receiving => match crate::codec::Depacketizer::<()>::new(&format) {
+            Ok(d) => d.parameters().map(crate::codec::Parameters::from),
+            Err(e) => {
                 log::info!("no depacketizer for media/encoding_name {media}/{encoding_name}: {e}");
+                None
             }
-            d
-        }
-        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
+        },
+        StreamDirection::Sending => None,
     };
-    let parameters = depacketizer
-        .as_ref()
-        .ok()
-        .and_then(|d| d.parameters())
-        .map(crate::codec::Parameters::from);
 
     Ok(Stream {
-        frame_format: Default::default(),
         media,
         encoding_name,
         clock_rate_hz: clock_rate,
         rtp_payload_type,
         fmtp: fmtp.map(Into::into),
         parameters,
-        depacketizer,
         control,
         channels,
         framerate,
@@ -1907,7 +1900,7 @@ mod tests {
         assert_eq!(back.encoding_name(), "pcmu");
         assert_eq!(back.rtp_payload_type(), 0);
         assert_eq!(back.clock_rate_hz(), 8_000);
-        assert!(back.depacketizer.is_err());
+        assert!(back.new_depacketizer::<()>().is_err());
         assert!(back.parameters().is_none());
         assert_eq!(
             back.control().unwrap().as_str(),
@@ -1920,7 +1913,7 @@ mod tests {
         for s in &p.streams[..] {
             assert_eq!(s.direction(), StreamDirection::Receiving);
         }
-        assert!(p.streams[2].depacketizer.is_ok());
+        assert!(p.streams[2].new_depacketizer::<()>().is_ok());
     }
 
     /// Tests the ONVIF Streaming Specification section 5.3.2.3 example: a

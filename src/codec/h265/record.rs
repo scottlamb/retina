@@ -22,7 +22,7 @@ pub struct Out {
 ///
 /// Only a single of each of may be active at a time according to H.265, so this
 /// should be sufficient. If the active parameter set changes,
-/// `retina::VideoFrame::has_new_parameters` will return true.
+/// [`crate::codec::VideoFrameEnd::has_new_parameters`] will return true.
 ///
 /// Always declares `lengthSizeMinusOne` of 3, meaning that NAL units are
 /// prefixed with a 4-byte length.

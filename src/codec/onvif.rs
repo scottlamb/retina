@@ -34,7 +34,6 @@ struct InProgress<Ctx> {
     ctx: Ctx,
     timestamp: crate::Timestamp,
     data: Vec<u8>,
-    loss: u16,
 }
 
 impl<Ctx: Clone> Depacketizer<Ctx> {
@@ -51,11 +50,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
+    pub(super) fn push(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl MessageHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         if pkt.meta.loss > 0
             && let Some(in_progress) = &self.in_progress
         {
@@ -70,10 +69,14 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         let mut in_progress = match self.in_progress.take() {
             Some(in_progress) => {
                 if in_progress.timestamp.timestamp != pkt.meta.timestamp.timestamp {
-                    return Err(format!(
-                        "Timestamp changed from {} to {} with message in progress",
-                        in_progress.timestamp, pkt.meta.timestamp,
-                    ));
+                    return super::report_corrupt(
+                        pkt,
+                        format!(
+                            "Timestamp changed from {} to {} with message in progress",
+                            in_progress.timestamp, pkt.meta.timestamp,
+                        ),
+                        |l| handler.loss(l),
+                    );
                 }
                 in_progress
             }
@@ -89,13 +92,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     handler.message_frame(&MessageFrameRef {
                         ctx: &pkt.meta.ctx,
                         timestamp: pkt.meta.timestamp,
-                        loss: pkt.meta.loss,
                         data,
                     });
-                    return Ok(());
+                    return;
                 }
                 InProgress {
-                    loss: pkt.meta.loss,
                     ctx: pkt.meta.ctx.clone(),
                     timestamp: pkt.meta.timestamp,
                     data: Vec::with_capacity(self.high_water_size),
@@ -109,12 +110,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             handler.message_frame(&MessageFrameRef {
                 ctx: &in_progress.ctx,
                 timestamp: in_progress.timestamp,
-                loss: in_progress.loss,
                 data: &in_progress.data,
             });
         } else {
             self.in_progress = Some(in_progress);
         }
-        Ok(())
     }
 }

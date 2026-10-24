@@ -119,6 +119,9 @@ pub mod h265;
 pub(crate) mod onvif;
 pub(crate) mod simple_audio;
 
+#[cfg(test)]
+mod testutil;
+
 pub(crate) use events::FrameBody;
 pub use events::{
     Accumulate, AudioFrameRef, AudioHandler, Corruption, Loss, LossReason, MessageFrameRef,
@@ -134,8 +137,7 @@ pub use events::{
 /// It's supplied wherever frame data or matching "extra data" is produced:
 /// [`VideoFrameEnd::complete_frame`], [`VideoFrameEnd::visit_frame_data`],
 /// [`AudioFrameRef::data`], [`VideoParameters::extra_data`], and
-/// [`AudioParameters::extra_data`]. [`crate::client::Demuxed`] uses the
-/// format given by [`SetupOptions::frame_format`](crate::client::SetupOptions::frame_format).
+/// [`AudioParameters::extra_data`].
 ///
 /// Preset constants are provided for common use cases:
 ///
@@ -676,18 +678,16 @@ fn report_packet_loss<Ctx>(pkt: &ReceivedPacketRef<'_, Ctx>, loss: impl FnOnce(&
     }
 }
 
-/// Reports an error from `push_with` as corruption.
+/// Reports corrupt data found in a packet.
 fn report_corrupt<Ctx>(
     pkt: &ReceivedPacketRef<'_, Ctx>,
-    r: Result<(), String>,
+    description: String,
     loss: impl FnOnce(&Loss<'_, Ctx>),
 ) {
-    if let Err(description) = r {
-        loss(&Loss {
-            ctx: &pkt.meta.ctx,
-            reason: LossReason::Corrupt(Corruption::new(description)),
-        });
-    }
+    loss(&Loss {
+        ctx: &pkt.meta.ctx,
+        reason: LossReason::Corrupt(Corruption::new(description)),
+    });
 }
 
 /// Turns RTP packets into video frames, delivering them to a [`VideoHandler`].
@@ -900,46 +900,17 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         match &mut self.inner {
             // These report loss and track decodability via their analyzers.
             #[cfg(feature = "h264")]
-            VideoInner::H264(d) => {
-                if let Err(description) = d.push_with(pkt, handler) {
-                    d.report_corrupt(&pkt.meta.ctx, description, handler);
-                }
-            }
+            VideoInner::H264(d) => d.push(pkt, handler),
             #[cfg(feature = "h265")]
-            VideoInner::H265(d) => {
-                if let Err(description) = d.push_with(pkt, handler) {
-                    d.report_corrupt(&pkt.meta.ctx, description, handler);
-                }
-            }
+            VideoInner::H265(d) => d.push(pkt, handler),
             VideoInner::Jpeg(d) => {
                 let handler = &mut DecodabilityTracker {
                     state: &mut self.decodability,
                     inner: handler,
                 };
                 report_packet_loss(pkt, |l| handler.loss(l));
-                let r = d.push_with(pkt, handler);
-                report_corrupt(pkt, r, |l| handler.loss(l));
+                d.push(pkt, handler)
             }
-        }
-    }
-
-    /// Supplies a new packet, delivering any resulting events to `handler`.
-    ///
-    /// Unlike [`VideoDepacketizer::push`], this doesn't report packet loss
-    /// (except for H.264 and H.265, which report it via their analyzers),
-    /// and it returns some errors (those detected before any events for the
-    /// packet) rather than reporting them via [`VideoHandler::loss`].
-    pub(crate) fn push_with(
-        &mut self,
-        pkt: &ReceivedPacketRef<'_, Ctx>,
-        handler: &mut impl VideoHandler<Ctx>,
-    ) -> Result<(), String> {
-        match &mut self.inner {
-            #[cfg(feature = "h264")]
-            VideoInner::H264(d) => d.push_with(pkt, handler),
-            #[cfg(feature = "h265")]
-            VideoInner::H265(d) => d.push_with(pkt, handler),
-            VideoInner::Jpeg(d) => d.push_with(pkt, handler),
         }
     }
 }
@@ -1026,20 +997,10 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
     /// [`AudioHandler::loss`].
     pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
         report_packet_loss(pkt, |l| handler.loss(l));
-        let r = self.push_with(pkt, handler);
-        report_corrupt(pkt, r, |l| handler.loss(l));
-    }
-
-    /// As in [`VideoDepacketizer::push_with`].
-    pub(crate) fn push_with(
-        &mut self,
-        pkt: &ReceivedPacketRef<'_, Ctx>,
-        handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
         match &mut self.0 {
-            AudioInner::Aac(d) => d.push_with(pkt, handler),
-            AudioInner::SimpleAudio(d) => d.push_with(pkt, handler),
-            AudioInner::G723(d) => d.push_with(pkt, handler),
+            AudioInner::Aac(d) => d.push(pkt, handler),
+            AudioInner::SimpleAudio(d) => d.push(pkt, handler),
+            AudioInner::G723(d) => d.push(pkt, handler),
         }
     }
 }
@@ -1087,17 +1048,7 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
         handler: &mut impl MessageHandler<Ctx>,
     ) {
         report_packet_loss(pkt, |l| handler.loss(l));
-        let r = self.push_with(pkt, handler);
-        report_corrupt(pkt, r, |l| handler.loss(l));
-    }
-
-    /// As in [`VideoDepacketizer::push_with`].
-    pub(crate) fn push_with(
-        &mut self,
-        pkt: &ReceivedPacketRef<'_, Ctx>,
-        handler: &mut impl MessageHandler<Ctx>,
-    ) -> Result<(), String> {
-        self.0.push_with(pkt, handler)
+        self.0.push(pkt, handler);
     }
 }
 
@@ -1267,31 +1218,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             Self::Message(d) => d.push(pkt, handler),
         }
     }
-
-    /// As in [`VideoDepacketizer::push_with`].
-    pub(crate) fn push_with(
-        &mut self,
-        pkt: &ReceivedPacketRef<'_, Ctx>,
-        handler: &mut (impl VideoHandler<Ctx> + AudioHandler<Ctx> + MessageHandler<Ctx>),
-    ) -> Result<(), String> {
-        match self {
-            Self::Video(d) => d.push_with(pkt, handler),
-            Self::Audio(d) => d.push_with(pkt, handler),
-            Self::Message(d) => d.push_with(pkt, handler),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buf::MarkBuf;
-    use crate::client::{AudioFrame, CodecItem, MessageFrame, VideoFrame};
     #[cfg(feature = "h264")]
     use crate::rtp::ReceivedPacketMeta;
     use events::testutil::{Event, Recorder, hex};
-    #[cfg(feature = "h264")]
-    use std::collections::VecDeque;
 
     /// Pushes a packet via the infallible `push`.
     fn push(
@@ -1346,7 +1281,6 @@ mod tests {
             },
             Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
             Event::FrameEnd {
-                loss: 0,
                 is_random_access_point: true,
                 is_disposable: false,
                 has_new_parameters: false,
@@ -1701,13 +1635,7 @@ mod tests {
             vec![Event::Loss(LossReason::PacketLoss { packets: 2 })]
         );
         push(&mut d, &mut buf, (4, 1, true, 0), b"\x65slice", &mut h);
-        let mut expected = idr_frame();
-        for e in &mut expected {
-            if let Event::FrameEnd { loss, .. } = e {
-                *loss = 2;
-            }
-        }
-        assert_eq!(h.take(), expected);
+        assert_eq!(h.take(), idr_frame());
     }
 
     #[test]
@@ -1731,7 +1659,6 @@ mod tests {
                 },
                 Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
                 Event::FrameEnd {
-                    loss: 1,
                     is_random_access_point: false,
                     is_disposable: false,
                     has_new_parameters: false,
@@ -1866,11 +1793,11 @@ mod tests {
     const BUNNY_AAC_FMTP: &str = "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
                                   indexdeltalength=3;config=1490";
 
-    /// The legacy interface (used by `Demuxed`) and the handler interface produce
-    /// identical frames; streamed data matches accumulated data.
+    /// The test harness's `Collector` and the `Recorder` produce identical
+    /// frames; streamed data matches accumulated data.
     #[test]
     #[cfg(feature = "h264")]
-    fn bunny_legacy_vs_handler() {
+    fn bunny_collector_vs_recorder() {
         crate::testutil::init_logging();
         for (channel, media, encoding, clock_rate, fmtp) in [
             (2, "video", "h264", 90_000, BUNNY_H264_FMTP),
@@ -1885,31 +1812,24 @@ mod tests {
                 .unwrap()
             };
 
-            // Legacy, as used by `Demuxed`.
-            let mut legacy = new();
-            let mut legacy_frames = Vec::new();
+            // The test harness.
+            let mut d = new();
+            let mut collected = Vec::new();
+            let mut pending = testutil::Pending::default();
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
-                let mut pending = VecDeque::new();
-                legacy
-                    .push_with(
-                        &ReceivedPacketRef::new(meta, buf, pos, len),
-                        &mut crate::client::LegacyHandler {
-                            pending: &mut pending,
-                            meta: &meta,
-                            stream_id: 0,
-                            format: FrameFormat::default(),
-                        },
-                    )
-                    .unwrap();
-                for item in pending {
-                    legacy_frames.push(match item.unwrap() {
-                        CodecItem::VideoFrame(f) => f.into_data(),
-                        CodecItem::AudioFrame(f) => f.data().to_vec(),
+                d.push(
+                    &ReceivedPacketRef::new(meta, buf, pos, len),
+                    &mut testutil::Collector::new(&mut pending, FrameFormat::default()),
+                );
+                while let Some(item) = pending.pull() {
+                    collected.push(match item.unwrap() {
+                        testutil::Item::Video(f) => f.into_data(),
+                        testutil::Item::Audio(f) => f.data().to_vec(),
                         _ => unreachable!(),
                     });
                 }
             });
-            assert!(legacy_frames.len() > 100);
+            assert!(collected.len() > 100);
 
             // Handler, accumulating in the default format and in `MP4` (which
             // checks streamed data against the accumulated frame).
@@ -1930,9 +1850,9 @@ mod tests {
                         e => panic!("unexpected event {e:?}"),
                     })
                     .collect();
-                assert_eq!(frames.len(), legacy_frames.len());
+                assert_eq!(frames.len(), collected.len());
                 if format == FrameFormat::default() {
-                    for (i, (a, b)) in frames.iter().zip(&legacy_frames).enumerate() {
+                    for (i, (a, b)) in frames.iter().zip(&collected).enumerate() {
                         assert!(a == b, "frame {i} differs");
                     }
                 }
@@ -1949,7 +1869,7 @@ mod tests {
                 .iter()
                 .filter(|e| matches!(e, Event::FrameEnd { data: None, .. } | Event::AudioFrame(_)))
                 .count();
-            assert_eq!(ends, legacy_frames.len());
+            assert_eq!(ends, collected.len());
         }
     }
 
@@ -1996,10 +1916,6 @@ mod tests {
                 "simple_audio::Depacketizer",
                 std::mem::size_of::<simple_audio::Depacketizer>(),
             ),
-            ("CodecItem", std::mem::size_of::<CodecItem>()),
-            ("VideoFrame", std::mem::size_of::<VideoFrame>()),
-            ("AudioFrame", std::mem::size_of::<AudioFrame>()),
-            ("MessageFrame", std::mem::size_of::<MessageFrame>()),
             ("VideoParameters", std::mem::size_of::<VideoParameters>()),
             ("AudioParameters", std::mem::size_of::<AudioParameters>()),
             (
