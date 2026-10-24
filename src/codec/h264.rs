@@ -4,7 +4,9 @@
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
 //! with RTP encoding as in [RFC 6184](https://tools.ietf.org/html/rfc6184).
 
-use std::{collections::VecDeque, convert::TryFrom};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::convert::TryFrom;
 
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -14,7 +16,9 @@ use log::debug;
 
 use crate::Error;
 use crate::buf::{BufRange, MarkBuf, PacketRef};
-use crate::codec::{AllPixelDimensions, DepacketizeError, Handler, LossReason};
+use crate::codec::{AllPixelDimensions, Handler, LossReason};
+#[cfg(test)]
+use crate::codec::{CodecItem, DepacketizeError};
 use crate::inputs::Input as _;
 use crate::{
     Timestamp,
@@ -22,7 +26,7 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoParameters};
+use super::VideoParameters;
 
 mod analyzer;
 pub(crate) use analyzer::Analyzer;
@@ -92,7 +96,8 @@ pub fn parameters_from_sps_and_pps(
 pub(crate) struct Depacketizer<Ctx> {
     input_state: DepacketizerInputState,
 
-    /// Completed items ready to be pulled via the legacy `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    #[cfg(test)]
     pending: VecDeque<Result<CodecItem, DepacketizeError>>,
 
     /// The transport-independent layer, which holds the current access unit's
@@ -217,6 +222,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         };
         Ok(Depacketizer {
             input_state: DepacketizerInputState::New,
+            #[cfg(test)]
             pending: VecDeque::with_capacity(1),
             analyzer: Analyzer::with_internal_parameters(parameters),
             seen_inconsistent_fu_a_nal_hdr: false,
@@ -251,6 +257,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// Returns errors detected as the packet arrives, for the legacy
+    /// interface, rather than reporting them via [`Handler::loss`];
+    /// [`Depacketizer::report_corrupt`] reports them.
     pub(super) fn push_with(
         &mut self,
         pkt: &PacketRef<'_, Ctx>,
@@ -265,6 +275,17 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             self.analyzer.discard_lossy_au();
         }
         r
+    }
+
+    /// Reports an error returned by [`Depacketizer::push_with`].
+    pub(super) fn report_corrupt(
+        &mut self,
+        ctx: &Ctx,
+        description: String,
+        handler: &mut impl Handler<Ctx>,
+    ) {
+        self.analyzer
+            .loss(ctx, LossReason::Corrupt { description }, handler);
     }
 
     fn push_inner(
@@ -540,12 +561,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 }
 
+#[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the legacy `push`/`pull` interface.
     ///
     /// Between any two calls to `push`, the caller must call `pull` until it
     /// returns `None`.
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+    fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
         if let Some(p) = self.pending.front() {
             panic!("push with data already pending: {p:?}");
         }
@@ -563,7 +585,7 @@ impl Depacketizer<crate::PacketContext> {
         r
     }
 
-    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
+    fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
         self.pending.pop_front()
     }
 }

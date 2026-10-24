@@ -856,24 +856,32 @@ impl std::fmt::Debug for VideoFrame {
     }
 }
 
-/// Turns RTP packets into [`CodecItem`]s.
+/// Turns RTP packets into frames.
 ///
 /// This interface unstable and for internal use; it's exposed for direct fuzzing and benchmarking.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct Depacketizer(DepacketizerInner);
+pub struct Depacketizer<Ctx = crate::PacketContext> {
+    inner: DepacketizerInner<Ctx>,
+
+    /// The format most recently supplied to `set_frame_format`.
+    frame_format: FrameFormat,
+
+    /// Items ready for the legacy `pull` interface.
+    pending: VecDeque<Result<CodecItem, DepacketizeError>>,
+}
 
 #[derive(Debug)]
-enum DepacketizerInner {
-    Aac(Box<aac::Depacketizer>),
+enum DepacketizerInner<Ctx> {
+    Aac(Box<aac::Depacketizer<Ctx>>),
     SimpleAudio(Box<simple_audio::Depacketizer>),
     G723(Box<g723::Depacketizer>),
     #[cfg(feature = "h264")]
-    H264(Box<h264::Depacketizer<crate::PacketContext>>),
+    H264(Box<h264::Depacketizer<Ctx>>),
     #[cfg(feature = "h265")]
-    H265(Box<h265::Depacketizer<crate::PacketContext>>),
-    Onvif(Box<onvif::Depacketizer>),
-    Jpeg(Box<jpeg::Depacketizer>),
+    H265(Box<h265::Depacketizer<Ctx>>),
+    Onvif(Box<onvif::Depacketizer<Ctx>>),
+    Jpeg(Box<jpeg::Depacketizer<Ctx>>),
 }
 
 /// This is similar to `ErrorInt::RtpPacketError`, but without the connection/stream context, to avoid
@@ -893,7 +901,6 @@ pub struct DepacketizeError {
 ///
 /// Accumulates every frame, queueing it as a [`CodecItem`]. Queues corruption
 /// as an error.
-#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 pub(crate) struct LegacyHandler<'a> {
     pub(crate) pending: &'a mut VecDeque<Result<CodecItem, DepacketizeError>>,
 
@@ -926,6 +933,28 @@ impl Handler<crate::PacketContext> for LegacyHandler<'_> {
         })));
     }
 
+    fn audio_frame(&mut self, frame: &AudioFrameRef<'_, crate::PacketContext>) {
+        self.pending.push_back(Ok(CodecItem::AudioFrame(AudioFrame {
+            ctx: *frame.ctx(),
+            stream_id: self.meta.stream_id,
+            timestamp: frame.timestamp(),
+            frame_length: frame.frame_length(),
+            loss: frame.loss(),
+            data: Bytes::copy_from_slice(frame.data()),
+        })));
+    }
+
+    fn message_frame(&mut self, frame: &MessageFrameRef<'_, crate::PacketContext>) {
+        self.pending
+            .push_back(Ok(CodecItem::MessageFrame(MessageFrame {
+                ctx: *frame.ctx(),
+                stream_id: self.meta.stream_id,
+                timestamp: frame.timestamp(),
+                loss: frame.loss(),
+                data: Bytes::copy_from_slice(frame.data()),
+            })));
+    }
+
     fn loss(&mut self, loss: &Loss<'_, crate::PacketContext>) {
         if let LossReason::Corrupt { description } = loss.reason() {
             self.pending.push_back(Err(DepacketizeError {
@@ -938,7 +967,7 @@ impl Handler<crate::PacketContext> for LegacyHandler<'_> {
     }
 }
 
-impl Depacketizer {
+impl<Ctx: Clone> Depacketizer<Ctx> {
     pub fn new(
         media: &str,
         encoding_name: &str,
@@ -950,76 +979,80 @@ impl Depacketizer {
 
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
-        Ok(Depacketizer(match (media, encoding_name) {
-            #[cfg(feature = "h264")]
-            ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
-                clock_rate,
-                format_specific_params,
-            )?)),
-            #[cfg(feature = "h265")]
-            ("video", "h265") => DepacketizerInner::H265(Box::new(h265::Depacketizer::new(
-                clock_rate,
-                format_specific_params,
-            )?)),
-            ("image" | "video", "jpeg") => DepacketizerInner::Jpeg(Box::default()),
-            ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
-                clock_rate,
-                channels,
-                format_specific_params,
-            )?)),
-            ("audio", "g726-16") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 2, channels),
-            )),
-            ("audio", "g726-24") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 3, channels),
-            )),
-            ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 4, channels),
-            )),
-            ("audio", "g726-40") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 5, channels),
-            )),
-            ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
-                DepacketizerInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
-                    clock_rate, 8, channels,
-                )))
-            }
-            ("audio", "l16") => DepacketizerInner::SimpleAudio(Box::new(
-                simple_audio::Depacketizer::new(clock_rate, 16, channels),
-            )),
-            // Dahua cameras when configured with G723 send packets with a
-            // non-standard encoding-name "G723.1" and length 40, which doesn't
-            // make sense. Don't try to depacketize these.
-            ("audio", "g723") => {
-                DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
-            }
-            ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
-                onvif::Depacketizer::new(CompressionType::Uncompressed),
-            )),
-            ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
-                onvif::Depacketizer::new(CompressionType::GzipCompressed),
-            )),
-            ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(Box::new(
-                onvif::Depacketizer::new(CompressionType::ExiDefault),
-            )),
-            ("application", "vnd.onvif.metadata.exi.ext") => DepacketizerInner::Onvif(Box::new(
-                onvif::Depacketizer::new(CompressionType::ExiInBand),
-            )),
-            (_, _) => {
-                log::info!(
-                    "no depacketizer for media/encoding_name {}/{}",
-                    media,
-                    encoding_name
-                );
-                return Err(format!(
-                    "no depacketizer for media/encoding_name {media}/{encoding_name}"
-                ));
-            }
-        }))
+        let inner =
+            match (media, encoding_name) {
+                #[cfg(feature = "h264")]
+                ("video", "h264") => DepacketizerInner::H264(Box::new(h264::Depacketizer::new(
+                    clock_rate,
+                    format_specific_params,
+                )?)),
+                #[cfg(feature = "h265")]
+                ("video", "h265") => DepacketizerInner::H265(Box::new(h265::Depacketizer::new(
+                    clock_rate,
+                    format_specific_params,
+                )?)),
+                ("image" | "video", "jpeg") => DepacketizerInner::Jpeg(Box::default()),
+                ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(
+                    aac::Depacketizer::new(clock_rate, channels, format_specific_params)?,
+                )),
+                ("audio", "g726-16") => DepacketizerInner::SimpleAudio(Box::new(
+                    simple_audio::Depacketizer::new(clock_rate, 2, channels),
+                )),
+                ("audio", "g726-24") => DepacketizerInner::SimpleAudio(Box::new(
+                    simple_audio::Depacketizer::new(clock_rate, 3, channels),
+                )),
+                ("audio", "dvi4") | ("audio", "g726-32") => DepacketizerInner::SimpleAudio(
+                    Box::new(simple_audio::Depacketizer::new(clock_rate, 4, channels)),
+                ),
+                ("audio", "g726-40") => DepacketizerInner::SimpleAudio(Box::new(
+                    simple_audio::Depacketizer::new(clock_rate, 5, channels),
+                )),
+                ("audio", "pcma") | ("audio", "pcmu") | ("audio", "u8") | ("audio", "g722") => {
+                    DepacketizerInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
+                        clock_rate, 8, channels,
+                    )))
+                }
+                ("audio", "l16") => DepacketizerInner::SimpleAudio(Box::new(
+                    simple_audio::Depacketizer::new(clock_rate, 16, channels),
+                )),
+                // Dahua cameras when configured with G723 send packets with a
+                // non-standard encoding-name "G723.1" and length 40, which doesn't
+                // make sense. Don't try to depacketize these.
+                ("audio", "g723") => {
+                    DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
+                }
+                ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
+                    onvif::Depacketizer::new(CompressionType::Uncompressed),
+                )),
+                ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
+                    onvif::Depacketizer::new(CompressionType::GzipCompressed),
+                )),
+                ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(
+                    Box::new(onvif::Depacketizer::new(CompressionType::ExiDefault)),
+                ),
+                ("application", "vnd.onvif.metadata.exi.ext") => DepacketizerInner::Onvif(
+                    Box::new(onvif::Depacketizer::new(CompressionType::ExiInBand)),
+                ),
+                (_, _) => {
+                    log::info!(
+                        "no depacketizer for media/encoding_name {}/{}",
+                        media,
+                        encoding_name
+                    );
+                    return Err(format!(
+                        "no depacketizer for media/encoding_name {media}/{encoding_name}"
+                    ));
+                }
+            };
+        Ok(Depacketizer {
+            inner,
+            frame_format: FrameFormat::default(),
+            pending: VecDeque::new(),
+        })
     }
 
     pub fn check_invariants(&self) {
-        match &self.0 {
+        match &self.inner {
             DepacketizerInner::Aac(_) => {}
             DepacketizerInner::G723(_) => {}
             #[cfg(feature = "h264")]
@@ -1038,7 +1071,8 @@ impl Depacketizer {
     /// set insertion. No-op for codecs that don't use these settings.
     #[doc(hidden)]
     pub fn set_frame_format(&mut self, format: FrameFormat) {
-        match &mut self.0 {
+        self.frame_format = format;
+        match &mut self.inner {
             DepacketizerInner::Aac(d) => d.set_frame_format(format),
             #[cfg(feature = "h264")]
             DepacketizerInner::H264(d) => d.set_frame_format(format),
@@ -1056,7 +1090,7 @@ impl Depacketizer {
     /// whether the depacketizer returns parameters as of the most recently pulled or the upcoming
     /// frame.
     pub fn parameters(&self) -> Option<ParametersRef<'_>> {
-        match &self.0 {
+        match &self.inner {
             DepacketizerInner::Aac(d) => d.parameters(),
             DepacketizerInner::G723(d) => d.parameters(),
             #[cfg(feature = "h264")]
@@ -1069,23 +1103,94 @@ impl Depacketizer {
         }
     }
 
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// This never fails: lost packets and corrupt data are reported via
+    /// [`Handler::loss`], and the depacketizer resynchronizes at the next
+    /// frame boundary. It's up to the handler whether to treat this as fatal.
+    #[allow(dead_code)] // TODO: remove when this is public API.
+    pub(crate) fn push(&mut self, pkt: &PacketRef<'_, Ctx>, handler: &mut impl Handler<Ctx>) {
+        match &mut self.inner {
+            // These report loss via their analyzers.
+            #[cfg(feature = "h264")]
+            DepacketizerInner::H264(d) => {
+                if let Err(description) = d.push_with(pkt, handler) {
+                    d.report_corrupt(&pkt.meta.ctx, description, handler);
+                }
+                return;
+            }
+            #[cfg(feature = "h265")]
+            DepacketizerInner::H265(d) => {
+                if let Err(description) = d.push_with(pkt, handler) {
+                    d.report_corrupt(&pkt.meta.ctx, description, handler);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if pkt.meta.loss > 0 {
+            handler.loss(&Loss {
+                ctx: &pkt.meta.ctx,
+                reason: LossReason::PacketLoss {
+                    packets: pkt.meta.loss,
+                },
+            });
+        }
+        if let Err(description) = self.push_with(pkt, handler) {
+            handler.loss(&Loss {
+                ctx: &pkt.meta.ctx,
+                reason: LossReason::Corrupt { description },
+            });
+        }
+    }
+
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// Unlike [`Depacketizer::push`], this doesn't report packet loss (except
+    /// for H.264 and H.265, which report it via their analyzers), and it
+    /// returns some errors (those detected before any events for the
+    /// packet) rather than reporting them via [`Handler::loss`].
+    pub(crate) fn push_with(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
+        match &mut self.inner {
+            DepacketizerInner::Aac(d) => d.push_with(pkt, handler),
+            DepacketizerInner::G723(d) => d.push_with(pkt, handler),
+            #[cfg(feature = "h264")]
+            DepacketizerInner::H264(d) => d.push_with(pkt, handler),
+            #[cfg(feature = "h265")]
+            DepacketizerInner::H265(d) => d.push_with(pkt, handler),
+            DepacketizerInner::Onvif(d) => d.push_with(pkt, handler),
+            DepacketizerInner::SimpleAudio(d) => d.push_with(pkt, handler),
+            DepacketizerInner::Jpeg(d) => d.push_with(pkt, handler),
+        }
+    }
+}
+
+impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet to the depacketizer.
     ///
     /// Depacketizers are not required to buffer unbounded numbers of packets. Between any two
     /// calls to `push`, the caller must call `pull` until `pull` returns `None`. The later
     /// `push` call may panic or drop data if this expectation is violated.
-    pub(crate) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.push(pkt),
-            DepacketizerInner::G723(d) => d.push(pkt),
-            #[cfg(feature = "h264")]
-            DepacketizerInner::H264(d) => d.push(pkt),
-            #[cfg(feature = "h265")]
-            DepacketizerInner::H265(d) => d.push(pkt),
-            DepacketizerInner::Onvif(d) => d.push(pkt),
-            DepacketizerInner::SimpleAudio(d) => d.push(pkt),
-            DepacketizerInner::Jpeg(d) => d.push(pkt),
+    pub(crate) fn push_legacy(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
+        if let Some(p) = self.pending.front() {
+            panic!("push with data already pending: {p:?}");
         }
+        let mut pending = std::mem::take(&mut self.pending);
+        let format = self.frame_format;
+        let r = self.push_with(
+            pkt,
+            &mut LegacyHandler {
+                pending: &mut pending,
+                meta: &pkt.meta,
+                format,
+            },
+        );
+        self.pending = pending;
+        r
     }
 
     /// Retrieves a completed frame from the depacketizer.
@@ -1093,23 +1198,251 @@ impl Depacketizer {
     /// Some packetization formats support aggregating multiple frames into one packet, so a single
     /// `push` call may cause `pull` to return `Some(...))` more than once.
     pub fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
-        match &mut self.0 {
-            DepacketizerInner::Aac(d) => d.pull(),
-            DepacketizerInner::G723(d) => d.pull(),
-            #[cfg(feature = "h264")]
-            DepacketizerInner::H264(d) => d.pull(),
-            #[cfg(feature = "h265")]
-            DepacketizerInner::H265(d) => d.pull(),
-            DepacketizerInner::Onvif(d) => d.pull(),
-            DepacketizerInner::SimpleAudio(d) => d.pull(),
-            DepacketizerInner::Jpeg(d) => d.pull(),
-        }
+        self.pending.pop_front()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buf::MarkBuf;
+    use events::testutil::{Event, Recorder, hex};
+
+    /// Pushes a packet via the infallible `push`.
+    fn push(
+        d: &mut Depacketizer,
+        buf: &mut MarkBuf,
+        (sequence_number, timestamp, mark, loss): (u16, i64, bool, u16),
+        payload: &[u8],
+        h: &mut Recorder,
+    ) {
+        let meta = crate::rtp::PacketMeta {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp::new(timestamp, NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            ssrc: 0,
+            sequence_number,
+            mark,
+            loss,
+        };
+        let pos = buf.end();
+        buf.extend(payload);
+        buf.advance_unparsed(buf.end());
+        d.push(&PacketRef::new(meta, buf, pos, payload.len() as u16), h);
+        d.check_invariants();
+    }
+
+    #[cfg(feature = "h264")]
+    fn h264() -> Depacketizer {
+        Depacketizer::new(
+            "video",
+            "h264",
+            90_000,
+            None,
+            Some(
+                "packetization-mode=1;profile-level-id=4d002a;\
+                 sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+            ),
+        )
+        .unwrap()
+    }
+
+    fn assert_corrupt(events: &[Event]) {
+        assert!(
+            matches!(events, [Event::Loss(LossReason::Corrupt { .. })]),
+            "{events:#?}"
+        );
+    }
+
+    #[cfg(feature = "h264")]
+    fn idr_frame() -> Vec<Event> {
+        vec![
+            Event::FrameStart {
+                loss: 0,
+                is_random_access_point: true,
+                is_disposable: false,
+                has_new_parameters: false,
+            },
+            Event::Data(UnitPosition::Complete, hex(b"\x65slice")),
+            Event::FrameEnd {
+                loss: 0,
+                is_random_access_point: true,
+                is_disposable: false,
+                has_new_parameters: false,
+                data: Some(hex(b"\x00\x00\x00\x06\x65slice")),
+            },
+        ]
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn forbidden_bit_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\xe5slice", &mut h);
+        assert_corrupt(&h.take());
+        push(&mut d, &mut buf, (1, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn empty_payload_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"", &mut h);
+        assert_corrupt(&h.take());
+        push(&mut d, &mut buf, (1, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    /// Corruption after `frame_start` abandons the frame; the next frame recovers.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn recovery_after_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        assert_eq!(h.take().len(), 2); // FrameStart, Data(Start).
+
+        // A STAP-A isn't allowed while a FU-A is in progress.
+        push(
+            &mut d,
+            &mut buf,
+            (1, 0, false, 0),
+            b"\x18\x00\x02\x06x",
+            &mut h,
+        );
+        assert_corrupt(&h.take());
+
+        // The rest of the access unit is ignored until the next one starts.
+        push(&mut d, &mut buf, (2, 1, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn loss_within_frame() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"\x7c\x85start", &mut h);
+        h.take();
+        push(&mut d, &mut buf, (3, 0, true, 2), b"\x7c\x45end", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::PacketLoss { packets: 2 })]
+        );
+        push(&mut d, &mut buf, (4, 1, true, 0), b"\x65slice", &mut h);
+        let mut expected = idr_frame();
+        for e in &mut expected {
+            match e {
+                Event::FrameStart { loss, .. } | Event::FrameEnd { loss, .. } => *loss = 2,
+                _ => {}
+            }
+        }
+        assert_eq!(h.take(), expected);
+    }
+
+    #[test]
+    #[cfg(feature = "h264")]
+    fn loss_across_frames() {
+        crate::testutil::init_logging();
+        let mut d = h264();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\x65slice", &mut h);
+        assert_eq!(h.take(), idr_frame());
+        push(&mut d, &mut buf, (2, 1, true, 1), b"\x41slice", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Loss(LossReason::PacketLoss { packets: 1 }),
+                Event::FrameStart {
+                    loss: 1,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(UnitPosition::Complete, hex(b"\x41slice")),
+                Event::FrameEnd {
+                    loss: 1,
+                    is_random_access_point: false,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x41slice")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_events() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new("audio", "pcmu", 8_000, None, None).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"abcd", &mut h);
+        push(&mut d, &mut buf, (3, 4, true, 2), b"efgh", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::AudioFrame(hex(b"abcd")),
+                Event::Loss(LossReason::PacketLoss { packets: 2 }),
+                Event::AudioFrame(hex(b"efgh")),
+            ]
+        );
+    }
+
+    #[test]
+    fn aac_corrupt() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new(
+            "audio",
+            "mpeg4-generic",
+            12_000,
+            NonZeroU16::new(2),
+            Some(
+                "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                 indexdeltalength=3;config=1490",
+            ),
+        )
+        .unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, true, 0), b"\x00", &mut h);
+        assert_corrupt(&h.take());
+
+        // One AU header (size 4), then the AU.
+        push(
+            &mut d,
+            &mut buf,
+            (1, 1024, true, 0),
+            b"\x00\x10\x00\x20abcd",
+            &mut h,
+        );
+        assert_eq!(h.take(), vec![Event::AudioFrame(hex(b"abcd"))]);
+    }
+
+    #[test]
+    fn message_events() {
+        crate::testutil::init_logging();
+        let mut d =
+            Depacketizer::new("application", "vnd.onvif.metadata", 90_000, None, None).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"<a>", &mut h);
+        push(&mut d, &mut buf, (1, 0, true, 0), b"</a>", &mut h);
+        assert_eq!(h.take(), vec![Event::MessageFrame(hex(b"<a></a>"))]);
+    }
 
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
@@ -1119,7 +1452,7 @@ mod tests {
             ("Depacketizer", std::mem::size_of::<Depacketizer>()),
             (
                 "aac::Depacketizer",
-                std::mem::size_of::<aac::Depacketizer>(),
+                std::mem::size_of::<aac::Depacketizer<crate::PacketContext>>(),
             ),
             (
                 "g723::Depacketizer",
@@ -1137,7 +1470,7 @@ mod tests {
             ),
             (
                 "onvif::Depacketizer",
-                std::mem::size_of::<onvif::Depacketizer>(),
+                std::mem::size_of::<onvif::Depacketizer<crate::PacketContext>>(),
             ),
             (
                 "simple_audio::Depacketizer",

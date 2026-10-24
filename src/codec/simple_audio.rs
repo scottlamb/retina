@@ -6,16 +6,13 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use bytes::Bytes;
-
 use crate::buf::PacketRef;
 
-use super::{AudioParameters, CodecItem};
+use super::{AudioFrameRef, AudioParameters, Handler};
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
     parameters: AudioParameters,
-    pending: Option<super::AudioFrame>,
     bits_per_sample: u32,
 }
 
@@ -32,7 +29,6 @@ impl Depacketizer {
                 codec: super::AudioParametersCodec::Other,
             },
             bits_per_sample,
-            pending: None,
         }
     }
 
@@ -51,8 +47,12 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn push(&mut self, pkt: &PacketRef<'_>) -> Result<(), String> {
-        assert!(self.pending.is_none());
+    /// Supplies a new packet, delivering any resulting events to `handler`.
+    pub(super) fn push_with<Ctx>(
+        &mut self,
+        pkt: &PacketRef<'_, Ctx>,
+        handler: &mut impl Handler<Ctx>,
+    ) -> Result<(), String> {
         let payload_len = pkt.payload_len();
         let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
             format!(
@@ -61,22 +61,21 @@ impl Depacketizer {
             )
         })?;
         let (s1, s2) = pkt.payload().slices();
-        let mut payload = Vec::with_capacity(payload_len as usize);
-        payload.extend_from_slice(s1);
-        payload.extend_from_slice(s2);
-        self.pending = Some(super::AudioFrame {
-            loss: pkt.meta.loss,
-            ctx: pkt.meta.ctx,
-            stream_id: pkt.meta.stream_id,
+        let joined;
+        let data = if s2.is_empty() {
+            s1
+        } else {
+            joined = [s1, s2].concat();
+            &joined[..]
+        };
+        handler.audio_frame(&AudioFrameRef {
+            ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length,
-            data: Bytes::from(payload),
+            loss: pkt.meta.loss,
+            data,
         });
         Ok(())
-    }
-
-    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
-        self.pending.take().map(|f| Ok(CodecItem::AudioFrame(f)))
     }
 }
 

@@ -3505,7 +3505,7 @@ impl futures::Stream for Demuxed {
                                 _ => inner.conn.as_ref().unwrap().inner.read_buf(),
                             };
                             depacketizer
-                                .push(&crate::buf::PacketRef::new(
+                                .push_legacy(&crate::buf::PacketRef::new(
                                     rtp.meta,
                                     buf,
                                     payload_pos,
