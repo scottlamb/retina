@@ -1983,7 +1983,9 @@ mod tests {
 
     #[test]
     fn validate_hole_punch_rtp() {
-        let (header, _) = crate::rtp::PacketHeader::validate(&HOLE_PUNCH_RTP[..]).unwrap();
+        let header = crate::rtp::PacketHeader::validate(&HOLE_PUNCH_RTP[..])
+            .unwrap()
+            .header;
         assert_eq!(header.payload_type(), 0);
     }
 

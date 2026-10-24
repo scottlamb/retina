@@ -2036,8 +2036,9 @@ mod tests {
             let pos = buf.end();
             buf.extend(&frame[4..]);
             buf.advance_unparsed(buf.end());
-            let (header, payload) =
-                crate::rtp::PacketHeader::validate(buf.split(pos, len.into())).unwrap();
+            let crate::rtp::ValidatedPacket {
+                header, payload, ..
+            } = crate::rtp::PacketHeader::validate(buf.split(pos, len.into())).unwrap();
             let raw = header.timestamp();
             let extended = match prev {
                 None => i64::from(raw),

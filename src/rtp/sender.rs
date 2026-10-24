@@ -364,6 +364,7 @@ impl<F: FnMut(&OutgoingPacketRef<'_>)> crate::codec::PayloadSink for SenderSink<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtp::ValidatedPacket;
 
     #[test]
     fn sender() {
@@ -378,7 +379,9 @@ mod tests {
         let pkt = s.packet(ts, true, &[b"ab", b"cde"]);
         let raw = pkt.to_vec();
         assert_eq!(raw.len(), pkt.len());
-        let (header, payload) = PacketHeader::validate(&raw[..]).unwrap();
+        let ValidatedPacket {
+            header, payload, ..
+        } = PacketHeader::validate(&raw[..]).unwrap();
         assert_eq!(header, pkt.header());
         assert_eq!(&raw[usize::from(payload.start)..], b"abcde");
         assert!(header.mark());

@@ -171,8 +171,8 @@ mod tests {
     #[test]
     fn geovision_pt50_packet() {
         let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 105, 0xd25614e, true, *b"foo").unwrap();
-        assert!(!skip(&PacketHeader::validate(&pkt[..]).unwrap().0));
+        assert!(!skip(&PacketHeader::validate(&pkt[..]).unwrap().header));
         let pkt = crate::rtp::build_raw_rtp(0x1234, 141000, 50, 0xd25614e, true, *b"bar").unwrap();
-        assert!(skip(&PacketHeader::validate(&pkt[..]).unwrap().0));
+        assert!(skip(&PacketHeader::validate(&pkt[..]).unwrap().header));
     }
 }

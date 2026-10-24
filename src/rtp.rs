@@ -45,11 +45,12 @@ pub struct PacketHeader(
 impl PacketHeader {
     pub(crate) const LEN: u16 = 12;
 
-    /// Validates an RTP packet, returning the fixed header and payload range.
+    /// Validates an RTP packet, returning its fixed header and the location of
+    /// its payload.
     ///
     /// Accepts any [`Input`] implementation: a `&[u8]` or a
     /// [`Split`] pair of ring-buffer slices.
-    pub fn validate<'i>(input: impl Input<'i>) -> Result<(Self, Range<u16>), &'static str> {
+    pub fn validate<'i>(input: impl Input<'i>) -> Result<ValidatedPacket, &'static str> {
         let len = u16::try_from(input.len()).map_err(|_| "too long")?;
         if len < Self::LEN {
             return Err("too short");
@@ -98,7 +99,10 @@ impl PacketHeader {
         } else {
             len
         };
-        Ok((header, payload_start..payload_end))
+        Ok(ValidatedPacket {
+            header,
+            payload: payload_start..payload_end,
+        })
     }
 
     /// Returns the raw 12-byte header.
@@ -143,6 +147,20 @@ impl std::fmt::Debug for PacketHeader {
             .field("ssrc", &self.ssrc())
             .finish()
     }
+}
+
+/// An RTP packet's layout, as returned by [`PacketHeader::validate`].
+///
+/// This is `#[non_exhaustive]` so that the locations of other parts of the
+/// packet, such as its header extension, can be added later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ValidatedPacket {
+    /// The packet's fixed header.
+    pub header: PacketHeader,
+
+    /// The byte range of the payload within the packet, excluding any padding.
+    pub payload: Range<u16>,
 }
 
 /// Metadata about an RTP packet, as supplied to a depacketizer such as
@@ -389,10 +407,10 @@ mod tests {
                      \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x67\x64\x00\x32\
                      \xac\x3c\x6b\x81\x7c\x05\x46\x9b\x82\x80\x82\xa0\x00\x00\x03\x00\
                      \x20\x00\x00\x07\x90\x80\x00";
-        let (header, payload_range) = PacketHeader::validate(&data[..]).unwrap();
-        assert_eq!(payload_range, 28..55);
-        assert_eq!(data[payload_range.start as usize], 0x67);
-        assert!(!header.mark());
+        let pkt = PacketHeader::validate(&data[..]).unwrap();
+        assert_eq!(pkt.payload, 28..55);
+        assert_eq!(data[pkt.payload.start as usize], 0x67);
+        assert!(!pkt.header.mark());
     }
 
     fn meta() -> ReceivedPacketMeta<()> {

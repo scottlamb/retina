@@ -467,7 +467,7 @@ mod tests {
 
     fn header(seq: u16, ts: u32, ssrc: u32) -> PacketHeader {
         let pkt = build_raw_rtp(seq, ts, 96, ssrc, true, *b"x").unwrap();
-        PacketHeader::validate(&pkt[..]).unwrap().0
+        PacketHeader::validate(&pkt[..]).unwrap().header
     }
 
     #[test]
