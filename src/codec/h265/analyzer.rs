@@ -8,12 +8,12 @@ use std::fmt::Write as _;
 use bytes::Bytes;
 use log::{debug, log_enabled, trace};
 
-use super::{AuData, FrameEndBody, InternalParameters, Nal, nal};
+use super::{AuData, FrameEndBody, InternalParameters, Nal, is_rasl, nal};
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, check_range};
 use crate::codec::{
-    Accumulate, FrameBody, Loss, LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler,
-    VideoParameters,
+    Accumulate, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason, VideoFrameEnd,
+    VideoFrameStart, VideoHandler, VideoParameters,
 };
 
 /// Analyzes H.265 access units (frames), regardless of how they're transported.
@@ -21,7 +21,8 @@ use crate::codec::{
 /// This is the codec layer beneath the H.265 RTP depacketizer. Its interface
 /// is [`NalAnalyzer`]; see there for an overview.
 ///
-/// It currently never reports a frame as disposable.
+/// It detects leading (RASL) pictures from their NAL unit types and currently
+/// never reports a frame as disposable.
 #[derive(Debug)]
 pub struct Analyzer<Ctx> {
     parameters: Option<InternalParameters>,
@@ -49,6 +50,8 @@ pub struct Analyzer<Ctx> {
 
     /// The current access unit, if any.
     au: Option<AuState<Ctx>>,
+
+    decodability: DecodabilityState,
 
     /// Packets lost since the last access unit started.
     lost: u16,
@@ -107,6 +110,9 @@ struct FrameMeta {
     /// True unless a non-IRAP VCL NAL has been seen.
     is_random_access_point: bool,
 
+    /// True if a RASL VCL NAL has been seen; see [`VideoFrameStart::is_rasl`].
+    is_rasl: bool,
+
     /// True if a VCL NAL has been seen.
     seen_vcl: bool,
 
@@ -120,6 +126,11 @@ struct FrameMeta {
     /// frames; see `AuView::scan_meta`.
     deferred: Option<Box<NewParams>>,
 
+    /// Whether the first VCL NAL begins a picture, once known. If packets
+    /// were lost just before this access unit and this isn't `Some(true)`,
+    /// the access unit may be missing its beginning.
+    first_vcl_starts_picture: Option<bool>,
+
     /// The header of the last complete NAL, for `can_end_au`.
     last_nal_hdr: Option<nal::Header>,
 }
@@ -128,9 +139,11 @@ impl Default for FrameMeta {
     fn default() -> Self {
         FrameMeta {
             is_random_access_point: true,
+            is_rasl: false,
             seen_vcl: false,
             new_params: None,
             deferred: None,
+            first_vcl_starts_picture: None,
             last_nal_hdr: None,
         }
     }
@@ -345,7 +358,15 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         if self.au.is_none() {
             return;
         }
-        self.stream_inner(buf, handler);
+        let mut decodability = self.decodability;
+        self.stream_inner(
+            buf,
+            &mut DecodabilityTracker {
+                state: &mut decodability,
+                inner: handler,
+            },
+        );
+        self.decodability = decodability;
     }
 
     /// Finishes the current access unit, delivering any remaining events to
@@ -371,7 +392,18 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         let r = if au.in_progress.is_some() {
             Err("access unit ended in the middle of a NAL unit".to_owned())
         } else {
-            self.finalize(&mut au, end_ctx, buf, handler)
+            let mut decodability = self.decodability;
+            let r = self.finalize(
+                &mut au,
+                end_ctx,
+                buf,
+                &mut DecodabilityTracker {
+                    state: &mut decodability,
+                    inner: handler,
+                },
+            );
+            self.decodability = decodability;
+            r
         };
         self.discard_au();
         r
@@ -394,6 +426,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             pieces: Vec::new(),
             nals: Vec::new(),
             au: None,
+            decodability: DecodabilityState::default(),
             lost: 0,
             prev_timestamp: None,
         }
@@ -414,7 +447,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             self.lost = self.lost.saturating_add(packets);
         }
         self.loss_without_report();
-        handler.loss(&Loss { ctx, reason });
+        DecodabilityTracker {
+            state: &mut self.decodability,
+            inner: handler,
+        }
+        .loss(&Loss { ctx, reason });
     }
 
     /// Discards the access unit in progress, without reporting it, after loss
@@ -511,7 +548,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         view.scan_meta(au, buf);
         let in_progress = au.in_progress.as_ref().map(|ip| ip.hdr);
         if au.started.is_none() && (au.meta.seen_vcl || in_progress.is_some_and(is_vcl)) {
-            view.start_frame(au, handler);
+            view.start_frame(au, buf, handler);
         }
         let Some(accumulate) = au.started else {
             return;
@@ -576,9 +613,13 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             self.parameters = new_params;
         }
 
+        let missing_prefix = au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true);
         let accumulate = match au.started {
             Some(a) => a,
             None => handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix,
+                is_rasl: au.meta.is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point: au.meta.is_random_access_point,
@@ -591,6 +632,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .deliver(&self.nals, &self.pieces, None, buf, handler);
 
         handler.frame_end(&mut VideoFrameEnd {
+            is_decodable: true,
+            missing_prefix,
+            is_rasl: au.meta.is_rasl,
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx,
@@ -661,8 +705,13 @@ impl AuView<'_> {
             match nal.hdr.unit_type().unit_type_class() {
                 nal::UnitTypeClass::Vcl { irap } => {
                     meta.seen_vcl = true;
+                    meta.first_vcl_starts_picture
+                        .get_or_insert_with(|| crate::codec::h26x::starts_picture(nal_pieces, buf));
                     if !irap {
                         meta.is_random_access_point = false;
+                    }
+                    if is_rasl(nal.hdr) {
+                        meta.is_rasl = true;
                     }
                 }
                 nal::UnitTypeClass::NonVcl => {}
@@ -692,15 +741,37 @@ impl AuView<'_> {
     ///
     /// The frame's metadata so far is provisional. In particular, parameters
     /// are parsed but not committed to `parameters` until the frame ends.
-    fn start_frame<Ctx>(&self, au: &mut AuState<Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    fn start_frame<Ctx>(
+        &self,
+        au: &mut AuState<Ctx>,
+        buf: &MarkBuf,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
+        if au.meta.first_vcl_starts_picture.is_none() {
+            // The first VCL NAL is still in progress; its pieces follow the
+            // last complete NAL's.
+            let first_piece = self
+                .nals
+                .last()
+                .map_or(0, |n| crate::to_usize(n.next_piece_idx));
+            if first_piece == self.pieces.len() {
+                return; // try again once the byte after its header arrives.
+            }
+            au.meta.first_vcl_starts_picture = Some(crate::codec::h26x::starts_picture(
+                &self.pieces[first_piece..],
+                buf,
+            ));
+        }
         let mut is_random_access_point = au.meta.is_random_access_point;
-        if let Some(ip) = au.in_progress.as_ref()
-            && matches!(
+        let mut is_rasl = au.meta.is_rasl;
+        if let Some(ip) = au.in_progress.as_ref() {
+            if matches!(
                 ip.hdr.unit_type().unit_type_class(),
                 nal::UnitTypeClass::Vcl { irap: false }
-            )
-        {
-            is_random_access_point = false;
+            ) {
+                is_random_access_point = false;
+            }
+            is_rasl |= super::is_rasl(ip.hdr);
         }
         if let Some(np) = au.meta.new_params.as_mut()
             && np.parsed.is_none()
@@ -716,6 +787,9 @@ impl AuView<'_> {
             .and_then(|np| np.parsed.as_ref());
         au.started = Some(
             handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
+                is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point,
@@ -942,17 +1016,20 @@ mod tests {
         a.start_nal(hdr, &buf, buf.end(), 0).unwrap();
         assert_eq!(e.0, [], "start_nal alone delivers nothing");
         a.stream_with(&buf, &mut e);
+        assert_eq!(
+            e.0,
+            [],
+            "the frame waits for the slice's first byte after its header"
+        );
+        let pos = append_data(&mut buf, f1_body);
+        a.extend_nal(&buf, pos, f1_body.len()).unwrap();
+        a.stream_with(&buf, &mut e);
         let data = |first, last, bytes: &[u8]| Event::Data {
             first,
             last,
             bytes: bytes.to_vec(),
         };
-        assert_eq!(e.0, [Event::Start, data(true, false, hdr)]);
-        e.0.clear();
-        let pos = append_data(&mut buf, f1_body);
-        a.extend_nal(&buf, pos, f1_body.len()).unwrap();
-        a.stream_with(&buf, &mut e);
-        assert_eq!(e.0, [data(false, false, f1_body)]);
+        assert_eq!(e.0, [Event::Start, data(true, false, f1)]);
         assert!(
             !a.has_mark(),
             "delivered data is released under Accumulate::No"
