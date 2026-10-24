@@ -79,7 +79,7 @@ impl CheckingHandler {
 }
 
 impl VideoHandler<u64> for CheckingHandler {
-    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, u64>) -> Accumulate {
+    fn frame_start(&mut self, _frame_start: &mut VideoFrameStart<'_, u64>) -> Accumulate {
         assert!(!self.in_frame, "frame_start without frame_end or loss");
         self.in_frame = true;
         self.streamed.clear();

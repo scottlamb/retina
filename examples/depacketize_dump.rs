@@ -42,7 +42,7 @@ struct Printer {
 }
 
 impl VideoHandler<Ctx> for Printer {
-    fn frame_start(&mut self, _frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+    fn frame_start(&mut self, _frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
         self.units = 0;
         self.bytes = 0;
         Accumulate::No

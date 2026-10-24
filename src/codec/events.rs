@@ -43,7 +43,7 @@ pub trait VideoHandler<Ctx> {
     /// Return [`Accumulate::Yes`] to have the depacketizer retain the frame's
     /// data for [`VideoFrameEnd::complete_frame`]. [`VideoHandler::data`]
     /// events are delivered either way.
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate;
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate;
 
     /// A chunk of unframed codec unit data. See [`VideoData`].
     fn data(&mut self, _data: &VideoData<'_>) {}
@@ -84,7 +84,7 @@ pub trait MessageHandler<Ctx> {
 
 impl<Ctx, H: VideoHandler<Ctx> + ?Sized> VideoHandler<Ctx> for &mut H {
     #[inline]
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
         (**self).frame_start(frame_start)
     }
 
@@ -167,6 +167,21 @@ pub struct VideoFrameStart<'a, Ctx> {
     /// `is_decodable`.
     pub(crate) is_rasl: bool,
     pub(crate) parameters: Option<&'a VideoParameters>,
+
+    /// For H.264 and H.265, where [`VideoFrameStart::set_parameters`] stores
+    /// its override for the depacketizer to commit when the frame ends.
+    pub(crate) param_override: Option<&'a mut dyn ParametersOverrideSlot>,
+}
+
+/// Storage for a parameter override set via [`VideoFrameStart`], not yet
+/// committed. Each codec that supports overrides implements this for its own
+/// override type.
+pub(crate) trait ParametersOverrideSlot {
+    /// Returns the override's parameters, if set.
+    fn parameters(&self) -> Option<&VideoParameters>;
+
+    /// Sets the override, or returns an error if `parameters` are for another codec.
+    fn set(&mut self, parameters: &VideoParameters) -> Result<(), String>;
 }
 
 impl<Ctx> VideoFrameStart<'_, Ctx> {
@@ -212,7 +227,7 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// See [`VideoFrameEnd::has_new_parameters`].
     #[inline]
     pub fn has_new_parameters(&self) -> bool {
-        self.has_new_parameters
+        self.has_new_parameters || self.overridden_parameters().is_some()
     }
 
     /// Returns the parameters in effect for this frame, if known.
@@ -222,7 +237,45 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// until the frame ends.
     #[inline]
     pub fn parameters(&self) -> Option<&VideoParameters> {
-        self.parameters
+        self.overridden_parameters().or(self.parameters)
+    }
+
+    fn overridden_parameters(&self) -> Option<&VideoParameters> {
+        self.param_override.as_deref().and_then(|o| o.parameters())
+    }
+
+    /// Overrides the parameters for this frame and later ones.
+    ///
+    /// This is useful to "fix" a camera's parameters, such as adding missing
+    /// pixel aspect ratio information to the SPS VUI, or bitstream
+    /// restrictions which reduce decode latency. See
+    /// [`VideoParameters::from_h264_parameter_sets`].
+    ///
+    /// Afterward, [`VideoFrameStart::parameters`] returns the new parameters
+    /// and [`VideoFrameStart::has_new_parameters`] returns true, as do their
+    /// [`VideoFrameEnd`] counterparts. The frame's data doesn't include
+    /// parameter sets either way; [`VideoFrameEnd::complete_frame`] and
+    /// [`VideoFrameEnd::visit_frame_data`] prepend these if the
+    /// [`FrameFormat`] requests it.
+    ///
+    /// The override stays in effect until the stream's in-band parameters
+    /// change; repeats of the parameters it replaced don't undo it. The
+    /// override covers the whole frame: parameter sets which arrive after the
+    /// frame's first slice take effect with the next frame (they can't be for
+    /// this one), which then reports [`VideoFrameStart::has_new_parameters`]
+    /// if they're a change. (H.264 section 7.4.1.2.3 and H.265 section
+    /// 7.4.2.4.4 allow parameter sets there, as long as they precede the
+    /// frame's last slice.)
+    ///
+    /// Currently only H.264 and H.265 streams support overrides. Returns an
+    /// error for other streams, or if `parameters` are for a different codec
+    /// than the stream.
+    pub fn set_parameters(&mut self, parameters: &VideoParameters) -> Result<(), crate::Error> {
+        match self.param_override.as_deref_mut() {
+            Some(slot) => slot.set(parameters),
+            None => Err("this codec doesn't support overriding parameters".to_owned()),
+        }
+        .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))
     }
 }
 
@@ -691,7 +744,7 @@ pub(crate) mod testutil {
     }
 
     impl<Ctx> VideoHandler<Ctx> for Recorder {
-        fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+        fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
             self.events.push(Event::FrameStart {
                 is_random_access_point: frame_start.is_random_access_point(),
                 is_disposable: frame_start.is_disposable(),

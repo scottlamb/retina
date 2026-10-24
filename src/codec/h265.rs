@@ -23,6 +23,33 @@ use crate::codec::{LossReason, VideoHandler, VideoParameters};
 use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
 
+/// Returns parameters for the given VPS, SPS, and PPS, in any order.
+///
+/// Currently requires exactly one of each.
+pub(super) fn parameters_from_unordered_sets<'s>(
+    sets: impl IntoIterator<Item = &'s [u8]>,
+) -> Result<VideoParameters, String> {
+    let mut ordered: [Option<&[u8]>; 3] = [None; 3];
+    for set in sets {
+        let hex = crate::hex::LimitedHex::new(set, 64);
+        let i = match set.first().map(|h| (h >> 1) & 0b11_1111) {
+            Some(32) => 0,
+            Some(33) => 1,
+            Some(34) => 2,
+            _ => return Err(format!("not a parameter set: {hex}")),
+        };
+        if ordered[i].replace(set).is_some() {
+            return Err(format!(
+                "multiple parameter sets of the same type are currently unsupported: {hex}"
+            ));
+        }
+    }
+    let [Some(vps), Some(sps), Some(pps)] = ordered else {
+        return Err("expected a VPS, an SPS, and a PPS".to_owned());
+    };
+    InternalParameters::parse_vps_sps_pps(vps, sps, pps, true).map(|p| p.generic_parameters)
+}
+
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
 /// 7798](https://tools.ietf.org/html/rfc7798).
@@ -465,7 +492,7 @@ impl Depacketizer<crate::PacketContext> {
 pub(crate) struct FrameEndBody<'a> {
     /// The access unit's data, if accumulated and not yet taken.
     au: Option<AuData<'a>>,
-    parameters: Option<&'a InternalParameters>,
+    parameters: &'a Option<InternalParameters>,
     is_random_access_point: bool,
     has_new_parameters: bool,
 }
@@ -478,7 +505,7 @@ struct AuData<'a> {
 
 impl FrameEndBody<'_> {
     pub(super) fn parameters(&self) -> Option<&VideoParameters> {
-        self.parameters.map(|p| &p.generic_parameters)
+        self.parameters.as_ref().map(|p| &p.generic_parameters)
     }
 
     /// Returns the parameter set NALs to prepend to the frame in the given format.
@@ -494,6 +521,7 @@ impl FrameEndBody<'_> {
             return None;
         }
         self.parameters
+            .as_ref()
             .map(|p| [&p.vps_nal[..], &p.sps_nal[..], &p.pps_nal[..]])
     }
 
@@ -586,6 +614,50 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
+
+    /// If set via [`VideoFrameStart::set_parameters`], the in-band VPS, SPS,
+    /// and PPS which were overridden. Parameter sets received later are
+    /// compared against these to detect changes, so that a camera repeating
+    /// its original parameters doesn't undo the override.
+    overridden: Option<Box<(Bytes, Bytes, Bytes)>>,
+}
+
+/// Parameters set via [`VideoFrameStart::set_parameters`], not yet committed.
+#[derive(Debug)]
+struct ParametersOverride(Box<InternalParameters>);
+
+impl super::events::ParametersOverrideSlot for Option<ParametersOverride> {
+    fn parameters(&self) -> Option<&VideoParameters> {
+        self.as_ref().map(|o| &o.0.generic_parameters)
+    }
+
+    fn set(&mut self, parameters: &VideoParameters) -> Result<(), String> {
+        let super::VideoParametersCodec::H265 { vps, sps, pps } = &parameters.codec else {
+            return Err("parameters aren't for an H.265 stream".to_owned());
+        };
+        let p = InternalParameters::parse_vps_sps_pps(vps, sps, pps, true)?;
+        *self = Some(ParametersOverride(Box::new(p)));
+        Ok(())
+    }
+}
+
+impl ParametersOverride {
+    /// Returns the parameters to use in place of `old`, remembering the in-band
+    /// parameter sets `old` represents so that repeats of them don't undo the override.
+    fn commit(self, old: Option<&InternalParameters>) -> InternalParameters {
+        let mut new = *self.0;
+        if let Some(old) = old {
+            new.seen_extra_trailing_data = old.seen_extra_trailing_data;
+            new.overridden = Some(Box::new((
+                Bytes::copy_from_slice(old.in_band_vps()),
+                Bytes::copy_from_slice(old.in_band_sps()),
+                Bytes::copy_from_slice(old.in_band_pps()),
+            )));
+        } else {
+            new.seen_extra_trailing_data = false;
+        }
+        new
+    }
 }
 
 impl InternalParameters {
@@ -726,7 +798,29 @@ impl InternalParameters {
             sps_nal: sps_nal_b,
             pps_nal: pps_nal_b,
             seen_extra_trailing_data,
+            overridden: None,
         })
+    }
+
+    /// Returns the VPS as last received in-band (or via `sprop-vps`).
+    fn in_band_vps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.vps_nal[..], |o| &o.0[..])
+    }
+
+    /// Returns the SPS as last received in-band (or via `sprop-sps`).
+    fn in_band_sps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.sps_nal[..], |o| &o.1[..])
+    }
+
+    /// Returns the PPS as last received in-band (or via `sprop-pps`).
+    fn in_band_pps(&self) -> &[u8] {
+        self.overridden
+            .as_ref()
+            .map_or(&self.pps_nal[..], |o| &o.2[..])
     }
 }
 
@@ -1389,5 +1483,115 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// `VideoFrameStart::set_parameters` overrides parameters, surviving
+    /// repeats of the in-band parameters it replaced.
+    #[test]
+    fn set_parameters() {
+        use crate::codec::{Accumulate, FrameFormat, VideoFrameEnd, VideoFrameStart, VideoHandler};
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+        let (vps_a, sps_a, pps_a) = (
+            b64("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA=="),
+            b64("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE="),
+            b64("RAHA8saNA7NA"),
+        );
+        let (vps_b, sps_b, pps_b) = (
+            b64("QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA=="),
+            b64("QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I="),
+            b64("RAHA8vAzJA=="),
+        );
+
+        /// Records `(has_new_parameters at start, SPS at start, has_new_parameters at end, data)`.
+        struct Overrider<'a> {
+            b: [&'a [u8]; 3],
+            overridden: bool,
+            frames: Vec<(bool, Vec<u8>, bool, Vec<u8>)>,
+            start: Option<(bool, Vec<u8>)>,
+        }
+        fn sps(p: Option<&crate::codec::VideoParameters>) -> Vec<u8> {
+            match &p.unwrap().codec {
+                crate::codec::VideoParametersCodec::H265 { sps, .. } => sps.to_vec(),
+                _ => unreachable!(),
+            }
+        }
+        impl VideoHandler<PacketContext> for Overrider<'_> {
+            fn frame_start(&mut self, fs: &mut VideoFrameStart<'_, PacketContext>) -> Accumulate {
+                if !self.overridden {
+                    let p =
+                        crate::codec::VideoParameters::from_h265_parameter_sets(self.b).unwrap();
+                    fs.set_parameters(&p).unwrap();
+                    self.overridden = true;
+                }
+                self.start = Some((fs.has_new_parameters(), sps(fs.parameters())));
+                Accumulate::Yes
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, PacketContext>) {
+                let (start_new, start_sps) = self.start.take().unwrap();
+                let data = fe.complete_frame(FrameFormat::default()).unwrap();
+                self.frames
+                    .push((start_new, start_sps, fe.has_new_parameters(), data));
+            }
+        }
+
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let mut h = Overrider {
+            b: [&vps_b, &sps_b, &pps_b],
+            overridden: false,
+            frames: Vec::new(),
+            start: None,
+        };
+        let mut push =
+            |d: &mut super::Depacketizer<_>, seq: u16, ts: i64, mark: bool, payload: &[u8]| {
+                let meta = crate::rtp::ReceivedPacketMeta {
+                    ctx: PacketContext::dummy(),
+                    timestamp: crate::Timestamp {
+                        timestamp: ts,
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: seq,
+                    mark,
+                    loss: 0,
+                };
+                let pos = buf.end();
+                buf.extend(payload);
+                buf.advance_unparsed(buf.end());
+                d.push(
+                    &ReceivedPacketRef::new(meta, &buf, pos, payload.len() as u16),
+                    &mut h,
+                );
+            };
+        const IDR: &[u8] = b"\x26\x01slice";
+        let mut expected_frame = Vec::new();
+        for nal in [&vps_b[..], &sps_b[..], &pps_b[..], IDR] {
+            expected_frame.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            expected_frame.extend_from_slice(nal);
+        }
+        for (i, ts) in [0, 1].into_iter().enumerate() {
+            let seq = 4 * i as u16;
+            push(&mut d, seq, ts, false, &vps_a);
+            push(&mut d, seq + 1, ts, false, &sps_a);
+            push(&mut d, seq + 2, ts, false, &pps_a);
+            push(&mut d, seq + 3, ts, true, IDR);
+        }
+        assert_eq!(
+            h.frames,
+            vec![
+                // overridden
+                (true, sps_b.clone(), true, expected_frame.clone()),
+                // in-band set A doesn't undo override
+                (false, sps_b.clone(), false, expected_frame),
+            ]
+        );
+        let Some(v) = d.parameters() else { panic!() };
+        let crate::codec::VideoParametersCodec::H265 { sps, .. } = &v.codec else {
+            panic!()
+        };
+        assert_eq!(&sps[..], &sps_b[..]);
     }
 }

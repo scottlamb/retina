@@ -315,6 +315,46 @@ pub struct AllPixelDimensions {
 }
 
 impl VideoParameters {
+    /// Returns parameters for the given H.264 parameter sets.
+    ///
+    /// It's sometimes useful to "fix" a server's parameters, e.g.:
+    ///
+    /// * adding missing pixel aspect ratio information to the SPS VUI so that
+    ///   anamorphic video is displayed at the correct aspect ratio.
+    /// * adding missing bitstream restrictions such as `num_reorder_frames = 0`
+    ///   that significantly reduce decode latency.
+    /// * removing garbage after the RBSP trailing bits.
+    ///
+    /// Retina currently does not support directly making these changes itself, but
+    /// callers can use e.g. [`h264_reader`](https://crates.io/crates/h264_reader)
+    /// to rewrite the SPS, then use Retina's logic to repackage the parameters into
+    /// a [`VideoParameters`]. Pass these to
+    /// [`VideoFrameStart::set_parameters`].
+    ///
+    /// Each set is a raw NAL unit, as in [`VideoParameters::parameter_sets`]:
+    /// it includes its NAL header, with no start code or length prefix. They
+    /// may be in any order. Currently this requires exactly one SPS and one
+    /// PPS; a future version may accept several of each (with distinct ids).
+    ///
+    /// Returns an error if the sets are invalid.
+    #[cfg(feature = "h264")]
+    pub fn from_h264_parameter_sets<'a>(
+        sets: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<Self, Error> {
+        h264::parameters_from_unordered_sets(sets).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+    }
+
+    /// Returns parameters for the given H.265 parameter sets.
+    ///
+    /// As in [`VideoParameters::from_h264_parameter_sets`], but this
+    /// currently requires exactly one VPS, one SPS, and one PPS.
+    #[cfg(feature = "h265")]
+    pub fn from_h265_parameter_sets<'a>(
+        sets: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<Self, Error> {
+        h265::parameters_from_unordered_sets(sets).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+    }
+
     /// Returns a codec description in
     /// [RFC-6381](https://tools.ietf.org/html/rfc6381) form, eg `avc1.4D401E`.
     // TODO: use https://github.com/dholroyd/rfc6381-codec crate once published?
@@ -387,9 +427,27 @@ impl VideoParameters {
         self.frame_rate
     }
 
-    /// Raw codec-cpecific paramers (SPS, PPS, VPS)
-    pub fn codec_params(&self) -> &VideoParametersCodec {
-        &self.codec
+    /// Returns the parameter sets, as raw NAL units.
+    ///
+    /// For H.264, these are the SPS and PPS; for H.265, the VPS, SPS, and
+    /// PPS. Each includes its NAL header, with no start code or length prefix.
+    /// They're in the order a packetizer or depacketizer inserts them in-band.
+    /// Other codecs have none.
+    ///
+    /// Currently there's exactly one of each type, but a future version may
+    /// support streams with several (with distinct ids), so look at each NAL
+    /// header to find the type rather than relying on position. To insert the
+    /// parameter sets in-band yourself, [`VideoParameters::extra_data`] with
+    /// [`h26x::Framing::AnnexB`] returns them already framed.
+    pub fn parameter_sets(&self) -> impl Iterator<Item = &[u8]> {
+        let sets: [Option<&Bytes>; 3] = match &self.codec {
+            #[cfg(feature = "h264")]
+            VideoParametersCodec::H264 { sps, pps } => [Some(sps), Some(pps), None],
+            #[cfg(feature = "h265")]
+            VideoParametersCodec::H265 { vps, sps, pps } => [Some(vps), Some(sps), Some(pps)],
+            VideoParametersCodec::Jpeg => [None; 3],
+        };
+        sets.into_iter().flatten().map(|s| &s[..])
     }
 
     /// Returns the codec-specific "extra data" to feed to a decoder (such as
@@ -427,9 +485,9 @@ impl std::fmt::Debug for VideoParameters {
     }
 }
 
+/// The codec of a [`VideoParameters`], with its codec-specific parameters.
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum VideoParametersCodec {
+pub(crate) enum VideoParametersCodec {
     #[cfg(feature = "h264")]
     H264 {
         sps: Bytes,
@@ -767,17 +825,14 @@ pub(crate) struct DecodabilityTracker<'a, H> {
 }
 
 impl<Ctx, H: VideoHandler<Ctx>> VideoHandler<Ctx> for DecodabilityTracker<'_, H> {
-    fn frame_start(&mut self, frame_start: &VideoFrameStart<'_, Ctx>) -> Accumulate {
+    fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
         self.state.before_frame = Some(self.state.current);
-        let is_decodable = self.state.current.update(
+        frame_start.is_decodable = self.state.current.update(
             frame_start.is_random_access_point,
             frame_start.is_rasl,
             frame_start.missing_prefix,
         );
-        self.inner.frame_start(&VideoFrameStart {
-            is_decodable,
-            ..*frame_start
-        })
+        self.inner.frame_start(frame_start)
     }
 
     #[inline]
@@ -1318,7 +1373,7 @@ mod tests {
         impl VideoHandler<crate::PacketContext> for H {
             fn frame_start(
                 &mut self,
-                fs: &VideoFrameStart<'_, crate::PacketContext>,
+                fs: &mut VideoFrameStart<'_, crate::PacketContext>,
             ) -> Accumulate {
                 self.1 = Some(fs.is_decodable());
                 Accumulate::No
@@ -1385,7 +1440,7 @@ mod tests {
         impl VideoHandler<crate::PacketContext> for H {
             fn frame_start(
                 &mut self,
-                fs: &VideoFrameStart<'_, crate::PacketContext>,
+                fs: &mut VideoFrameStart<'_, crate::PacketContext>,
             ) -> Accumulate {
                 self.1 = Some(fs.is_decodable());
                 Accumulate::No
@@ -1449,7 +1504,7 @@ mod tests {
         impl VideoHandler<crate::PacketContext> for H {
             fn frame_start(
                 &mut self,
-                fs: &VideoFrameStart<'_, crate::PacketContext>,
+                fs: &mut VideoFrameStart<'_, crate::PacketContext>,
             ) -> Accumulate {
                 self.1 = Some(fs.is_decodable());
                 Accumulate::No

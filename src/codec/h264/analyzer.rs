@@ -9,7 +9,9 @@ use bytes::Bytes;
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
-use super::{AuData, FrameEndBody, InternalParameters, Nal, is_non_idr_slice, is_vcl};
+use super::{
+    AuData, FrameEndBody, InternalParameters, Nal, ParametersOverride, is_non_idr_slice, is_vcl,
+};
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, PiecesReader, check_range};
 use crate::codec::{
@@ -137,8 +139,8 @@ impl ParameterSetKind {
     /// Returns the set of this kind as last received in-band.
     fn in_band(self, p: &InternalParameters) -> &[u8] {
         match self {
-            Self::Sps => &p.sps_nal,
-            Self::Pps => &p.pps_nal,
+            Self::Sps => p.in_band_sps(),
+            Self::Pps => p.in_band_pps(),
         }
     }
 }
@@ -233,6 +235,10 @@ struct FrameMeta {
     /// The header of the last complete NAL, for `can_end_au`.
     last_nal_hdr: Option<NalHeader>,
 
+    /// Parameters set via [`VideoFrameStart::set_parameters`], to be
+    /// committed (after any in-band `new_params`) when the frame ends.
+    param_override: Option<ParametersOverride>,
+
     /// Set when the frame starts.
     leading: Option<Leading>,
 }
@@ -248,6 +254,7 @@ impl Default for FrameMeta {
             deferred: None,
             first_vcl_starts_picture: None,
             last_nal_hdr: None,
+            param_override: None,
             leading: None,
         }
     }
@@ -695,7 +702,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 None => view.parse_new_params(&np)?,
             },
         };
-        let has_new_parameters = new_params.is_some();
+        let mut has_new_parameters = new_params.is_some();
         if new_params.is_some() {
             *view.parameters = new_params;
         }
@@ -715,7 +722,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         let missing_prefix = au.after_loss && au.meta.first_vcl_starts_picture != Some(true);
         let accumulate = match au.started {
             Some(a) => a,
-            None => handler.frame_start(&VideoFrameStart {
+            None => handler.frame_start(&mut VideoFrameStart {
                 is_decodable: true,
                 missing_prefix,
                 is_rasl,
@@ -725,8 +732,13 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 is_disposable: au.meta.is_disposable,
                 has_new_parameters,
                 parameters: view.parameters.as_ref().map(|p| &p.generic_parameters),
+                param_override: Some(&mut au.meta.param_override),
             }),
         };
+        if let Some(o) = au.meta.param_override.take() {
+            *view.parameters = Some(o.commit(view.parameters.as_ref()));
+            has_new_parameters = true;
+        }
         au.delivery
             .deliver(view.nals, view.pieces, None, buf, handler);
 
@@ -746,7 +758,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                     pieces: &view.pieces[..],
                     buf,
                 }),
-                parameters: view.parameters,
+                parameters: &*view.parameters,
                 is_random_access_point: au.meta.is_random_access_point(),
                 has_new_parameters,
             }),
@@ -1077,8 +1089,9 @@ impl AuView<'_> {
             .new_params
             .as_ref()
             .and_then(|np| np.parsed.as_ref());
+        let mut param_override = None;
         au.started = Some(
-            handler.frame_start(&VideoFrameStart {
+            handler.frame_start(&mut VideoFrameStart {
                 is_decodable: true,
                 missing_prefix: au.after_loss && au.meta.first_vcl_starts_picture != Some(true),
                 is_rasl,
@@ -1090,8 +1103,10 @@ impl AuView<'_> {
                 parameters: new_params
                     .or(self.parameters.as_ref())
                     .map(|p| &p.generic_parameters),
+                param_override: Some(&mut param_override),
             }),
         );
+        au.meta.param_override = param_override;
     }
 }
 
@@ -1257,7 +1272,7 @@ mod tests {
     struct Events(Vec<Event>);
 
     impl VideoHandler<u32> for Events {
-        fn frame_start(&mut self, _: &VideoFrameStart<'_, u32>) -> Accumulate {
+        fn frame_start(&mut self, _: &mut VideoFrameStart<'_, u32>) -> Accumulate {
             self.0.push(Event::Start);
             Accumulate::No
         }

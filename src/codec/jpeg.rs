@@ -536,7 +536,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             }
             let parameters = self.parameters.as_ref();
 
-            let accumulate = handler.frame_start(&VideoFrameStart {
+            let accumulate = handler.frame_start(&mut VideoFrameStart {
                 is_decodable: true,
                 missing_prefix: false,
                 is_rasl: false,
@@ -546,6 +546,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 is_disposable: true,
                 has_new_parameters,
                 parameters,
+                param_override: None,
             });
             handler.data(&VideoData {
                 position: UnitPosition::Complete,
