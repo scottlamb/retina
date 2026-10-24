@@ -360,10 +360,10 @@ impl PlayingCore {
     pub fn udp_recv_error(&self, stream_i: usize, source: std::io::Error) -> Error {
         let stream_ctx = self.streams[stream_i]
             .as_ref()
-            .map(|s| s.ctx)
+            .map(|s| s.ctx.clone())
             .unwrap_or_else(StreamContext::dummy);
         wrap!(ErrorInt::UdpRecvError {
-            conn_ctx: self.conn.ctx,
+            conn_ctx: self.conn.ctx.clone(),
             stream_ctx,
             when: WallTime::now(),
             source,
@@ -539,14 +539,14 @@ impl PlayingCore {
         // Expect the previous keepalive request to have finished.
         match keepalive.state {
             KeepaliveState::Flushing { cseq, .. } => bail!(ErrorInt::WriteError {
-                conn_ctx: self.conn.ctx,
+                conn_ctx: self.conn.ctx.clone(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("Unable to write keepalive {cseq} within {interval:?}",),
                 ),
             }),
             KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
-                conn_ctx: self.conn.ctx,
+                conn_ctx: self.conn.ctx.clone(),
                 msg_ctx: self.conn.reader.eof_ctx(now),
                 source: std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -816,7 +816,7 @@ impl PlayingCore {
 
         // The only response we expect in this state is to our keepalive request.
         bail!(ErrorInt::RtspFramingError {
-            conn_ctx: self.conn.ctx,
+            conn_ctx: self.conn.ctx.clone(),
             msg_ctx: *msg_ctx,
             description: format!("Unexpected RTSP response {response:#?}"),
         })
@@ -876,8 +876,8 @@ impl PlayingCore {
                     ..
                 } = crate::rtp::PacketHeader::validate(split).map_err(|reason| {
                     wrap!(ErrorInt::PacketError {
-                        conn_ctx: self.conn.ctx,
-                        stream_ctx: stream.ctx,
+                        conn_ctx: self.conn.ctx.clone(),
+                        stream_ctx: stream.ctx.clone(),
                         pkt_ctx: item.pkt_ctx,
                         stream_id: item.stream_i,
                         description: stream.rtp_handler.validate_error(reason, split),
@@ -943,8 +943,8 @@ impl PlayingCore {
                         Ok(p.map(ValidatedItem::Rtcp))
                     }
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
-                        conn_ctx: self.conn.ctx,
-                        stream_ctx: stream.ctx,
+                        conn_ctx: self.conn.ctx.clone(),
+                        stream_ctx: stream.ctx.clone(),
                         pkt_ctx: item.pkt_ctx,
                         stream_id: item.stream_i,
                         description,

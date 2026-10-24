@@ -69,7 +69,7 @@ impl Reader {
     ) -> Result<Option<ReceivedMessage>, Error> {
         try_decode(&mut self.parser, &mut self.buf, eof, now).map_err(|e| {
             wrap!(ErrorInt::RtspFramingError {
-                conn_ctx: *conn_ctx,
+                conn_ctx: conn_ctx.clone(),
                 msg_ctx: RtspMessageContext {
                     pos: e.pos,
                     received_wall: WallTime::now(),
@@ -98,7 +98,7 @@ impl Reader {
         now: Instant,
     ) -> Error {
         wrap!(ErrorInt::RtspReadError {
-            conn_ctx: *conn_ctx,
+            conn_ctx: conn_ctx.clone(),
             msg_ctx: self.eof_ctx(now),
             source,
         })

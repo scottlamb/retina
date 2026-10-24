@@ -1702,7 +1702,7 @@ fn handle_unassigned_data(
     }
 
     bail!(ErrorInt::RtspUnassignedChannelError {
-        conn_ctx: *conn_ctx,
+        conn_ctx: conn_ctx.clone(),
         msg_ctx,
         channel_id,
         data,
@@ -1802,7 +1802,7 @@ impl Session<Described> {
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
-        let core = SessionCore::from_conn(conn::ConnCore::new(*conn.ctx(), options));
+        let core = SessionCore::from_conn(conn::ConnCore::new(conn.ctx().clone(), options));
         let mut inner = Box::new(SessionInner {
             conn: Some(conn),
             core,
@@ -2254,7 +2254,7 @@ impl Session<Playing> {
         loop {
             ready!(socket.poll_recv_ready(cx)).map_err(|source| {
                 wrap!(ErrorInt::UdpRecvError {
-                    conn_ctx: *conn_ctx,
+                    conn_ctx: conn_ctx.clone(),
                     stream_ctx: stream_ctx.to_owned(),
                     when: crate::WallTime::now(),
                     source,
@@ -2301,7 +2301,7 @@ impl Session<Playing> {
                 }
                 Err(source) => {
                     return Poll::Ready(Err(wrap!(ErrorInt::UdpRecvError {
-                        conn_ctx: *conn_ctx,
+                        conn_ctx: conn_ctx.clone(),
                         stream_ctx: stream_ctx.to_owned(),
                         when: crate::WallTime::now(),
                         source,
@@ -2323,8 +2323,11 @@ impl Session<Playing> {
         i: usize,
         now: std::time::Instant,
     ) -> Poll<Result<(), Error>> {
-        let conn_ctx = *core.conn_ctx();
-        let stream_ctx = *core.streams()[i].ctx().expect("UDP stream is set up");
+        let conn_ctx = core.conn_ctx().clone();
+        let stream_ctx = core.streams()[i]
+            .ctx()
+            .expect("UDP stream is set up")
+            .clone();
 
         // Prioritize RTCP over RTP within a stream.
         for channel_type in [ChannelType::Rtcp, ChannelType::Rtp] {

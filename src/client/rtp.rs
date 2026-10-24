@@ -98,9 +98,9 @@ impl StreamReceiver {
                 note_stale_live555_data_if_tcp(conn, stream_ctx, pkt_ctx, now);
             }
             wrap!(ErrorInt::RtpPacketError {
-                conn_ctx: conn.ctx,
+                conn_ctx: conn.ctx.clone(),
                 pkt_ctx: *pkt_ctx,
-                stream_ctx: *stream_ctx,
+                stream_ctx: stream_ctx.clone(),
                 stream_id,
                 ssrc: header.ssrc(),
                 sequence_number: header.sequence_number(),
