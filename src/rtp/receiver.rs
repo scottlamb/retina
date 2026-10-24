@@ -751,7 +751,11 @@ impl<T> Receiver<T> {
     /// create one, unless it's the expected one.
     ///
     /// Errors if the compound packet is malformed, without changing state.
-    pub fn rtcp(&mut self, compound: &[u8], now: Instant) -> Result<RtcpOutcome, String> {
+    pub fn rtcp(
+        &mut self,
+        compound: &[u8],
+        now: Instant,
+    ) -> Result<RtcpOutcome, crate::rtcp::ParseError> {
         crate::rtcp::ReceivedCompoundPacket::validate(compound)?;
         let mut outcome = RtcpOutcome {
             rtp_timestamp: None,

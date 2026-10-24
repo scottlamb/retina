@@ -50,11 +50,11 @@ pub(crate) struct Depacketizer {
 
 impl Depacketizer {
     /// Creates a new Depacketizer.
-    pub(super) fn new(clock_rate: u32, channels: Option<NonZeroU16>) -> Result<Self, String> {
+    pub(super) fn new(clock_rate: u32, channels: Option<NonZeroU16>) -> Result<Self, super::Error> {
         if clock_rate != FIXED_CLOCK_RATE {
-            return Err(format!(
+            return Err(super::Error::invalid(format!(
                 "Expected clock rate of {FIXED_CLOCK_RATE} for Opus, got {clock_rate}"
-            ));
+            )));
         }
         Ok(Self {
             parameters: AudioParameters {

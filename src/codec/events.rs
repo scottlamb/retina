@@ -181,7 +181,7 @@ pub(crate) trait ParametersOverrideSlot {
     fn parameters(&self) -> Option<&VideoParameters>;
 
     /// Sets the override, or returns an error if `parameters` are for another codec.
-    fn set(&mut self, parameters: &VideoParameters) -> Result<(), String>;
+    fn set(&mut self, parameters: &VideoParameters) -> Result<(), super::Error>;
 }
 
 impl<Ctx> VideoFrameStart<'_, Ctx> {
@@ -268,14 +268,17 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     /// frame's last slice.)
     ///
     /// Currently only H.264 and H.265 streams support overrides. Returns an
-    /// error for other streams, or if `parameters` are for a different codec
-    /// than the stream.
-    pub fn set_parameters(&mut self, parameters: &VideoParameters) -> Result<(), crate::Error> {
+    /// [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported) error for
+    /// other streams, or an [`ErrorKind::Invalid`](super::ErrorKind::Invalid)
+    /// error if `parameters` are for a different codec than the stream.
+    /// Either way, the stream's parameters are unchanged.
+    pub fn set_parameters(&mut self, parameters: &VideoParameters) -> Result<(), super::Error> {
         match self.param_override.as_deref_mut() {
             Some(slot) => slot.set(parameters),
-            None => Err("this codec doesn't support overriding parameters".to_owned()),
+            None => Err(super::Error::unsupported(
+                "this codec doesn't support overriding parameters",
+            )),
         }
-        .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))
     }
 }
 

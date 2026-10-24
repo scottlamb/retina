@@ -44,8 +44,10 @@ use std::{
     num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
+use crate::rtp::ReceivedPacketMeta;
 use crate::rtp::ReceivedPacketRef;
-use crate::{Error, error::ErrorInt, rtp::ReceivedPacketMeta};
+
+use super::Error;
 
 use super::{AudioFrameRef, AudioHandler, AudioParameters, FmtpParser};
 
@@ -96,16 +98,16 @@ const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
 
 impl AudioSpecificConfig {
     /// Parses from raw bytes.
-    fn parse(raw: &[u8]) -> Result<Self, String> {
+    fn parse(raw: &[u8]) -> Result<Self, Error> {
         let mut r = bitstream_io::BitReader::endian(raw, bitstream_io::BigEndian);
         let audio_object_type = match r
             .read::<5, u8>()
-            .map_err(|e| format!("unable to read audio_object_type: {e}"))?
+            .map_err(|e| Error::invalid(format!("unable to read audio_object_type: {e}")))?
         {
             31 => {
-                32 + r
-                    .read::<6, u8>()
-                    .map_err(|e| format!("unable to read audio_object_type ext: {e}"))?
+                32 + r.read::<6, u8>().map_err(|e| {
+                    Error::invalid(format!("unable to read audio_object_type ext: {e}"))
+                })?
             }
             o => o,
         };
@@ -113,7 +115,7 @@ impl AudioSpecificConfig {
         // ISO/IEC 14496-3 section 1.6.3.3.
         let sampling_frequency_index = r
             .read::<4, u8>()
-            .map_err(|e| format!("unable to read sampling_frequency: {e}"))?;
+            .map_err(|e| Error::invalid(format!("unable to read sampling_frequency: {e}")))?;
         let sampling_frequency = match sampling_frequency_index {
             0x0 => 96_000,
             0x1 => 88_200,
@@ -129,55 +131,71 @@ impl AudioSpecificConfig {
             0xb => 8_000,
             0xc => 7_350,
             v @ 0xd | v @ 0xe => {
-                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"));
+                return Err(Error::invalid(format!(
+                    "reserved sampling_frequency_index value 0x{v:x}"
+                )));
             }
-            0xf => r
-                .read::<24, u32>()
-                .map_err(|e| format!("unable to read sampling_frequency ext: {e}"))?,
+            0xf => r.read::<24, u32>().map_err(|e| {
+                Error::invalid(format!("unable to read sampling_frequency ext: {e}"))
+            })?,
             0x10..=0xff => unreachable!(),
         };
         let channels_config_id = r
             .read::<4, u8>()
-            .map_err(|e| format!("unable to read channels: {e}"))?;
+            .map_err(|e| Error::invalid(format!("unable to read channels: {e}")))?;
         let channels = CHANNEL_CONFIGS
             .get(usize::from(channels_config_id))
-            .ok_or_else(|| format!("reserved channelConfiguration 0x{channels_config_id:x}"))?
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "reserved channelConfiguration 0x{channels_config_id:x}"
+                ))
+            })?
             .as_ref()
-            .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?;
+            .ok_or_else(|| Error::unsupported("program_config_element parsing unimplemented"))?;
         let channels_config_id = NonZeroU8::new(channels_config_id).expect("non-zero");
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
-            if r.read::<4, u8>()
-                .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {e}"))?
-                == 0xf
+            if r.read::<4, u8>().map_err(|e| {
+                Error::invalid(format!(
+                    "unable to read extensionSamplingFrequencyIndex: {e}"
+                ))
+            })? == 0xf
             {
-                r.skip(24)
-                    .map_err(|e| format!("unable to read extensionSamplingFrequency: {e}"))?;
+                r.skip(24).map_err(|e| {
+                    Error::invalid(format!("unable to read extensionSamplingFrequency: {e}"))
+                })?;
             }
             // audioObjectType (a different one) + extensionChannelConfiguration.
-            if r.read::<5, u8>()
-                .map_err(|e| format!("unable to read second audioObjectType: {e}"))?
-                == 22
+            if r.read::<5, u8>().map_err(|e| {
+                Error::invalid(format!("unable to read second audioObjectType: {e}"))
+            })? == 22
             {
-                r.skip(4)
-                    .map_err(|e| format!("unable to read extensionChannelConfiguration: {e}"))?;
+                r.skip(4).map_err(|e| {
+                    Error::invalid(format!("unable to read extensionChannelConfiguration: {e}"))
+                })?;
             }
         }
 
         // The supported types here are the ones that use GASpecificConfig.
         match audio_object_type {
             1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23 => {}
-            o => return Err(format!("unsupported audio_object_type {o}")),
+            o => {
+                return Err(Error::unsupported(format!(
+                    "unsupported audio_object_type {o}"
+                )));
+            }
         }
 
         // GASpecificConfig, ISO/IEC 14496-3 section 4.4.1.
         let frame_length_flag = r
             .read_bit()
-            .map_err(|e| format!("unable to read frame_length_flag: {e}"))?;
+            .map_err(|e| Error::invalid(format!("unable to read frame_length_flag: {e}")))?;
         let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
             (3 /* AAC SR */, true) => {
-                return Err("frame_length_flag must be false for AAC SSR".into());
+                return Err(Error::invalid(
+                    "frame_length_flag must be false for AAC SSR",
+                ));
             }
             (23 /* ER AAC LD */, false) => NonZeroU16::new(512).expect("non-zero"),
             (23 /* ER AAC LD */, true) => NonZeroU16::new(480).expect("non-zero"),
@@ -241,7 +259,7 @@ pub(super) fn make_sample_entry(
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
         let Ok(sampling_frequency) = u16::try_from(sampling_frequency) else {
-            bail!(ErrorInt::Unsupported(format!(
+            return Err(Error::unsupported(format!(
                 "aac sampling_frequency={sampling_frequency} requires a SamplingRateBox"
             )));
         };
@@ -309,7 +327,7 @@ pub(super) fn make_sample_entry(
 fn parse_format_specific_params(
     clock_rate: u32,
     format_specific_params: &str,
-) -> Result<AudioSpecificConfig, String> {
+) -> Result<AudioSpecificConfig, Error> {
     let mut mode = None;
     let mut config = None;
     let mut size_length = None;
@@ -320,23 +338,25 @@ fn parse_format_specific_params(
             "config" => {
                 config = Some(
                     hex::decode(value)
-                        .map_err(|_| "config has invalid hex encoding".to_string())?,
+                        .map_err(|_| Error::invalid("config has invalid hex encoding"))?,
                 );
             }
             "mode" => mode = Some(value),
             "sizelength" => {
-                size_length =
-                    Some(u16::from_str_radix(value, 10).map_err(|_| "bad sizeLength".to_string())?);
+                size_length = Some(
+                    u16::from_str_radix(value, 10).map_err(|_| Error::invalid("bad sizeLength"))?,
+                );
             }
             "indexlength" => {
                 index_length = Some(
-                    u16::from_str_radix(value, 10).map_err(|_| "bad indexLength".to_string())?,
+                    u16::from_str_radix(value, 10)
+                        .map_err(|_| Error::invalid("bad indexLength"))?,
                 );
             }
             "indexdeltalength" => {
                 index_delta_length = Some(
                     u16::from_str_radix(value, 10)
-                        .map_err(|_| "bad indexDeltaLength".to_string())?,
+                        .map_err(|_| Error::invalid("bad indexDeltaLength"))?,
                 );
             }
             _ => {}
@@ -344,13 +364,15 @@ fn parse_format_specific_params(
     }
     // https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6 AAC-hbr
     if mode != Some("AAC-hbr") {
-        return Err(format!("Expected mode AAC-hbr, got {mode:#?}"));
+        return Err(Error::unsupported(format!(
+            "Expected mode AAC-hbr, got {mode:#?}"
+        )));
     }
-    let config = config.ok_or_else(|| "config must be specified".to_string())?;
+    let config = config.ok_or_else(|| Error::invalid("config must be specified"))?;
     if size_length != Some(13) || index_length != Some(3) || index_delta_length != Some(3) {
-        return Err(format!(
+        return Err(Error::unsupported(format!(
             "Unexpected sizeLength={size_length:?} indexLength={index_length:?} indexDeltaLength={index_delta_length:?}"
-        ));
+        )));
     }
 
     let config = AudioSpecificConfig::parse(&config[..])?;
@@ -358,10 +380,10 @@ fn parse_format_specific_params(
     // TODO: is this a requirement? I might have read somewhere that the RTP clock rate can be
     // a multiple of the AudioSpecificConfig sampling_frequency or vice versa.
     if clock_rate != config.parameters.clock_rate {
-        return Err(format!(
+        return Err(Error::invalid(format!(
             "Expected RTP clock rate {} and AAC sampling frequency {} to match",
             clock_rate, config.parameters.clock_rate,
-        ));
+        )));
     }
 
     Ok(config)
@@ -563,15 +585,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         clock_rate: u32,
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let format_specific_params = format_specific_params
-            .ok_or_else(|| "AAC requires format specific params".to_string())?;
+            .ok_or_else(|| Error::invalid("AAC requires format specific params"))?;
         let config = parse_format_specific_params(clock_rate, format_specific_params)?;
         if matches!(channels, Some(c) if c != config.channels.channels) {
-            return Err(format!(
+            return Err(Error::invalid(format!(
                 "Expected RTP channels {:?} and AAC channels {:?} to match",
                 channels, config.channels
-            ));
+            )));
         }
         let adts = AdtsParams::new(&config);
         Ok(Self {

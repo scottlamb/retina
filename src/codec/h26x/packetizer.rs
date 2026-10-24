@@ -12,7 +12,7 @@
 
 use bytes::Bytes;
 
-use crate::Error;
+use crate::codec::Error;
 use crate::codec::{
     ParameterSetInsertion, Payload, PayloadFormat, PayloadSink, Position, VideoFrameInfo,
     VideoPacketizerOptions, VideoParameters,
@@ -36,7 +36,7 @@ pub(crate) trait Codec {
     fn parameter_sets(parameters: &VideoParameters) -> Option<Vec<Bytes>>;
 
     /// Returns parameters for the given parameter sets, in insertion order.
-    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, String>;
+    fn parameters(sets: &[&[u8]]) -> Result<VideoParameters, crate::codec::Error>;
 
     /// Returns a description of the stream, with parameter sets as in
     /// [`Codec::parameter_sets`].
@@ -219,10 +219,10 @@ impl<C: Codec> Packetizer<C> {
         options: VideoPacketizerOptions,
     ) -> Result<Self, Error> {
         let Some(parameter_sets) = C::parameter_sets(parameters) else {
-            return Err(wrap!(crate::error::ErrorInt::InvalidArgument(format!(
+            return Err(Error::invalid(format!(
                 "parameters are for a different codec: {}",
                 parameters.rfc6381_codec()
-            ))));
+            )));
         };
         Ok(Self {
             max_payload_size: 1400, // `PayloadSink::max_payload_size`'s default.
@@ -274,10 +274,10 @@ impl<C: Codec> Packetizer<C> {
             return Ok(());
         }
         let Some(parameter_sets) = C::parameter_sets(parameters) else {
-            return Err(wrap!(crate::error::ErrorInt::InvalidArgument(format!(
+            return Err(Error::invalid(format!(
                 "parameters are for a different codec: {}",
                 parameters.rfc6381_codec()
-            ))));
+            )));
         };
         if parameter_sets != self.parameter_sets {
             self.parameter_sets = parameter_sets;
@@ -822,21 +822,20 @@ impl<C: Codec> Packetizer<C> {
         data: &[u8],
         sink: &mut impl PayloadSink,
     ) -> Result<(), Error> {
-        let nals = super::NalUnits::new(framing, data)
-            .map_err(|e| wrap!(crate::error::ErrorInt::InvalidArgument(e)))?;
+        let nals = super::NalUnits::new(framing, data).map_err(Error::invalid)?;
 
         // Validate everything first, so as to deliver nothing on error.
         for (_, body) in nals.clone() {
             let nal = &data[body];
             let Some(hdr) = Self::header(&[nal]) else {
-                return Err(wrap!(crate::error::ErrorInt::InvalidArgument(format!(
+                return Err(Error::invalid(format!(
                     "NAL {nal:02x?} is shorter than a NAL header"
-                ))));
+                )));
             };
             if let Some(reason) = Self::invalid_header(hdr) {
-                return Err(wrap!(crate::error::ErrorInt::InvalidArgument(format!(
+                return Err(Error::invalid(format!(
                     "NAL header {hdr:02x?} has {reason}"
-                ))));
+                )));
             }
         }
         self.start_frame(frame, sink);

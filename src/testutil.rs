@@ -26,33 +26,33 @@ pub const NONASCII_HEX_CONFIG: HexConfig = HexConfig {
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct InvalidAvccFrame<'i> {
+pub struct InvalidAvccFrameError<'i> {
     reason: &'static str,
 
     #[debug("{:?}", data.hex_conf(NONASCII_HEX_CONFIG))]
     data: &'i [u8],
 }
 
-pub fn validate_avcc_frame(data: &[u8]) -> Result<(), InvalidAvccFrame<'_>> {
+pub fn validate_avcc_frame(data: &[u8]) -> Result<(), InvalidAvccFrameError<'_>> {
     let finder = FINDER.get_or_init(|| memchr::memmem::Finder::new(&[0, 0][..]));
     let mut remaining = data;
     while let Some((len, rest)) = remaining.split_first_chunk() {
         let len = u32::from_be_bytes(*len);
         let Some((nal, rest)) = rest.split_at_checked(len as usize) else {
-            return Err(InvalidAvccFrame {
+            return Err(InvalidAvccFrameError {
                 reason: "ends mid-NAL",
                 data,
             });
         };
         let body = match nal {
             [] => {
-                return Err(InvalidAvccFrame {
+                return Err(InvalidAvccFrameError {
                     reason: "NAL has zero length",
                     data,
                 });
             }
             [_hdr, .., 0] => {
-                return Err(InvalidAvccFrame {
+                return Err(InvalidAvccFrameError {
                     reason: "NAL has trailing zero",
                     data,
                 });
@@ -61,7 +61,7 @@ pub fn validate_avcc_frame(data: &[u8]) -> Result<(), InvalidAvccFrame<'_>> {
         };
         for i in finder.find_iter(body) {
             if body.get(i + 2).is_some_and(|b| [0, 1, 2].contains(b)) {
-                return Err(InvalidAvccFrame {
+                return Err(InvalidAvccFrameError {
                     reason: "NAL body has forbidden Annex B byte sequence",
                     data,
                 });
@@ -70,7 +70,7 @@ pub fn validate_avcc_frame(data: &[u8]) -> Result<(), InvalidAvccFrame<'_>> {
         remaining = rest;
     }
     if !remaining.is_empty() {
-        return Err(InvalidAvccFrame {
+        return Err(InvalidAvccFrameError {
             reason: "frame ends mid-NAL length prefix",
             data,
         });

@@ -97,6 +97,20 @@ pub struct ReceivedCompoundPacket {
     pub(crate) raw: Bytes,
 }
 
+/// An error parsing an RTCP packet: the packet is malformed.
+///
+/// This is opaque; its [`std::fmt::Display`] output describes the problem.
+#[derive(Clone, Debug)]
+pub struct ParseError(String);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 impl ReceivedCompoundPacket {
     /// For tests.
     #[doc(hidden)]
@@ -113,14 +127,16 @@ impl ReceivedCompoundPacket {
     ///
     /// Returns the first packet on success so the caller doesn't need to
     /// recaculate its lengths.
-    pub(crate) fn validate(raw: &[u8]) -> Result<PacketRef<'_>, String> {
+    pub(crate) fn validate(raw: &[u8]) -> Result<PacketRef<'_>, ParseError> {
         let (first_pkt, mut rest) = PacketRef::parse(raw)?;
         let mut pkt = first_pkt;
         loop {
             if rest.is_empty() {
                 break;
             } else if pkt.has_padding() {
-                return Err("padding on non-final packet within RTCP compound packet".to_owned());
+                return Err(ParseError(
+                    "padding on non-final packet within RTCP compound packet".to_owned(),
+                ));
             }
             (pkt, rest) = PacketRef::parse(rest)?;
         }
@@ -251,17 +267,17 @@ pub enum TypedPacketRef<'a> {
 pub struct SenderReportRef<'a>(PacketRef<'a>);
 
 impl<'a> SenderReportRef<'a> {
-    fn validate(pkt: PacketRef<'a>) -> Result<Self, String> {
+    fn validate(pkt: PacketRef<'a>) -> Result<Self, ParseError> {
         let count = usize::from(pkt.count());
         const HEADER_LEN: usize = 8;
         const SENDER_INFO_LEN: usize = 20;
         const REPORT_BLOCK_LEN: usize = 24;
         let expected_len = HEADER_LEN + SENDER_INFO_LEN + (count * REPORT_BLOCK_LEN);
         if pkt.payload_end < expected_len {
-            return Err(format!(
+            return Err(ParseError(format!(
                 "RTCP SR has invalid count={} with unpadded_byte_len={}",
                 count, pkt.payload_end
-            ));
+            )));
         }
         Ok(Self(pkt))
     }
@@ -321,16 +337,16 @@ impl<'a> std::ops::Deref for SenderReportRef<'a> {
 pub struct ReceiverReportRef<'a>(PacketRef<'a>);
 
 impl<'a> ReceiverReportRef<'a> {
-    fn validate(pkt: PacketRef<'a>) -> Result<Self, String> {
+    fn validate(pkt: PacketRef<'a>) -> Result<Self, ParseError> {
         let count = usize::from(pkt.count());
         const HEADER_LEN: usize = 8;
         const REPORT_BLOCK_LEN: usize = 24;
         let expected_len = HEADER_LEN + (count * REPORT_BLOCK_LEN);
         if pkt.payload_end < expected_len {
-            return Err(format!(
+            return Err(ParseError(format!(
                 "RTCP RR has invalid count={} with unpadded_byte_len={}",
                 count, pkt.payload_end
-            ));
+            )));
         }
         Ok(Self(pkt))
     }
@@ -370,17 +386,19 @@ const COMMON_HEADER_LEN: usize = 4;
 impl<'a> PacketRef<'a> {
     /// Parses a buffer into this packet and rest, doing only basic validation
     /// of the version, padding, and length.
-    pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), String> {
+    pub fn parse(buf: &'a [u8]) -> Result<(Self, &'a [u8]), ParseError> {
         if buf.len() < COMMON_HEADER_LEN {
-            return Err(format!(
+            return Err(ParseError(format!(
                 "RTCP packets must be at least {} bytes; have only {}",
                 COMMON_HEADER_LEN,
                 buf.len()
-            ));
+            )));
         }
         let ver = buf[0] >> 6;
         if ver != 2 {
-            return Err(format!("RTCP packets must be version 2; got {ver}"));
+            return Err(ParseError(format!(
+                "RTCP packets must be version 2; got {ver}"
+            )));
         }
 
         // raw_len is "The length of this RTCP packet in 32-bit words minus one,
@@ -388,23 +406,25 @@ impl<'a> PacketRef<'a> {
         let raw_len = (u16::from(buf[2]) << 8) | u16::from(buf[3]);
         let len = (usize::from(raw_len) + 1) * 4;
         if buf.len() < len {
-            return Err(format!(
+            return Err(ParseError(format!(
                 "RTCP packet header has length {} bytes; have only {}",
                 len,
                 buf.len()
-            ));
+            )));
         }
         let (this, rest) = buf.split_at(len);
         let padding_bit = this[0] & 0b0010_0000;
         if padding_bit != 0 {
             if raw_len == 0 {
-                return Err("RTCP packet has invalid combination of padding and len=0".to_owned());
+                return Err(ParseError(
+                    "RTCP packet has invalid combination of padding and len=0".to_owned(),
+                ));
             }
             let padding_bytes = usize::from(this[len - 1]);
             if padding_bytes == 0 || padding_bytes > len - COMMON_HEADER_LEN {
-                return Err(format!(
+                return Err(ParseError(format!(
                     "RTCP packet of len {len} states invalid {padding_bytes} padding bytes"
-                ));
+                )));
             }
             Ok((
                 PacketRef {
@@ -431,7 +451,7 @@ impl<'a> PacketRef<'a> {
     }
 
     /// Parses to a `TypedPacketRef` if the payload type is supported.
-    pub fn as_typed(self) -> Result<Option<TypedPacketRef<'a>>, String> {
+    pub fn as_typed(self) -> Result<Option<TypedPacketRef<'a>>, ParseError> {
         match self.payload_type() {
             200 => Ok(Some(TypedPacketRef::SenderReport(
                 SenderReportRef::validate(self)?,
@@ -444,7 +464,7 @@ impl<'a> PacketRef<'a> {
     }
 
     /// Parses as a sender report, if the type matches.
-    pub fn as_sender_report(self) -> Result<Option<SenderReportRef<'a>>, String> {
+    pub fn as_sender_report(self) -> Result<Option<SenderReportRef<'a>>, ParseError> {
         if self.payload_type() == 200 {
             return Ok(Some(SenderReportRef::validate(self)?));
         }

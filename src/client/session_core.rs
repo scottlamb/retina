@@ -14,6 +14,7 @@ use bytes::Bytes;
 use log::{debug, trace, warn};
 use url::Url;
 
+use super::Error;
 use super::channel_mapping::ChannelType;
 use super::conn::{ConnCore, ResponseMode};
 use super::parse::{self, SessionHeader};
@@ -27,7 +28,7 @@ use super::{
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
 use crate::{
-    ConnectionContext, Error, ErrorInt, StreamContext, StreamContextInner, TcpStreamContext,
+    ConnectionContext, ErrorInt, StreamContext, StreamContextInner, TcpStreamContext,
     UdpStreamContext, WallTime,
 };
 

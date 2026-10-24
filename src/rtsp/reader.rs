@@ -6,8 +6,9 @@
 use std::time::Instant;
 
 use crate::buf::MarkBuf;
+use crate::error::Error;
 use crate::inputs::Split;
-use crate::{ConnectionContext, Error, ErrorInt, ReceivedMessage, RtspMessageContext, WallTime};
+use crate::{ConnectionContext, ErrorInt, ReceivedMessage, RtspMessageContext, WallTime};
 
 /// Default initial capacity for the read ring buffer (64 KiB).
 const DEFAULT_READ_CAPACITY: usize = 64 * 1024;

@@ -189,7 +189,7 @@ impl StreamPolicy {
 /// Formats an error description for a failed [`PacketHeader::validate`].
 pub(crate) fn validate_error<T>(
     receiver: &Receiver<T>,
-    reason: &'static str,
+    reason: crate::rtp::ParseError,
     pkt: crate::inputs::Split<'_>,
 ) -> String {
     format!(

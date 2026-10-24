@@ -28,8 +28,6 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::Bytes;
 
-use crate::Error;
-use crate::error::ErrorInt;
 use crate::rtp::ReceivedPacketRef;
 
 /// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
@@ -143,6 +141,7 @@ impl<'a> Iterator for FmtpParser<'a> {
 }
 
 pub mod aac;
+mod error;
 pub(crate) mod events;
 pub(crate) mod g723;
 #[cfg(any(feature = "h264", feature = "h265"))]
@@ -165,6 +164,7 @@ pub(crate) mod simple_audio;
 #[cfg(test)]
 mod testutil;
 
+pub use error::{Error, ErrorKind};
 pub(crate) use events::FrameBody;
 pub use events::{
     Accumulate, AudioFrameRef, AudioHandler, Corruption, FormatError, Loss, LossReason,
@@ -379,9 +379,7 @@ impl VideoParameters {
     pub fn from_h264_parameter_sets<'a>(
         sets: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, Error> {
-        h26x::Codec::H264
-            .parameters_from_unordered_sets(sets)
-            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+        h26x::Codec::H264.parameters_from_unordered_sets(sets)
     }
 
     /// Returns parameters for the given H.265 parameter sets.
@@ -392,9 +390,7 @@ impl VideoParameters {
     pub fn from_h265_parameter_sets<'a>(
         sets: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, Error> {
-        h26x::Codec::H265
-            .parameters_from_unordered_sets(sets)
-            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
+        h26x::Codec::H265.parameters_from_unordered_sets(sets)
     }
 
     /// Returns a codec description in
@@ -761,9 +757,7 @@ impl AudioSampleEntryBuilder<'_> {
                 &self.params.extra_data,
             ),
             AudioParametersCodec::Other => {
-                bail!(ErrorInt::Unsupported(
-                    "unsupported audio codec for mp4".to_owned()
-                ));
+                Err(Error::unsupported("unsupported audio codec for mp4"))
             }
         }
     }
@@ -934,14 +928,15 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// attributes, for media type `video`. `encoding_name` is expected to be
     /// lowercase.
     ///
-    /// Returns an error if the format is unsupported or the parameters are invalid.
+    /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
+    /// format, or an [`ErrorKind::Invalid`] error if the parameters are
+    /// malformed. Either way, the stream can't be depacketized.
     pub fn new(
         encoding_name: &str,
         clock_rate: u32,
         format_specific_params: Option<&str>,
     ) -> Result<Self, Error> {
         Self::new_inner(encoding_name, clock_rate, format_specific_params)
-            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
     }
 
     #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
@@ -949,7 +944,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         encoding_name: &str,
         clock_rate: u32,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let inner = match encoding_name {
             #[cfg(feature = "h264")]
             "h264" => VideoInner::H264(Box::new(h264::Depacketizer::new(
@@ -961,11 +956,23 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
                 clock_rate,
                 format_specific_params,
             )?)),
+            #[cfg(not(feature = "h264"))]
+            "h264" => {
+                return Err(Error::unsupported(
+                    "H.264 depacketization requires the `h264` feature",
+                ));
+            }
+            #[cfg(not(feature = "h265"))]
+            "h265" => {
+                return Err(Error::unsupported(
+                    "H.265 depacketization requires the `h265` feature",
+                ));
+            }
             "jpeg" => VideoInner::Jpeg(Box::default()),
             _ => {
-                return Err(format!(
+                return Err(Error::unsupported(format!(
                     "no video depacketizer for encoding_name {encoding_name}"
-                ));
+                )));
             }
         };
         Ok(Self {
@@ -1073,7 +1080,9 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
     /// Arguments are from the SDP media description's `rtpmap` and `fmtp`
     /// attributes. `encoding_name` is expected to be lowercase.
     ///
-    /// Returns an error if the format is unsupported or the parameters are invalid.
+    /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
+    /// format, or an [`ErrorKind::Invalid`] error if the parameters are
+    /// malformed. Either way, the stream can't be depacketized.
     pub fn new(
         encoding_name: &str,
         clock_rate: u32,
@@ -1081,7 +1090,6 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
         format_specific_params: Option<&str>,
     ) -> Result<Self, Error> {
         Self::new_inner(encoding_name, clock_rate, channels, format_specific_params)
-            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))
     }
 
     fn new_inner(
@@ -1089,7 +1097,7 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
         clock_rate: u32,
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Error> {
         let simple = |bits_per_sample| {
             AudioInner::SimpleAudio(Box::new(simple_audio::Depacketizer::new(
                 clock_rate,
@@ -1115,9 +1123,9 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
             "g723" => AudioInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?)),
             "opus" => AudioInner::Opus(Box::new(opus::Depacketizer::new(clock_rate, channels)?)),
             _ => {
-                return Err(format!(
+                return Err(Error::unsupported(format!(
                     "no audio depacketizer for encoding_name {encoding_name}"
-                ));
+                )));
             }
         }))
     }
@@ -1160,7 +1168,8 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     /// `encoding_name` is from the SDP media description's `rtpmap` attribute,
     /// and is expected to be lowercase.
     ///
-    /// Returns an error if the format is unsupported.
+    /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
+    /// format.
     pub fn new(encoding_name: &str) -> Result<Self, Error> {
         use onvif::CompressionType;
         let compression_type = match encoding_name {
@@ -1168,9 +1177,11 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
             "vnd.onvif.metadata+gzip" => CompressionType::GzipCompressed,
             "vnd.onvif.metadata.exi.onvif" => CompressionType::ExiDefault,
             "vnd.onvif.metadata.exi.ext" => CompressionType::ExiInBand,
-            _ => bail!(ErrorInt::InvalidArgument(format!(
-                "no message depacketizer for encoding_name {encoding_name}"
-            ))),
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "no message depacketizer for encoding_name {encoding_name}"
+                )));
+            }
         };
         Ok(Self(Box::new(onvif::Depacketizer::new(compression_type))))
     }
@@ -1300,7 +1311,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     ///
     /// The media type and encoding name are matched case-insensitively.
     ///
-    /// Returns an error if the format is unsupported or the parameters are invalid.
+    /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
+    /// format, or an [`ErrorKind::Invalid`] error if the parameters are
+    /// malformed. Either way, the stream can't be depacketized.
     pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
         let media = format.media.to_ascii_lowercase();
         let encoding_name = format.encoding_name.to_ascii_lowercase();
@@ -1320,7 +1333,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     .map(Self::Audio)
             }
             ("application", _) => MessageDepacketizer::new(&encoding_name).map(Self::Message),
-            _ => bail!(ErrorInt::InvalidArgument(format!(
+            _ => Err(Error::unsupported(format!(
                 "no depacketizer for media {media}"
             ))),
         }

@@ -280,11 +280,11 @@ impl From<StatusCode> for u16 {
 }
 
 impl TryFrom<u16> for StatusCode {
-    type Error = InvalidStatusCode;
+    type Error = InvalidStatusCodeError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         if !(100..600).contains(&value) {
-            return Err(InvalidStatusCode(value));
+            return Err(InvalidStatusCodeError(value));
         }
         Ok(StatusCode(value))
     }
@@ -298,7 +298,7 @@ impl fmt::Display for StatusCode {
 
 #[derive(Copy, Clone, Debug, derive_more::Display, derive_more::Error)]
 #[display("status code {_0} outside the valid range 100..=599")]
-pub struct InvalidStatusCode(#[error(not(source))] u16);
+pub struct InvalidStatusCodeError(#[error(not(source))] u16);
 
 // ---------------------------------------------------------------------------
 // Headers

@@ -6,29 +6,15 @@ use std::sync::Arc;
 use crate::{ConnectionContext, PacketContext, RtspMessageContext, StreamContext, WallTime};
 use bytes::Bytes;
 
-/// An opaque `std::error::Error + Send + Sync + 'static` implementation.
+/// The error produced by `bail!` and `wrap!`, shared by the client and the
+/// modules it uses.
 ///
-/// Currently the focus is on providing detailed human-readable error messages.
-/// In most cases they have enough information to find the offending packet
-/// in Wireshark.
-///
-/// If you wish to inspect Retina errors programmatically, or if you need
-/// errors formatted in a different way, please file an issue on the `retina`
-/// repository.
-#[derive(Clone, derive_more::Debug, derive_more::Display, derive_more::Error)]
+/// This is private; each public API converts it to its module's error type
+/// (such as `client::Error`) via `From`.
+#[derive(Clone, derive_more::Debug, derive_more::Display)]
 #[display("{_0}")]
 #[debug("{_0:?}")]
-pub struct Error(#[error(not(source))] pub(crate) Arc<ErrorInt>);
-
-impl Error {
-    /// Returns the status code, if the error was generated from a response.
-    pub fn status_code(&self) -> Option<u16> {
-        match self.0.as_ref() {
-            ErrorInt::RtspResponseError { status, .. } => Some((*status).into()),
-            _ => None,
-        }
-    }
-}
+pub(crate) struct Error(pub(crate) Arc<ErrorInt>);
 
 #[derive(Debug, derive_more::Display, derive_more::Error)]
 pub(crate) enum ErrorInt {
