@@ -3,6 +3,7 @@
 
 //! RTSP client examples.
 
+mod backchannel;
 mod info;
 mod jpeg;
 mod mp4;
@@ -31,6 +32,8 @@ struct Source {
 
 #[derive(Parser)]
 enum Cmd {
+    /// Sends a tone via the ONVIF audio backchannel (PCMU or PCMA).
+    Backchannel(backchannel::Opts),
     /// Gets info about available streams and exits.
     Info(info::Opts),
     /// Writes available audio and video streams to mp4 file; use Ctrl+C to stop.
@@ -87,6 +90,7 @@ fn creds(
 async fn main_inner() -> Result<(), Error> {
     let cmd = Cmd::parse();
     match cmd {
+        Cmd::Backchannel(opts) => backchannel::run(opts).await,
         Cmd::Info(opts) => info::run(opts).await,
         Cmd::Jpeg(opts) => jpeg::run(opts).await,
         Cmd::Mp4(opts) => mp4::run(opts).await,

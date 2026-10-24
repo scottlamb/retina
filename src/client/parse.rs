@@ -7,7 +7,7 @@ use sdp_types::Media;
 use std::{net::IpAddr, num::NonZeroU16};
 use url::Url;
 
-use super::{Presentation, Stream};
+use super::{Presentation, Stream, StreamDirection};
 
 /// A static payload type in the [RTP parameters
 /// registry](https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1).
@@ -219,7 +219,14 @@ pub(crate) fn get_cseq(response: &crate::rtsp::msg::Response) -> Option<u32> {
 /// Parses a [MediaDescription] to a [Stream].
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
-fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, String> {
+///
+/// `direction` is the stream's direction, as [`parse_describe`] decides it
+/// from the SDP's direction attributes.
+fn parse_media(
+    base_url: &Url,
+    media_description: &Media,
+    direction: StreamDirection,
+) -> Result<Stream, String> {
     let media = media_description.media.clone().into_boxed_str();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
@@ -369,8 +376,12 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
     }
 
     let encoding_name = encoding_name.to_ascii_lowercase().into_boxed_str();
-    let depacketizer =
-        crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp);
+    let depacketizer = match direction {
+        StreamDirection::Receiving => {
+            crate::codec::Depacketizer::new(&media, &encoding_name, clock_rate, channels, fmtp)
+        }
+        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
+    };
 
     Ok(Stream {
         media,
@@ -381,18 +392,34 @@ fn parse_media(base_url: &Url, media_description: &Media) -> Result<Stream, Stri
         control,
         channels,
         framerate,
+        direction,
         state: super::StreamState::Uninit,
     })
 }
 
 use crate::mostly_ascii::MostlyAscii;
 
+/// The SDP direction attributes, as defined in [RFC 8866 section
+/// 6.7](https://datatracker.ietf.org/doc/html/rfc8866#section-6.7).
+const DIRECTION_ATTRIBUTES: [&str; 4] = ["recvonly", "sendrecv", "sendonly", "inactive"];
+
+/// Returns the first direction attribute among `attributes`, if any.
+fn direction_attribute(attributes: &[sdp_types::Attribute]) -> Option<&str> {
+    attributes
+        .iter()
+        .map(|a| a.attribute.as_str())
+        .find(|a| DIRECTION_ATTRIBUTES.contains(a))
+}
+
 /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
 /// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
+///
+/// `backchannel` says whether the request asked for an ONVIF backchannel.
 pub(crate) fn parse_describe(
     request_url: Url,
     response: &crate::rtsp::msg::Response,
     body: &Bytes,
+    backchannel: bool,
 ) -> Result<Presentation, String> {
     match response.headers.get("Content-Type") {
         Some(v) if &**v == "application/sdp" => {}
@@ -453,12 +480,26 @@ pub(crate) fn parse_describe(
     }
     let control = control.unwrap_or(request_url);
 
+    // ONVIF Streaming Specification section 5.3.2: "the server shall include
+    // the a=sendonly in each media section representing media being sent from
+    // the client to the server". A media section without a direction
+    // attribute has the session's (RFC 8866 section 6.7). Without the
+    // backchannel requested, the attribute is ignored as before.
+    let session_direction = direction_attribute(&sdp.attributes);
+
     let streams: Box<[Stream]> = sdp
         .medias
         .iter()
         .enumerate()
         .filter_map(|(i, m)| {
-            parse_media(&base_url, m).map_or_else(
+            let direction = if backchannel
+                && direction_attribute(&m.attributes).or(session_direction) == Some("sendonly")
+            {
+                StreamDirection::Sending
+            } else {
+                StreamDirection::Receiving
+            };
+            parse_media(&base_url, m, direction).map_or_else(
                 |e| {
                     warn!(
                         "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
@@ -765,7 +806,7 @@ mod tests {
     ) -> Result<super::Presentation, String> {
         let url = Url::parse(raw_url).unwrap();
         let (resp, body) = response(raw_response);
-        super::parse_describe(url, &resp, &body)
+        super::parse_describe(url, &resp, &body, false)
     }
 
     fn dummy_stream_state_init(ssrc: Option<u32>) -> StreamState {
@@ -821,7 +862,7 @@ mod tests {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let (response, body) = sdp_response(include_bytes!("testdata/anpviz_sdp.txt"));
-        super::parse_describe(url, &response, &body).unwrap();
+        super::parse_describe(url, &response, &body, false).unwrap();
     }
 
     #[test]
@@ -829,7 +870,7 @@ mod tests {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let (response, body) = sdp_response(include_bytes!("testdata/geovision_sdp.txt"));
-        super::parse_describe(url, &response, &body).unwrap();
+        super::parse_describe(url, &response, &body, false).unwrap();
     }
 
     #[test]
@@ -837,7 +878,7 @@ mod tests {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let (response, body) = sdp_response(include_bytes!("testdata/ubiquiti_sdp.txt"));
-        let d = super::parse_describe(url, &response, &body).unwrap();
+        let d = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(d.streams.len(), 3);
     }
 
@@ -850,7 +891,7 @@ mod tests {
         init_logging();
         let url = Url::parse("rtsp://127.0.0.1/").unwrap();
         let (response, body) = sdp_response(include_bytes!("testdata/tplink_sdp.txt"));
-        let p = super::parse_describe(url, &response, &body).unwrap();
+        let p = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(p.streams.len(), 2);
     }
 
@@ -867,7 +908,7 @@ mod tests {
         ] {
             let url = Url::parse("rtsp://127.0.0.1/").unwrap();
             let (response, body) = sdp_response(body);
-            let e = super::parse_describe(url, &response, &body).unwrap_err();
+            let e = super::parse_describe(url, &response, &body, false).unwrap_err();
             assert!(e.starts_with("Unable to parse SDP"), "{e}");
         }
     }
@@ -1271,7 +1312,7 @@ mod tests {
         let (response, body) = sdp_response(
             b"v=0\nm=video 0 RTP/AVP \nm=video 0 RTP/AVP 96\na=rtpmap:96 H264/90000\n",
         );
-        let p = super::parse_describe(url, &response, &body).unwrap();
+        let p = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(p.streams.len(), 1);
         assert_eq!(p.streams[0].encoding_name(), "h264");
     }
@@ -1807,6 +1848,159 @@ mod tests {
         assert_eq!(
             p.streams[0].control,
             Some(Url::parse("rtsp://192.168.1.10:554/stream0/trackID=1").unwrap())
+        );
+    }
+
+    fn parse_backchannel_describe(
+        raw_url: &str,
+        raw_response: &'static [u8],
+        backchannel: bool,
+    ) -> super::Presentation {
+        let url = Url::parse(raw_url).unwrap();
+        let (resp, body) = response(raw_response);
+        super::parse_describe(url, &resp, &body, backchannel).unwrap()
+    }
+
+    /// Tests the ONVIF Streaming Specification section 5.3.2.2 example: video
+    /// and audio from the server, and an audio backchannel to it. The example's
+    /// `o=` line lacks the session id and version; they're filled in so the SDP
+    /// parses.
+    #[test]
+    fn onvif_5_3_2_2_backchannel() {
+        init_logging();
+        let raw = include_bytes!("testdata/onvif_backchannel_describe.txt");
+        let p = parse_backchannel_describe("rtsp://192.168.0.1/", raw, true);
+        assert_eq!(p.streams.len(), 3);
+        assert_eq!(p.streams[0].encoding_name(), "jpeg");
+        assert_eq!(p.streams[0].direction(), StreamDirection::Receiving);
+        assert_eq!(p.streams[1].encoding_name(), "pcmu");
+        assert_eq!(p.streams[1].direction(), StreamDirection::Receiving);
+        let back = &p.streams[2];
+        assert_eq!(back.direction(), StreamDirection::Sending);
+        assert_eq!(back.media(), "audio");
+        assert_eq!(back.encoding_name(), "pcmu");
+        assert_eq!(back.rtp_payload_type(), 0);
+        assert_eq!(back.clock_rate_hz(), 8_000);
+        assert!(back.depacketizer.is_err());
+        assert!(back.parameters().is_none());
+        assert_eq!(
+            back.control().unwrap().as_str(),
+            "rtsp://192.168.0.1/audioback"
+        );
+
+        // Without the backchannel option, `a=sendonly` is ignored.
+        let p = parse_backchannel_describe("rtsp://192.168.0.1/", raw, false);
+        assert_eq!(p.streams.len(), 3);
+        for s in &p.streams[..] {
+            assert_eq!(s.direction(), StreamDirection::Receiving);
+        }
+        assert!(p.streams[2].depacketizer.is_ok());
+    }
+
+    /// Tests the ONVIF Streaming Specification section 5.3.2.3 example: a
+    /// backchannel offering several decoders.
+    #[test]
+    fn onvif_backchannel_multiple_formats() {
+        init_logging();
+        let p = parse_backchannel_describe(
+            "rtsp://192.168.0.1/",
+            include_bytes!("testdata/onvif_backchannel_multiple_formats_describe.txt"),
+            true,
+        );
+        assert_eq!(p.streams.len(), 3);
+        assert_eq!(p.streams[0].direction(), StreamDirection::Receiving);
+        assert_eq!(p.streams[1].direction(), StreamDirection::Receiving);
+        let back = &p.streams[2];
+        assert_eq!(back.direction(), StreamDirection::Sending);
+
+        // Retina describes, and sends, the first format.
+        assert_eq!(back.encoding_name(), "pcmu");
+        assert_eq!(back.rtp_payload_type(), 0);
+        assert_eq!(
+            back.control().unwrap().as_str(),
+            "rtsp://192.168.0.1/audioback"
+        );
+    }
+
+    /// Parses `sdp` as a `DESCRIBE` response with the backchannel requested,
+    /// returning each stream's direction.
+    fn backchannel_directions(sdp: &'static [u8]) -> Vec<StreamDirection> {
+        let (response, body) = sdp_response(sdp);
+        let url = Url::parse("rtsp://192.168.0.1/").unwrap();
+        let p = super::parse_describe(url, &response, &body, true).unwrap();
+        p.streams.iter().map(Stream::direction).collect()
+    }
+
+    /// ONVIF Streaming Specification section 5.3.2: every media section marked
+    /// `a=sendonly` is sent from the client to the server, whatever its media
+    /// type; section 5.3 names audio and metadata backchannels.
+    #[test]
+    fn onvif_5_3_2_every_sendonly_media_is_sending() {
+        init_logging();
+        let directions = backchannel_directions(
+            b"v=0\r\n\
+              o=- 0 0 IN IP4 192.168.0.1\r\n\
+              s=Session\r\n\
+              c=IN IP4 0.0.0.0\r\n\
+              t=0 0\r\n\
+              m=video 0 RTP/AVP 96\r\n\
+              a=rtpmap:96 H264/90000\r\n\
+              a=control:track1\r\n\
+              a=recvonly\r\n\
+              m=application 0 RTP/AVP 107\r\n\
+              a=rtpmap:107 vnd.onvif.metadata/90000\r\n\
+              a=control:track2\r\n\
+              a=sendonly\r\n\
+              m=audio 0 RTP/AVP 8\r\n\
+              a=rtpmap:8 PCMA/8000\r\n\
+              a=control:track3\r\n\
+              a=sendonly\r\n",
+        );
+        assert_eq!(
+            directions,
+            [
+                StreamDirection::Receiving,
+                StreamDirection::Sending,
+                StreamDirection::Sending,
+            ]
+        );
+
+        // Even when every media section is `a=sendonly`.
+        let directions = backchannel_directions(
+            b"v=0\r\n\
+              o=- 0 0 IN IP4 192.168.0.1\r\n\
+              s=Session\r\n\
+              c=IN IP4 0.0.0.0\r\n\
+              t=0 0\r\n\
+              m=audio 0 RTP/AVP 0\r\n\
+              a=control:track1\r\n\
+              a=sendonly\r\n",
+        );
+        assert_eq!(directions, [StreamDirection::Sending]);
+    }
+
+    /// RFC 8866 section 6.7: a media section without a direction attribute
+    /// has the session's; its own attribute overrides it.
+    #[test]
+    fn rfc8866_6_7_session_level_direction() {
+        init_logging();
+        let directions = backchannel_directions(
+            b"v=0\r\n\
+              o=- 0 0 IN IP4 192.168.0.1\r\n\
+              s=Session\r\n\
+              c=IN IP4 0.0.0.0\r\n\
+              t=0 0\r\n\
+              a=sendonly\r\n\
+              m=video 0 RTP/AVP 96\r\n\
+              a=rtpmap:96 H264/90000\r\n\
+              a=control:track1\r\n\
+              a=recvonly\r\n\
+              m=audio 0 RTP/AVP 0\r\n\
+              a=control:track2\r\n",
+        );
+        assert_eq!(
+            directions,
+            [StreamDirection::Receiving, StreamDirection::Sending]
         );
     }
 }
