@@ -49,7 +49,7 @@ fuzz_target!(|pkts: Vec<Pkt<'_>>| {
             sequence_number,
             0,
             pkt.mark,
-            u16::from(pkt.loss),
+            retina::rtp::Continuity::from_loss(u16::from(pkt.loss)),
         );
         let Ok(_) = u16::try_from(pkt.payload.len()) else {
             return;

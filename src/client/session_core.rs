@@ -41,7 +41,10 @@ pub enum SetupTransport {
     /// RTP/AVP/UDP: send RTP and RTCP to a pair of UDP sockets the caller has
     /// bound on the RTSP connection's local address, on ports `client_rtp_port`
     /// (even) and `client_rtp_port + 1`. See [`crate::UdpPair`].
-    Udp { client_rtp_port: u16 },
+    Udp {
+        client_rtp_port: u16,
+        options: super::UdpTransportOptions,
+    },
 }
 
 /// A packet to send on a UDP stream's socket, from
@@ -93,6 +96,7 @@ enum Op {
     Setup {
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
     },
     Play {
         options: PlayOptions,
@@ -324,6 +328,7 @@ impl SetupCore {
             // backchannel's `SETUP` and not on the others.
             headers.insert(msg::HeaderName::REQUIRE, super::backchannel_require());
         }
+        let mut reorder = None;
         let udp = match transport {
             SetupTransport::Tcp => {
                 let proposed_channel_id =
@@ -343,7 +348,11 @@ impl SetupCore {
                 );
                 None
             }
-            SetupTransport::Udp { client_rtp_port } => {
+            SetupTransport::Udp {
+                client_rtp_port,
+                options,
+            } => {
+                reorder = Some(options.reorder);
                 headers.insert(
                     msg::HeaderName::TRANSPORT,
                     msg::HeaderValue::try_from(format!(
@@ -372,7 +381,15 @@ impl SetupCore {
             },
             body: Bytes::new(),
         };
-        self.start(ResponseMode::Normal, Op::Setup { stream_i, udp }, req)?;
+        self.start(
+            ResponseMode::Normal,
+            Op::Setup {
+                stream_i,
+                udp,
+                reorder,
+            },
+            req,
+        )?;
         self.flags |= if udp.is_some() {
             SessionFlag::UdpStreams
         } else {
@@ -547,7 +564,14 @@ impl SetupCore {
             }
             (_, Err(e)) => Err(e),
             (Op::Describe { url }, Ok(r)) => self.handle_describe(url, r),
-            (Op::Setup { stream_i, udp }, Ok(r)) => self.handle_setup(stream_i, udp, r),
+            (
+                Op::Setup {
+                    stream_i,
+                    udp,
+                    reorder,
+                },
+                Ok(r),
+            ) => self.handle_setup(stream_i, udp, reorder, r),
             (Op::Play { options }, Ok(r)) => self.handle_play(options, r),
         })
     }
@@ -570,6 +594,7 @@ impl SetupCore {
         &mut self,
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
         r: super::conn::Response,
     ) -> Result<SessionEvent, Error> {
         debug!("SETUP response: {:#?}", r.head);
@@ -657,6 +682,7 @@ impl SetupCore {
             initial_seq: None,
             initial_rtptime: None,
             ctx,
+            reorder: reorder.filter(|_| udp_peer.is_some()),
         });
         Ok(SessionEvent::SetUp { stream_i, udp_peer })
     }
@@ -699,6 +725,7 @@ impl SetupCore {
                 initial_seq,
                 ssrc,
                 ctx,
+                reorder,
             }) = s.state
             else {
                 continue;
@@ -715,6 +742,10 @@ impl SetupCore {
                 .map_err(|e| r.error(&conn_ctx, e.to_string()))?;
                 core_streams[i] = Some(PlayingStream {
                     rtp_handler: rtp::StreamReceiver::new(receiver, policy.unknown_rtcp_ssrc),
+                    // Unused: RTP received on a sending stream is ignored.
+                    reorderer: crate::rtp::Reorderer::new(
+                        crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO),
+                    ),
                     ctx,
                     udp_buf: None,
 
@@ -772,20 +803,20 @@ impl SetupCore {
             };
             let mut options = crate::rtp::ReceiverOptions::default()
                 .max_forward_jump_secs(policy.enforce_timestamps_with_max_jump_secs)
-                .out_of_order(if matches!(ctx.0, StreamContextInner::Udp(_)) {
-                    crate::rtp::OutOfOrder::Drop
-                } else {
-                    crate::rtp::OutOfOrder::Error
-                })
                 .learn_ssrc_from_sender_report(!matches!(
                     policy.unknown_rtcp_ssrc,
                     UnknownRtcpSsrcPolicy::ProcessPackets
                 ));
+            // TCP doesn't reorder packets, so it doesn't wait for them. Its
+            // reorderer still drops late packets and recognizes restarts.
+            let mut reorder = reorder
+                .unwrap_or_else(|| crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO));
             if let Some(ssrc) = ssrc {
                 options = options.ssrc(ssrc);
             }
             if let Some(seq) = initial_seq {
                 options = options.initial_sequence_number(seq);
+                reorder = reorder.initial_sequence_number(seq);
             }
             if let Some(rtptime) = initial_rtptime {
                 options = options.initial_rtptime(rtptime);
@@ -794,6 +825,7 @@ impl SetupCore {
                 .map_err(|e| r.error(&conn_ctx, e.to_string()))?;
             core_streams[i] = Some(PlayingStream {
                 rtp_handler: rtp::StreamReceiver::new(receiver, policy.unknown_rtcp_ssrc),
+                reorderer: crate::rtp::Reorderer::new(reorder),
                 ctx,
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
                 reception: self
@@ -1787,6 +1819,7 @@ mod tests {
                 2,
                 SetupTransport::Udp {
                     client_rtp_port: 5000,
+                    options: Default::default(),
                 },
             )
             .unwrap_err();
@@ -1895,6 +1928,7 @@ mod tests {
             1,
             SetupTransport::Udp {
                 client_rtp_port: 54060,
+                options: Default::default(),
             },
         )
         .unwrap();

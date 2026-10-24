@@ -587,6 +587,11 @@ pub enum LossReason {
         packets: u16,
     },
 
+    /// The sender restarted its RTP sequence numbers, as indicated by
+    /// [`crate::rtp::Continuity::Discontinuity`]. Any number of packets may
+    /// have been lost.
+    Discontinuity,
+
     /// The depacketizer detected corrupt data or a protocol violation.
     ///
     /// It discards any in-progress frame and resynchronizes at the next frame

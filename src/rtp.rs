@@ -10,13 +10,14 @@ use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
 
 mod receiver;
+mod reorder;
 #[cfg(feature = "unstable-send")]
 mod sender;
+mod seq;
 mod timeline;
 
-pub use receiver::{
-    OutOfOrder, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
-};
+pub use receiver::{ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch};
+pub use reorder::{Pushed, ReorderCounters, ReorderOptions, Reordered, Reorderer};
 #[cfg(feature = "unstable-send")]
 pub use sender::{OutgoingPacketRef, Sender, SenderOptions, SenderSink};
 
@@ -172,9 +173,8 @@ pub struct ReceivedPacketMeta<Ctx> {
     /// The RTP marker bit.
     pub mark: bool,
 
-    /// The number of packets lost immediately before this one, as determined
-    /// by a gap in sequence numbers.
-    pub loss: u16,
+    /// How this packet relates to the previous one in sequence.
+    pub continuity: Continuity,
 }
 
 impl<Ctx> ReceivedPacketMeta<Ctx> {
@@ -186,7 +186,7 @@ impl<Ctx> ReceivedPacketMeta<Ctx> {
         sequence_number: u16,
         ssrc: u32,
         mark: bool,
-        loss: u16,
+        continuity: Continuity,
     ) -> Self {
         Self {
             ctx,
@@ -194,7 +194,53 @@ impl<Ctx> ReceivedPacketMeta<Ctx> {
             sequence_number,
             ssrc,
             mark,
-            loss,
+            continuity,
+        }
+    }
+}
+
+/// How an RTP packet relates to the previous one in its stream, as reported
+/// in [`ReceivedPacketMeta::continuity`].
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum Continuity {
+    /// The packet directly follows the previous one, or is the first.
+    #[default]
+    Contiguous,
+
+    /// This many packets were lost immediately before this one, as indicated
+    /// by a gap in sequence numbers.
+    Lost(std::num::NonZeroU16),
+
+    /// The packet is unrelated to the previous one: the sender restarted its
+    /// sequence numbers, as recognized by a [`Reorderer`]. Any number of
+    /// packets may have been lost, and timestamps may not be comparable
+    /// across it.
+    Discontinuity,
+}
+
+impl Continuity {
+    /// Returns [`Continuity::Lost`] with `packets`, or
+    /// [`Continuity::Contiguous`] if `packets` is 0.
+    #[inline]
+    pub fn from_loss(packets: u16) -> Self {
+        std::num::NonZeroU16::new(packets).map_or(Continuity::Contiguous, Continuity::Lost)
+    }
+
+    /// Returns true if this packet directly follows the previous one.
+    #[inline]
+    pub fn is_contiguous(self) -> bool {
+        matches!(self, Continuity::Contiguous)
+    }
+
+    /// Returns a count for depacketizers' internal bookkeeping, which only
+    /// distinguishes zero from nonzero: the packets lost, or 1 at a
+    /// discontinuity.
+    #[inline]
+    pub(crate) fn loss_count(self) -> u16 {
+        match self {
+            Continuity::Contiguous => 0,
+            Continuity::Lost(n) => n.get(),
+            Continuity::Discontinuity => 1,
         }
     }
 }
@@ -209,6 +255,10 @@ pub struct ReceivedPacketRef<'a, Ctx> {
     buf: &'a MarkBuf,
     payload_pos: u64,
     payload_len: u16,
+
+    /// The position a depacketizer pins to retain this packet's payload and
+    /// that of every packet pushed after it; see [`ReceivedPacketRef::with_pin_pos`].
+    pin_pos: u64,
 }
 
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
@@ -240,7 +290,38 @@ impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
             buf,
             payload_pos,
             payload_len,
+            pin_pos: payload_pos,
         }
+    }
+
+    /// Sets the position a depacketizer pins to retain this packet's data.
+    ///
+    /// A depacketizer holding data from several packets pins only the first
+    /// one's position, relying on a [`MarkBuf`] to retain everything after
+    /// it. That holds when packets are pushed in the order they were received.
+    /// When they aren't, as with [`crate::rtp::Reorderer`], each packet's pin
+    /// position must be at or before the payload of every packet pushed after
+    /// it. `Reorderer` supplies such a position.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `pin_pos` is within `[start(), payload_pos]`, where
+    /// `start()` is the oldest position still in the buffer.
+    pub fn with_pin_pos(self, pin_pos: u64) -> Self {
+        assert!(
+            pin_pos >= self.buf.start() && pin_pos <= self.payload_pos,
+            "pin_pos {pin_pos} must be within [{}, {}]",
+            self.buf.start(),
+            self.payload_pos,
+        );
+        Self { pin_pos, ..self }
+    }
+
+    /// The position to pin to retain this packet's data and that of every
+    /// packet pushed after it; see [`ReceivedPacketRef::with_pin_pos`].
+    #[inline]
+    pub(crate) fn pin_pos(&self) -> u64 {
+        self.pin_pos
     }
 
     /// Ring-buffer position of the first payload byte.
@@ -322,7 +403,7 @@ mod tests {
             sequence_number: 0,
             ssrc: 0,
             mark: false,
-            loss: 0,
+            continuity: crate::rtp::Continuity::Contiguous,
         }
     }
 

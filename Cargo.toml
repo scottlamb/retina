@@ -83,6 +83,10 @@ name = "depacketize"
 harness = false
 required-features = ["h264"]
 
+[[bench]]
+name = "reorder"
+harness = false
+
 [[test]]
 name = "repacketize"
 required-features = ["h264", "unstable-send"]

@@ -600,10 +600,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         self.payload.extend_from_slice(s1);
         self.payload.extend_from_slice(s2);
         let payload = &self.payload;
-        if meta.loss > 0 && matches!(self.state, DepacketizerState::Fragmented(_)) {
+        if !meta.continuity.is_contiguous()
+            && matches!(self.state, DepacketizerState::Fragmented(_))
+        {
             log::debug!(
-                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                meta.loss,
+                "Discarding in-progress fragmented AAC frame due to {:?}.",
+                meta.continuity,
             );
             self.state = DepacketizerState::Idle {
                 loss_since_mark: true,
@@ -686,7 +688,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 }
                 self.state = DepacketizerState::Aggregated(Aggregate {
                     meta: meta.clone(),
-                    loss_since_mark: *loss_since_mark || meta.loss > 0,
+                    loss_since_mark: *loss_since_mark || !meta.continuity.is_contiguous(),
                     frame_i: 0,
                     frame_count: au_headers_count,
                     data_off,

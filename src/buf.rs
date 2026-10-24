@@ -52,7 +52,7 @@
 //!     0,    // sequence number
 //!     0,    // SSRC
 //!     true, // mark
-//!     0,    // loss
+//!     retina::rtp::Continuity::Contiguous,
 //! );
 //! d.push(&ReceivedPacketRef::new(meta, &buf, pos, received.len() as u16), &mut MyHandler);
 //! ```
@@ -341,6 +341,16 @@ impl MarkRegistry {
         }
     }
 
+    fn move_forward(&self, from: u64, to: u64) {
+        let mut marks = self.marks.lock().unwrap();
+        let i = marks
+            .binary_search(&from)
+            .unwrap_or_else(|_| panic!("Mark::move_forward: no mark at position {from}"));
+        let j = marks.partition_point(|&m| m <= to);
+        marks[i..j].rotate_left(1);
+        marks[j - 1] = to;
+    }
+
     fn earliest(&self) -> Option<u64> {
         self.marks.lock().unwrap().first().copied()
     }
@@ -361,6 +371,24 @@ impl Mark {
     #[allow(dead_code)]
     pub fn pos(&self) -> u64 {
         self.pos
+    }
+
+    /// Moves this mark forward to `pos`, releasing the data before it.
+    ///
+    /// `pos` must not be beyond [`MarkBuf::unparsed`], as with
+    /// [`MarkBuf::add_mark_at`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pos` is before the mark's current position.
+    pub fn move_forward(&mut self, pos: u64) {
+        assert!(
+            pos >= self.pos,
+            "move_forward({pos}): before current position {}",
+            self.pos
+        );
+        self.registry.move_forward(self.pos, pos);
+        self.pos = pos;
     }
 }
 
@@ -795,6 +823,28 @@ mod tests {
         assert_eq!(buf.split(5, 5).slices(), (&b"56789"[..], &b""[..]));
 
         drop(mark2);
+    }
+
+    #[test]
+    fn mark_move_forward() {
+        let mut buf = MarkBuf::new(16);
+        buf.extend(b"0123456789");
+        buf.advance_unparsed(8);
+        let mut a = buf.add_mark_at(2);
+        let b = buf.add_mark_at(4);
+
+        // Moving `a` past `b` leaves `b` pinning its data.
+        a.move_forward(6);
+        assert_eq!(a.pos(), 6);
+        buf.extend(b"");
+        assert_eq!(buf.start(), 4);
+        drop(b);
+        buf.extend(b"");
+        assert_eq!(buf.start(), 6);
+        a.move_forward(6);
+        drop(a);
+        buf.extend(b"");
+        assert_eq!(buf.start(), 8);
     }
 
     #[test]

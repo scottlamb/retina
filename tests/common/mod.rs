@@ -52,7 +52,7 @@ impl Feeder {
             header.sequence_number(),
             header.ssrc(),
             header.mark(),
-            loss,
+            retina::rtp::Continuity::from_loss(loss),
         );
         let pos = self.buf.end();
         self.buf.extend(raw);

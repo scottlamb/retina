@@ -98,7 +98,7 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
             _ => unreachable!(),
         };
         let (header, payload_range) = retina::rtp::PacketHeader::validate(&data[..]).unwrap();
-        let meta = rtps[stream_id].rtp(pkt_ctx, &header).unwrap().unwrap();
+        let meta = rtps[stream_id].rtp(pkt_ctx, &header).unwrap();
         let buf = &mut bufs[stream_id];
         let pos = buf.end();
         buf.extend(&data);

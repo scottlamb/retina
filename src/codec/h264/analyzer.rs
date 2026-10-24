@@ -520,8 +520,8 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         }
     }
 
-    /// Reports lost or unusable input, such as
-    /// [`LossReason::PacketLoss`].
+    /// Reports lost or unusable input, such as a
+    /// [`LossReason::Discontinuity`].
     ///
     /// Discards any in-progress access unit and notes that the next one may
     /// be missing its beginning.
@@ -553,6 +553,17 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         }
         self.discard_au();
         self.lost = true;
+    }
+
+    /// Pins `buf` from `pos` onward if nothing is pinned yet, so data the RTP
+    /// layer supplies (at or after `pos`) may arrive out of buffer order.
+    ///
+    /// `pos` must be at or before all data supplied until the access unit
+    /// ends or [`Analyzer::stream_with`] releases its data, as a packet's
+    /// [`crate::rtp::ReceivedPacketRef::with_pin_pos`] is for the packets
+    /// pushed after it.
+    pub(crate) fn pin_at(&mut self, buf: &MarkBuf, pos: u64) {
+        crate::codec::h26x::pin_at(&mut self.mark, buf, pos);
     }
 
     /// Returns the current access unit's timestamp, if any.

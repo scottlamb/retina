@@ -659,6 +659,21 @@ pub(super) enum AnnexBScanner<A: U8Array> {
     Mid(Mid),
 }
 
+impl<A: U8Array> AnnexBScanner<A> {
+    /// Returns the position the scanner has pinned for deferred data, if any.
+    ///
+    /// The analyzer must be pinned at or before this before the data is
+    /// supplied to it; see [`pin`].
+    pub(super) fn pinned_pos(&self) -> Option<u64> {
+        match self {
+            AnnexBScanner::Mid(Mid {
+                deferred: Some(d), ..
+            }) => Some(d.mark.pos()),
+            _ => None,
+        }
+    }
+}
+
 impl<A: U8Array> Default for AnnexBScanner<A> {
     fn default() -> Self {
         Self::Pre {
@@ -681,17 +696,15 @@ pub(crate) struct Mid {
 /// One or two zero bytes from a prior `scan`, held back from the analyzer.
 ///
 /// This is the only data the scanner holds across calls, so it pins it with
-/// its own mark, at the first zero. That also covers any zero from a later
-/// packet. It's rare: only a
+/// its own mark, at the `pin_pos` of the packet the first zero came from.
+/// That also covers any zero from a later packet. It's rare: only a
 /// fragmentation unit ending in `00` gets here.
 #[derive(Debug)]
 struct Deferred {
     /// The positions of the zeros; only the first `n` are valid.
     zeros: [u64; 2],
     n: u8,
-
-    /// Held only to pin the zeros.
-    _mark: Mark,
+    mark: Mark,
 }
 
 impl Deferred {
@@ -737,13 +750,15 @@ impl<A: U8Array> AnnexBScanner<A> {
     ///
     /// Each run of NAL content within the data is supplied as one piece. Only
     /// zero bytes ending the data are held back, until a later call says
-    /// whether they're NAL content or the start of a separator.
+    /// whether they're NAL content or the start of a separator. They're
+    /// pinned from `pin_pos`, as in [`crate::rtp::ReceivedPacketRef::with_pin_pos`].
     pub(super) fn scan<Ctx>(
         &mut self,
         buf: &MarkBuf,
         mut pos: u64,
         len: usize,
         end: bool,
+        pin_pos: u64,
         analyzer: &mut impl NalAnalyzer<Ctx>,
     ) -> Result<(), String> {
         let mut data = buf.split(pos, len);
@@ -851,7 +866,7 @@ impl<A: U8Array> AnnexBScanner<A> {
                 let d = mid.deferred.get_or_insert_with(|| Deferred {
                     zeros: [0; 2],
                     n: 0,
-                    _mark: buf.add_mark_at(first),
+                    mark: buf.add_mark_at(pin_pos),
                 });
                 for z in first..pos {
                     d.zeros[usize::from(d.n)] = z;
@@ -877,7 +892,8 @@ pub(super) fn check_range(buf: &MarkBuf, pos: u64, len: usize) {
 ///
 /// An analyzer pins the first data it's given and relies on later data being
 /// after it in the buffer, which holds when the transport supplies data in
-/// the order it read it.
+/// the order it read it. The RTP layer, whose packets may be reordered,
+/// pins in advance via [`pin_at`] instead.
 ///
 /// Panics if data is supplied before the existing mark, if `mark` belongs to
 /// a different buffer, or as [`MarkBuf::add_mark_at`] does.
@@ -896,6 +912,26 @@ pub(super) fn pin(mark: &mut Option<Mark>, buf: &MarkBuf, pos: u64) {
                 m.pos(),
             );
         }
+    }
+}
+
+/// Ensures `mark` pins `buf` from `pos` onward, before the RTP layer supplies
+/// a packet's data.
+///
+/// `pos` is the packet's [`crate::rtp::ReceivedPacketRef::with_pin_pos`]
+/// (or earlier), which is at or before the data of this and every later
+/// packet. An existing mark is at or before it: pin positions never decrease.
+///
+/// Panics if `mark` belongs to a different buffer, or as
+/// [`MarkBuf::add_mark_at`] does.
+#[inline]
+pub(super) fn pin_at(mark: &mut Option<Mark>, buf: &MarkBuf, pos: u64) {
+    match mark {
+        None => *mark = Some(buf.add_mark_at(pos)),
+        Some(m) => assert!(
+            m.belongs_to(buf),
+            "analyzer holding data from one MarkBuf was supplied data from another"
+        ),
     }
 }
 
@@ -981,7 +1017,7 @@ mod tests {
             bytes_read: 1,
         };
         let pos = append(&mut buf, b"\x88ab\x00\x00");
-        scanner.scan(&buf, pos, 5, false, &mut a).unwrap();
+        scanner.scan(&buf, pos, 5, false, pos, &mut a).unwrap();
         a.stream_with(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab");
         assert!(!a.has_mark(), "the analyzer released what it delivered");
@@ -989,9 +1025,58 @@ mod tests {
         // Reclaim space, as further input would.
         append(&mut buf, &[0xff; 64]);
         let pos = append(&mut buf, b"\x03cd");
-        scanner.scan(&buf, pos, 3, true, &mut a).unwrap();
+        scanner.scan(&buf, pos, 3, true, pos, &mut a).unwrap();
         a.stream_with(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab\x00\x00\x03cd");
+    }
+
+    /// Deferred zeros from fragments supplied out of buffer order (as via
+    /// `rtp::Reorderer`) all stay pinned, given each fragment's `pin_pos`.
+    /// Pins the analyzer before each fragment as the H.264 depacketizer does.
+    #[cfg(feature = "h264")]
+    #[test]
+    fn annex_b_scanner_deferred_zeros_out_of_order() {
+        use crate::codec::Accumulate;
+        use crate::codec::h264::Analyzer;
+        for accumulate in [Accumulate::No, Accumulate::Yes] {
+            let ts =
+                crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+            let append = |buf: &mut MarkBuf, data: &[u8]| {
+                let pos = buf.end();
+                buf.extend(data);
+                buf.advance_unparsed(buf.end());
+                pos
+            };
+            let mut buf = MarkBuf::new(16);
+            let mut a = Analyzer::new();
+            let mut h = Data(Vec::new(), Some(accumulate));
+            a.start_au(ts, ());
+            let mut scanner = AnnexBScanner::Pre {
+                cur: [0x65],
+                bytes_read: 1,
+            };
+            let mut scan = |a: &mut Analyzer<()>, buf: &MarkBuf, pos, len, end, pin_pos| {
+                a.pin_at(buf, scanner.pinned_pos().unwrap_or(pin_pos));
+                scanner.scan(buf, pos, len, end, pin_pos, a).unwrap();
+            };
+
+            // The second fragment arrived (and was buffered) before the
+            // first, so the first's pin position is the second's.
+            // The reorderer holds it meanwhile.
+            let pos2 = append(&mut buf, b"\x00");
+            let held = buf.add_mark_at(pos2);
+            let pos1 = append(&mut buf, b"\x88ab\x00");
+            scan(&mut a, &buf, pos1, 4, false, pos2);
+            a.stream_with(&buf, &mut h);
+            assert_eq!(a.has_mark(), accumulate == Accumulate::Yes);
+            scan(&mut a, &buf, pos2, 1, false, pos2);
+            drop(held);
+            append(&mut buf, &[0xff; 64]); // reclaims space.
+            let pos3 = append(&mut buf, b"\x03cd");
+            scan(&mut a, &buf, pos3, 3, true, pos3);
+            a.stream_with(&buf, &mut h);
+            assert_eq!(h.0, b"\x65\x88ab\x00\x00\x03cd", "{accumulate:?}");
+        }
     }
 
     /// Analyzers pin the first data they're given, and require later data to
@@ -1008,6 +1093,14 @@ mod tests {
         assert_eq!(mark.as_ref().map(Mark::pos), Some(4));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(&mut mark, &buf, 3)));
         assert!(r.is_err(), "out-of-order data should panic");
+
+        // `pin_at` pins in advance, after which earlier data is fine.
+        let mut mark = None;
+        pin_at(&mut mark, &buf, 2);
+        pin(&mut mark, &buf, 6);
+        pin(&mut mark, &buf, 2);
+        pin_at(&mut mark, &buf, 5); // already pinned earlier.
+        assert_eq!(mark.as_ref().map(Mark::pos), Some(2));
 
         // Data from another buffer panics.
         let mut other = MarkBuf::new(16);

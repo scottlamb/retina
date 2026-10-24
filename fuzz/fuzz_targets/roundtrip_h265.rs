@@ -125,7 +125,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
             header.sequence_number(),
             header.ssrc(),
             mark,
-            0,
+            retina::rtp::Continuity::Contiguous,
         );
         let payload = &pkt[usize::from(payload.start)..usize::from(payload.end)];
         retina_fuzz::push(&mut buf, meta, payload, &mut [(&mut d, &mut h)]);

@@ -769,16 +769,20 @@ impl AudioSampleEntryBuilder<'_> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MessageParameters(onvif::CompressionType);
 
-/// Returns the loss to report before a packet following `loss` lost packets, if any.
-fn packet_loss_reason(loss: u16) -> Option<LossReason> {
-    (loss > 0).then_some(LossReason::PacketLoss { packets: loss })
+/// Returns the loss to report before a packet with the given continuity, if any.
+fn packet_loss_reason(continuity: crate::rtp::Continuity) -> Option<LossReason> {
+    match continuity {
+        crate::rtp::Continuity::Contiguous => None,
+        crate::rtp::Continuity::Lost(n) => Some(LossReason::PacketLoss { packets: n.get() }),
+        crate::rtp::Continuity::Discontinuity => Some(LossReason::Discontinuity),
+    }
 }
 
 /// Reports packet loss before a packet is pushed, as all depacketizers do.
 ///
 /// The H.264 and H.265 depacketizers do this themselves, via their analyzers.
 fn report_packet_loss<Ctx>(pkt: &ReceivedPacketRef<'_, Ctx>, loss: impl FnOnce(&Loss<'_, Ctx>)) {
-    if let Some(reason) = packet_loss_reason(pkt.meta.loss) {
+    if let Some(reason) = packet_loss_reason(pkt.meta.continuity) {
         loss(&Loss {
             ctx: &pkt.meta.ctx,
             reason,
@@ -1349,7 +1353,7 @@ mod tests {
             ssrc: 0,
             sequence_number,
             mark,
-            loss,
+            continuity: crate::rtp::Continuity::from_loss(loss),
         };
         let pos = buf.end();
         buf.extend(payload);
@@ -1445,7 +1449,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark: true,
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1512,7 +1516,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark: true,
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1576,7 +1580,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark: true,
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1879,7 +1883,7 @@ mod tests {
                 sequence_number: header.sequence_number(),
                 ssrc: header.ssrc(),
                 mark: header.mark(),
-                loss,
+                continuity: crate::rtp::Continuity::from_loss(loss),
             };
             f(
                 &buf,

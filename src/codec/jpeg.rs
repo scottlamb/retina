@@ -342,7 +342,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
 
         let ctx = &pkt.meta.ctx;
-        let loss = pkt.meta.loss;
+        let loss = pkt.meta.continuity.loss_count();
         let timestamp = pkt.meta.timestamp;
         let last_packet_in_frame = pkt.meta.mark;
 
