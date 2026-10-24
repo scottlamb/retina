@@ -562,6 +562,14 @@ impl FrameEndBody<'_> {
     }
 }
 
+/// Returns true for a "random access skipped leading (RASL)" VCL NAL unit.
+///
+/// H.265 section 7.4.2.2 / Table 7-1: these may reference pictures preceding
+/// their associated IRAP picture in decoding order.
+fn is_rasl(hdr: nal::Header) -> bool {
+    matches!(hdr.unit_type(), nal::UnitType::RaslN | nal::UnitType::RaslR)
+}
+
 /// Returns true if we allow the given NAL unit type to end an access unit.
 fn can_end_au(nal_unit_type: nal::UnitType) -> bool {
     // H.265 section 7.4.2.4.4 "Order of NAL units and coded pictures and their

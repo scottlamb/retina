@@ -282,6 +282,10 @@ struct JpegFrameMetadata<Ctx> {
     start_ctx: Ctx,
     timestamp: Timestamp,
     parameters: Option<VideoParameters>,
+
+    /// The fragment offset expected of the next packet: the number of bytes
+    /// of JPEG scan data received so far.
+    next_offset: u32,
 }
 
 /// A [super::Depacketizer] implementation which combines fragmented RTP/JPEG
@@ -456,6 +460,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     self.metadata.replace(JpegFrameMetadata {
                         start_ctx: ctx.clone(),
                         timestamp,
+                        next_offset: 0,
                         parameters: Some(VideoParameters {
                             all_pixel_dimensions: AllPixelDimensions {
                                 coded: (width, height),
@@ -477,7 +482,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             }
         }
 
-        let metadata = match &self.metadata {
+        let metadata = match &mut self.metadata {
             Some(metadata) => metadata,
             None => return Err("Invalid RTP/JPEG packet. Missing start packet".to_string()),
         };
@@ -487,6 +492,21 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             // We return Ok here instead of an error to not spam the log.
             return Ok(());
         }
+
+        if frag_offset != metadata.next_offset {
+            // Discard the incomplete frame. If packets were lost, that's
+            // expected and has already been reported.
+            let expected = metadata.next_offset;
+            self.metadata = None;
+            self.data.clear();
+            if loss > 0 {
+                return Ok(());
+            }
+            return Err(format!(
+                "RTP/JPEG fragment offset {frag_offset}, expected {expected}"
+            ));
+        }
+        metadata.next_offset = frag_offset + payload.len() as u32;
 
         self.data.extend_from_slice(&payload);
 
@@ -509,6 +529,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             let parameters = self.parameters.as_ref();
 
             let accumulate = handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix: false,
+                is_rasl: false,
                 timestamp,
                 ctx: &metadata.start_ctx,
                 is_random_access_point: true,
@@ -525,6 +548,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 Accumulate::No => Vec::new(),
             };
             let mut frame_end = VideoFrameEnd {
+                is_decodable: true,
+                missing_prefix: false,
+                is_rasl: false,
                 timestamp,
                 start_ctx: &metadata.start_ctx,
                 end_ctx: ctx,

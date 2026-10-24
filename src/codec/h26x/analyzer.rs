@@ -15,7 +15,8 @@ use crate::codec::VideoParameters;
 /// transport finds access unit boundaries and supplies each access unit's NAL
 /// units; the analyzer tracks parameter sets and random access state across
 /// access units and reports each to a [`crate::codec::VideoHandler`]: whether
-/// each frame is a random access point, disposable, and so on.
+/// each frame is a random access point, disposable, decodable given earlier
+/// losses, and so on.
 ///
 /// NAL units are supplied as byte ranges within a [`MarkBuf`]. The analyzer
 /// marks the buffer to retain them while it needs them, so the transport can

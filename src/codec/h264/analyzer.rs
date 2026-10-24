@@ -13,14 +13,17 @@ use super::{AuData, FrameEndBody, InternalParameters, Nal, is_non_idr_slice, is_
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::h26x::{Delivery, NalAnalyzer, PiecesReader, check_range};
 use crate::codec::{
-    Accumulate, FrameBody, Loss, LossReason, VideoFrameEnd, VideoFrameStart, VideoHandler,
-    VideoParameters,
+    Accumulate, DecodabilityState, DecodabilityTracker, FrameBody, Loss, LossReason, VideoFrameEnd,
+    VideoFrameStart, VideoHandler, VideoParameters,
 };
 
 /// Analyzes H.264 access units (frames), regardless of how they're transported.
 ///
 /// This is the codec layer beneath the H.264 RTP depacketizer. Its interface
 /// is [`NalAnalyzer`]; see there for an overview.
+///
+/// Leading pictures of open GOP random access points are detected via
+/// picture order count, for `pic_order_cnt_type` 0 only.
 #[derive(Debug)]
 pub struct Analyzer<Ctx> {
     parameters: Option<InternalParameters>,
@@ -31,6 +34,9 @@ pub struct Analyzer<Ctx> {
     /// They're consumed when an access unit with a slice finishes, and
     /// survive losses before then.
     pending: Option<Box<NewParams>>,
+
+    /// Picture order count state since the latest recovery point, if any.
+    recovery_point_poc: Option<RecoveryPointPoc>,
 
     /// Mark pinning buffer data for the current access unit's pieces.
     /// Set when the first piece is added; cleared when the access unit ends
@@ -48,6 +54,8 @@ pub struct Analyzer<Ctx> {
 
     /// The current access unit, if any.
     au: Option<AuState<Ctx>>,
+
+    decodability: DecodabilityState,
 
     /// Packets lost since the last access unit started.
     lost: u16,
@@ -217,8 +225,16 @@ struct FrameMeta {
     /// frames; see `AuView::scan_meta`.
     deferred: Option<Box<NewParams>>,
 
+    /// Whether the first VCL NAL begins a picture, once known. If packets
+    /// were lost just before this access unit and this isn't `Some(true)`,
+    /// the access unit may be missing its beginning.
+    first_vcl_starts_picture: Option<bool>,
+
     /// The header of the last complete NAL, for `can_end_au`.
     last_nal_hdr: Option<NalHeader>,
+
+    /// Set when the frame starts.
+    leading: Option<Leading>,
 }
 
 impl Default for FrameMeta {
@@ -230,7 +246,9 @@ impl Default for FrameMeta {
             seen_vcl: false,
             new_params: None,
             deferred: None,
+            first_vcl_starts_picture: None,
             last_nal_hdr: None,
+            leading: None,
         }
     }
 }
@@ -242,6 +260,74 @@ impl FrameMeta {
         !self.has_non_idr_slice || self.has_recovery_point
     }
 }
+
+/// What's needed from a picture's first slice header to detect leading
+/// pictures. H.264 section 7.4.3 requires that all of a picture's slice
+/// headers agree on these.
+#[derive(Debug)]
+struct SliceInfo {
+    /// `pic_order_cnt_lsb`, if `pic_order_cnt_type` is 0.
+    pic_order_cnt_lsb: Option<u32>,
+
+    /// `MaxPicOrderCntLsb`, if `pic_order_cnt_type` is 0.
+    max_pic_order_cnt_lsb: u32,
+
+    /// True if `dec_ref_pic_marking` includes `memory_management_control_operation` 5.
+    has_mmco5: bool,
+
+    /// True if `nal_ref_idc != 0`.
+    is_reference: bool,
+}
+
+/// Picture order count state since the latest recovery point, for detecting
+/// its leading pictures; see [`VideoFrameStart::is_rasl`].
+///
+/// This follows H.264 section 8.2.1.1, which applies to `pic_order_cnt_type`
+/// 0, taking the recovery point's `PicOrderCntMsb` as 0. Leading pictures are
+/// those which follow the recovery point in decoding order and have a lower
+/// picture order count. Type 2 has no leading pictures; type 1 isn't
+/// supported, so its leading pictures go undetected.
+#[derive(Clone, Debug)]
+struct RecoveryPointPoc {
+    /// The recovery point's picture order count.
+    poc: i64,
+
+    max_pic_order_cnt_lsb: u32,
+
+    /// `prevPicOrderCntMsb`, from the previous reference picture.
+    prev_ref_msb: i64,
+
+    /// `prevPicOrderCntLsb`, from the previous reference picture.
+    prev_ref_lsb: u32,
+}
+
+impl RecoveryPointPoc {
+    /// Returns `PicOrderCntMsb` for a picture, as in H.264 equation 8-3.
+    fn msb(&self, lsb: u32) -> i64 {
+        let (lsb, prev_lsb) = (i64::from(lsb), i64::from(self.prev_ref_lsb));
+        let max = i64::from(self.max_pic_order_cnt_lsb);
+        if lsb < prev_lsb && prev_lsb - lsb >= max / 2 {
+            self.prev_ref_msb + max
+        } else if lsb > prev_lsb && lsb - prev_lsb > max / 2 {
+            self.prev_ref_msb - max
+        } else {
+            self.prev_ref_msb
+        }
+    }
+}
+
+/// An access unit's leading picture status, determined when it starts.
+#[derive(Debug)]
+struct Leading {
+    /// See [`VideoFrameStart::is_rasl`].
+    is_rasl: bool,
+
+    /// The value for `Analyzer::recovery_point_poc` after this access unit.
+    next: Option<RecoveryPointPoc>,
+}
+
+/// Returned when a slice header is incomplete.
+struct NeedMoreData;
 
 impl<Ctx: Clone> Analyzer<Ctx> {
     /// Creates an analyzer which has no parameters until they arrive in-band.
@@ -346,12 +432,16 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         };
         Self::stream_inner(
             &mut self.parameters,
+            &self.recovery_point_poc,
             &mut self.mark,
             &mut self.nals,
             &mut self.pieces,
             au,
             buf,
-            handler,
+            &mut DecodabilityTracker {
+                state: &mut self.decodability,
+                inner: handler,
+            },
         );
     }
 
@@ -378,7 +468,18 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         let r = if au.in_progress.is_some() {
             Err("access unit ended in the middle of a NAL unit".to_owned())
         } else {
-            self.finalize(&mut au, end_ctx, buf, handler)
+            let mut decodability = self.decodability;
+            let r = self.finalize(
+                &mut au,
+                end_ctx,
+                buf,
+                &mut DecodabilityTracker {
+                    state: &mut decodability,
+                    inner: handler,
+                },
+            );
+            self.decodability = decodability;
+            r
         };
         self.discard_au();
         r
@@ -397,10 +498,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         Analyzer {
             parameters,
             pending: None,
+            recovery_point_poc: None,
             mark: None,
             pieces: Vec::new(),
             nals: Vec::new(),
             au: None,
+            decodability: DecodabilityState::default(),
             lost: 0,
             prev_timestamp: None,
         }
@@ -421,7 +524,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             self.lost = self.lost.saturating_add(packets);
         }
         self.loss_without_report();
-        handler.loss(&Loss { ctx, reason });
+        DecodabilityTracker {
+            state: &mut self.decodability,
+            inner: handler,
+        }
+        .loss(&Loss { ctx, reason });
     }
 
     /// Discards the access unit in progress, without reporting it, after loss
@@ -505,8 +612,10 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         self.au = None;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stream_inner(
         parameters: &mut Option<InternalParameters>,
+        recovery_point_poc: &Option<RecoveryPointPoc>,
         mark: &mut Option<Mark>,
         nals: &mut Vec<Nal>,
         pieces: &mut Vec<BufRange>,
@@ -516,13 +625,14 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     ) {
         let state = AuView {
             parameters,
+            recovery_point_poc,
             nals,
             pieces,
         };
         state.scan_meta(au, buf);
         let in_progress = au.in_progress.as_ref().map(|ip| ip.hdr);
         if au.started.is_none() && (au.meta.seen_vcl || in_progress.is_some_and(is_vcl)) {
-            state.start_frame(au, handler);
+            state.start_frame(au, buf, handler);
         }
         let Some(accumulate) = au.started else {
             return;
@@ -552,6 +662,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     ) -> Result<(), String> {
         let view = AuView {
             parameters: &mut self.parameters,
+            recovery_point_poc: &self.recovery_point_poc,
             nals: &mut self.nals,
             pieces: &mut self.pieces,
         };
@@ -586,9 +697,25 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             *view.parameters = new_params;
         }
 
+        if au.meta.leading.is_none() {
+            // The access unit is complete, so `NeedMoreData` is impossible.
+            au.meta.leading = view
+                .leading(
+                    au,
+                    buf,
+                    au.meta.is_random_access_point(),
+                    view.parameters.as_ref(),
+                )
+                .ok();
+        }
+        let is_rasl = au.meta.leading.as_ref().is_some_and(|l| l.is_rasl);
+        let missing_prefix = au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true);
         let accumulate = match au.started {
             Some(a) => a,
             None => handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix,
+                is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point: au.meta.is_random_access_point(),
@@ -601,6 +728,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .deliver(view.nals, view.pieces, None, buf, handler);
 
         handler.frame_end(&mut VideoFrameEnd {
+            is_decodable: true,
+            missing_prefix,
+            is_rasl,
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
             end_ctx,
@@ -619,6 +749,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 has_new_parameters,
             }),
         });
+        self.recovery_point_poc = au.meta.leading.take().and_then(|l| l.next);
         Ok(())
     }
 }
@@ -627,6 +758,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
 /// separately from it.
 struct AuView<'a> {
     parameters: &'a mut Option<InternalParameters>,
+    recovery_point_poc: &'a Option<RecoveryPointPoc>,
     nals: &'a mut Vec<Nal>,
     pieces: &'a mut Vec<BufRange>,
 }
@@ -681,6 +813,8 @@ impl AuView<'_> {
             }
             if is_vcl(nal.hdr) {
                 meta.seen_vcl = true;
+                meta.first_vcl_starts_picture
+                    .get_or_insert_with(|| crate::codec::h26x::starts_picture(nal_pieces, buf));
             }
             if is_non_idr_slice(nal.hdr) {
                 meta.has_non_idr_slice = true;
@@ -723,11 +857,187 @@ impl AuView<'_> {
         }
     }
 
-    /// Calls `frame_start` for a frame which is still in progress.
+    /// Returns the access unit's first slice NAL's header and body pieces, and
+    /// whether it's complete.
+    ///
+    /// Only valid before the access unit has been trimmed.
+    fn first_slice_nal<Ctx>(&self, au: &AuState<Ctx>) -> Option<(NalHeader, &[BufRange], bool)> {
+        let mut piece_idx = 0;
+        for nal in self.nals.iter() {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            if is_vcl(nal.hdr) {
+                return Some((nal.hdr, &self.pieces[piece_idx..next_piece_idx], true));
+            }
+            piece_idx = next_piece_idx;
+        }
+        au.in_progress
+            .as_ref()
+            .map(|ip| ip.hdr)
+            .filter(|&hdr| is_vcl(hdr))
+            .map(|hdr| (hdr, &self.pieces[piece_idx..], false))
+    }
+
+    /// Parses the access unit's first slice header, without copying it.
+    ///
+    /// Returns `Ok(None)` if there's no slice header or it can't be parsed, or
+    /// `Err(NeedMoreData)` if the slice NAL is incomplete and ends within its
+    /// header.
+    fn slice_info<Ctx>(
+        &self,
+        au: &AuState<Ctx>,
+        buf: &MarkBuf,
+        parameters: Option<&InternalParameters>,
+    ) -> Result<Option<SliceInfo>, NeedMoreData> {
+        use h264_reader::nal::slice::{
+            DecRefPicMarking, MemoryManagementControlOperation, PicOrderCountLsb, SliceHeader,
+            SliceHeaderError,
+        };
+        use h264_reader::nal::sps::PicOrderCntType;
+        use h264_reader::rbsp::{BitReader, BitReaderError, ByteReader};
+        let Some((hdr, pieces, complete)) = self.first_slice_nal(au) else {
+            return Ok(None);
+        };
+        if !matches!(
+            hdr.nal_unit_type(),
+            UnitType::SliceLayerWithoutPartitioningNonIdr
+                | UnitType::SliceDataPartitionALayer
+                | UnitType::SliceLayerWithoutPartitioningIdr
+        ) {
+            return Ok(None); // data partitions B and C have no slice header.
+        }
+        let Some(ctx) = parameters.and_then(|p| p.slice_ctx.as_deref()) else {
+            return Ok(None);
+        };
+        let mut r = BitReader::new(ByteReader::without_skip(PiecesReader::new(buf, pieces)));
+        match SliceHeader::from_bits(ctx, &mut r, hdr, None) {
+            Ok((sh, sps, _pps)) => Ok(Some(SliceInfo {
+                pic_order_cnt_lsb: match sh.pic_order_cnt_lsb {
+                    Some(
+                        PicOrderCountLsb::Frame(lsb)
+                        | PicOrderCountLsb::FieldsAbsolute {
+                            pic_order_cnt_lsb: lsb,
+                            ..
+                        },
+                    ) => Some(lsb),
+                    _ => None,
+                },
+                max_pic_order_cnt_lsb: match sps.pic_order_cnt {
+                    PicOrderCntType::TypeZero {
+                        log2_max_pic_order_cnt_lsb_minus4,
+                    } => 1 << (log2_max_pic_order_cnt_lsb_minus4 + 4),
+                    _ => 0,
+                },
+                has_mmco5: matches!(
+                    &sh.dec_ref_pic_marking,
+                    Some(DecRefPicMarking::Adaptive(ops))
+                        if ops.iter().any(|op| matches!(
+                            op,
+                            MemoryManagementControlOperation::AllRefPicturesUnused
+                        ))
+                ),
+                is_reference: hdr.nal_ref_idc() != 0,
+            })),
+            Err(SliceHeaderError::RbspError(BitReaderError::ReaderError(_, e)))
+                if !complete && e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                Err(NeedMoreData)
+            }
+            Err(e) => {
+                debug!("Can't parse slice header: {e:?}; won't detect leading pictures");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Determines an access unit's leading picture status as it starts.
+    ///
+    /// Returns `Err(NeedMoreData)` if this requires more of its first slice header.
+    fn leading<Ctx>(
+        &self,
+        au: &AuState<Ctx>,
+        buf: &MarkBuf,
+        is_random_access_point: bool,
+        parameters: Option<&InternalParameters>,
+    ) -> Result<Leading, NeedMoreData> {
+        let not_rasl = |next| Leading {
+            is_rasl: false,
+            next,
+        };
+        let meta = &au.meta;
+        if is_random_access_point && !meta.has_recovery_point {
+            // IDR: no following picture references any before it.
+            return Ok(not_rasl(None));
+        }
+        if !meta.has_recovery_point && self.recovery_point_poc.is_none() {
+            return Ok(not_rasl(None));
+        }
+        let slice = self.slice_info(au, buf, parameters)?;
+        let Some((slice, lsb)) = slice.and_then(|s| s.pic_order_cnt_lsb.map(|lsb| (s, lsb))) else {
+            // `pic_order_cnt_type` isn't 0 or the slice header couldn't be
+            // parsed; keep any existing state, though it may go stale.
+            return Ok(not_rasl(if meta.has_recovery_point {
+                None
+            } else {
+                self.recovery_point_poc.clone()
+            }));
+        };
+        if slice.has_mmco5 {
+            // No following picture references any before this one.
+            return Ok(not_rasl(None));
+        }
+        if meta.has_recovery_point {
+            return Ok(not_rasl(Some(RecoveryPointPoc {
+                poc: i64::from(lsb),
+                max_pic_order_cnt_lsb: slice.max_pic_order_cnt_lsb,
+                prev_ref_msb: 0,
+                prev_ref_lsb: lsb,
+            })));
+        }
+        let rp = self
+            .recovery_point_poc
+            .as_ref()
+            .expect("recovery_point_poc is set");
+        let msb = rp.msb(lsb);
+        Ok(Leading {
+            is_rasl: msb + i64::from(lsb) < rp.poc,
+            next: Some(if slice.is_reference {
+                RecoveryPointPoc {
+                    prev_ref_msb: msb,
+                    prev_ref_lsb: lsb,
+                    ..rp.clone()
+                }
+            } else {
+                rp.clone()
+            }),
+        })
+    }
+
+    /// Calls `frame_start` for a frame which is still in progress, unless
+    /// its first slice header is needed and incomplete.
     ///
     /// The frame's metadata so far is provisional. In particular, parameters
     /// are parsed but not committed to `parameters` until the frame ends.
-    fn start_frame<Ctx>(&self, au: &mut AuState<Ctx>, handler: &mut impl VideoHandler<Ctx>) {
+    fn start_frame<Ctx>(
+        &self,
+        au: &mut AuState<Ctx>,
+        buf: &MarkBuf,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
+        if au.meta.first_vcl_starts_picture.is_none() {
+            // The first VCL NAL is still in progress; its pieces follow the
+            // last complete NAL's.
+            let first_piece = self
+                .nals
+                .last()
+                .map_or(0, |n| crate::to_usize(n.next_piece_idx));
+            if first_piece == self.pieces.len() {
+                return; // try again once the byte after its header arrives.
+            }
+            au.meta.first_vcl_starts_picture = Some(crate::codec::h26x::starts_picture(
+                &self.pieces[first_piece..],
+                buf,
+            ));
+        }
         let mut is_random_access_point = au.meta.is_random_access_point();
         let mut is_disposable = au.meta.is_disposable;
         if let Some(ip) = au.in_progress.as_ref() {
@@ -750,8 +1060,26 @@ impl AuView<'_> {
             .new_params
             .as_ref()
             .and_then(|np| np.parsed.as_ref());
+        let Ok(leading) = self.leading(
+            au,
+            buf,
+            is_random_access_point,
+            new_params.or(self.parameters.as_ref()),
+        ) else {
+            return; // try again after more data.
+        };
+        let is_rasl = leading.is_rasl;
+        au.meta.leading = Some(leading);
+        let new_params = au
+            .meta
+            .new_params
+            .as_ref()
+            .and_then(|np| np.parsed.as_ref());
         au.started = Some(
             handler.frame_start(&VideoFrameStart {
+                is_decodable: true,
+                missing_prefix: au.loss > 0 && au.meta.first_vcl_starts_picture != Some(true),
+                is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
                 is_random_access_point,
@@ -904,7 +1232,7 @@ fn to_bytes(hdr: NalHeader, len: u32, pieces: &[BufRange], buf: &MarkBuf) -> Byt
 
 #[cfg(test)]
 mod tests {
-    use super::Analyzer;
+    use super::{Analyzer, RecoveryPointPoc};
     use crate::buf::MarkBuf;
     use crate::codec::h26x::NalAnalyzer as _;
     use crate::codec::{Accumulate, Loss, VideoFrameEnd, VideoFrameStart, VideoHandler};
@@ -989,6 +1317,27 @@ mod tests {
     const SPS: &[u8] = b"\x67\x64\x00\x1e\xac\x2c\x6a\x82\xc0\xf6\x9b\x82\x80\x82\xa0\x00\x00\x03\x00\x20\x00\x00\x03\x03\xd0\x80";
     const PPS: &[u8] = b"\x68\xee\x31\xb2\x1b";
 
+    /// `PicOrderCntMsb` follows `pic_order_cnt_lsb` across wraparound in
+    /// either direction.
+    #[test]
+    fn recovery_point_poc_wraparound() {
+        let rp = RecoveryPointPoc {
+            poc: 250,
+            max_pic_order_cnt_lsb: 256,
+            prev_ref_msb: 0,
+            prev_ref_lsb: 250,
+        };
+        assert_eq!(rp.msb(248), 0); // leading: 248 < 250.
+        assert_eq!(rp.msb(2), 256); // trailing: 258 > 250.
+        let rp = RecoveryPointPoc {
+            poc: 2,
+            prev_ref_lsb: 2,
+            ..rp
+        };
+        assert_eq!(rp.msb(254), -256); // leading: -2 < 2.
+        assert_eq!(rp.msb(6), 0);
+    }
+
     /// Shows how data is delivered: nothing on `start_nal`/`extend_nal`/
     /// `push_nal` alone; each [`Analyzer::stream_with`] call delivers what's new,
     /// including part of a NAL unit still in progress.
@@ -1013,17 +1362,20 @@ mod tests {
         a.start_nal(hdr, &buf, buf.end(), 0).unwrap();
         assert_eq!(e.0, [], "start_nal alone delivers nothing");
         a.stream_with(&buf, &mut e);
+        assert_eq!(
+            e.0,
+            [],
+            "the frame waits for the slice's first byte after its header"
+        );
+        let pos = append_data(&mut buf, f1_body);
+        a.extend_nal(&buf, pos, f1_body.len()).unwrap();
+        a.stream_with(&buf, &mut e);
         let data = |first, last, bytes: &[u8]| Event::Data {
             first,
             last,
             bytes: bytes.to_vec(),
         };
-        assert_eq!(e.0, [Event::Start, data(true, false, hdr)]);
-        e.0.clear();
-        let pos = append_data(&mut buf, f1_body);
-        a.extend_nal(&buf, pos, f1_body.len()).unwrap();
-        a.stream_with(&buf, &mut e);
-        assert_eq!(e.0, [data(false, false, f1_body)]);
+        assert_eq!(e.0, [Event::Start, data(true, false, f1)]);
         assert!(
             !a.has_mark(),
             "delivered data is released under Accumulate::No"

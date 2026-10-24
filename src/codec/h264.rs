@@ -714,6 +714,10 @@ struct InternalParameters {
     pps_nal: Bytes,
 
     seen_extra_trailing_data: bool,
+
+    /// The parsed SPS and PPS, for parsing slice headers, or `None` if the
+    /// PPS couldn't be parsed. See `Depacketizer::slice_info`.
+    slice_ctx: Option<std::sync::Arc<h264_reader::Context>>,
 }
 
 impl InternalParameters {
@@ -884,6 +888,7 @@ impl InternalParameters {
                 frame_rate = None;
             }
         }
+        let slice_ctx = Self::slice_ctx(sps, &pps_nal);
         Ok(InternalParameters {
             generic_parameters: VideoParameters {
                 rfc6381_codec,
@@ -900,7 +905,43 @@ impl InternalParameters {
             sps_nal,
             pps_nal,
             seen_extra_trailing_data,
+            slice_ctx,
         })
+    }
+
+    /// Returns a context for parsing slice headers, or `None` if the PPS can't
+    /// be parsed. Failure is logged but otherwise tolerated, as slice headers
+    /// are only needed to detect leading pictures; see
+    /// [`VideoFrameStart::is_rasl`].
+    fn slice_ctx(
+        sps: SeqParameterSet,
+        pps_nal: &[u8],
+    ) -> Option<std::sync::Arc<h264_reader::Context>> {
+        let mut ctx = h264_reader::Context::new();
+        ctx.put_seq_param_set(sps);
+        let pps_hex = crate::hex::LimitedHex::new(pps_nal, 256);
+        let pps_rbsp = match h264_reader::rbsp::decode_nal(pps_nal) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Can't decode PPS {pps_hex}: {e}");
+                return None;
+            }
+        };
+        let mut has_extra_trailing_data = false;
+        match h264_reader::nal::pps::PicParameterSet::from_bits(
+            &ctx,
+            TolerantBitReader {
+                inner: h264_reader::rbsp::BitReader::new(&*pps_rbsp),
+                has_extra_trailing_data: &mut has_extra_trailing_data,
+            },
+        ) {
+            Ok(pps) => ctx.put_pic_param_set(pps),
+            Err(e) => {
+                debug!("Can't parse PPS {pps_hex}: {e:?}; won't detect leading pictures");
+                return None;
+            }
+        }
+        Some(std::sync::Arc::new(ctx))
     }
 
     // XXX: copy'n'pasted'n'modified from `h264-reader`.

@@ -41,6 +41,19 @@ pub(super) fn annex_b_parameter_sets(nals: &[&[u8]]) -> bytes::Bytes {
     buf.into()
 }
 
+/// Returns true if the given VCL NAL body begins a picture.
+///
+/// This checks the first bit after the NAL header: H.264's `first_mb_in_slice`
+/// is 0 iff its exp-Golomb encoding is a single `1` bit, and H.265's
+/// `first_slice_segment_in_pic_flag` is that bit. `pieces` are the NAL's body
+/// (excluding the header).
+pub(super) fn starts_picture(pieces: &[BufRange], buf: &MarkBuf) -> bool {
+    pieces
+        .iter()
+        .find(|p| p.len > 0)
+        .is_some_and(|p| buf.split(p.pos, 1).slices().0[0] & 0x80 != 0)
+}
+
 /// A NAL unit header, as stored by the H.264 and H.265 depacketizers.
 pub(super) trait NalHeader: Copy + std::fmt::Debug {
     /// The header's raw bytes: 1 for H.264, 2 for H.265.
