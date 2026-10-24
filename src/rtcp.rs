@@ -5,10 +5,79 @@
 //! [RFC 3550 section 6](https://datatracker.ietf.org/doc/html/rfc3550#section-6).
 
 use std::convert::TryInto;
+use std::time::Duration;
 
 use bytes::Bytes;
 
 use crate::PacketContext;
+
+/// The minimum interval between reports, from [RFC 3550 section
+/// 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2).
+pub(crate) const MIN_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The compensation factor `e - 3/2` from [RFC 3550 section
+/// 6.3.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.3.1), by
+/// which the randomized interval is divided.
+pub(crate) const REPORT_COMPENSATION: f64 = std::f64::consts::E - 1.5;
+
+/// Randomizes the deterministic report interval `td` as in [RFC 3550 section
+/// 6.3.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.3.1).
+///
+/// This simplifies the computation for a unicast session with one sender and
+/// one receiver; see the client's receiver report schedule. Sender reports
+/// ([`crate::rtp::Sender::report_sent`]) follow the same schedule.
+pub(crate) fn report_interval(td: Duration, rng: &mut impl rand::Rng) -> Duration {
+    td.mul_f64(rng.gen_range(0.5..1.5) / REPORT_COMPENSATION)
+}
+
+/// RTCP packet type for a source description (RFC 3550 section 6.5).
+pub(crate) const PT_SDES: u8 = 202;
+
+/// The `CNAME` SDES item type (RFC 3550 section 6.5.1).
+pub(crate) const SDES_CNAME: u8 = 1;
+
+/// Returns a random `CNAME`.
+///
+/// The `CNAME` is 96 random bits, Base64-encoded, as [RFC 7022 section
+/// 4.2](https://datatracker.ietf.org/doc/html/rfc7022#section-4.2) and
+/// [section 5](https://datatracker.ietf.org/doc/html/rfc7022#section-5)
+/// suggest for a short-term persistent `CNAME`.
+///
+/// Every RTCP compound packet carries its sender's `CNAME`; see
+/// [`crate::rtp::Sender::sender_report`]. Streams meant to be synchronized
+/// with each other (e.g. a presentation's audio and video) should share one.
+pub fn random_cname() -> String {
+    use rand::Rng as _;
+    cname_from_bits(rand::thread_rng().r#gen())
+}
+
+/// Encodes 96 random bits as a `CNAME`, as in [`random_cname`].
+pub(crate) fn cname_from_bits(bits: [u8; 12]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bits)
+}
+
+/// Appends a source description with one chunk to `out`: `ssrc`, the `CNAME`
+/// item, a null octet to end the item list, and null octets to pad to a
+/// 32-bit boundary (RFC 3550 section 6.5).
+///
+/// # Panics
+///
+/// If `cname` is longer than 255 bytes.
+pub(crate) fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut Vec<u8>) {
+    let cname_len = u8::try_from(cname.len()).expect("CNAME is at most 255 bytes");
+    let start = out.len();
+    out.extend_from_slice(&[(2 << 6) | 1, PT_SDES, 0, 0]); // length filled in below.
+    out.extend_from_slice(&ssrc.to_be_bytes());
+    out.extend_from_slice(&[SDES_CNAME, cname_len]);
+    out.extend_from_slice(cname.as_bytes());
+    out.push(0);
+    while !(out.len() - start).is_multiple_of(4) {
+        out.push(0);
+    }
+    let len = ((out.len() - start) / 4 - 1) as u16;
+    out[start + 2..start + 4].copy_from_slice(&len.to_be_bytes());
+}
 
 /// A received RTCP compound packet.
 ///

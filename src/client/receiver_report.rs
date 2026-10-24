@@ -15,10 +15,11 @@
 //! it has its own interleaved channel pair or UDP port pair, so it gets its own
 //! statistics and its own report, sent on its own RTCP channel or socket.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use base64::Engine as _;
 use rand::Rng;
+
+use crate::rtcp::{MIN_REPORT_INTERVAL, report_interval};
 
 /// `MAX_DROPOUT` from [RFC 3550 appendix
 /// A.1](https://datatracker.ietf.org/doc/html/rfc3550#appendix-A.1): a jump
@@ -36,23 +37,8 @@ const MIN_SEQUENTIAL: u8 = 2;
 /// `RTP_SEQ_MOD` from RFC 3550 appendix A.1.
 const RTP_SEQ_MOD: u32 = 1 << 16;
 
-/// The minimum interval between reports, from [RFC 3550 section
-/// 6.2](https://datatracker.ietf.org/doc/html/rfc3550#section-6.2).
-const MIN_INTERVAL: Duration = Duration::from_secs(5);
-
-/// The compensation factor `e - 3/2` from [RFC 3550 section
-/// 6.3.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.3.1), by
-/// which the randomized interval is divided.
-const COMPENSATION: f64 = std::f64::consts::E - 1.5;
-
 /// RTCP packet type for a receiver report (RFC 3550 section 6.4.2).
 const PT_RR: u8 = 201;
-
-/// RTCP packet type for a source description (RFC 3550 section 6.5).
-const PT_SDES: u8 = 202;
-
-/// The `CNAME` SDES item type (RFC 3550 section 6.5.1).
-const SDES_CNAME: u8 = 1;
 
 /// Per-source sequence number state, the `source` struct of RFC 3550 appendix
 /// A.1.
@@ -406,15 +392,11 @@ pub(crate) struct ReportWriter {
 }
 
 impl ReportWriter {
-    /// Returns a writer with a random SSRC and `CNAME`.
-    ///
-    /// The `CNAME` is 96 random bits, Base64-encoded, as [RFC 7022 section
-    /// 4.2](https://datatracker.ietf.org/doc/html/rfc7022#section-4.2) and
-    /// [section 5](https://datatracker.ietf.org/doc/html/rfc7022#section-5)
-    /// suggest for a short-term persistent `CNAME`.
+    /// Returns a writer with a random SSRC and `CNAME`, as in
+    /// [`crate::rtcp::random_cname`].
     pub(crate) fn random(rng: &mut impl Rng) -> Self {
         let ssrc = rng.r#gen();
-        let cname = base64::engine::general_purpose::STANDARD.encode(rng.r#gen::<[u8; 12]>());
+        let cname = crate::rtcp::cname_from_bits(rng.r#gen());
         ReportWriter { ssrc, cname }
     }
 
@@ -438,30 +420,9 @@ impl ReportWriter {
             block.write(&mut out);
         }
 
-        write_sdes_cname(self.ssrc, &self.cname, &mut out);
+        crate::rtcp::write_sdes_cname(self.ssrc, &self.cname, &mut out);
         out
     }
-}
-
-/// Appends a source description with one chunk to `out`: `ssrc`, the `CNAME`
-/// item, a null octet to end the item list, and null octets to pad to a 32-bit
-/// boundary (RFC 3550 section 6.5).
-///
-/// Used by both receiver and sender reports. `cname` must be at most 255 bytes.
-pub(crate) fn write_sdes_cname(ssrc: u32, cname: &str, out: &mut impl bytes::BufMut) {
-    debug_assert!(cname.len() <= 255);
-    let items_len = 2 + cname.len();
-    let padding = 4 - items_len % 4; // 1..=4 null octets.
-
-    // The packet's length in 32-bit words, minus one for the header: SSRC,
-    // items, padding.
-    let length_words = ((4 + items_len + padding) / 4) as u16;
-    out.put_slice(&[(2 << 6) | 1, PT_SDES]);
-    out.put_u16(length_words);
-    out.put_u32(ssrc);
-    out.put_slice(&[SDES_CNAME, cname.len() as u8]);
-    out.put_slice(cname.as_bytes());
-    out.put_slice(&[0; 4][..padding]);
 }
 
 /// Decides when reports are due, as described in [RFC 3550 section
@@ -487,7 +448,7 @@ impl ReportSchedule {
     /// Schedules the first report after joining the session at `start`.
     pub(crate) fn new(start: Instant, rng: &mut impl Rng) -> Self {
         ReportSchedule {
-            next: start + interval(MIN_INTERVAL / 2, rng),
+            next: start + report_interval(MIN_REPORT_INTERVAL / 2, rng),
         }
     }
 
@@ -498,25 +459,14 @@ impl ReportSchedule {
 
     /// Notes that reports were sent at `now`, scheduling the next.
     pub(crate) fn sent(&mut self, now: Instant, rng: &mut impl Rng) {
-        self.next = now + regular_interval(rng);
+        self.next = now + report_interval(MIN_REPORT_INTERVAL, rng);
     }
-}
-
-/// Returns the randomized interval from one report to the next.
-///
-/// Shared by receiver and sender reports, which RFC 3550 section 6.3.1
-/// schedules alike given the 5-second minimum.
-pub(crate) fn regular_interval(rng: &mut impl Rng) -> Duration {
-    interval(MIN_INTERVAL, rng)
-}
-
-/// Randomizes the deterministic interval `td` as in RFC 3550 section 6.3.1.
-fn interval(td: Duration, rng: &mut impl Rng) -> Duration {
-    td.mul_f64(rng.gen_range(0.5..1.5) / COMPENSATION)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use rand::SeedableRng as _;
     use rand::rngs::StdRng;
 
@@ -750,11 +700,11 @@ pub(crate) mod tests {
         assert_eq!(rr_len, 8 + 24 * usize::from(rc));
         let (sdes, rest) = PacketRef::parse(&pkt[rr_len..]).unwrap();
         assert!(rest.is_empty());
-        assert_eq!(sdes.payload_type(), PT_SDES);
+        assert_eq!(sdes.payload_type(), crate::rtcp::PT_SDES);
         assert_eq!(sdes.count(), 1);
         let sdes = sdes.raw();
         assert_eq!(&sdes[4..8], &ssrc.to_be_bytes());
-        assert_eq!(sdes[8], SDES_CNAME);
+        assert_eq!(sdes[8], crate::rtcp::SDES_CNAME);
         let len = usize::from(sdes[9]);
         assert_eq!(&sdes[10..10 + len], cname.as_bytes());
         // At least one null octet ends the item list; the rest is padding.
@@ -839,7 +789,7 @@ pub(crate) mod tests {
     fn interval_bounds() {
         let mut rng = StdRng::seed_from_u64(0);
         let start = Instant::now();
-        let compensated = |d: f64| Duration::from_secs_f64(d / COMPENSATION);
+        let compensated = |d: f64| Duration::from_secs_f64(d / crate::rtcp::REPORT_COMPENSATION);
         let (mut min, mut max) = (Duration::MAX, Duration::ZERO);
         for _ in 0..10_000 {
             let first = ReportSchedule::new(start, &mut rng).next_due() - start;

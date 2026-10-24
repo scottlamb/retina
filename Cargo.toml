@@ -20,6 +20,12 @@ default = ["h264", "h265"]
 h264 = ["dep:h264-reader"]
 h265 = ["dep:h264-reader"]
 
+# Exposes the send side: packetizers (`codec::VideoPacketizer` and friends)
+# and `rtp::Sender`. These are for a server responding to `PLAY`, or (in the
+# future) a client using `RECORD` or an ONVIF audio backchannel. They're
+# experimental: they may change in any release, without regard to semver.
+unstable-send = []
+
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
 # To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
@@ -59,9 +65,17 @@ debug = true
 [[bench]]
 name = "client"
 harness = false
-required-features = ["h264"]
+required-features = ["h264", "unstable-send"]
 
 [[bench]]
 name = "depacketize"
 harness = false
 required-features = ["h264"]
+
+[[test]]
+name = "repacketize"
+required-features = ["h264", "unstable-send"]
+
+[[test]]
+name = "repacketize_h265"
+required-features = ["h265", "unstable-send"]
