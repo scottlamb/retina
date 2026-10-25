@@ -19,6 +19,11 @@
 //!
 //! The send side requires the `unstable-send` feature and is exempt from
 //! semver: it may change in any release.
+//!
+//! Beneath the H.264 and H.265 depacketizers is a transport-independent codec
+//! layer, [`h26x::NalAnalyzer`], for transports Retina doesn't handle itself
+//! (such as FLV). It requires the `unstable-codec-analyzer` feature and is
+//! likewise exempt from semver.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -869,12 +874,12 @@ impl Decodability {
 }
 
 /// Wraps a [`VideoHandler`] to track [`VideoFrameEnd::is_decodable`].
-pub(crate) struct DecodabilityTracker<'a, H> {
+pub(crate) struct DecodabilityTracker<'a, H: ?Sized> {
     pub(crate) state: &'a mut DecodabilityState,
     pub(crate) inner: &'a mut H,
 }
 
-impl<Ctx, H: VideoHandler<Ctx>> VideoHandler<Ctx> for DecodabilityTracker<'_, H> {
+impl<Ctx, H: VideoHandler<Ctx> + ?Sized> VideoHandler<Ctx> for DecodabilityTracker<'_, H> {
     fn frame_start(&mut self, frame_start: &mut VideoFrameStart<'_, Ctx>) -> Accumulate {
         self.state.before_frame = Some(self.state.current);
         frame_start.is_decodable = self.state.current.update(

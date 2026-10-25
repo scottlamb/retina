@@ -51,6 +51,8 @@ Progress:
     *   [x] application: ONVIF metadata
 *   codec packetization (experimental, behind the `unstable-send` feature)
     *   [x] video: H.264, H.265
+*   transport-independent H.264/H.265 analysis, for transports such as FLV
+    (experimental, behind the `unstable-codec-analyzer` feature)
 *   [ ] clean, stable API. (See [#47](https://github.com/scottlamb/retina/issues/47).)
 *   quality errors
 *   *   [x] detailed error description text.

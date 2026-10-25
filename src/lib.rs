@@ -15,6 +15,7 @@
 #![cfg_attr(
     not(all(
         feature = "tokio",
+        feature = "unstable-codec-analyzer",
         feature = "unstable-sans-io",
         feature = "unstable-server"
     )),

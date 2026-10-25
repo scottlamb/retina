@@ -14,7 +14,11 @@ use crate::inputs::Input as _;
 pub(crate) mod packetizer;
 
 mod analyzer;
+#[cfg(not(feature = "unstable-codec-analyzer"))]
 pub(crate) use analyzer::NalAnalyzer;
+#[cfg(feature = "unstable-codec-analyzer")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-codec-analyzer")))]
+pub use analyzer::NalAnalyzer;
 
 /// H.264 or H.265, for code shared between them.
 #[derive(Copy, Clone, Debug)]
@@ -1037,7 +1041,7 @@ mod tests {
         };
         let pos = append(&mut buf, b"\x88ab\x00\x00");
         scanner.scan(&buf, pos, 5, false, pos, &mut a).unwrap();
-        a.stream_with(&buf, &mut h);
+        a.stream(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab");
         assert!(!a.has_mark(), "the analyzer released what it delivered");
         assert!(!scanner.is_evicted());
@@ -1046,7 +1050,7 @@ mod tests {
         append(&mut buf, &[0xff; 64]);
         let pos = append(&mut buf, b"\x03cd");
         scanner.scan(&buf, pos, 3, true, pos, &mut a).unwrap();
-        a.stream_with(&buf, &mut h);
+        a.stream(&buf, &mut h);
         assert_eq!(h.0, b"\x65\x88ab\x00\x00\x03cd");
 
         // The scanner's mark can be revoked like any other.
@@ -1054,7 +1058,7 @@ mod tests {
             cur: [0x41],
             bytes_read: 1,
         };
-        a.finish_au_with(&buf, &(), &mut h);
+        a.finish_au(&buf, &(), &mut h);
         a.start_au(ts, ());
         let pos = append(&mut buf, b"\x9a\x00");
         scanner.scan(&buf, pos, 2, false, pos, &mut a).unwrap();
@@ -1101,14 +1105,14 @@ mod tests {
             let held = buf.add_mark_at(pos2);
             let pos1 = append(&mut buf, b"\x88ab\x00");
             scan(&mut a, &buf, pos1, 4, false, pos2);
-            a.stream_with(&buf, &mut h);
+            a.stream(&buf, &mut h);
             assert_eq!(a.has_mark(), accumulate == Accumulate::Yes);
             scan(&mut a, &buf, pos2, 1, false, pos2);
             drop(held);
             append(&mut buf, &[0xff; 64]); // reclaims space.
             let pos3 = append(&mut buf, b"\x03cd");
             scan(&mut a, &buf, pos3, 3, true, pos3);
-            a.stream_with(&buf, &mut h);
+            a.stream(&buf, &mut h);
             assert_eq!(h.0, b"\x65\x88ab\x00\x00\x03cd", "{accumulate:?}");
         }
     }

@@ -4,6 +4,16 @@
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
     `Display` is accurate through 2106, not just 2038.
+*   `unstable-codec-analyzer`: add `codec::h264::Analyzer` and
+    `codec::h265::Analyzer`, the transport-independent layers beneath the
+    H.264 and H.265 RTP depacketizers, for transports Retina doesn't handle
+    (such as FLV). Their interface is the dyn-compatible
+    `codec::h26x::NalAnalyzer` trait, so transports which learn the codec at
+    runtime can hold either. They report access units to a `VideoHandler`
+    with the same metadata as the depacketizers, including `is_decodable` and
+    leading picture detection. NAL units may be supplied whole (`push_nal`)
+    or in fragments as they arrive (`start_nal`, `extend_nal`, `finish_nal`),
+    so large slices can be passed on with low latency.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   H.265: treat all intra random access point (IRAP) pictures as random

@@ -29,6 +29,12 @@ tokio = ["dep:futures", "dep:socket2", "dep:tokio"]
 # it may change in any release, without regard to semver.
 unstable-sans-io = []
 
+# Exposes the H.264 and H.265 analyzers (`codec::h26x::NalAnalyzer`,
+# `codec::h264::Analyzer`, and `codec::h265::Analyzer`), the codec layer beneath
+# the RTP depacketizers, for transports such as FLV. They're experimental: they
+# may change in any release, without regard to semver.
+unstable-codec-analyzer = []
+
 # Exposes the send side: packetizers (`codec::VideoPacketizer` and friends),
 # `rtp::Sender`, and the client's ONVIF backchannel
 # (`client::SessionOptions::backchannel`). These are for a server responding

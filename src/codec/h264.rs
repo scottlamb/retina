@@ -21,7 +21,11 @@ use crate::rtp::ReceivedPacketRef;
 use super::VideoParameters;
 
 mod analyzer;
+#[cfg(not(feature = "unstable-codec-analyzer"))]
 pub(crate) use analyzer::Analyzer;
+#[cfg(feature = "unstable-codec-analyzer")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-codec-analyzer")))]
+pub use analyzer::Analyzer;
 
 /// Returns parameters for the given SPS and PPS, in that order.
 pub(super) fn parameters_from_sets(sets: &[&[u8]]) -> Result<VideoParameters, super::Error> {

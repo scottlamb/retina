@@ -10,7 +10,11 @@ pub mod nal;
 mod analyzer;
 mod record;
 
+#[cfg(not(feature = "unstable-codec-analyzer"))]
 pub(crate) use analyzer::Analyzer;
+#[cfg(feature = "unstable-codec-analyzer")]
+#[cfg_attr(docsrs, doc(cfg(feature = "unstable-codec-analyzer")))]
+pub use analyzer::Analyzer;
 
 use std::convert::TryFrom;
 
