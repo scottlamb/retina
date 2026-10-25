@@ -19,7 +19,7 @@ use crate::codec::{
 /// Analyzes H.265 access units (frames), regardless of how they're transported.
 ///
 /// This is the codec layer beneath the H.265 RTP depacketizer. Its interface
-/// is [`NalAnalyzer`]; see there for an overview.
+/// is [`NalAnalyzer`]; see there for an overview and example.
 ///
 /// It detects leading (RASL) pictures from their NAL unit types and currently
 /// never reports a frame as disposable.
@@ -28,7 +28,8 @@ pub struct Analyzer<Ctx> {
     parameters: Option<InternalParameters>,
 
     /// Parameter sets which differ from `parameters`, to take effect at the
-    /// next access unit's first slice. These followed the first slice of an
+    /// next access unit's first slice. These were supplied via
+    /// [`NalAnalyzer::push_parameter_set`], followed the first slice of an
     /// earlier access unit, or were in an access unit without slices.
     /// They're consumed when an access unit with a slice finishes, and
     /// survive losses before then.
@@ -36,7 +37,7 @@ pub struct Analyzer<Ctx> {
 
     /// Mark pinning buffer data for the current access unit's pieces.
     /// Set when the first piece is added; cleared when the access unit ends
-    /// or [`Analyzer::stream_with`] releases its data.
+    /// or [`Analyzer::stream`] releases its data.
     mark: Option<Mark>,
 
     /// Byte ranges of the current access unit's NAL bodies (excluding header
@@ -259,17 +260,60 @@ fn is_vcl(hdr: nal::Header) -> bool {
     )
 }
 
+impl<Ctx: Clone> Default for Analyzer<Ctx> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg_attr(not(feature = "unstable-codec-analyzer"), allow(dead_code))]
 impl<Ctx: Clone> Analyzer<Ctx> {
     /// Creates an analyzer which has no parameters until they arrive in-band.
-    #[cfg(test)]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_internal_parameters(None)
+    }
+
+    /// Creates an analyzer with initial parameters received out-of-band.
+    ///
+    /// Returns an [`crate::codec::ErrorKind::Invalid`] error if `parameters`
+    /// aren't for H.265.
+    pub fn with_parameters(parameters: &VideoParameters) -> Result<Self, Error> {
+        let super::super::VideoParametersCodec::H265 { vps, sps, pps } = &parameters.codec else {
+            return Err(Error::invalid("parameters aren't for an H.265 stream"));
+        };
+        let p = InternalParameters::parse_vps_sps_pps(vps, sps, pps, false)?;
+        Ok(Self::with_internal_parameters(Some(p)))
     }
 }
 
 impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
     fn parameters(&self) -> Option<&VideoParameters> {
         self.parameters.as_ref().map(|p| &p.generic_parameters)
+    }
+
+    fn push_parameter_set(&mut self, nal: &[u8]) -> Result<(), Error> {
+        assert!(
+            self.au.is_none(),
+            "push_parameter_set while an access unit is in progress"
+        );
+        let Some(&[h0, h1]) = nal.first_chunk::<2>() else {
+            return Err(Error::invalid("NAL unit shorter than its header"));
+        };
+        let hdr = nal::Header::try_from([h0, h1]).map_err(|e| Error::invalid(e.0))?;
+        let kind = ParameterSetKind::of(hdr).ok_or_else(|| {
+            Error::invalid(format!(
+                "{:?} NAL unit isn't a parameter set",
+                hdr.unit_type()
+            ))
+        })?;
+        NewParams::note(
+            &mut self.pending,
+            kind,
+            self.parameters.as_ref().map(|p| kind.in_band(p)),
+            |b| b == nal,
+            || Bytes::copy_from_slice(nal),
+        );
+        Ok(())
     }
 
     fn start_au(&mut self, timestamp: crate::Timestamp, ctx: Ctx) {
@@ -350,16 +394,28 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         });
         Ok(())
     }
+
+    fn stream(&mut self, buf: &MarkBuf, handler: &mut dyn VideoHandler<Ctx>) {
+        self.stream_with(buf, handler)
+    }
+
+    fn finish_au(&mut self, buf: &MarkBuf, end_ctx: &Ctx, handler: &mut dyn VideoHandler<Ctx>) {
+        self.finish_au_with(buf, end_ctx, handler)
+    }
+
+    fn discontinuity(&mut self, ctx: &Ctx, handler: &mut dyn VideoHandler<Ctx>) {
+        self.loss(ctx, LossReason::Discontinuity, handler);
+    }
 }
 
 /// The crate-internal interface, for the RTP depacketizer.
 impl<Ctx: Clone> Analyzer<Ctx> {
-    /// Starts the frame if possible and delivers its data so far.
-    ///
-    /// This is optional; [`Analyzer::finish_au_with`] does the same. Calling
-    /// it after each NAL unit or fragment delivers events with lower latency,
-    /// and with [`Accumulate::No`] releases the buffer data supplied so far.
-    pub(crate) fn stream_with<H: VideoHandler<Ctx>>(&mut self, buf: &MarkBuf, handler: &mut H) {
+    /// As [`NalAnalyzer::stream`], statically dispatched, for the RTP layer.
+    pub(crate) fn stream_with<H: VideoHandler<Ctx> + ?Sized>(
+        &mut self,
+        buf: &MarkBuf,
+        handler: &mut H,
+    ) {
         let Some(au) = self.au.as_ref() else {
             return;
         };
@@ -378,19 +434,8 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         self.decodability = decodability;
     }
 
-    /// Finishes the current access unit, delivering any remaining events to
-    /// `handler`.
-    ///
-    /// `end_ctx` will be supplied as [`VideoFrameEnd::end_ctx`]. If the access
-    /// unit is invalid (for example, it has an invalid parameter set, or a NAL
-    /// unit is still in progress), reports [`LossReason::Corrupt`] to
-    /// [`VideoHandler::loss`] instead of finishing the frame. An access unit
-    /// without slices produces no events.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no access unit is in progress.
-    pub(crate) fn finish_au_with<H: VideoHandler<Ctx>>(
+    /// As [`NalAnalyzer::finish_au`], statically dispatched, for the RTP layer.
+    pub(crate) fn finish_au_with<H: VideoHandler<Ctx> + ?Sized>(
         &mut self,
         buf: &MarkBuf,
         end_ctx: &Ctx,
@@ -447,12 +492,12 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         }
     }
 
-    /// Reports lost or unusable input, such as a
-    /// [`LossReason::Discontinuity`].
+    /// Reports lost or unusable input, as [`Analyzer::discontinuity`] does
+    /// for [`LossReason::Discontinuity`].
     ///
     /// Discards any in-progress access unit and notes that the next one may
     /// be missing its beginning.
-    pub(crate) fn loss<H: VideoHandler<Ctx>>(
+    pub(crate) fn loss<H: VideoHandler<Ctx> + ?Sized>(
         &mut self,
         ctx: &Ctx,
         reason: LossReason,
@@ -476,7 +521,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// layer supplies (at or after `pos`) may arrive out of buffer order.
     ///
     /// `pos` must be at or before all data supplied until the access unit
-    /// ends or [`Analyzer::stream_with`] releases its data, as a packet's
+    /// ends or [`NalAnalyzer::stream`] releases its data, as a packet's
     /// [`crate::rtp::ReceivedPacketRef::with_pin_pos`] is for the packets
     /// pushed after it.
     pub(crate) fn pin_at(&mut self, buf: &MarkBuf, pos: u64) {
@@ -942,7 +987,10 @@ mod tests {
     use super::Analyzer;
     use crate::buf::MarkBuf;
     use crate::codec::h26x::NalAnalyzer as _;
-    use crate::codec::{Accumulate, Loss, VideoFrameEnd, VideoFrameStart, VideoHandler};
+    use crate::codec::{
+        Accumulate, FrameFormat, Loss, ParameterSetInsertion, VideoFrameEnd, VideoFrameStart,
+        VideoHandler, VideoParameters, VideoParametersCodec,
+    };
 
     /// An event delivered to [`Events`].
     #[derive(Debug, PartialEq, Eq)]
@@ -1021,8 +1069,183 @@ mod tests {
         assert!(bytes == nal, "chunks don't reassemble the NAL unit");
     }
 
+    /// Records `(ctx, is_random_access_point, is_rasl_decodable, data)` per
+    /// frame, and the number of losses.
+    #[derive(Default)]
+    struct Recorder {
+        frames: Vec<(u32, bool, bool, Vec<u8>)>,
+        losses: usize,
+    }
+
+    impl VideoHandler<u32> for Recorder {
+        fn frame_start(&mut self, _: &mut VideoFrameStart<'_, u32>) -> Accumulate {
+            Accumulate::Yes
+        }
+
+        fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, u32>) {
+            let data = fe
+                .complete_frame(FrameFormat {
+                    parameter_set_insertion: ParameterSetInsertion::Never,
+                    ..Default::default()
+                })
+                .unwrap();
+            self.frames.push((
+                *fe.start_ctx(),
+                fe.is_random_access_point(),
+                fe.is_decodable(),
+                data,
+            ));
+        }
+
+        fn loss(&mut self, _: &Loss<'_, u32>) {
+            self.losses += 1;
+        }
+    }
+
+    /// Exercises the public interface as a non-RTP transport would, including
+    /// a CRA picture's leading pictures after a discontinuity.
+    #[test]
+    fn public_interface() {
+        use base64::Engine as _;
+        let b64 = |s| base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+        let vps = b64("QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==");
+        let sps = b64("QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=");
+        let pps = b64("RAHA8vAzJA==");
+        const IDR: &[u8] = b"\x26\x01\x80idr"; // IDR_W_RADL.
+        const TRAIL: &[u8] = b"\x02\x01\x80t"; // TRAIL_R.
+        const CRA: &[u8] = b"\x2a\x01\x80cra"; // CRA_NUT.
+        const RASL: &[u8] = b"\x10\x01\x80rasl"; // RASL_R.
+        let mut buf = MarkBuf::new(64);
+        let mut a = Analyzer::new();
+        let mut r = Recorder::default();
+        let timestamp =
+            |t| crate::Timestamp::new(t, std::num::NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+        let au = |a: &mut Analyzer<u32>,
+                  buf: &mut MarkBuf,
+                  r: &mut Recorder,
+                  ctx: u32,
+                  nals: &[&[u8]]| {
+            a.start_au(timestamp(i64::from(ctx) * 3000), ctx);
+            for nal in nals {
+                let pos = buf.end();
+                buf.extend(nal);
+                buf.advance_unparsed(buf.end());
+                a.push_nal(buf, pos, nal.len()).unwrap();
+            }
+            a.finish_au(buf, &ctx, r);
+            assert!(a.is_idle());
+        };
+        au(&mut a, &mut buf, &mut r, 0, &[&vps, &sps, &pps, IDR]);
+        assert!(a.parameters().unwrap().rfc6381_codec().starts_with("hvc1."));
+        au(&mut a, &mut buf, &mut r, 1, &[CRA]);
+        au(&mut a, &mut buf, &mut r, 2, &[RASL]);
+        a.discontinuity(&3, &mut r);
+        au(&mut a, &mut buf, &mut r, 4, &[TRAIL]);
+        au(&mut a, &mut buf, &mut r, 5, &[CRA]);
+        au(&mut a, &mut buf, &mut r, 6, &[RASL]);
+        au(&mut a, &mut buf, &mut r, 7, &[TRAIL]);
+        let len = |nal: &[u8]| [&(nal.len() as u32).to_be_bytes()[..], nal].concat();
+        assert_eq!(r.losses, 1);
+        assert_eq!(
+            r.frames,
+            [
+                (0, true, true, len(IDR)),
+                (1, true, true, len(CRA)),
+                (2, false, true, len(RASL)), // references intact since the IDR.
+                (4, false, false, len(TRAIL)),
+                (5, true, true, len(CRA)),
+                (6, false, false, len(RASL)), // may reference lost pictures.
+                (7, false, true, len(TRAIL)),
+            ]
+        );
+    }
+
+    /// A parameter set takes effect at the first slice that follows it,
+    /// whether out-of-band, after an earlier access unit's first slice, or in
+    /// an access unit without slices.
+    #[test]
+    fn parameter_sets_take_effect_at_next_slice() {
+        use base64::Engine as _;
+        let b64 = |s| base64::engine::general_purpose::STANDARD.decode(s).unwrap();
+        let vps = b64("QAEMAf//AWAAAAMAkAAAAwAAAwA/LAwAAgAAAwAoAAIAAgACgA==");
+        let sps_a = b64("QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXFlLkkyS7I=");
+        let pps = b64("RAHA8vAzJA==");
+        let mut sps_c = sps_a.clone();
+        assert_eq!(sps_c[17], 0x3f); // general_level_idc
+        sps_c[17] = 0x5a;
+        const IDR: &[u8] = b"\x26\x01\x80idr"; // IDR_W_RADL.
+        const TRAIL: &[u8] = b"\x02\x01\x80t"; // TRAIL_R.
+
+        /// Records `(has_new_parameters, SPS)` at the start and end of each
+        /// frame, streaming.
+        #[derive(Default)]
+        struct ParamRecorder {
+            start: Option<(bool, Vec<u8>)>,
+            frames: Vec<[(bool, Vec<u8>); 2]>,
+        }
+        fn sps_of(p: Option<&VideoParameters>) -> Vec<u8> {
+            match &p.expect("parameters").codec {
+                VideoParametersCodec::H265 { sps, .. } => sps.to_vec(),
+                _ => unreachable!(),
+            }
+        }
+        impl VideoHandler<u32> for ParamRecorder {
+            fn frame_start(&mut self, fs: &mut VideoFrameStart<'_, u32>) -> Accumulate {
+                self.start = Some((fs.has_new_parameters(), sps_of(fs.parameters())));
+                Accumulate::No
+            }
+            fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, u32>) {
+                let start = self.start.take().expect("frame started");
+                self.frames
+                    .push([start, (fe.has_new_parameters(), sps_of(fe.parameters()))]);
+            }
+            fn loss(&mut self, _: &Loss<'_, u32>) {}
+        }
+
+        let mut buf = MarkBuf::new(256);
+        let mut a = Analyzer::new();
+        let mut r = ParamRecorder::default();
+        let au =
+            |a: &mut Analyzer<u32>, buf: &mut MarkBuf, r: &mut ParamRecorder, nals: &[&[u8]]| {
+                a.start_au(ts(), 0);
+                for nal in nals {
+                    let pos = append_data(buf, nal);
+                    a.push_nal(buf, pos, nal.len()).unwrap();
+                    a.stream(buf, r);
+                }
+                a.finish_au(buf, &0, r);
+            };
+        let new = |sps: &[u8]| [(true, sps.to_vec()), (true, sps.to_vec())];
+        let same = |sps: &[u8]| [(false, sps.to_vec()), (false, sps.to_vec())];
+
+        // Out-of-band parameter sets apply to the next access unit.
+        for p in [&vps, &sps_a, &pps] {
+            a.push_parameter_set(p).unwrap();
+        }
+        a.push_parameter_set(b"\x40").unwrap_err();
+        a.push_parameter_set(IDR).unwrap_err();
+        assert!(a.parameters().is_none());
+        au(&mut a, &mut buf, &mut r, &[IDR]);
+        assert_eq!(r.frames.pop().unwrap(), new(&sps_a));
+
+        // A change between two slice segments is deferred to the next
+        // access unit, surviving a discontinuity.
+        au(&mut a, &mut buf, &mut r, &[TRAIL, &sps_c, TRAIL]);
+        assert_eq!(r.frames.pop().unwrap(), same(&sps_a));
+        a.discontinuity(&0, &mut r);
+        au(&mut a, &mut buf, &mut r, &[&sps_c, IDR]);
+        assert_eq!(r.frames.pop().unwrap(), new(&sps_c));
+
+        // An access unit without slices produces no events, but its
+        // parameter sets apply to the next one.
+        au(&mut a, &mut buf, &mut r, &[&vps, &sps_a]);
+        assert!(r.frames.is_empty());
+        au(&mut a, &mut buf, &mut r, &[IDR]);
+        assert_eq!(r.frames.pop().unwrap(), new(&sps_a));
+    }
+
     /// Shows how data is delivered: nothing on `start_nal`/`extend_nal`/
-    /// `push_nal` alone; each [`Analyzer::stream_with`] call delivers what's new,
+    /// `push_nal` alone; each [`Analyzer::stream`] call delivers what's new,
     /// including part of a NAL unit still in progress.
     #[test]
     fn streams_nal_fragments() {
@@ -1042,7 +1265,7 @@ mod tests {
             let pos = append_data(&mut buf, &p);
             a.push_nal(&buf, pos, p.len()).unwrap();
         }
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(e.0, [], "parameter sets alone don't start a frame");
 
         // An IDR slice, arriving in three fragments.
@@ -1052,7 +1275,7 @@ mod tests {
         let (hdr, f1_body) = f1.split_at(2);
         a.start_nal(hdr, &buf, buf.end(), 0).unwrap();
         assert_eq!(e.0, [], "start_nal alone delivers nothing");
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(
             e.0,
             [],
@@ -1060,7 +1283,7 @@ mod tests {
         );
         let pos = append_data(&mut buf, f1_body);
         a.extend_nal(&buf, pos, f1_body.len()).unwrap();
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         let data = |first, last, bytes: &[u8]| Event::Data {
             first,
             last,
@@ -1075,7 +1298,7 @@ mod tests {
 
         let pos = append_data(&mut buf, f2);
         a.extend_nal(&buf, pos, f2.len()).unwrap();
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(e.0, [data(false, false, f2)]);
         e.0.clear();
 
@@ -1083,10 +1306,10 @@ mod tests {
         a.extend_nal(&buf, pos, f3.len()).unwrap();
         a.finish_nal().unwrap();
         assert_eq!(e.0, []);
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(e.0, [data(false, true, f3)]);
         e.0.clear();
-        a.finish_au_with(&buf, &0, &mut e);
+        a.finish_au(&buf, &0, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1097,11 +1320,11 @@ mod tests {
         let pos = append_data(&mut buf, &big);
         a.push_nal(&buf, pos, big.len()).unwrap();
         assert_eq!(e.0, [], "push_nal alone delivers nothing");
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(e.0[0], Event::Start);
         assert_eq!(e.0[1..], [data(true, true, &big)]);
         e.0.clear();
-        a.finish_au_with(&buf, &1, &mut e);
+        a.finish_au(&buf, &1, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1117,11 +1340,11 @@ mod tests {
             a.extend_nal(&buf, pos, frag.len()).unwrap();
         }
         a.finish_nal().unwrap();
-        a.stream_with(&buf, &mut e);
+        a.stream(&buf, &mut e);
         assert_eq!(e.0[0], Event::Start);
         assert_chunks(&e.0[1..], &big);
         e.0.clear();
-        a.finish_au_with(&buf, &2, &mut e);
+        a.finish_au(&buf, &2, &mut e);
         assert_eq!(e.0, [Event::End]);
         e.0.clear();
 
@@ -1129,7 +1352,7 @@ mod tests {
         a.start_au(ts(), 3);
         let pos = append_data(&mut buf, &big[2..10]);
         a.start_nal(&big[..2], &buf, pos, 10 - 2).unwrap();
-        a.finish_au_with(&buf, &3, &mut e);
+        a.finish_au(&buf, &3, &mut e);
         assert_eq!(e.0, [Event::Loss]);
         assert!(a.is_idle());
     }
