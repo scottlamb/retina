@@ -777,7 +777,7 @@ impl SetupCore {
             let timeline = Timeline::new(
                 initial_rtptime,
                 s.payload_formats[0].format.clock_rate(),
-                policy.enforce_timestamps_with_max_jump_secs,
+                None,
             )
             .map_err(|description| r.error(&conn_ctx, description))?;
             core_streams[i] = Some(PlayingStream {

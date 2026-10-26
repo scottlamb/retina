@@ -18,20 +18,19 @@
 )]
 
 use std::convert::TryFrom;
+use std::fmt::Debug;
 #[cfg(feature = "tokio")]
 use std::io;
 #[cfg(feature = "tokio")]
 use std::mem::MaybeUninit;
 #[cfg(feature = "tokio")]
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
 #[cfg(feature = "tokio")]
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
-use std::fmt::Debug;
 
 #[cfg(feature = "unstable-sans-io")]
 pub use self::channel_mapping::ChannelType;
@@ -953,7 +952,6 @@ impl SetupOptions {
 pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
     initial_seq: InitialSequenceNumberPolicy,
-    enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
     unknown_rtcp_ssrc: UnknownRtcpSsrcPolicy,
 }
 
@@ -992,19 +990,6 @@ impl PlayOptions {
                 true => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
                 false => InitialSequenceNumberPolicy::Respect,
             },
-            ..self
-        }
-    }
-
-    /// Enforces that timestamps are non-decreasing and jump forward by no more
-    /// than the given number of seconds.
-    ///
-    /// By default, no enforcement is done, and computed [crate::Timestamp]
-    /// values will go backward if subsequent 32-bit RTP timestamps differ by
-    /// more than `i32::MAX`.
-    pub fn enforce_timestamps_with_max_jump_secs(self, secs: NonZeroU32) -> Self {
-        Self {
-            enforce_timestamps_with_max_jump_secs: Some(secs),
             ..self
         }
     }
@@ -4036,7 +4021,7 @@ mod tests {
         /// Returns a timestamp at the 8 kHz clock rate of the backchannel in
         /// [`BACKCHANNEL_DESCRIBE`].
         fn ts(timestamp: i64) -> crate::Timestamp {
-            crate::Timestamp::new(timestamp, NonZeroU32::new(8_000).unwrap(), 0).unwrap()
+            crate::Timestamp::new(timestamp, std::num::NonZeroU32::new(8_000).unwrap(), 0).unwrap()
         }
 
         /// Like [`next_data`], but polls `session` meanwhile, so it writes what's

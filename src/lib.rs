@@ -101,8 +101,9 @@ struct ReceivedMessage {
 ///
 /// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
-/// many RTP servers violate this. The Retina client allows such violations unless
-/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`] says otherwise.
+/// many RTP servers violate this. The Retina client allows any jump, forward or backward; how
+/// strictly to require monotonic timestamps is up to the caller, which can check the
+/// `Timestamp`s it gets.
 ///
 /// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
 /// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return

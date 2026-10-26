@@ -5,7 +5,7 @@
 //!
 //! This writes depacketized RTSP MJPEG images to a specified output directory.
 
-use std::{num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
@@ -54,11 +54,7 @@ async fn write_jpeg(
     stop_signal: Pin<Box<dyn Future<Output = Result<(), std::io::Error>>>>,
 ) -> Result<(), Error> {
     let mut session = session
-        .play(
-            retina::client::PlayOptions::default()
-                .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
-        )
+        .play(retina::client::PlayOptions::default().initial_timestamp(opts.initial_timestamp))
         .await?;
     let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::default())?;
 
