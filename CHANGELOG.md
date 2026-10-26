@@ -10,6 +10,12 @@
     leading picture detection. NAL units may be supplied whole (`push_nal`)
     or in fragments as they arrive (`start_nal`, `extend_nal`, `finish_nal`),
     so large slices can be passed on with low latency.
+*   add `AudioParameters::from_aac_config`, for transports which carry a raw
+    AAC `AudioSpecificConfig` (such as FLV).
+*   `unstable-send`: add `codec::AudioPacketizer`, the audio counterpart of
+    `VideoPacketizer`, and `AudioParameters::payload_format`. It supports AAC
+    as RFC 3640 `AAC-hbr`, fragmenting access units that don't fit in one
+    payload.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   BREAKING: replace the crate-wide `retina::Error` with module-scoped error
