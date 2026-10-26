@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | used by | client `PLAY`; server `RECORD` | server `PLAY`; client `RECORD` |
 //! | converts | RTP packets → frames | frames → RTP payloads |
-//! | entry point | [`Depacketizer`] | [`VideoPacketizer`] |
+//! | entry point | [`Depacketizer`] | [`VideoPacketizer`], [`AudioPacketizer`] |
 //! | delivers to | [`VideoHandler`], [`AudioHandler`], [`MessageHandler`] | [`PayloadSink`] |
 //!
 //! Parameter types such as [`VideoParameters`], and [`PayloadFormat`], are
@@ -149,7 +149,8 @@ pub use events::{
 };
 #[cfg(feature = "unstable-send")]
 pub use packetize::{
-    Payload, PayloadSink, VideoFrameInfo, VideoPacketizer, VideoPacketizerOptions,
+    AudioPacketizer, AudioPacketizerOptions, Payload, PayloadSink, VideoFrameInfo, VideoPacketizer,
+    VideoPacketizerOptions,
 };
 
 /// Options controlling how frames are formatted.
@@ -733,6 +734,16 @@ impl AudioParameters {
     /// Returns a builder for an `.mp4` `AudioSampleEntry` box (as defined in ISO/IEC 14496-12).
     pub fn mp4_sample_entry(&self) -> AudioSampleEntryBuilder<'_> {
         AudioSampleEntryBuilder { params: self }
+    }
+
+    /// Returns the RTP payload format for sending a stream with these
+    /// parameters, as an [`AudioPacketizer`] would, or `None` if Retina can't
+    /// packetize this codec.
+    ///
+    /// Currently AAC is supported.
+    #[cfg(feature = "unstable-send")]
+    pub fn payload_format(&self) -> Option<PayloadFormat> {
+        packetize::audio_payload_format(self)
     }
 }
 

@@ -356,7 +356,7 @@ pub enum Position {
 impl Position {
     /// Returns the position of a chunk given whether it's the first and/or last chunk.
     #[inline]
-    #[cfg(any(feature = "h264", feature = "h265"))]
+    #[cfg(any(feature = "h264", feature = "h265", feature = "unstable-send"))]
     pub(crate) fn new(first: bool, last: bool) -> Self {
         match (first, last) {
             (true, true) => Position::Complete,

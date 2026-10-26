@@ -804,6 +804,92 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 }
 
+/// An AAC packetizer, as RFC 3640's `AAC-hbr` mode.
+///
+/// Each payload has a single 16-bit AU header (13-bit size and 3-bit index)
+/// and one access unit, or a fragment of one (RFC 3640 section 3.2.3). Every
+/// fragment repeats the AU header with the whole access unit's size; the RTP
+/// marker bit is set on payloads which complete an access unit (section
+/// 3.2.1).
+#[cfg(feature = "unstable-send")]
+#[derive(Debug)]
+pub(super) struct Packetizer {
+    parameters: AudioParameters,
+}
+
+#[cfg(feature = "unstable-send")]
+impl Packetizer {
+    /// The length of the AU-headers-length field and the one AU header.
+    const HEADER_LEN: u16 = 4;
+
+    /// The largest access unit an AU header's 13-bit size can describe.
+    const MAX_AU_SIZE: usize = (1 << 13) - 1;
+
+    pub(super) fn new(parameters: &AudioParameters) -> Self {
+        Self {
+            parameters: parameters.clone(),
+        }
+    }
+
+    pub(super) fn payload_format_for(parameters: &AudioParameters) -> super::PayloadFormat {
+        super::PayloadFormat::new("audio", "MPEG4-GENERIC", parameters.clock_rate)
+            .with_channels(parameters.channels)
+            .with_fmtp(format!(
+                "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                 indexdeltalength=3;config={}",
+                hex::encode(&parameters.extra_data)
+            ))
+    }
+
+    pub(super) fn payload_format(&self) -> super::PayloadFormat {
+        Self::payload_format_for(&self.parameters)
+    }
+
+    pub(super) fn parameters(&self) -> &AudioParameters {
+        &self.parameters
+    }
+
+    pub(super) fn push_frame(
+        &self,
+        timestamp: crate::Timestamp,
+        data: &[u8],
+        sink: &mut impl super::PayloadSink,
+    ) -> Result<(), Error> {
+        if timestamp.clock_rate().get() != self.parameters.clock_rate {
+            return Err(Error::invalid(format!(
+                "timestamp clock rate {} doesn't match AAC sampling frequency {}",
+                timestamp.clock_rate(),
+                self.parameters.clock_rate
+            )));
+        }
+        if data.is_empty() || data.len() > Self::MAX_AU_SIZE {
+            return Err(Error::invalid(format!(
+                "AAC access unit of {} bytes can't be packetized",
+                data.len()
+            )));
+        }
+        if sink.congested() {
+            return Ok(());
+        }
+        let au_header = (data.len() as u16) << 3; // AU-index is 0.
+        let header = [0x00, 0x10, (au_header >> 8) as u8, au_header as u8];
+        // The minimum makes progress.
+        let max_data =
+            usize::from(sink.max_payload_size().max(Self::HEADER_LEN + 1) - Self::HEADER_LEN);
+        let n = data.len().div_ceil(max_data);
+        for (i, chunk) in data.chunks(max_data).enumerate() {
+            sink.payload(&super::Payload {
+                timestamp,
+                position: super::Position::new(i == 0, i + 1 == n),
+                data: &[&header[..], chunk],
+                is_random_access_point: true,
+                is_disposable: true,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
     /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
@@ -846,6 +932,106 @@ mod tests {
         assert_eq!(rfc3640.parameters.clock_rate, 48_000);
         assert_eq!(rfc3640.channels.name, "5.1");
         assert_eq!(rfc3640.parameters.rfc6381_codec(), Some("mp4a.40.2"));
+    }
+
+    /// Packetizes frames, then depacketizes the payloads, as one payload or
+    /// fragments.
+    #[cfg(feature = "unstable-send")]
+    #[test]
+    fn packetize_round_trip() {
+        use crate::codec::{AudioPacketizer, AudioPacketizerOptions, Payload, PayloadSink};
+
+        #[derive(Default)]
+        struct Collect(Vec<(i64, bool, Vec<u8>)>);
+        impl PayloadSink for Collect {
+            fn payload(&mut self, payload: &Payload<'_>) {
+                self.0.push((
+                    payload.timestamp().timestamp(),
+                    payload.mark(),
+                    payload.data().concat(),
+                ));
+            }
+            fn max_payload_size(&self) -> u16 {
+                8
+            }
+        }
+
+        // 48 kHz mono, as in `depacketize_happy_path`.
+        let fmtp = "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                    indexdeltalength=3;config=1188";
+        let params = AudioSpecificConfig::parse(&[0x11, 0x88])
+            .unwrap()
+            .parameters;
+        let mut p = AudioPacketizer::new(&params, AudioPacketizerOptions::default()).unwrap();
+        let format = p.payload_format();
+        assert_eq!(format.encoding_name(), "MPEG4-GENERIC");
+        assert_eq!(format.clock_rate(), 48_000);
+        assert_eq!(format.channels().map(NonZeroU16::get), Some(1));
+        assert_eq!(format.fmtp(), Some(fmtp));
+        assert_eq!(params.payload_format().as_ref(), Some(&format));
+
+        let ts = |t| crate::Timestamp::new(t, NonZeroU32::new(48_000).unwrap(), 0).unwrap();
+        let mut sink = Collect::default();
+        p.push_frame(ts(0), b"asdf", &mut sink).unwrap(); // fits one payload.
+        p.push_frame(ts(1024), b"0123456789", &mut sink).unwrap(); // fragmented.
+        assert_eq!(
+            sink.0,
+            [
+                (0, true, b"\x00\x10\x00\x20asdf".to_vec()),
+                (1024, false, b"\x00\x10\x00\x500123".to_vec()),
+                (1024, false, b"\x00\x10\x00\x504567".to_vec()),
+                (1024, true, b"\x00\x10\x00\x5089".to_vec()),
+            ]
+        );
+
+        let mut d = Depacketizer::new(48_000, NonZeroU16::new(1), Some(fmtp)).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut frames = Vec::new();
+        for (i, (timestamp, mark, payload)) in sink.0.into_iter().enumerate() {
+            let pkt = TestPacket {
+                ctx: PacketContext::dummy(),
+                sequence_number: i as u16,
+                timestamp: ts(timestamp),
+                payload_type: 0,
+                ssrc: 0,
+                mark,
+                loss: 0,
+            }
+            .write(&mut buf, payload);
+            d.push_collect(&pkt);
+            while let Some(item) = d.pull() {
+                let Ok(Item::Audio(a)) = item else {
+                    panic!("unexpected {item:?}");
+                };
+                frames.push((a.timestamp.timestamp(), a.data));
+            }
+        }
+        assert_eq!(
+            frames,
+            [(0, b"asdf".to_vec()), (1024, b"0123456789".to_vec())]
+        );
+
+        // Bad frames are rejected without delivering anything.
+        let mut sink = Collect::default();
+        p.push_frame(ts(0), b"", &mut sink).unwrap_err();
+        p.push_frame(ts(0), &[0; 8192], &mut sink).unwrap_err();
+        let wrong_rate = crate::Timestamp::new(0, NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+        p.push_frame(wrong_rate, b"asdf", &mut sink).unwrap_err();
+        assert!(sink.0.is_empty());
+
+        // A congested sink drops whole frames.
+        struct Congested(usize);
+        impl PayloadSink for Congested {
+            fn payload(&mut self, _: &Payload<'_>) {
+                self.0 += 1;
+            }
+            fn congested(&self) -> bool {
+                true
+            }
+        }
+        let mut sink = Congested(0);
+        p.push_frame(ts(0), b"asdf", &mut sink).unwrap();
+        assert_eq!(sink.0, 0);
     }
 
     #[test]

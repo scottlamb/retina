@@ -13,7 +13,8 @@ use super::Error;
 #[cfg(any(feature = "h264", feature = "h265"))]
 use super::VideoParametersCodec;
 use super::{
-    FrameFormat, ParameterSetInsertion, PayloadFormat, Position, VideoFrameStart, VideoParameters,
+    AudioParameters, AudioParametersCodec, FrameFormat, ParameterSetInsertion, PayloadFormat,
+    Position, VideoFrameStart, VideoParameters,
 };
 
 /// Options for a [`VideoPacketizer`].
@@ -579,6 +580,110 @@ impl VideoPacketizer {
             #[cfg(feature = "h265")]
             VideoPacketizerInner::H265(ref mut p) => p.discontinuity(sink),
         }
+    }
+}
+
+/// Options for an [`AudioPacketizer`].
+///
+/// There are currently none; this exists so that future options (such as
+/// aggregating several frames into one payload) can be added without
+/// changing [`AudioPacketizer::new`]'s signature. The maximum payload size
+/// comes from [`PayloadSink::max_payload_size`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct AudioPacketizerOptions {}
+
+/// Turns audio frames into RTP payloads.
+///
+/// Unlike [`VideoPacketizer`], frames are supplied whole, via
+/// [`AudioPacketizer::push_frame`]: audio frames are small, and a codec's
+/// payload format may need a frame's size before its data.
+///
+/// Currently supports AAC, as RFC 3640's `AAC-hbr` mode, with one access unit
+/// per payload, or fragmented across payloads if it doesn't fit in one. As
+/// AAC's `AudioSpecificConfig` can only be sent out of band (in the SDP),
+/// parameters can't change mid-stream; create a new packetizer instead.
+///
+/// # Throttling
+///
+/// When [`PayloadSink::congested`] returns true at the start of a frame, the
+/// packetizer drops the whole frame. This leaves no gap in sequence numbers;
+/// receivers see a gap in timestamps. As every audio frame is independently
+/// decodable, the next frame is sent as usual.
+#[derive(Debug)]
+pub struct AudioPacketizer(AudioPacketizerInner);
+
+#[derive(Debug)]
+enum AudioPacketizerInner {
+    Aac(super::aac::Packetizer),
+}
+
+impl AudioPacketizer {
+    /// Creates a packetizer for a stream with the given parameters.
+    ///
+    /// Returns an [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported)
+    /// error if Retina can't packetize this codec.
+    pub fn new(
+        parameters: &AudioParameters,
+        _options: AudioPacketizerOptions,
+    ) -> Result<Self, Error> {
+        match parameters.codec {
+            AudioParametersCodec::Aac { .. } => Ok(Self(AudioPacketizerInner::Aac(
+                super::aac::Packetizer::new(parameters),
+            ))),
+            AudioParametersCodec::Other => Err(Error::unsupported(format!(
+                "packetizing {} is unsupported",
+                parameters.rfc6381_codec().unwrap_or("this audio codec")
+            ))),
+        }
+    }
+
+    /// Returns the payload format, suitable for describing the stream in SDP.
+    ///
+    /// This is equivalent to [`AudioParameters::payload_format`] on
+    /// [`AudioPacketizer::parameters`].
+    pub fn payload_format(&self) -> PayloadFormat {
+        match self.0 {
+            AudioPacketizerInner::Aac(ref p) => p.payload_format(),
+        }
+    }
+
+    /// Returns the parameters.
+    pub fn parameters(&self) -> &AudioParameters {
+        match self.0 {
+            AudioPacketizerInner::Aac(ref p) => p.parameters(),
+        }
+    }
+
+    /// Packetizes a frame.
+    ///
+    /// `timestamp` must be in units of the parameters' clock rate
+    /// ([`AudioParameters::clock_rate`]). For AAC, `data` is a raw access
+    /// unit, as when depacketized with [`super::aac::Framing::Raw`].
+    ///
+    /// Returns an [`ErrorKind::Invalid`](super::ErrorKind::Invalid) error if
+    /// the timestamp's clock rate is wrong, or the frame can't be
+    /// packetized (for AAC, if it's empty or exceeds 8,191 bytes). Nothing
+    /// has been delivered to `sink` in that case.
+    pub fn push_frame(
+        &mut self,
+        timestamp: crate::Timestamp,
+        data: &[u8],
+        sink: &mut impl PayloadSink,
+    ) -> Result<(), Error> {
+        match self.0 {
+            AudioPacketizerInner::Aac(ref p) => p.push_frame(timestamp, data, sink),
+        }
+    }
+}
+
+/// Returns the payload format for `parameters`, if they can be packetized.
+pub(super) fn audio_payload_format(parameters: &AudioParameters) -> Option<PayloadFormat> {
+    match parameters.codec {
+        AudioParametersCodec::Aac { .. } => {
+            Some(super::aac::Packetizer::payload_format_for(parameters))
+        }
+        AudioParametersCodec::Other => None,
     }
 }
 
