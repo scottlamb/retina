@@ -8,9 +8,9 @@ publish = false
 [dependencies]
 anyhow = "1.0.41"
 clap = { version = "4.1.4", features = ["derive"] }
-log = "0.4.8"
-mylog = { git = "https://github.com/scottlamb/mylog" }
 polling = "3.11.0"
 retina = { path = "../../", default-features = false, features = ["h264", "h265", "unstable-sans-io"] }
 socket2 = "0.5"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.2.1"

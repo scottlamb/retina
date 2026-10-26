@@ -131,19 +131,15 @@ pub(crate) use assert_eq_hexes;
 
 #[cfg(test)]
 pub(crate) fn init_logging() {
-    use std::str::FromStr as _;
     INIT_LOGGING.call_once(|| {
-        let h = mylog::Builder::new()
-            .is_test(true)
-            .format(
-                ::std::env::var("RUST_FORMAT")
-                    .map_err(|_| ())
-                    .and_then(|s| mylog::Format::from_str(&s))
-                    .unwrap_or(mylog::Format::Google),
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                    .from_env_lossy(),
             )
-            .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-            .build();
-        h.install().unwrap();
+            .init();
     })
 }
 

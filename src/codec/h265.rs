@@ -139,7 +139,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    log::warn!("Ignoring bad H.265 format-specific-params {:?}: {}", fp, e);
+                    tracing::warn!(
+                        fmtp = ?fp,
+                        error = %e,
+                        "Ignoring bad H.265 format-specific-params"
+                    );
                     None
                 }
             },
@@ -271,9 +275,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                                 self.analyzer.finish_au_with(buf, &meta.ctx, handler);
                                 self.start_au(meta)
                             } else {
-                                log::debug!(
-                                    "Bogus mid-access unit timestamp change after {:?}",
-                                    last_nal_hdr
+                                tracing::debug!(
+                                    nal_header = ?last_nal_hdr,
+                                    "Bogus mid-access unit timestamp change"
                                 );
                                 self.analyzer.set_au_timestamp(meta.timestamp);
                                 access_unit
@@ -400,8 +404,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             // set to one in the same FU header". Some cameras violate this by
                             // wrapping small NALs in a single-fragment FU.
                             // Tolerate by treating them as a complete NAL.
-                            log::warn!(
-                                "FU header {fu_header:02x} has both start and end bits set; \
+                            tracing::warn!(
+                                fu_header = format_args!("{fu_header:02x}"),
+                                "FU header has both start and end bits set; \
                                  treating as a complete NAL. \
                                  Will not log about this again for this stream."
                             );
@@ -417,10 +422,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     }
                     (false, Some(initial_hdr)) => {
                         if hdr != initial_hdr && !self.seen_inconsistent_fu_nal_hdr {
-                            log::warn!(
-                                "FU has inconsistent NAL header: {:?} then {:?}; will not log about this again for this stream",
-                                initial_hdr,
-                                hdr,
+                            tracing::warn!(
+                                initial_nal_header = ?initial_hdr,
+                                nal_header = ?hdr,
+                                "FU has inconsistent NAL header; \
+                                 will not log about this again for this stream",
                             );
                             self.seen_inconsistent_fu_nal_hdr = true;
                         }
@@ -457,9 +463,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 self.analyzer.finish_au_with(buf, &meta.ctx, handler);
                 DepacketizerInputState::New
             } else {
-                log::debug!(
-                    "Bogus mid-access unit timestamp change after {:?}",
-                    last_nal_hdr
+                tracing::debug!(
+                    nal_header = ?last_nal_hdr,
+                    "Bogus mid-access unit timestamp change"
                 );
                 self.analyzer.set_au_timestamp(timestamp);
                 DepacketizerInputState::PreMark(access_unit)
@@ -757,8 +763,10 @@ impl InternalParameters {
             super::Error::invalid(format!("{e}\nwhile parsing SPS: {sps_hex}")).with_source(e)
         })?;
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!(
-                "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."
+            tracing::warn!(
+                sps = %sps_hex,
+                "Ignoring trailing data in SPS; \
+                 will not log about trailing data again for this stream."
             );
             seen_extra_trailing_data = true;
         }
@@ -779,8 +787,10 @@ impl InternalParameters {
             super::Error::invalid(format!("{e}\nwhile parsing PPS: {pps_hex}")).with_source(e)
         })?;
         if pps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!(
-                "Ignoring trailing data in PPS {pps_hex}; will not log about trailing data again for this stream."
+            tracing::warn!(
+                pps = %pps_hex,
+                "Ignoring trailing data in PPS; \
+                 will not log about trailing data again for this stream."
             );
             seen_extra_trailing_data = true;
         }

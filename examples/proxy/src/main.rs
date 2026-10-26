@@ -14,14 +14,13 @@
 mod conn;
 mod fanout;
 
-use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::{Error, bail};
 use clap::Parser;
-use log::{error, info, warn};
 use retina::client::{PlayingItem, SetupOptions};
 use retina::codec::{Depacketizer, PayloadFormat, VideoPacketizerOptions};
+use tracing::{error, info, warn};
 use url::Url;
 
 use fanout::{Downstream, TrackFormat, UpstreamKind, UpstreamTrack, WallClock};
@@ -108,27 +107,21 @@ impl Proxy {
     }
 }
 
-fn init_logging() -> mylog::Handle {
-    let h = mylog::Builder::new()
-        .format(
-            ::std::env::var("RUST_FORMAT")
-                .map_err(|_| ())
-                .and_then(|s| mylog::Format::from_str(&s))
-                .unwrap_or(mylog::Format::Google),
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
-        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-        .build();
-    h.clone().install().unwrap();
-    h
+        .init();
 }
 
 #[tokio::main]
 async fn main() {
-    let mut h = init_logging();
-    if let Err(e) = {
-        let _a = h.async_scope();
-        run().await
-    } {
+    init_logging();
+    if let Err(e) = run().await {
         error!("{e}");
         std::process::exit(1);
     }
@@ -227,7 +220,12 @@ async fn setup_rtsp(
             ("video", "h264" | "h265") => Some((i, TrackKind::Repacketize)),
             ("video" | "audio", _) => Some((i, TrackKind::Passthrough)),
             (m, e) => {
-                info!("skipping upstream stream {i}: {m}/{e}");
+                info!(
+                    stream = i,
+                    media = m,
+                    encoding_name = e,
+                    "skipping upstream stream"
+                );
                 None
             }
         })
@@ -297,12 +295,12 @@ async fn setup_rtsp(
 async fn accept(listener: tokio::net::TcpListener, proxy: Arc<Proxy>) -> Result<(), Error> {
     loop {
         let (stream, peer) = listener.accept().await?;
-        info!("{peer}: connected");
+        info!(%peer, "connected");
         let proxy = proxy.clone();
         tokio::spawn(async move {
             match conn::serve(proxy, stream).await {
-                Ok(()) => info!("{peer}: closed"),
-                Err(e) => warn!("{peer}: {e}"),
+                Ok(()) => info!(%peer, "closed"),
+                Err(e) => warn!(%peer, error = %e, "connection failed"),
             }
         });
     }

@@ -592,8 +592,6 @@ dependencies = [
  "clap",
  "futures",
  "itertools 0.14.0",
- "log",
- "mylog",
  "rcgen 0.14.7",
  "retina",
  "rustls",
@@ -602,7 +600,6 @@ dependencies = [
  "tokio-tungstenite",
  "tower-http",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "url",
 ]
@@ -1027,10 +1024,10 @@ dependencies = [
  "clap",
  "ffmpeg-next",
  "futures",
- "log",
- "mylog",
  "retina",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -1813,16 +1810,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3720a0d1569be60cd7b0ff00d31c8e1397f6928957a5d9ad0724592f3e78f24c"
 
 [[package]]
-name = "mylog"
-version = "0.1.0"
-source = "git+https://github.com/scottlamb/mylog#78a46b9c98521e32b0db04bdb5e026b11609b925"
-dependencies = [
- "jiff",
- "libc",
- "log",
-]
-
-[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2118,11 +2105,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "log",
- "mylog",
  "polling",
  "retina",
  "socket2 0.5.10",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -2229,11 +2216,11 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
- "log",
- "mylog",
  "rand 0.8.5",
  "retina",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -2411,9 +2398,7 @@ dependencies = [
  "hex",
  "http-auth",
  "jiff",
- "log",
  "memchr",
- "mylog",
  "pretty-hex",
  "pretty_assertions",
  "rand 0.8.5",
@@ -2421,6 +2406,8 @@ dependencies = [
  "smallvec",
  "socket2 0.5.10",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -2431,11 +2418,11 @@ dependencies = [
  "bytes",
  "derive_more",
  "libfuzzer-sys",
- "log",
  "memchr",
- "mylog",
  "pretty-hex",
  "retina",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3572,13 +3559,13 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "log",
- "mylog",
  "retina",
  "rustyline",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "webrtc",
 ]

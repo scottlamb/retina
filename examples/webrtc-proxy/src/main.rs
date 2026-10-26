@@ -5,14 +5,14 @@ use anyhow::{Error, bail};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::BytesMut;
 use clap::Parser;
-use log::{error, info, warn};
 use retina::PacketContext;
 use retina::client::{PlayingItem, SetupOptions};
 use retina::codec::{
     Accumulate, Depacketizer, FrameFormat, Loss, VideoData, VideoDepacketizer, VideoFrameEnd,
     VideoFrameStart, VideoHandler,
 };
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 use webrtc::{
     api::{APIBuilder, interceptor_registry::register_default_interceptors},
     ice_transport::{ice_connection_state::RTCIceConnectionState, ice_server::RTCIceServer},
@@ -59,27 +59,21 @@ struct Opts {
     transport: retina::client::Transport,
 }
 
-fn init_logging() -> mylog::Handle {
-    let h = mylog::Builder::new()
-        .format(
-            ::std::env::var("RUST_FORMAT")
-                .map_err(|_| ())
-                .and_then(|s| mylog::Format::from_str(&s))
-                .unwrap_or(mylog::Format::Google),
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
-        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-        .build();
-    h.clone().install().unwrap();
-    h
+        .init();
 }
 
 #[tokio::main]
 async fn main() {
-    let mut h = init_logging();
-    if let Err(e) = {
-        let _a = h.async_scope();
-        run().await
-    } {
+    init_logging();
+    if let Err(e) = run().await {
         error!("{}", e);
         std::process::exit(1);
     }
@@ -144,7 +138,7 @@ impl VideoHandler<PacketContext> for UpstreamHandler {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("upstream loss: {:?}", loss.reason());
+        warn!(reason = ?loss.reason(), "upstream loss");
     }
 }
 
@@ -306,7 +300,7 @@ async fn run() -> Result<(), Error> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    error!("upstream failed: {e}");
+                    error!(error = %e, "upstream failed");
                     break;
                 }
             }

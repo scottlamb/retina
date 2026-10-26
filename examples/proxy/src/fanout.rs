@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use log::{debug, warn};
 use retina::PacketContext;
 use retina::buf::MarkBuf;
 use retina::codec::{
@@ -23,6 +22,7 @@ use retina::codec::{
 use retina::rtp::{Continuity, ReceivedPacketRef};
 use retina::rtp::{OutgoingPacketRef, Sender};
 use retina::{NtpTimestamp, Timestamp};
+use tracing::{debug, warn};
 
 /// Above this many unsent bytes, a connection is congested: its packetizers
 /// drop frames. A few frames' worth at typical camera bitrates.
@@ -511,7 +511,7 @@ impl VideoHandler<PacketContext> for FanOut<'_> {
             if let Some(parameters) = parameters
                 && let Err(e) = p.set_parameters(parameters)
             {
-                warn!("unable to repacketize with new parameters: {e}");
+                warn!(error = %e, "unable to repacketize with new parameters");
             }
             p.start_frame(frame, sink);
         });
@@ -527,7 +527,7 @@ impl VideoHandler<PacketContext> for FanOut<'_> {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("upstream loss: {:?}", loss.reason());
+        warn!(reason = ?loss.reason(), "upstream loss");
         self.each(|p, sink| p.discontinuity(sink));
     }
 }

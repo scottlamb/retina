@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use bytes::Bytes;
 use h264_reader::nal::{NalHeader, UnitType};
-use log::{debug, log_enabled, trace};
+use tracing::{debug, enabled, trace};
 
 use super::{
     AuData, FrameEndBody, InternalParameters, Nal, ParametersOverride, is_non_idr_slice, is_vcl,
@@ -744,7 +744,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             nals: &mut self.nals,
             pieces: &mut self.pieces,
         };
-        if !au.trimmed && log_enabled!(log::Level::Debug) {
+        if !au.trimmed && enabled!(tracing::Level::DEBUG) {
             log_access_unit(view.nals, au);
         }
         view.scan_meta(au, buf);
@@ -1025,7 +1025,7 @@ impl AuView<'_> {
                 Err(NeedMoreData)
             }
             Err(e) => {
-                debug!("Can't parse slice header: {e:?}; won't detect leading pictures");
+                debug!(error = ?e, "Can't parse slice header; won't detect leading pictures");
                 Ok(None)
             }
         }
@@ -1193,15 +1193,15 @@ fn log_access_unit<Ctx>(nals: &[Nal], au: &AuState<Ctx>) {
             let _ = write!(&mut nals_str, "\n  {}: {:?}", i, nal.hdr);
         }
         debug!(
-            "bad access unit at ts {}\nerrors are:{}\nNALs are:{}",
-            au.timestamp, errs, nals_str
+            timestamp = %au.timestamp,
+            "bad access unit\nerrors are:{errs}\nNALs are:{nals_str}"
         );
-    } else if log_enabled!(log::Level::Trace) {
+    } else if enabled!(tracing::Level::TRACE) {
         let mut nals_str = String::new();
         for (i, nal) in nals.iter().enumerate() {
             let _ = write!(&mut nals_str, "\n  {}: {:?}", i, nal.hdr);
         }
-        trace!("access unit at ts {}; NALS are:{}", au.timestamp, nals_str);
+        trace!(timestamp = %au.timestamp, "access unit; NALs are:{nals_str}");
     }
 }
 

@@ -378,7 +378,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             self.data.clear();
 
             // This can happen if we somehow drop the first packet in a frame
-            log::debug!("Got JPEG fragment when we have no header");
+            tracing::debug!("Got JPEG fragment when we have no header");
             return Ok(());
         }
 

@@ -660,7 +660,7 @@ impl MarkBuf {
         let min_floor = self.unparsed.saturating_sub(self.max_retained);
         if floor < min_floor {
             let n = self.registry.revoke_below(min_floor);
-            log::debug!(
+            tracing::debug!(
                 "revoking {n} mark(s) retaining {} bytes; limit is {}",
                 self.unparsed - floor,
                 self.max_retained,

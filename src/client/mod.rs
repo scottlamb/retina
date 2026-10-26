@@ -48,11 +48,11 @@ use crate::inputs::Input as _;
 use crate::rtsp::msg::{self as msg, OwnedMessage};
 use bytes::Bytes;
 #[cfg(feature = "tokio")]
-use log::{debug, warn};
-#[cfg(feature = "tokio")]
 use std::task::ready;
 #[cfg(feature = "tokio")]
 use tokio::net::UdpSocket;
+#[cfg(feature = "tokio")]
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::{ErrorInt, RtspMessageContext, StreamContext};
@@ -255,7 +255,7 @@ impl SessionGroup {
     /// An identifier for this session group, for use in log messages.
     ///
     /// Currently uses the name if set, a pointer address otherwise.
-    fn debug_id(&self) -> impl Debug + use<> {
+    fn debug_id(&self) -> String {
         self.name.clone().unwrap_or_else(|| format!("{:p}", &self))
     }
 
@@ -265,9 +265,9 @@ impl SessionGroup {
         let before = l.sessions.len();
         l.sessions.retain(|s| s.expires > now);
         if l.sessions.len() != before {
-            log::debug!(
-                "Session group {:?} forgot {} expired sessions",
-                self.debug_id(),
+            tracing::debug!(
+                session_group = %self.debug_id(),
+                "forgot {} expired sessions",
                 before - l.sessions.len()
             );
             l.changed();
@@ -384,9 +384,9 @@ impl SessionGroup {
                     .iter()
                     .filter(|s| s.maybe_playing && s.seqnum < status.next_seqnum);
                 let max_expires = relevant.clone().map(|s| s.expires).max();
-                log::trace!(
-                    "Session group {:?} has {} relevant sessions numbered < {}",
-                    self.debug_id(),
+                tracing::trace!(
+                    session_group = %self.debug_id(),
+                    "has {} relevant sessions numbered < {}",
                     relevant.by_ref().count(),
                     status.next_seqnum
                 );
@@ -1729,25 +1729,23 @@ fn handle_unassigned_data(
         UnassignedChannelDataPolicy::Error => false,
         UnassignedChannelDataPolicy::Ignore | UnassignedChannelDataPolicy::Auto => {
             if !*seen_unassigned {
-                log::warn!(
-                    "Ignoring data on unassigned RTSP interleaved data channel {}. \
-                     This is the first such message. Following messages will be logged \
-                     at trace priority only.\n\n\
-                     conn: {}\nmsg: {}\ndata: {:#?}",
+                tracing::warn!(
+                    conn = %conn_ctx,
+                    msg = %msg_ctx,
                     channel_id,
-                    conn_ctx,
-                    msg_ctx,
-                    crate::hex::LimitedHex::new(&data, 128),
+                    data = ?crate::hex::LimitedHex::new(&data, 128),
+                    "Ignoring data on unassigned RTSP interleaved data channel. \
+                     This is the first such message. Following messages will be logged \
+                     at trace priority only.",
                 );
                 *seen_unassigned = true;
             } else {
-                log::trace!(
-                    "Ignoring data on unassigned RTSP interleaved data channel {}.\n\n\
-                     conn: {}\nmsg: {}\ndata: {:#?}",
+                tracing::trace!(
+                    conn = %conn_ctx,
+                    msg = %msg_ctx,
                     channel_id,
-                    conn_ctx,
-                    msg_ctx,
-                    crate::hex::LimitedHex::new(&data, 128),
+                    data = ?crate::hex::LimitedHex::new(&data, 128),
+                    "Ignoring data on unassigned RTSP interleaved data channel",
                 );
             }
             return Ok(());
@@ -1999,20 +1997,24 @@ fn note_stale_live555_data(
 ) {
     let known_to_have_live555_tcp_bug = tool.map(Tool::has_live555_tcp_bug).unwrap_or(false);
     if !known_to_have_live555_tcp_bug {
-        log::warn!(
-            "saw unexpected RTSP packet. This is presumed to be due to a bug in old
-             live555 servers' TCP handling, though tool attribute {tool:?} does not refer to a \
-             known-buggy version. Consider switching to UDP.\n\n\
-             conn: {conn_ctx:?}\n\
-             channel: {channel_id}\n\
-             msg: {msg_ctx:?}"
+        tracing::warn!(
+            conn = %conn_ctx,
+            msg = %msg_ctx,
+            channel_id,
+            tool = ?tool,
+            "saw unexpected RTSP packet. This is presumed to be due to a bug in old \
+             live555 servers' TCP handling, though the tool attribute does not refer to a \
+             known-buggy version. Consider switching to UDP."
         );
     }
 
     let group = match options.session_group.as_ref() {
         Some(g) => g,
         None => {
-            log::debug!("Not tracking stale session because there's no session group.");
+            tracing::debug!(
+                conn = %conn_ctx,
+                "Not tracking stale session because there's no session group."
+            );
             return;
         }
     };
@@ -2022,12 +2024,13 @@ fn note_stale_live555_data(
         // (We could go so far as to examine the data packet's SSRC to
         // see if it matches one associated with this session. But
         // retrying once per expiration is probably good enough.)
-        log::debug!(
+        tracing::debug!(
+            conn = %conn_ctx,
+            session_group = %group.debug_id(),
+            session_seqnum = s.seqnum,
             "Unexpected RTSP interleaved packet (live555 stale file \
              descriptor bug) plausibly explained by known stale \
-             session {:?}/{}. Not adding a session entry.",
-            group.debug_id(),
-            s.seqnum,
+             session. Not adding a session entry.",
         );
         return;
     }
@@ -2037,13 +2040,13 @@ fn note_stale_live555_data(
     // The group forgets the session lazily once it expires.
     let expires = now + std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC);
     let seqnum = group.add(now, StaleTeardown::Impossible, true, true, expires);
-    log::debug!(
+    tracing::debug!(
+        conn = %conn_ctx,
+        session_group = %group.debug_id(),
+        session_seqnum = seqnum,
         "Unexpected RTSP interleaved packet, presumed due to live555 stale \
-         file descriptor bug; added stale session {:?}/{} that will \
-         expire in {} seconds.",
-        group.debug_id(),
-        seqnum,
-        LIVE555_EXPIRATION_SEC,
+         file descriptor bug; added stale session that will \
+         expire in {LIVE555_EXPIRATION_SEC} seconds.",
     );
 }
 
@@ -2200,7 +2203,7 @@ impl Session<Playing> {
                 return Poll::Ready(Some(r));
             }
             if core.is_closed() {
-                debug!("Server closed RTSP connection");
+                debug!(conn = %core.conn_ctx(), "Server closed RTSP connection");
                 return Poll::Ready(None);
             }
 
@@ -2213,7 +2216,7 @@ impl Session<Playing> {
                 Poll::Ready(Ok(_)) => continue,
                 Poll::Ready(Err(e)) => {
                     let e = core.read_error(e, now);
-                    debug!("RTSP connection error: {:?}", e);
+                    debug!(error = ?e, "RTSP connection error");
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Pending => {}
@@ -2268,9 +2271,19 @@ impl Session<Playing> {
                 // socket buffer is a reason to end the session.
                 match e.kind() {
                     io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused => {
-                        debug!("Unable to send RTCP receiver report for stream {i}: {e}")
+                        debug!(
+                            conn = %core.conn_ctx(),
+                            stream = i,
+                            error = %e,
+                            "Unable to send RTCP receiver report"
+                        )
                     }
-                    _ => warn!("Unable to send RTCP receiver report for stream {i}: {e}"),
+                    _ => warn!(
+                        conn = %core.conn_ctx(),
+                        stream = i,
+                        error = %e,
+                        "Unable to send RTCP receiver report"
+                    ),
                 }
             }
         }
@@ -2431,6 +2444,7 @@ impl Session<Playing> {
 #[cfg(feature = "tokio")]
 impl Drop for SessionInner {
     fn drop(&mut self) {
+        use tracing::Instrument as _;
         let Some(core) = self.core.take_setup() else {
             return;
         };
@@ -2439,7 +2453,11 @@ impl Drop for SessionInner {
         let Some(teardown) = core.into_teardown(now) else {
             return;
         };
-        tokio::spawn(teardown::background_teardown(teardown, self.conn.take()));
+        // The span's parent is the caller's current span, so the background
+        // task's log messages keep the caller's context. It lasts only until
+        // the teardown succeeds or the session expires.
+        let span = tracing::info_span!("rtsp_teardown", url = %teardown.url());
+        tokio::spawn(teardown::background_teardown(teardown, self.conn.take()).instrument(span));
     }
 }
 
@@ -4588,7 +4606,7 @@ mod tests {
             ("SessionOptions", std::mem::size_of::<SessionOptions>()),
             ("Stream", std::mem::size_of::<Stream>()),
         ] {
-            log::info!("{name:-40} {size:4}");
+            tracing::info!("{name:-40} {size:4}");
         }
     }
 

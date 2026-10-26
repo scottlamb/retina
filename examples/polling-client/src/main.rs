@@ -17,12 +17,10 @@
 
 use std::io::{self, IoSlice, IoSliceMut, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
-use std::str::FromStr as _;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Error, bail};
 use clap::Parser;
-use log::{debug, info, warn};
 use polling::{Event, Events, Poller};
 use retina::PacketContext;
 use retina::buf::MarkBuf;
@@ -34,6 +32,7 @@ use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
     VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
+use tracing::{debug, info, warn};
 
 /// How long to wait for each request before `PLAY`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -184,7 +183,12 @@ impl Io {
         if let Err(e) = self.udp_socket(stream_i, channel_type).send(data) {
             // A full socket buffer, or `ConnectionRefused` following an ICMP
             // error, isn't a reason to end the session.
-            debug!("unable to send on stream {stream_i}'s {channel_type:?} socket: {e}");
+            debug!(
+                stream = stream_i,
+                ?channel_type,
+                error = %e,
+                "unable to send on UDP socket"
+            );
         }
     }
 
@@ -371,7 +375,7 @@ fn teardown(io: Io, core: SessionCore) -> Result<bool, Error> {
             }
             TeardownAction::Connect { deadline } => {
                 io = None;
-                info!("TEARDOWN: connecting to {}", td.url());
+                info!(url = %td.url(), "TEARDOWN: connecting");
                 let timeout = deadline.saturating_duration_since(now);
                 match connect_tcp(td.url(), timeout).and_then(Io::new) {
                     Ok(conn) => {
@@ -430,7 +434,7 @@ fn play(
                 }
                 PlayingItem::Rtcp(pkt) => {
                     if let Some(t) = pkt.rtp_timestamp() {
-                        debug!("stream {}: RTCP sender report at {t}", pkt.stream_id());
+                        debug!(stream = pkt.stream_id(), timestamp = %t, "RTCP sender report");
                     }
                 }
                 _ => {}
@@ -511,8 +515,8 @@ impl VideoHandler<PacketContext> for Printer<'_> {
             && let Some(p) = frame_start.parameters()
         {
             info!(
-                "stream {}: {} {}x{}",
-                self.stream_id,
+                stream = self.stream_id,
+                "{} {}x{}",
                 p.rfc6381_codec(),
                 p.pixel_dimensions().0,
                 p.pixel_dimensions().1
@@ -541,7 +545,7 @@ impl VideoHandler<PacketContext> for Printer<'_> {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("stream {}: {:?}", self.stream_id, loss.reason());
+        warn!(stream = self.stream_id, reason = ?loss.reason(), "loss");
     }
 }
 
@@ -556,7 +560,7 @@ impl AudioHandler<PacketContext> for Printer<'_> {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("stream {}: {:?}", self.stream_id, loss.reason());
+        warn!(stream = self.stream_id, reason = ?loss.reason(), "loss");
     }
 }
 
@@ -571,7 +575,7 @@ impl MessageHandler<PacketContext> for Printer<'_> {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("stream {}: {:?}", self.stream_id, loss.reason());
+        warn!(stream = self.stream_id, reason = ?loss.reason(), "loss");
     }
 }
 
@@ -603,17 +607,20 @@ fn run(opts: Opts) -> Result<(), Error> {
             Ok(d) => d,
             Err(e) => {
                 info!(
-                    "skipping stream {i} ({}/{}): {e}",
-                    s.media(),
-                    s.encoding_name()
+                    stream = i,
+                    media = s.media(),
+                    encoding_name = s.encoding_name(),
+                    error = %e,
+                    "skipping stream"
                 );
                 continue;
             }
         };
         info!(
-            "setting up stream {i} ({}/{})",
-            s.media(),
-            s.encoding_name()
+            stream = i,
+            media = s.media(),
+            encoding_name = s.encoding_name(),
+            "setting up stream"
         );
         let transport = match opts.transport {
             Transport::Tcp => SetupTransport::Tcp,
@@ -652,29 +659,31 @@ fn run(opts: Opts) -> Result<(), Error> {
         .map(|secs| Instant::now() + Duration::from_secs(secs));
     let result = play(&mut io, &mut core, &mut streams, stop_at);
     if let Err(e) = &result {
-        warn!("playing failed: {e}");
+        warn!(error = %e, "playing failed");
     }
     match teardown(io, core) {
         Ok(true) => info!("TEARDOWN done"),
         Ok(false) => {}
-        Err(e) => warn!("TEARDOWN failed: {e}"),
+        Err(e) => warn!(error = %e, "TEARDOWN failed"),
     }
     result
 }
 
-fn main() {
-    let h = mylog::Builder::new()
-        .format(
-            ::std::env::var("RUST_FORMAT")
-                .map_err(|_| ())
-                .and_then(|s| mylog::Format::from_str(&s))
-                .unwrap_or(mylog::Format::Google),
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
-        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-        .build();
-    h.install().unwrap();
+        .init();
+}
+
+fn main() {
+    init_logging();
     if let Err(e) = run(Opts::parse()) {
-        log::error!("Fatal: {}", chain(&e));
+        tracing::error!("Fatal: {}", chain(&e));
         std::process::exit(1);
     }
 }

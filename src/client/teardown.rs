@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::debug;
+use tracing::debug;
 use url::Url;
 
 use super::conn::{ConnCore, Response, ResponseMode};
@@ -131,9 +131,9 @@ impl TeardownCore {
         now: Instant,
     ) -> Self {
         debug!(
-            "TEARDOWN {} starting for URL {}",
-            &*session_id,
-            url.as_str()
+            session_id = &*session_id,
+            url = url.as_str(),
+            "TEARDOWN starting"
         );
 
         // A request may have been in progress when the session was dropped.
@@ -183,8 +183,8 @@ impl TeardownCore {
         loop {
             if !matches!(self.state, State::Done) && now >= self.expires {
                 debug!(
-                    "TEARDOWN {} stopped on session expiration",
-                    &*self.session_id
+                    session_id = &*self.session_id,
+                    "TEARDOWN stopped on session expiration"
                 );
                 self.finish();
             }
@@ -194,10 +194,10 @@ impl TeardownCore {
                         match status(r) {
                             Ok(status) => {
                                 debug!(
-                                    "TEARDOWN {} attempt {} succeeded (status {}).",
-                                    &*self.session_id,
+                                    session_id = &*self.session_id,
                                     attempt,
-                                    u16::from(status)
+                                    status = u16::from(status),
+                                    "TEARDOWN succeeded"
                                 );
                                 self.finish();
                             }
@@ -327,8 +327,10 @@ impl TeardownCore {
     ) {
         if attempt == 0 {
             debug!(
-                "TEARDOWN {} on existing conn failed: {}",
-                &*self.session_id, e
+                session_id = &*self.session_id,
+                attempt,
+                error = %e,
+                "TEARDOWN on existing conn failed"
             );
             if self.just_try_once {
                 // TCP, auto teardown, server not known to be affected by the
@@ -336,8 +338,8 @@ impl TeardownCore {
                 // conn (just in case the server really does have that bug),
                 // closed the connection. Good enough.
                 debug!(
-                    "Letting session {} expire; use TeardownPolicy::Always to try harder",
-                    &*self.session_id
+                    session_id = &*self.session_id,
+                    "Letting session expire; use TeardownPolicy::Always to try harder"
                 );
                 self.finish();
                 return;
@@ -363,8 +365,10 @@ impl TeardownCore {
             return;
         }
         debug!(
-            "TEARDOWN {} fresh connection attempt {} failed: {}",
-            &*self.session_id, attempt, e
+            session_id = &*self.session_id,
+            attempt,
+            error = %e,
+            "TEARDOWN on fresh connection failed"
         );
         if let Some((group, seqnum)) = &self.tracked {
             group.note_teardown_failure(*seqnum, e.clone());
@@ -382,19 +386,19 @@ impl TeardownCore {
 
     fn finish(&mut self) {
         if let Some((group, seqnum)) = self.tracked.take() {
-            log::trace!(
-                "Clearing session {:?}/{} for id {:?}",
-                group.debug_id(),
-                seqnum,
-                &*self.session_id
+            tracing::trace!(
+                session_group = %group.debug_id(),
+                session_seqnum = seqnum,
+                session_id = &*self.session_id,
+                "Clearing session"
             );
             if !group.try_remove_seqnum(seqnum) {
                 // It may have been forgotten on expiration.
                 debug!(
-                    "Unable to find session {:?}/{} for id {:?} on TEARDOWN",
-                    group.debug_id(),
-                    seqnum,
-                    &*self.session_id
+                    session_group = %group.debug_id(),
+                    session_seqnum = seqnum,
+                    session_id = &*self.session_id,
+                    "Unable to find session on TEARDOWN"
                 );
             }
         }
@@ -405,7 +409,10 @@ impl TeardownCore {
 impl Drop for TeardownCore {
     fn drop(&mut self) {
         if let Some((group, seqnum)) = self.tracked.take() {
-            debug!("TEARDOWN {} abandoned before completion", &*self.session_id);
+            debug!(
+                session_id = &*self.session_id,
+                "TEARDOWN abandoned before completion"
+            );
             group.note_teardown_failure(
                 seqnum,
                 wrap!(ErrorInt::FailedPrecondition(

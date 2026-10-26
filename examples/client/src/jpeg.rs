@@ -10,8 +10,8 @@ use std::{path::PathBuf, pin::Pin, sync::Arc};
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
 use futures::Future;
-use log::info;
 use retina::client::SetupOptions;
+use tracing::info;
 
 use crate::demux::{Demuxer, Item};
 
@@ -120,10 +120,10 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         let s = session.streams().iter().position(|s| {
             if s.media() == "image" || s.media() == "video" {
                 if s.encoding_name() == "jpeg" {
-                    log::info!("Using jpeg video stream");
+                    tracing::info!("Using jpeg video stream");
                     return true;
                 }
-                log::info!(
+                tracing::info!(
                     "Ignoring {} video stream because it's unsupported",
                     s.encoding_name(),
                 );
@@ -131,7 +131,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             false
         });
         if s.is_none() {
-            log::info!("No suitable video stream found");
+            tracing::info!("No suitable video stream found");
         }
         s
     };
@@ -150,7 +150,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     // Session has now been dropped, on success or failure. A TEARDOWN should
     // be pending if necessary. session_group.await_teardown() will wait for it.
     if let Err(e) = session_group.await_teardown().await {
-        log::error!("TEARDOWN failed: {}", e);
+        tracing::error!(error = %e, "TEARDOWN failed");
     }
     result
 }

@@ -10,10 +10,10 @@ use axum::extract::{WebSocketUpgrade, ws::Message};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures::{StreamExt as _, stream::FuturesUnordered};
-use log::{debug, info};
 use retina::{client::SetupOptions, codec::VideoParameters};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+use tracing::{debug, info};
 
 use crate::demux::{Demuxer, Item, VideoFrame};
 
@@ -77,13 +77,13 @@ impl axum::serve::Listener for TlsListener {
                                 (acceptor.accept(stream).await, addr)
                             }));
                         }
-                        Err(e) => log::warn!("TCP accept error: {e}"),
+                        Err(e) => tracing::warn!(error = %e, "TCP accept error"),
                     }
                 }
                 Some((res, addr)) = self.handshaking.next(), if !self.handshaking.is_empty() => {
                     match res {
                         Ok(tls_stream) => return (tls_stream, addr),
-                        Err(e) => log::warn!("TLS handshake error from {addr}: {e}"),
+                        Err(e) => tracing::warn!(peer = %addr, error = %e, "TLS handshake error"),
                     }
                 }
             }
@@ -191,20 +191,20 @@ async fn serve_websocket(
                             out.put_u8(2); // skipped frames msg.
                             out.put_u64(skipped);
                             if let Err(e) = socket.send(Message::Binary(out.freeze())).await {
-                                log::error!("Failed to send skipped frames msg: {e}");
+                                tracing::error!(error = %e, "Failed to send skipped frames msg");
                                 return;
                             }
                             skipped = 0;
                         }
                         if Some(item.parameters_id) != last_param_id {
                             if let Err(e) = socket.send(item.parameters_update_msg).await {
-                                log::error!("Failed to send parameters update msg: {e}");
+                                tracing::error!(error = %e, "Failed to send parameters update msg");
                                 return;
                             }
                             last_param_id = Some(item.parameters_id);
                         }
                         if let Err(e) = socket.send(item.frame_msg).await {
-                            log::error!("Failed to send frame msg: {e}");
+                            tracing::error!(error = %e, "Failed to send frame msg");
                             return;
                         }
                         keepalive.reset_after(KEEPALIVE_AFTER_IDLE);
@@ -213,7 +213,7 @@ async fn serve_websocket(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(frames)) => {
                         skipped += frames;
                         need_key_frame = true;
-                        log::error!("Dropping {frames} frames");
+                        tracing::error!("Dropping {frames} frames");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return;
@@ -222,7 +222,7 @@ async fn serve_websocket(
             }
             _ = keepalive.tick() => {
                 if let Err(e) = socket.send(axum::extract::ws::Message::Ping(Bytes::new())).await {
-                    log::error!("Failed to send keepalive: {e}");
+                    tracing::error!(error = %e, "Failed to send keepalive");
                     return;
                 }
             }
@@ -294,10 +294,10 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         if s.media() == "video" {
             let encoding_name = s.encoding_name();
             if matches!(encoding_name, "h264" | "h265" | "jpeg") {
-                log::info!("Using {encoding_name} video stream");
+                tracing::info!("Using {encoding_name} video stream");
                 return true;
             }
-            log::info!(
+            tracing::info!(
                 "Ignoring {} video stream because it's unsupported",
                 s.encoding_name(),
             );

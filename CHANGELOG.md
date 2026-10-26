@@ -74,6 +74,17 @@
     How to handle non-monotonic timestamps is application policy; callers
     can check `Timestamp`s themselves. The lower-level
     `rtp::ReceiverOptions::max_forward_jump_secs` remains.
+*   BREAKING: log via `tracing` rather than `log`. Applications using a
+    `log` logger rather than a `tracing` subscriber can enable `tracing`'s
+    `log` feature. RTSP requests (client `DESCRIBE`, `SETUP`, `PLAY`, and
+    explicit `TEARDOWN`; server requests) have short-lived `rtsp_request`
+    spans with the method, URL, and connection; the background `TEARDOWN`
+    task of a dropped `Session` has an `rtsp_teardown` span, a child of the
+    span current at drop. Messages put identifiers in fields with consistent
+    names rather than in the message text: `conn`, `stream`, `session_id`,
+    `session_group`, `session_seqnum`, `url`, `channel_id`, `seq`,
+    `timestamp`, `status`, `error`, etc. `unstable-server`: add
+    `server::Pending::span`.
 *   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
     `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
     does, per `client::TeardownPolicy` and tracked in the session's

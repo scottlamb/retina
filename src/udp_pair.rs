@@ -3,10 +3,10 @@
 
 //! [`UdpPair`].
 
-use log::trace;
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::ops::Range;
+use tracing::trace;
 
 /// A pair of local UDP sockets used for RTP and RTCP transmission.
 ///
@@ -39,8 +39,9 @@ impl UdpPair {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
-                        "Try {}/{}: unable to bind RTP addr {:?}",
-                        i, MAX_TRIES, rtp_addr
+                        attempt = i,
+                        addr = %rtp_addr,
+                        "unable to bind RTP addr"
                     );
                     continue;
                 }
@@ -51,8 +52,9 @@ impl UdpPair {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
-                        "Try {}/{}: unable to bind RTCP addr {:?}",
-                        i, MAX_TRIES, rtcp_addr
+                        attempt = i,
+                        addr = %rtcp_addr,
+                        "unable to bind RTCP addr"
                     );
                     continue;
                 }

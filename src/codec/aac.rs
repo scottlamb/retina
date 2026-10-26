@@ -631,9 +631,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if !meta.continuity.is_contiguous()
             && matches!(self.state, DepacketizerState::Fragmented(_))
         {
-            log::debug!(
-                "Discarding in-progress fragmented AAC frame due to {:?}.",
-                meta.continuity,
+            tracing::debug!(
+                continuity = ?meta.continuity,
+                "Discarding in-progress fragmented AAC frame",
             );
             self.state = DepacketizerState::Idle {
                 loss_since_mark: true,
@@ -758,7 +758,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     }
                     if mark {
                         if agg.loss_since_mark {
-                            log::debug!(
+                            tracing::debug!(
                                 "Discarding in-progress fragmented AAC frame due to earlier loss."
                             );
                             self.state = DepacketizerState::Idle {

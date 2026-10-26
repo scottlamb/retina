@@ -14,10 +14,10 @@ cargo-fuzz = true
 bytes = "1"
 derive_more = { version = "2", features = ["debug"] }
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
-log = "0.4.29"
 pretty-hex = "0.4.0"
 memchr = "2.7.4"
-mylog = { git = "https://github.com/scottlamb/mylog" }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [dependencies.retina]
 path = ".."

@@ -36,7 +36,7 @@ fuzz_target!(|pkts: Vec<Pkt<'_>>| {
     let mut sequence_number: u16 = 0;
     let mut buf = retina::buf::MarkBuf::new(65536);
     for (i, pkt) in pkts.iter().enumerate() {
-        log::trace!("pkt: {pkt:?}");
+        tracing::trace!("pkt: {pkt:?}");
         if pkt.loss {
             sequence_number = sequence_number.wrapping_add(1);
         }

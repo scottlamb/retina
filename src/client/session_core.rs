@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use log::{debug, trace, warn};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 use super::Error;
@@ -116,6 +116,12 @@ pub(crate) struct SetupCore {
 
     op: Option<Op>,
 
+    /// A span for `op`, entered while handling its response.
+    ///
+    /// This lasts only as long as the request, so it doesn't make for
+    /// long-lived spans.
+    op_span: tracing::Span,
+
     /// Bitmask of [`SessionFlag`]s.
     flags: u8,
 
@@ -149,6 +155,7 @@ impl SetupCore {
             sdp: Bytes::new(),
             session: None,
             op: None,
+            op_span: tracing::Span::none(),
             flags: 0,
             transmit_udp: VecDeque::new(),
             played: None,
@@ -245,8 +252,19 @@ impl SetupCore {
                 "another request is in progress".into()
             ));
         }
+        let OwnedMessage::Request { head, .. } = &req else {
+            unreachable!("start is only called with requests");
+        };
+        let span = tracing::info_span!(
+            "rtsp_request",
+            method = %head.method,
+            url = head.request_uri.as_ref().map(Url::as_str),
+            conn = %self.conn.ctx,
+        );
+        let _enter = span.enter();
         self.conn.send(mode, req)?;
         self.op = Some(op);
+        self.op_span = span.clone();
         Ok(())
     }
 
@@ -420,10 +438,10 @@ impl SetupCore {
             && t.has_live555_tcp_bug()
         {
             warn!(
-                "Connecting via TCP to known-broken RTSP server {:?}. \
+                tool = ?t,
+                "Connecting via TCP to known-broken RTSP server. \
                  See <https://github.com/scottlamb/retina/issues/17>. \
-                 Consider using UDP instead!",
-                t
+                 Consider using UDP instead!"
             );
         }
         trace!("PLAY with channel mappings: {:#?}", self.conn.channels);
@@ -504,10 +522,10 @@ impl SetupCore {
                 expires,
             );
             debug!(
-                "{:?}/{} tracking TEARDOWN of session id {}",
-                group.debug_id(),
-                seqnum,
-                &*session.id
+                session_group = %group.debug_id(),
+                session_seqnum = seqnum,
+                session_id = &*session.id,
+                "tracking TEARDOWN"
             );
             (group, seqnum)
         });
@@ -556,8 +574,11 @@ impl SetupCore {
     /// [`SessionCore::teardown`]).
     pub(crate) fn poll_event(&mut self, now: Instant) -> Option<Result<SessionEvent, Error>> {
         self.op.as_ref()?;
+        let span = self.op_span.clone();
+        let _enter = span.enter();
         let r = self.conn.poll_response(now)?;
         let op = self.op.take().expect("op is set");
+        self.op_span = tracing::Span::none();
         Some(match (op, r) {
             (Op::Teardown, r) => super::teardown::status(r).map(|_| SessionEvent::TornDown),
             (Op::Describe { .. }, Err(e)) if self.conn.options.backchannel => {
@@ -617,8 +638,9 @@ impl SetupCore {
             Some(_) => {}
             None => {
                 debug!(
-                    "established session {:?}, timeout={}s",
-                    response.session.id, response.session.timeout_sec
+                    session_id = &*response.session.id,
+                    timeout_sec = response.session.timeout_sec,
+                    "established session"
                 );
                 self.session = Some(response.session);
             }
@@ -785,20 +807,20 @@ impl SetupCore {
                     InitialSequenceNumberPolicy::Default
                     | InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
                 ) => {
-                    log::info!(
-                        "ignoring PLAY seq={} on stream {} due to policy {:?}",
+                    tracing::info!(
+                        stream = i,
                         seq,
-                        i,
-                        policy.initial_seq
+                        policy = ?policy.initial_seq,
+                        "ignoring PLAY seq due to policy"
                     );
                     None
                 }
                 (Some(seq), _) => {
-                    log::debug!("setting PLAY seq={} on stream {}", seq, i);
+                    tracing::debug!(stream = i, seq, "setting PLAY seq");
                     Some(seq)
                 }
                 (None, _) => {
-                    log::debug!("no PLAY seq on stream {}", i);
+                    tracing::debug!(stream = i, "no PLAY seq");
                     None
                 }
             };

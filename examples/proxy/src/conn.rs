@@ -11,7 +11,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Error;
-use log::{debug, info};
 use retina::codec::VideoPacketizer;
 use retina::rtp::{Sender, SenderOptions};
 use retina::rtsp::msg::StatusCode;
@@ -19,6 +18,7 @@ use retina::server::{
     ConnectionCore, Describe, Event, Pending, Play, RtpInfo, SdpMedia, ServerOptions,
 };
 use tokio::time::Instant;
+use tracing::{Instrument as _, debug, info};
 
 use crate::fanout::{ConnOut, Downstream};
 use crate::{Proxy, Track, TrackFormat, TrackKind};
@@ -98,8 +98,8 @@ async fn read_loop(
         if eof || out.is_closed() {
             if answer.is_some() {
                 debug!(
-                    "{}: closed; abandoning outstanding request",
-                    core.conn_ctx()
+                    conn = %core.conn_ctx(),
+                    "closed; abandoning outstanding request"
                 );
             }
             return Ok(());
@@ -168,10 +168,14 @@ fn handle_event<'a>(
                 core.respond_describe(d, Err(StatusCode::NOT_FOUND));
                 return None;
             }
-            Some(Box::pin(async move {
-                let r = describe(proxy).await;
-                Answer::Describe(d, r)
-            }))
+            let span = d.span().clone();
+            Some(Box::pin(
+                async move {
+                    let r = describe(proxy).await;
+                    Answer::Describe(d, r)
+                }
+                .instrument(span),
+            ))
         }
         Event::Setup(s) => {
             let Some(Some(track_i)) = proxy.track_for_url(s.url()) else {
@@ -189,7 +193,7 @@ fn handle_event<'a>(
                 alive: Arc::new(AtomicBool::new(true)),
             };
             if let Ok(id) = core.respond_setup(s, Ok((data, ssrc))) {
-                debug!("session {id}: set up track {track_i}");
+                debug!(session_id = %id, track = track_i, "set up track");
             }
             None
         }
@@ -200,10 +204,14 @@ fn handle_event<'a>(
                 .iter()
                 .map(|s| s.data.track_i)
                 .collect();
-            Some(Box::pin(async move {
-                let r = play_packetizers(proxy, &track_is).await;
-                Answer::Play(p, r)
-            }))
+            let span = p.span().clone();
+            Some(Box::pin(
+                async move {
+                    let r = play_packetizers(proxy, &track_is).await;
+                    Answer::Play(p, r)
+                }
+                .instrument(span),
+            ))
         }
         Event::Teardown(t) => {
             // Stop the streams before responding, so no packet follows the
@@ -213,12 +221,12 @@ fn handle_event<'a>(
                 out.stop(&s.data.alive);
             }
             if core.respond_teardown(t).is_ok() {
-                info!("session {session}: torn down");
+                info!(session_id = %session, "torn down");
             }
             None
         }
         Event::SessionTimedOut(c) => {
-            info!("session {}: timed out", c.id);
+            info!(session_id = %c.id, "timed out");
             for s in c.streams {
                 out.stop(&s.data.alive);
             }
@@ -324,7 +332,7 @@ fn apply_answer(
             if core.respond_play(p, Ok(&rtp_info)).is_err() {
                 return Vec::new();
             }
-            info!("session {session}: playing {} track(s)", joins.len());
+            info!(session_id = %session, "playing {} track(s)", joins.len());
             joins
         }
     }

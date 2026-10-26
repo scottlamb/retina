@@ -2251,7 +2251,7 @@ mod tests {
                 std::mem::size_of::<MessageParameters>(),
             ),
         ] {
-            log::info!("{name:-40} {size:4}");
+            tracing::info!("{name:-40} {size:4}");
         }
     }
 }

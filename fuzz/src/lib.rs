@@ -1,26 +1,24 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{str::FromStr as _, sync::Once};
+use std::sync::Once;
 
 static INIT_LOGGING: Once = Once::new();
 
 // This is slightly different from `retina::testutil::init_logging()`:
 // * it defaults to no logging so that fuzzing output is not polluted with log messages,
 //   unless requested when drilling in.
-// * it doesn't force `eprintln!()`, as fuzzing doesn't go through `libtest`.
+// * it doesn't use the test writer, as fuzzing doesn't go through `libtest`.
 pub fn init_logging() {
     INIT_LOGGING.call_once(|| {
-        let h = mylog::Builder::new()
-            .format(
-                ::std::env::var("RUST_FORMAT")
-                    .map_err(|_| ())
-                    .and_then(|s| mylog::Format::from_str(&s))
-                    .unwrap_or(mylog::Format::Google),
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing_subscriber::filter::LevelFilter::OFF.into())
+                    .from_env_lossy(),
             )
-            .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or(""))
-            .build();
-        h.install().unwrap();
+            .init();
     })
 }
 

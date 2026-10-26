@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use bytes::Bytes;
-use log::{debug, warn};
+use tracing::{debug, warn};
 
 use super::Error;
 use crate::rtcp::ReceivedCompoundPacket;
@@ -138,8 +138,11 @@ impl StreamReceiver {
                     UnknownRtcpSsrcPolicy::Default | UnknownRtcpSsrcPolicy::DropPackets => {
                         if !self.seen_unknown_rtcp_ssrc {
                             warn!(
-                                "saw unknown rtcp ssrc {:08x}; rtp session has ssrc {expected:08x}",
-                                info.ssrc
+                                conn = %conn.ctx,
+                                stream = stream_id,
+                                ssrc = format_args!("{:08x}", info.ssrc),
+                                expected_ssrc = format_args!("{expected:08x}"),
+                                "saw unknown RTCP SSRC"
                             );
                             self.seen_unknown_rtcp_ssrc = true;
                         }

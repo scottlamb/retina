@@ -10,7 +10,7 @@ use base64::Engine as _;
 use bytes::{BufMut, Bytes, BytesMut};
 use h264_reader::nal::sps::{SeqParameterSet, SpsError};
 use h264_reader::nal::{NalHeader, UnitType};
-use log::debug;
+use tracing::debug;
 
 use crate::buf::{BufRange, MarkBuf};
 use crate::codec::h26x::{NalAnalyzer as _, TolerantBitReader};
@@ -205,7 +205,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             Some(fp) => match InternalParameters::parse_format_specific_params(fp) {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    log::warn!("Ignoring bad H.264 format-specific-params {:?}: {}", fp, e);
+                    tracing::warn!(
+                        fmtp = ?fp,
+                        error = %e,
+                        "Ignoring bad H.264 format-specific-params"
+                    );
                     None
                 }
             },
@@ -337,9 +341,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                                     self.start_au(meta)
                                 }
                                 Some(hdr) => {
-                                    log::debug!(
-                                        "Bogus mid-access unit timestamp change after {:?}",
-                                        hdr
+                                    tracing::debug!(
+                                        nal_header = ?hdr,
+                                        "Bogus mid-access unit timestamp change"
                                     );
                                     self.analyzer.set_au_timestamp(meta.timestamp);
                                     access_unit
@@ -476,8 +480,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             // set to one in the same FU header". Some cameras violate this by
                             // wrapping small NALs in a single-fragment FU-A.
                             // Tolerate by treating them as a complete NAL.
-                            log::warn!(
-                                "FU-A header {fu_header:02x} has both start and end bits set; \
+                            tracing::warn!(
+                                fu_header = format_args!("{fu_header:02x}"),
+                                "FU-A header has both start and end bits set; \
                                  treating as a complete NAL. \
                                  Will not log about this again for this stream."
                             );
@@ -507,10 +512,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         if nal_header != fu_a.initial_nal_header
                             && !self.seen_inconsistent_fu_a_nal_hdr
                         {
-                            log::warn!(
-                                "FU-A has inconsistent NAL header: {:?} then {:?}; will not log about this again for this stream",
-                                fu_a.initial_nal_header,
-                                nal_header,
+                            tracing::warn!(
+                                initial_nal_header = ?fu_a.initial_nal_header,
+                                nal_header = ?nal_header,
+                                "FU-A has inconsistent NAL header; \
+                                 will not log about this again for this stream",
                             );
                             self.seen_inconsistent_fu_a_nal_hdr = true;
                         }
@@ -553,7 +559,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     DepacketizerInputState::New
                 }
                 Some(hdr) => {
-                    log::debug!("Bogus mid-access unit mark on {:?}", hdr);
+                    tracing::debug!(rtp_header = ?hdr, "Bogus mid-access unit mark");
                     self.analyzer.set_au_timestamp(timestamp);
                     DepacketizerInputState::PreMark(access_unit)
                 }
@@ -864,10 +870,12 @@ impl InternalParameters {
             has_extra_trailing_data: &mut sps_has_extra_trailing_data,
         })
         .map_err(|e| format!("Bad SPS {sps_hex}: {e:?}"))?;
-        debug!("SPS {sps_hex}: {:#?}", sps);
+        debug!(sps = %sps_hex, "parsed SPS: {:#?}", sps);
         if sps_has_extra_trailing_data && !seen_extra_trailing_data {
-            log::warn!(
-                "Ignoring trailing data in SPS {sps_hex}; will not log about trailing data again for this stream."
+            tracing::warn!(
+                sps = %sps_hex,
+                "Ignoring trailing data in SPS; \
+                 will not log about trailing data again for this stream."
             );
             seen_extra_trailing_data = true;
         }
@@ -981,7 +989,7 @@ impl InternalParameters {
         let pps_rbsp = match h264_reader::rbsp::decode_nal(pps_nal) {
             Ok(r) => r,
             Err(e) => {
-                debug!("Can't decode PPS {pps_hex}: {e}");
+                debug!(pps = %pps_hex, error = %e, "Can't decode PPS");
                 return None;
             }
         };
@@ -995,7 +1003,11 @@ impl InternalParameters {
         ) {
             Ok(pps) => ctx.put_pic_param_set(pps),
             Err(e) => {
-                debug!("Can't parse PPS {pps_hex}: {e:?}; won't detect leading pictures");
+                debug!(
+                    pps = %pps_hex,
+                    error = ?e,
+                    "Can't parse PPS; won't detect leading pictures"
+                );
                 return None;
             }
         }

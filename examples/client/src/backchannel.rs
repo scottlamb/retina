@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
-use log::{error, info, warn};
 use retina::client::{PlayingItem, SessionGroup, SetupOptions, StreamDirection};
 use retina::rtp::{Sender, SenderOptions};
 use retina::{NtpTimestamp, Timestamp};
+use tracing::{error, info, warn};
 
 /// G.711 samples per packet: 20 ms at 8 kHz, the default packetization
 /// interval of RFC 3551 section 4.2 (Table 1's "ms/packet" for PCMU and PCMA).
@@ -45,7 +45,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let session_group = Arc::new(SessionGroup::default());
     let r = run_inner(opts, session_group.clone()).await;
     if let Err(e) = session_group.await_teardown().await {
-        error!("TEARDOWN failed: {}", e);
+        error!(error = %e, "TEARDOWN failed");
     }
     r
 }
@@ -80,7 +80,10 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
             Some((i, s, encode))
         })
         .ok_or_else(|| anyhow!("this example only sends PCMU or PCMA at 8 kHz"))?;
-    info!("sending to backchannel stream {stream_i}: {stream:?}");
+    info!(
+        stream = stream_i,
+        "sending to backchannel stream: {stream:?}"
+    );
     let payload_type = stream.rtp_payload_type();
     session.setup(stream_i, SetupOptions::default()).await?;
     let mut session = session.play(retina::client::PlayOptions::default()).await?;

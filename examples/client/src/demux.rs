@@ -11,13 +11,13 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Error, anyhow};
-use log::warn;
 use retina::PacketContext;
 use retina::client::{Playing, PlayingItem, Session};
 use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, FrameFormat, Loss, LossReason,
     MessageFrameRef, MessageHandler, VideoFrameEnd, VideoFrameStart, VideoHandler, VideoParameters,
 };
+use tracing::warn;
 
 /// A frame or RTCP packet, as returned by [`Demuxer::next`].
 pub enum Item {
@@ -148,7 +148,7 @@ impl Handler<'_> {
         let n = match loss.reason() {
             LossReason::PacketLoss { packets, .. } => *packets,
             r => {
-                warn!("stream {}: {r:?}", self.stream_id);
+                warn!(stream = self.stream_id, reason = ?r, "loss");
                 1
             }
         };

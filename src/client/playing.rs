@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use log::{trace, warn};
+use tracing::{trace, warn};
 use url::Url;
 
 use super::Error;
@@ -158,7 +158,13 @@ struct StreamItem {
 
 /// Logs a packet the reorderer dropped: a warning the first time each kind of
 /// drop happens on a stream, then only at debug level.
-fn note_dropped(stream_i: usize, seq: u16, pushed: Pushed, c: crate::rtp::ReorderCounters) {
+fn note_dropped(
+    conn_ctx: &ConnectionContext,
+    stream_i: usize,
+    seq: u16,
+    pushed: Pushed,
+    c: crate::rtp::ReorderCounters,
+) {
     let first = match pushed {
         Pushed::Late => c.late == 1,
         Pushed::Duplicate => c.duplicates == 1,
@@ -167,11 +173,19 @@ fn note_dropped(stream_i: usize, seq: u16, pushed: Pushed, c: crate::rtp::Reorde
     };
     if first {
         warn!(
-            "stream {stream_i}: dropping {pushed:?} seq={seq}; further such drops \
-             are logged at debug level"
+            conn = %conn_ctx,
+            stream = stream_i,
+            seq,
+            "dropping {pushed:?} packet; further such drops are logged at debug level"
         );
     } else {
-        log::debug!("stream {stream_i}: dropping {pushed:?} seq={seq}; {c:?}");
+        tracing::debug!(
+            conn = %conn_ctx,
+            stream = stream_i,
+            seq,
+            counters = ?c,
+            "dropping {pushed:?} packet"
+        );
     }
 }
 
@@ -418,6 +432,7 @@ impl PlayingCore {
                     }
                     msg::Message::Request(request) => {
                         warn!(
+                            conn = %self.conn.ctx,
                             "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
                             request
                         );
@@ -448,9 +463,11 @@ impl PlayingCore {
                 continue;
             };
             if p.restarted {
-                log::warn!(
-                    "stream {stream_i}: sender restarted RTP sequence numbers at seq={}",
-                    p.header.sequence_number()
+                tracing::warn!(
+                    conn = %self.conn.ctx,
+                    stream = stream_i,
+                    seq = p.header.sequence_number(),
+                    "sender restarted RTP sequence numbers"
                 );
                 stream.rtp_handler.receiver.restart_sequence();
             }
@@ -592,7 +609,7 @@ impl PlayingCore {
             body: Bytes::new(),
         };
         let cseq = self.conn.fill_req(&mut req)?;
-        trace!("sending {:?} keepalive", method);
+        trace!(conn = %self.conn.ctx, ?method, cseq, "sending keepalive");
         self.conn.queue(&req);
         let keepalive = &mut self.keepalive;
         keepalive.state = KeepaliveState::Flushing {
@@ -629,7 +646,7 @@ impl PlayingCore {
                 let seq = reorderer.reception_report()?;
                 Some(reception.report_block(now, ssrc, seq))
             });
-            trace!("sending RTCP receiver report for stream {i}: {block:?}");
+            trace!(stream = i, ?block, "sending RTCP receiver report");
             let pkt = reports.writer.write(block.as_ref());
             match (udp_buf, &ctx.0) {
                 (Some(_), _) => self.transmit_udp.push_back(UdpTransmit {
@@ -796,9 +813,19 @@ impl PlayingCore {
             // timeout or gets angry and closes the connection. (rtsp-simple-server
             // does the latter as of 2022-08-07, though I'm told this will be fixed.)
             if !response.status_code.is_success() {
-                warn!("keepalive failed with {:?}", response.status_code);
+                warn!(
+                    conn = %self.conn.ctx,
+                    ?method,
+                    status = %response.status_code,
+                    "keepalive failed"
+                );
             } else {
-                trace!("keepalive succeeded with {:?}", response.status_code);
+                trace!(
+                    conn = %self.conn.ctx,
+                    ?method,
+                    status = %response.status_code,
+                    "keepalive succeeded"
+                );
                 if matches!(method, KeepaliveMethod::Options) {
                     match parse::parse_options(&response) {
                         Ok(r) => {
@@ -806,7 +833,11 @@ impl PlayingCore {
                             keepalive.get_parameter_supported |= r.get_parameter_supported;
                         }
                         Err(e) => {
-                            warn!("Unable to parse OPTIONS response: {}", e);
+                            warn!(
+                                conn = %self.conn.ctx,
+                                error = %e,
+                                "Unable to parse OPTIONS response"
+                            );
                         }
                     }
                 }
@@ -863,9 +894,10 @@ impl PlayingCore {
         match item.channel_type {
             ChannelType::Rtp if stream.sending => {
                 // Retina sends RTP on this stream; the server shouldn't.
-                log::debug!(
-                    "ignoring RTP packet received on sending stream {}",
-                    item.stream_i
+                tracing::debug!(
+                    conn = %self.conn.ctx,
+                    stream = item.stream_i,
+                    "ignoring RTP packet received on sending stream"
                 );
                 Ok(None)
             }
@@ -911,7 +943,13 @@ impl PlayingCore {
                     reception.rtp(rtp_timestamp, now);
                 }
                 if pushed != Pushed::Held {
-                    note_dropped(item.stream_i, seq, pushed, stream.reorderer.counters());
+                    note_dropped(
+                        &self.conn.ctx,
+                        item.stream_i,
+                        seq,
+                        pushed,
+                        stream.reorderer.counters(),
+                    );
                 }
                 Ok(None) // returned later via `pop_reordered`.
             }

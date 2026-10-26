@@ -5,13 +5,13 @@ extern crate ffmpeg_next as ffmpeg;
 
 use anyhow::{Error, anyhow, bail};
 use clap::Parser;
-use log::{error, info, warn};
 use retina::PacketContext;
 use retina::client::{PlayingItem, SetupOptions};
 use retina::codec::{
     Accumulate, Depacketizer, FrameFormat, Loss, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
-use std::{fs::File, io::Write, path::Path, str::FromStr, sync::Arc};
+use std::{fs::File, io::Write, path::Path, sync::Arc};
+use tracing::{error, info, warn};
 
 /// Decodes video streams using ffmpeg, writing them into `frame<i>.ppm` images.
 #[derive(Parser)]
@@ -41,27 +41,21 @@ struct Opts {
     max_frames: Option<u64>,
 }
 
-fn init_logging() -> mylog::Handle {
-    let h = mylog::Builder::new()
-        .format(
-            ::std::env::var("RUST_FORMAT")
-                .map_err(|_| ())
-                .and_then(|s| mylog::Format::from_str(&s))
-                .unwrap_or(mylog::Format::Google),
+fn init_logging() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
-        .spec(::std::env::var("RUST_LOG").as_deref().unwrap_or("info"))
-        .build();
-    h.clone().install().unwrap();
-    h
+        .init();
 }
 
 #[tokio::main]
 async fn main() {
-    let mut h = init_logging();
-    if let Err(e) = {
-        let _a = h.async_scope();
-        run().await
-    } {
+    init_logging();
+    if let Err(e) = run().await {
         error!("{}", e);
         std::process::exit(1);
     }
@@ -84,7 +78,7 @@ impl VideoHandler<PacketContext> for Frames {
     }
 
     fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
-        warn!("loss: {:?}", loss.reason());
+        warn!(reason = ?loss.reason(), "loss");
     }
 }
 
@@ -232,7 +226,7 @@ async fn run() -> Result<(), Error> {
                     #[cfg(feature = "h265")]
                     "h265" => return Some((i, ffmpeg::codec::Id::H265)),
                     _ => {
-                        log::info!(
+                        tracing::info!(
                             "Ignoring {} video stream because it's unsupported",
                             s.encoding_name(),
                         );
