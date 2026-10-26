@@ -29,7 +29,6 @@ use retina::{
 
 use crate::demux::{Demuxer, Frame, Item, VideoFrame};
 
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::{convert::TryFrom, pin::Pin};
 use std::{io::SeekFrom, sync::Arc};
@@ -170,7 +169,16 @@ impl TrakTracker {
         self.next_pos = Some(byte_pos + size);
         if let Some(last_pts) = self.last_pts.replace(timestamp.timestamp()) {
             let duration = timestamp.timestamp().checked_sub(last_pts).unwrap();
-            self.tot_duration += u64::try_from(duration).unwrap();
+
+            // RTP senders don't always produce monotonic timestamps, but `.mp4`
+            // durations can't be negative.
+            let Ok(duration) = u64::try_from(duration) else {
+                bail!(
+                    "timestamp {timestamp} is {} ticks before previous",
+                    -duration
+                );
+            };
+            self.tot_duration += duration;
             let duration = u32::try_from(duration)?;
             match self.durations.last_mut() {
                 Some((s, d)) if *d == duration => *s += 1,
@@ -639,7 +647,6 @@ async fn write_mp4(
         .play(
             retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap())
                 .unknown_rtcp_ssrc(opts.unknown_rtcp_ssrc),
         )
         .await?;

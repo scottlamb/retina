@@ -802,9 +802,8 @@ impl SetupCore {
                     None
                 }
             };
-            let mut options = crate::rtp::ReceiverOptions::default()
-                .max_forward_jump_secs(policy.enforce_timestamps_with_max_jump_secs)
-                .learn_ssrc_from_sender_report(!matches!(
+            let mut options =
+                crate::rtp::ReceiverOptions::default().learn_ssrc_from_sender_report(!matches!(
                     policy.unknown_rtcp_ssrc,
                     UnknownRtcpSsrcPolicy::ProcessPackets
                 ));

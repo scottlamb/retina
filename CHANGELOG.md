@@ -70,6 +70,10 @@
     `SessionGroup::await_teardown` works with any async runtime (and no
     longer panics if the tokio runtime has shut down), as does the new
     `SessionGroup::changed`.
+*   BREAKING: remove `client::PlayOptions::enforce_timestamps_with_max_jump_secs`.
+    How to handle non-monotonic timestamps is application policy; callers
+    can check `Timestamp`s themselves. The lower-level
+    `rtp::ReceiverOptions::max_forward_jump_secs` remains.
 *   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
     `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
     does, per `client::TeardownPolicy` and tracked in the session's

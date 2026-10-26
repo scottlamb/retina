@@ -116,8 +116,7 @@ struct ReceivedMessage {
 /// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
 /// many RTP senders violate this. [`crate::rtp::Receiver`] allows such violations unless
-/// [`crate::rtp::ReceiverOptions::max_forward_jump_secs`] (or, in the client,
-/// [`crate::client::PlayOptions::enforce_timestamps_with_max_jump_secs`]) says otherwise.
+/// [`crate::rtp::ReceiverOptions::max_forward_jump_secs`] says otherwise.
 ///
 /// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` or
 /// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. [`crate::rtp::Receiver`]
