@@ -655,6 +655,22 @@ impl<T> ConnectionCore<T> {
         Ok(s.streams)
     }
 
+    /// Rejects any kind of request with the given status and extra headers,
+    /// e.g. `401 Unauthorized` with `WWW-Authenticate`.
+    ///
+    /// # Panics
+    ///
+    /// If `p` isn't this core's outstanding request.
+    pub fn reject<K>(
+        &mut self,
+        p: Pending<K>,
+        status: StatusCode,
+        headers: &[(HeaderName, HeaderValue)],
+    ) {
+        let _span = self.take_outstanding(&p);
+        self.respond(status, Some(&p.cseq), headers, "");
+    }
+
     /// Handles a request, returning it if it needs the application's answer.
     fn handle_request(&mut self, req: msg::Request, now: Instant) -> Option<Pending<PendingKind>> {
         let span = tracing::info_span!(

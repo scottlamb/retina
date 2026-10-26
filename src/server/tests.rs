@@ -229,6 +229,28 @@ fn dropped_request_gets_500() {
     assert_eq!(one_response(&mut c).0.status_code.as_u16(), 500);
 }
 
+#[test]
+fn reject_with_headers() {
+    init_logging();
+    let mut c = core();
+    c.read_buf().extend(
+        b"SETUP rtsp://h/cam/trackID=0 RTSP/1.0\r\nCSeq: 1\r\n\
+          Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n",
+    );
+    let Some(Ok(Event::Setup(s))) = c.poll_event(Instant::now()) else {
+        panic!()
+    };
+    c.reject(
+        s,
+        StatusCode::UNAUTHORIZED,
+        &[(HeaderName::WWW_AUTHENTICATE, hv("Basic realm=\"r\""))],
+    );
+    let (r, _) = one_response(&mut c);
+    assert_eq!(r.status_code, StatusCode::UNAUTHORIZED);
+    assert_eq!(header(&r, "WWW-Authenticate"), "Basic realm=\"r\"");
+    assert_eq!(c.sessions().count(), 0);
+}
+
 /// Retina's client understands the SDP.
 #[test]
 fn sdp_round_trip() {
