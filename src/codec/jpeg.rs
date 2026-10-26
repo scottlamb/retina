@@ -353,10 +353,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             // rather than returning it with a gap. If this packet starts a
             // new frame, it's handled below; otherwise the rest of this
             // frame's packets are ignored as having no header.
-            log::debug!(
-                "Discarding {}-byte JPEG frame prefix due to {:?}",
-                self.data.len(),
-                pkt.meta.continuity,
+            tracing::debug!(
+                bytes = self.data.len(),
+                continuity = ?pkt.meta.continuity,
+                "discarding JPEG frame prefix after packet loss"
             );
             self.metadata = None;
             self.data.clear();
@@ -396,7 +396,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             self.data.clear();
 
             // This can happen if we somehow drop the first packet in a frame
-            log::debug!("Got JPEG fragment when we have no header");
+            tracing::debug!("Got JPEG fragment when we have no header");
             return Ok(());
         }
 

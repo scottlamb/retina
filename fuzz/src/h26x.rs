@@ -166,7 +166,7 @@ pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
     let mut payload = Vec::new();
     for (i, pkt) in pkts.iter().enumerate() {
         pkt.payload.serialize(codec, &mut payload);
-        log::trace!(
+        tracing::trace!(
             "pkt: {pkt:?} -> {:?}",
             payload.hex_conf(retina::testutil::NONASCII_HEX_CONFIG)
         );

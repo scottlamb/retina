@@ -58,10 +58,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if !pkt.meta.continuity.is_contiguous()
             && let Some(in_progress) = &self.in_progress
         {
-            log::debug!(
-                "Discarding {}-byte message prefix due to {:?}",
+            tracing::debug!(
+                continuity = ?pkt.meta.continuity,
+                "Discarding {}-byte message prefix",
                 in_progress.data.len(),
-                pkt.meta.continuity,
             );
             self.in_progress = None;
         }

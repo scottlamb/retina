@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use bytes::Bytes;
-use log::debug;
+use tracing::debug;
 
 use super::Error;
 use super::channel_mapping::ChannelMappings;
@@ -289,9 +289,10 @@ impl ConnCore {
                         (mode, self.channels.lookup(d.channel_id))
                     {
                         debug!(
-                            "ignoring interleaved data message on {:?} channel {} while \
-                             waiting for response to PLAY CSeq {}",
-                            m.channel_type, d.channel_id, cseq
+                            channel_type = ?m.channel_type,
+                            channel_id = d.channel_id,
+                            cseq,
+                            "ignoring interleaved data message while waiting for PLAY response"
                         );
                         continue;
                     }

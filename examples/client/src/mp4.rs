@@ -21,11 +21,11 @@ use anyhow::{Context, Error, anyhow, bail};
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use futures::Future;
-use log::{debug, info, warn};
 use retina::{
     client::{SetupOptions, Transport},
     codec::{AudioParameters, VideoParameters},
 };
+use tracing::{debug, info, warn};
 
 use crate::demux::{Demuxer, Frame, Item, VideoFrame};
 
@@ -543,7 +543,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         } else {
             match frame.parameters.as_deref() {
                 Some(params) => {
-                    log::info!("new video params: {:?}", params);
+                    tracing::info!("new video params: {:?}", params);
                     let pos = self.video_params.iter().position(|p| p == params);
                     if let Some(pos) = pos {
                         u32::try_from(pos + 1)?
@@ -678,20 +678,20 @@ async fn write_mp4(
     if let Err(e) = result {
         // Log errors about finishing, returning the original error.
         if let Err(e) = mp4.finish().await {
-            log::error!(".mp4 finish failed: {}", e);
+            tracing::error!(error = %e, ".mp4 finish failed");
             if let Err(e) = tokio::fs::remove_file(&tmp_filename).await {
-                log::error!("and removing .mp4 failed too: {}", e);
+                tracing::error!(error = %e, "and removing .mp4 failed too");
             }
         } else if let Err(e) = tokio::fs::rename(&tmp_filename, &opts.out).await {
-            log::error!("unable to move completed .mp4 into place: {}", e);
+            tracing::error!(error = %e, "unable to move completed .mp4 into place");
         }
         Err(e)
     } else {
         // Directly return errors about finishing.
         if let Err(e) = mp4.finish().await {
-            log::error!(".mp4 finish failed: {}", e);
+            tracing::error!(error = %e, ".mp4 finish failed");
             if let Err(e) = tokio::fs::remove_file(&tmp_filename).await {
-                log::error!("and removing .mp4 failed too: {}", e);
+                tracing::error!(error = %e, "and removing .mp4 failed too");
             }
             Err(e)
         } else {
@@ -723,19 +723,19 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             if s.media() == "video" {
                 let encoding_name = s.payload_formats()[0].format().encoding_name();
                 if matches!(encoding_name, "h264" | "h265" | "jpeg") {
-                    log::info!("Using {encoding_name} video stream");
+                    tracing::info!("Using {encoding_name} video stream");
                     return true;
                 }
-                log::info!("Ignoring {encoding_name} video stream because it's unsupported");
+                tracing::info!("Ignoring {encoding_name} video stream because it's unsupported");
             }
             false
         });
         if s.is_none() {
-            log::info!("No suitable video stream found");
+            tracing::info!("No suitable video stream found");
         }
         s
     } else {
-        log::info!("Ignoring video streams (if any) because of --no-video");
+        tracing::info!("Ignoring video streams (if any) because of --no-video");
         None
     };
     if let Some(i) = video_stream_i {
@@ -760,14 +760,14 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                         if d.parameters().mp4_sample_entry().build().is_ok() =>
                     {
                         let a = d.parameters();
-                        log::info!(
+                        tracing::info!(
                             "Using {encoding_name} audio stream (rfc 6381 codec {})",
                             a.rfc6381_codec().unwrap()
                         );
                         Some((i, Box::new(a.clone())))
                     }
                     _ => {
-                        log::info!(
+                        tracing::info!(
                             "Ignoring {encoding_name} audio stream because it can't be placed into a .mp4 file without transcoding"
                         );
                         None
@@ -775,11 +775,11 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
                 }
             });
         if s.is_none() {
-            log::info!("No suitable audio stream found");
+            tracing::info!("No suitable audio stream found");
         }
         s
     } else {
-        log::info!("Ignoring audio streams (if any) because of --no-audio");
+        tracing::info!("Ignoring audio streams (if any) because of --no-audio");
         None
     };
     if let Some((i, _)) = audio_stream {
@@ -792,7 +792,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     }
     let result = write_mp4(&opts, session, audio_stream.map(|(_i, p)| p), stop_signal).await;
     if result.is_err() {
-        log::info!(
+        tracing::info!(
             "writing MP4 failed; \
                     details will be logged with `Fatal:` after RTSP session teardown"
         );
@@ -801,7 +801,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     // Session has now been dropped, on success or failure. A TEARDOWN should
     // be pending if necessary. session_group.await_teardown() will wait for it.
     if let Err(e) = session_group.await_teardown().await {
-        log::error!("TEARDOWN failed: {}", e);
+        tracing::error!(error = %e, "TEARDOWN failed");
     }
     result
 }

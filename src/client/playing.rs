@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use log::{debug, trace, warn};
+use tracing::{debug, trace, warn};
 use url::Url;
 
 use super::Error;
@@ -406,6 +406,7 @@ impl PlayingCore {
                     }
                     msg::Message::Request(request) => {
                         warn!(
+                            conn = %self.conn.ctx,
                             "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
                             request
                         );
@@ -436,9 +437,11 @@ impl PlayingCore {
                 continue;
             };
             if p.continuity == crate::rtp::Continuity::Discontinuity {
-                log::warn!(
-                    "stream {stream_i}: sender restarted RTP sequence numbers at seq={}",
-                    p.header.sequence_number()
+                tracing::warn!(
+                    conn = %self.conn.ctx,
+                    stream = stream_i,
+                    seq = p.header.sequence_number(),
+                    "sender restarted RTP sequence numbers"
                 );
             }
             let meta = p.meta(p.item.pkt_ctx);
@@ -573,7 +576,7 @@ impl PlayingCore {
             body: Bytes::new(),
         };
         let cseq = self.conn.fill_req(&mut req)?;
-        trace!("sending {:?} keepalive", method);
+        trace!(conn = %self.conn.ctx, ?method, cseq, "sending keepalive");
         self.conn.queue(&req);
         let keepalive = &mut self.keepalive;
         keepalive.state = KeepaliveState::Flushing {
@@ -606,7 +609,7 @@ impl PlayingCore {
                 continue;
             };
             let block = receiver.reception_report(now);
-            trace!("sending RTCP receiver report for stream {i}: {block:?}");
+            trace!(stream = i, ?block, "sending RTCP receiver report");
             let pkt = reports.writer.write(block.as_ref());
             match (udp_buf, &ctx.0) {
                 (Some(_), _) => self.transmit_udp.push_back(UdpTransmit {
@@ -808,17 +811,35 @@ impl PlayingCore {
                             }
                         }
                         Err(e) => {
-                            warn!("keepalive: can't understand WWW-Authenticate: {e}");
+                            warn!(
+                                conn = %self.conn.ctx,
+                                error = %e,
+                                "keepalive: can't understand WWW-Authenticate"
+                            );
                         }
                     }
                 }
                 if retrying {
-                    debug!("keepalive refused with a fresh challenge; retrying in 1 s");
+                    debug!(
+                        conn = %self.conn.ctx,
+                        ?method,
+                        "keepalive refused with a fresh challenge; retrying in 1 s"
+                    );
                 } else {
-                    warn!("keepalive failed with {:?}", response.status_code);
+                    warn!(
+                        conn = %self.conn.ctx,
+                        ?method,
+                        status = %response.status_code,
+                        "keepalive failed"
+                    );
                 }
             } else {
-                trace!("keepalive succeeded with {:?}", response.status_code);
+                trace!(
+                    conn = %self.conn.ctx,
+                    ?method,
+                    status = %response.status_code,
+                    "keepalive succeeded"
+                );
                 if matches!(method, KeepaliveMethod::Options) {
                     match parse::parse_options(&response) {
                         Ok(r) => {
@@ -826,7 +847,11 @@ impl PlayingCore {
                             keepalive.get_parameter_supported |= r.get_parameter_supported;
                         }
                         Err(e) => {
-                            warn!("Unable to parse OPTIONS response: {}", e);
+                            warn!(
+                                conn = %self.conn.ctx,
+                                error = %e,
+                                "Unable to parse OPTIONS response"
+                            );
                         }
                     }
                 }
@@ -883,9 +908,10 @@ impl PlayingCore {
         match item.channel_type {
             ChannelType::Rtp if stream.sending => {
                 // Retina sends RTP on this stream; the server shouldn't.
-                log::debug!(
-                    "ignoring RTP packet received on sending stream {}",
-                    item.stream_i
+                tracing::debug!(
+                    conn = %self.conn.ctx,
+                    stream = item.stream_i,
+                    "ignoring RTP packet received on sending stream"
                 );
                 Ok(None)
             }

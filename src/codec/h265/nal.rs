@@ -1407,19 +1407,19 @@ mod tests {
     impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for LoggingBitReader<R> {
         fn read_ue(&mut self, name: &'static str) -> Result<u32, BitReaderError> {
             let res = self.0.read_ue(name)?;
-            log::debug!("read_ue: {} -> {}", name, res);
+            tracing::debug!("read_ue: {} -> {}", name, res);
             Ok(res)
         }
 
         fn read_se(&mut self, name: &'static str) -> Result<i32, BitReaderError> {
             let res = self.0.read_se(name)?;
-            log::debug!("read_se: {} -> {}", name, res);
+            tracing::debug!("read_se: {} -> {}", name, res);
             Ok(res)
         }
 
         fn read_bit(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
             let res = self.0.read_bit(name)?;
-            log::debug!("read_bit: {} -> {}", name, res);
+            tracing::debug!("read_bit: {} -> {}", name, res);
             Ok(res)
         }
 
@@ -1428,7 +1428,7 @@ mod tests {
             name: &'static str,
         ) -> Result<I, BitReaderError> {
             let res = self.0.read::<BITS, I>(name)?;
-            log::debug!("read: {}({}) -> {:?}", name, BITS, res);
+            tracing::debug!("read: {}({}) -> {:?}", name, BITS, res);
             Ok(res)
         }
 
@@ -1438,7 +1438,7 @@ mod tests {
             name: &'static str,
         ) -> Result<I, BitReaderError> {
             let res = self.0.read_var(bit_count, name)?;
-            log::debug!("read_var: {}({}) -> {:?}", name, bit_count, res);
+            tracing::debug!("read_var: {}({}) -> {:?}", name, bit_count, res);
             Ok(res)
         }
 
@@ -1447,13 +1447,13 @@ mod tests {
             name: &'static str,
         ) -> Result<V, BitReaderError> {
             let res = self.0.read_to(name)?;
-            log::debug!("read_to: {}({})", name, std::mem::size_of::<V>() * 8);
+            tracing::debug!("read_to: {}({})", name, std::mem::size_of::<V>() * 8);
             Ok(res)
         }
 
         fn skip(&mut self, bit_count: u32, name: &'static str) -> Result<(), BitReaderError> {
             self.0.skip(bit_count, name)?;
-            log::debug!("skip: {}({})", name, bit_count);
+            tracing::debug!("skip: {}({})", name, bit_count);
             Ok(())
         }
 
@@ -1463,19 +1463,19 @@ mod tests {
 
         fn has_more_rbsp_data(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
             let res = self.0.has_more_rbsp_data(name)?;
-            log::debug!("has_more_rbsp_data: {} -> {}", name, res);
+            tracing::debug!("has_more_rbsp_data: {} -> {}", name, res);
             Ok(res)
         }
 
         fn finish_rbsp(self) -> Result<(), BitReaderError> {
             self.0.finish_rbsp()?;
-            log::debug!("finish_rbsp");
+            tracing::debug!("finish_rbsp");
             Ok(())
         }
 
         fn finish_sei_payload(self) -> Result<(), BitReaderError> {
             self.0.finish_sei_payload()?;
-            log::debug!("finish_sei_payload");
+            tracing::debug!("finish_sei_payload");
             Ok(())
         }
     }

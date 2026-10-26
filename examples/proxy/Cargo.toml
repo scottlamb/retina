@@ -9,9 +9,9 @@ publish = false
 anyhow = "1.0.41"
 futures = "0.3.14"
 clap = { version = "4.1.4", features = ["derive"] }
-log = "0.4.8"
-mylog = { git = "https://github.com/scottlamb/mylog" }
 rand = "0.8.3"
 retina = { path = "../../", features = ["unstable-server"] }
 tokio = { version = "1.13.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.2.1"

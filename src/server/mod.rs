@@ -173,6 +173,9 @@ struct Outstanding {
 
     /// The session this request is for, which must not time out meanwhile.
     session: Option<SessionId>,
+
+    /// The request's span; see [`Pending::span`].
+    span: tracing::Span,
 }
 
 /// The sans-I/O state of an RTSP server connection.
@@ -355,7 +358,7 @@ impl<T> ConnectionCore<T> {
             let s = &self.sessions[i];
             if Some(s.id) != busy && s.last_active.is_some_and(|t| t + timeout <= now) {
                 let s = self.sessions.swap_remove(i);
-                log::debug!("{}: session {} timed out", self.conn_ctx, s.id);
+                tracing::debug!(conn = %self.conn_ctx, session_id = %s.id, "session timed out");
                 self.timed_out.push_back(ClosedSession {
                     id: s.id,
                     streams: s.streams,
@@ -382,11 +385,8 @@ impl<T> ConnectionCore<T> {
                 && o.liveness.strong_count() == 0
             {
                 let o = self.outstanding.take().expect("outstanding is some");
-                log::warn!(
-                    "{}: {} request dropped without a response",
-                    self.conn_ctx,
-                    o.method
-                );
+                let _span = o.span.enter();
+                tracing::warn!(method = %o.method, "request dropped without a response");
                 self.respond(StatusCode::INTERNAL_SERVER_ERROR, Some(&o.cseq), &[], "");
                 if let Some(s) = o.session.and_then(|id| self.session_mut(id)) {
                     s.last_active = Some(now);
@@ -414,19 +414,19 @@ impl<T> ConnectionCore<T> {
                         }) {
                             s.last_active = Some(now);
                         } else {
-                            log::debug!(
-                                "{}: ignoring data on unassigned channel {}",
-                                self.conn_ctx,
-                                d.channel_id
+                            tracing::debug!(
+                                conn = %self.conn_ctx,
+                                channel_id = d.channel_id,
+                                "ignoring data on unassigned channel"
                             );
                         }
                         continue;
                     }
                     msg::Message::Response(r) => {
-                        log::debug!(
-                            "{}: ignoring unsolicited response {}",
-                            self.conn_ctx,
-                            r.status_code
+                        tracing::debug!(
+                            conn = %self.conn_ctx,
+                            status = %r.status_code,
+                            "ignoring unsolicited response"
                         );
                         continue;
                     }
@@ -458,6 +458,7 @@ impl<T> ConnectionCore<T> {
             method: p.req.method.to_string(),
             cseq: p.cseq.clone(),
             session,
+            span: p.span.clone(),
         });
         match std::mem::replace(&mut p.kind, PendingKind::Describe) {
             PendingKind::Describe => Event::Describe(p.with_kind(Describe(()))),
@@ -467,12 +468,13 @@ impl<T> ConnectionCore<T> {
         }
     }
 
-    /// Clears the outstanding request, which `p` must be.
+    /// Clears the outstanding request, which `p` must be, returning its
+    /// entered span.
     ///
     /// # Panics
     ///
     /// If `p` isn't this core's outstanding request.
-    fn take_outstanding<K>(&mut self, p: &Pending<K>) {
+    fn take_outstanding<K>(&mut self, p: &Pending<K>) -> tracing::span::EnteredSpan {
         let o = self
             .outstanding
             .take_if(|o| std::ptr::eq(o.liveness.as_ptr(), Arc::as_ptr(&p.liveness)))
@@ -481,6 +483,7 @@ impl<T> ConnectionCore<T> {
             // Set from the next `poll_event`'s `now`.
             s.last_active = None;
         }
+        o.span.entered()
     }
 
     fn session_mut(&mut self, id: SessionId) -> Option<&mut Session<T>> {
@@ -497,7 +500,7 @@ impl<T> ConnectionCore<T> {
     ///
     /// If `p` isn't this core's outstanding request.
     pub fn respond_describe(&mut self, p: Pending<Describe>, r: Result<&str, StatusCode>) {
-        self.take_outstanding(&p);
+        let _span = self.take_outstanding(&p);
         let sdp = match r {
             Ok(sdp) => sdp,
             Err(status) => return self.respond(status, Some(&p.cseq), &[], ""),
@@ -527,7 +530,7 @@ impl<T> ConnectionCore<T> {
         p: Pending<Setup>,
         r: Result<(T, u32), StatusCode>,
     ) -> Result<SessionId, SessionGoneError> {
-        self.take_outstanding(&p);
+        let _span = self.take_outstanding(&p);
         let id = p.kind.session;
         let (data, ssrc) = match r {
             Ok(r) => r,
@@ -588,7 +591,7 @@ impl<T> ConnectionCore<T> {
         p: Pending<Play>,
         r: Result<&[RtpInfo], StatusCode>,
     ) -> Result<(), SessionGoneError> {
-        self.take_outstanding(&p);
+        let _span = self.take_outstanding(&p);
         let rtp_info = match r {
             Ok(r) => r,
             Err(status) => {
@@ -641,7 +644,7 @@ impl<T> ConnectionCore<T> {
         &mut self,
         p: Pending<Teardown>,
     ) -> Result<Vec<SessionStream<T>>, SessionGoneError> {
-        self.take_outstanding(&p);
+        let _span = self.take_outstanding(&p);
         let id = p.kind.session;
         let Some(i) = self.sessions.iter().position(|s| s.id == id) else {
             self.respond(StatusCode::SESSION_NOT_FOUND, Some(&p.cseq), &[], "");
@@ -654,7 +657,14 @@ impl<T> ConnectionCore<T> {
 
     /// Handles a request, returning it if it needs the application's answer.
     fn handle_request(&mut self, req: msg::Request, now: Instant) -> Option<Pending<PendingKind>> {
-        log::trace!("{}: request:\n{req}", self.conn_ctx);
+        let span = tracing::info_span!(
+            "rtsp_request",
+            method = %req.method,
+            url = req.request_uri.as_ref().map(Url::as_str),
+            conn = %self.conn_ctx,
+        );
+        let _enter = span.enter();
+        tracing::trace!("request:\n{req}");
         let Some(cseq_value) = req.headers.get("CSeq").cloned() else {
             self.respond(StatusCode::BAD_REQUEST, None, &[], "");
             return None;
@@ -777,6 +787,7 @@ impl<T> ConnectionCore<T> {
             cseq: cseq_value,
             kind,
             liveness: Arc::new(()),
+            span: span.clone(),
         })
     }
 
@@ -865,7 +876,7 @@ impl<T> ConnectionCore<T> {
             reason_phrase: status.canonical_reason().to_owned(),
             headers: h,
         };
-        log::trace!("{}: response:\n{resp}{body}", self.conn_ctx);
+        tracing::trace!("response:\n{resp}{body}");
         resp.write_head(&mut self.transmit)
             .expect("TransmitBuf writes are infallible");
         self.transmit
@@ -906,11 +917,22 @@ pub struct Pending<K> {
 
     /// The core holds a `Weak` to this, to notice if it's dropped.
     liveness: Arc<()>,
+
+    span: tracing::Span,
 }
 
 impl<K> Pending<K> {
     pub fn request(&self) -> &msg::Request {
         &self.req
+    }
+
+    /// Returns a span for this request, with the method, URL, and connection.
+    ///
+    /// The core enters it while handling the request and its answer. The
+    /// application may too, e.g. via [`tracing::Instrument`] on asynchronous
+    /// work toward the answer. It lasts only as long as the request.
+    pub fn span(&self) -> &tracing::Span {
+        &self.span
     }
 
     fn with_kind<K2>(self, kind: K2) -> Pending<K2> {
@@ -919,6 +941,7 @@ impl<K> Pending<K> {
             cseq: self.cseq,
             kind,
             liveness: self.liveness,
+            span: self.span,
         }
     }
 }

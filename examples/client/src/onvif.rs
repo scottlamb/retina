@@ -3,8 +3,8 @@
 
 use anyhow::{Error, anyhow};
 use clap::Parser;
-use log::{error, info};
 use retina::client::{SessionGroup, SetupOptions};
+use tracing::{error, info};
 
 use crate::demux::{Demuxer, Item};
 use std::sync::Arc;
@@ -19,7 +19,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let session_group = Arc::new(SessionGroup::default());
     let r = run_inner(opts, session_group.clone()).await;
     if let Err(e) = session_group.await_teardown().await {
-        error!("TEARDOWN failed: {}", e);
+        error!(error = %e, "TEARDOWN failed");
     }
     r
 }

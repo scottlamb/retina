@@ -299,7 +299,7 @@ impl<C: Codec> Packetizer<C> {
         self.frame_vcl_ended = false;
         self.late_sets_delivered = false;
         if (self.awaiting_rap && !frame.is_random_access_point) || sink.congested() {
-            log::trace!("dropping frame {frame:?}");
+            tracing::trace!("dropping frame {frame:?}");
             self.drop_rest_of_frame();
             return;
         }
@@ -360,8 +360,9 @@ impl<C: Codec> Packetizer<C> {
                 .expect("parameters from parameter sets are for the same codec"),
             Err(e) => {
                 if !self.seen_unparsed_sets {
-                    log::warn!(
-                        "Passing through in-band parameter sets which can't be parsed: {e}; \
+                    tracing::warn!(
+                        error = %e,
+                        "Passing through in-band parameter sets which can't be parsed; \
                          will not log about this again for this stream"
                     );
                     self.seen_unparsed_sets = true;
@@ -427,7 +428,7 @@ impl<C: Codec> Packetizer<C> {
     /// Notes misuse by the caller, logging only the first time.
     fn misuse(&mut self, what: &str) {
         if !self.seen_misuse {
-            log::warn!("{what}; will not log about misuse again for this stream");
+            tracing::warn!("{what}; will not log about misuse again for this stream");
             self.seen_misuse = true;
         }
     }
@@ -515,10 +516,10 @@ impl<C: Codec> Packetizer<C> {
             };
             if let Some(reason) = invalid {
                 if !self.seen_invalid_nal {
-                    log::warn!(
-                        "Discarding NAL with header {:02x?}: {reason}; \
-                         will not log about this again for this stream",
-                        &hdr.as_ref()[..filled],
+                    tracing::warn!(
+                        nal_header = format_args!("{:02x?}", &hdr.as_ref()[..filled]),
+                        reason,
+                        "Discarding invalid NAL; will not log about this again for this stream",
                     );
                     self.seen_invalid_nal = true;
                 }
@@ -624,7 +625,10 @@ impl<C: Codec> Packetizer<C> {
     /// bit). It's held so that `end_frame` delivers it with the marker bit.
     fn truncate(&mut self, input: &[u8], sink: &mut impl PayloadSink) {
         let mut nal = self.nal.take().expect("truncate with NAL in progress");
-        log::trace!("truncating NAL {:02x?}", nal.hdr);
+        tracing::trace!(
+            nal_header = format_args!("{:02x?}", nal.hdr),
+            "truncating NAL"
+        );
         self.flush_held(false, sink);
         self.held.clear();
         let hdr = damaged(nal.hdr);

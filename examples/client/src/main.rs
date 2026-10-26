@@ -13,8 +13,7 @@ mod webcodecs;
 
 use anyhow::Error;
 use clap::Parser;
-use log::{error, info};
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing::{error, info};
 
 #[derive(Parser)]
 struct Source {
@@ -48,19 +47,15 @@ enum Cmd {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-        .with_env_var("RUST_LOG")
-        .from_env_lossy();
-    tracing_log::LogTracer::init().unwrap();
-    let sub = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::Layer::new()
-                .with_writer(std::io::stderr)
-                .with_thread_names(true),
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+                .from_env_lossy(),
         )
-        .with(filter);
-    tracing::subscriber::set_global_default(sub).unwrap();
+        .with_thread_names(true)
+        .init();
 }
 
 #[tokio::main]

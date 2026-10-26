@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bytes::Bytes;
-use log::{debug, warn};
 use sdp_types::Media;
 use std::{net::IpAddr, num::NonZeroU16};
+use tracing::{debug, warn};
 use url::Url;
 
 use super::{Presentation, Stream, StreamDirection};
@@ -276,18 +276,6 @@ fn parse_media(
         }
     }
 
-    // All of the `m=` line's formats, for the receiver's payload type filter.
-    // Ignore any after the first that aren't valid RTP payload types.
-    let mut rtp_payload_types = vec![rtp_payload_type];
-    for f in media_description.fmt.split_ascii_whitespace().skip(1) {
-        if let Ok(pt) = u8::from_str_radix(f, 10)
-            && pt < 0x80
-            && !rtp_payload_types.contains(&pt)
-        {
-            rtp_payload_types.push(pt);
-        }
-    }
-
     // Capture interesting attributes.
     // RFC 8866: "For dynamic payload type assignments, the "a=rtpmap:"
     // attribute (see Section 6.6) SHOULD be used to map from an RTP payload
@@ -337,7 +325,7 @@ fn parse_media(
                 } else {
                     // Ubiquiti cameras sometimes have e.g. "a=fmtp:96": payload
                     // type only, no actual attributes. Don't fail on this.
-                    warn!("ignoring invalid fmtp attribute value {:?}", v);
+                    warn!(value = ?v, "ignoring invalid fmtp attribute value");
                 }
             }
             "control" => {
@@ -359,8 +347,9 @@ fn parse_media(
     }
 
     // Describe each format. The first (default) format must be describable;
-    // others that aren't are left out of `payload_formats`. If an attribute
-    // is repeated for a payload type, the last one wins.
+    // others that aren't are left out of `payload_formats`, but packets with
+    // their payload types are still accepted as part of the stream. If an
+    // attribute is repeated for a payload type, the last one wins.
     fn lookup<'v>(attrs: &[(u8, &'v str)], pt: u8) -> Option<&'v str> {
         attrs.iter().rev().find(|&&(p, _)| p == pt).map(|&(_, v)| v)
     }
@@ -372,7 +361,7 @@ fn parse_media(
                 format,
             }),
             Err(e) if i == 0 => return Err(e),
-            Err(e) => debug!("ignoring undescribed format {pt}: {e}"),
+            Err(e) => debug!(payload_type = pt, error = %e, "ignoring undescribed format"),
         }
     }
 
@@ -500,8 +489,8 @@ pub(crate) fn parse_describe(
         }
         None => {
             warn!(
-                "DESCRIBE response at {} has no content type; trying sdp anyway",
-                request_url.as_str()
+                url = request_url.as_str(),
+                "DESCRIBE response has no content type; trying sdp anyway"
             );
         }
     }
@@ -527,7 +516,7 @@ pub(crate) fn parse_describe(
                 // See <https://github.com/scottlamb/moonfire-nvr/issues/356>.
                 let fixed = format!("{}://{v}", request_url.scheme());
                 let url = Url::parse(&fixed).map_err(|e| format!("bad {h} {v:?}: {e}"))?;
-                warn!("repaired schemeless {h} {v:?} to {url}");
+                warn!(header = %h, value = ?v, %url, "repaired schemeless URL");
                 Ok::<_, String>(url)
             })
         })
@@ -567,11 +556,13 @@ pub(crate) fn parse_describe(
             } else {
                 StreamDirection::Receiving
             };
+            let _span = tracing::info_span!("sdp_media", stream = i).entered();
             parse_media(&base_url, m, direction).map_or_else(
                 |e| {
                     warn!(
-                        "Ignoring unparseable stream {}: {}\nraw SDP: {:#?}",
-                        i, e, raw_sdp
+                        error = %e,
+                        "Ignoring unparseable stream\nraw SDP: {:#?}",
+                        raw_sdp
                     );
                     None
                 },
@@ -711,7 +702,10 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
             let v = v.trim();
             match u32::from_str_radix(v, 16) {
                 Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
-                _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
+                _ => warn!(
+                    transport = transport_str,
+                    "Ignoring nonconforming ssrc in Transport header"
+                ),
             }
         } else if name == "interleaved" {
             let mut channels = value.splitn(2, '-');
@@ -789,7 +783,7 @@ pub(crate) fn parse_play(
         let stream = match stream {
             Some(s) => s,
             None => {
-                log::warn!("RTP-Info contains unknown stream {}", url);
+                tracing::warn!(%url, "RTP-Info contains unknown stream");
                 continue;
             }
         };
@@ -799,8 +793,8 @@ pub(crate) fn parse_play(
                 // for all streams. It also happens in some of other the tests
                 // here simply because I didn't include all the SETUP steps.
                 debug!(
-                    "PLAY response described stream {} in Uninit state",
-                    stream.control.as_ref().unwrap_or(&presentation.control)
+                    url = %stream.control.as_ref().unwrap_or(&presentation.control),
+                    "PLAY response described stream in Uninit state"
                 );
                 continue;
             }
@@ -822,7 +816,7 @@ pub(crate) fn parse_play(
                 }
                 "rtptime" => match u32::from_str_radix(value, 10) {
                     Ok(v) => state.initial_rtptime = Some(v),
-                    Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
+                    Err(_) => warn!(rtp_info = ?rtp_info, "Unparseable rtptime in RTP-Info header"),
                 },
                 // `ssrc` is deliberately not read here. RTSP/1.0 defines no
                 // `ssrc` parameter for `RTP-Info` (RFC 2326 section 12.33);
@@ -1518,7 +1512,7 @@ mod tests {
 
     /// Each of a stream's formats gets its own `rtpmap` and `fmtp`. Formats
     /// after the first that can't be described are left out of
-    /// `payload_formats`.
+    /// `payload_formats`, but stay in the receiver's payload type filter.
     #[test]
     fn multiple_formats() {
         init_logging();

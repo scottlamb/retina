@@ -8,11 +8,13 @@
 use std::time::Instant;
 
 use bytes::Bytes;
-use log::{debug, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::rtcp::ReceivedCompoundPacket;
 use crate::rtp::{PacketHeader, Pushed, Receiver, ReceiverCounters};
-use crate::{PacketContext, PacketContextInner, StreamContext, StreamContextInner};
+use crate::{
+    ConnectionContext, PacketContext, PacketContextInner, StreamContext, StreamContextInner,
+};
 
 use super::UnknownRtcpSsrcPolicy;
 use super::conn::ConnCore;
@@ -54,7 +56,13 @@ fn note_stale_live555_data_if_tcp(
 
 /// Logs a packet the reorder buffer dropped: a warning the first time each
 /// kind of drop happens on a stream, then only at debug level.
-fn note_dropped(stream_i: usize, seq: u16, pushed: Pushed, c: ReceiverCounters) {
+fn note_dropped(
+    conn_ctx: &ConnectionContext,
+    stream_i: usize,
+    seq: u16,
+    pushed: Pushed,
+    c: ReceiverCounters,
+) {
     let first = match pushed {
         Pushed::Late => c.late == 1,
         Pushed::Duplicate => c.duplicates == 1,
@@ -63,11 +71,19 @@ fn note_dropped(stream_i: usize, seq: u16, pushed: Pushed, c: ReceiverCounters) 
     };
     if first {
         warn!(
-            "stream {stream_i}: dropping {pushed:?} seq={seq}; further such drops \
-             are logged at debug level"
+            conn = %conn_ctx,
+            stream = stream_i,
+            seq,
+            "dropping {pushed:?} packet; further such drops are logged at debug level"
         );
     } else {
-        debug!("stream {stream_i}: dropping {pushed:?} seq={seq}; {c:?}");
+        debug!(
+            conn = %conn_ctx,
+            stream = stream_i,
+            seq,
+            counters = ?c,
+            "dropping {pushed:?} packet"
+        );
     }
 }
 
@@ -97,6 +113,7 @@ impl StreamPolicy {
         match pushed {
             Pushed::Held => {}
             Pushed::Late | Pushed::Duplicate | Pushed::Stray => note_dropped(
+                &conn.ctx,
                 stream_id,
                 header.sequence_number(),
                 pushed,
@@ -105,37 +122,42 @@ impl StreamPolicy {
             Pushed::Filtered | Pushed::FilteredRtcp => {
                 if !std::mem::replace(&mut self.seen_filtered, true) {
                     warn!(
-                        "skipping RTP packets whose payload type isn't one of stream \
-                         {stream_id}'s SDP formats (e.g. another stream's on its channel): \
-                         ssrc={:08x} pt={} rtcp={}; {receiver:?}; won't log further ones",
-                        header.ssrc(),
-                        header.payload_type(),
-                        matches!(pushed, Pushed::FilteredRtcp),
+                        conn = %conn.ctx,
+                        stream = stream_id,
+                        ssrc = format_args!("{:08x}", header.ssrc()),
+                        payload_type = header.payload_type(),
+                        rtcp = matches!(pushed, Pushed::FilteredRtcp),
+                        receiver = ?receiver,
+                        "skipping RTP packets whose payload type isn't one of the stream's \
+                         SDP formats (e.g. another stream's on this stream's channel); \
+                         won't log further ones"
                     );
                 } else {
                     trace!(
-                        "skipping RTP packet of another stream on stream {stream_id}'s \
-                         channel: ssrc={:08x} pt={}",
-                        header.ssrc(),
-                        header.payload_type(),
+                        stream = stream_id,
+                        ssrc = format_args!("{:08x}", header.ssrc()),
+                        payload_type = header.payload_type(),
+                        "skipping RTP packet of another stream"
                     );
                 }
             }
             Pushed::Unselected { first: true } => {
                 warn!(
-                    "stream {stream_id}: ignoring RTP packets from ssrc={:08x} (starting at \
-                     seq={}) while playing ssrc={:08x?}; won't log further ones from it",
-                    header.ssrc(),
-                    header.sequence_number(),
-                    receiver.selected_ssrc(),
+                    conn = %conn.ctx,
+                    stream = stream_id,
+                    ssrc = format_args!("{:08x}", header.ssrc()),
+                    seq = header.sequence_number(),
+                    selected_ssrc = ?receiver.selected_ssrc().map(|s| format!("{s:08x}")),
+                    "ignoring RTP packets from another source; won't log further ones from it"
                 );
                 note_stale_live555_data_if_tcp(conn, stream_ctx, pkt_ctx, now);
             }
             Pushed::Unselected { first: false } => {
                 trace!(
-                    "stream {stream_id}: ignoring RTP packet from ssrc={:08x} seq={}",
-                    header.ssrc(),
-                    header.sequence_number(),
+                    stream = stream_id,
+                    ssrc = format_args!("{:08x}", header.ssrc()),
+                    seq = header.sequence_number(),
+                    "ignoring RTP packet from another source"
                 );
             }
         }
@@ -167,9 +189,11 @@ impl StreamPolicy {
                 UnknownRtcpSsrcPolicy::Default | UnknownRtcpSsrcPolicy::DropPackets => {
                     if !std::mem::replace(&mut self.seen_unknown_rtcp_ssrc, true) {
                         warn!(
-                            "stream {stream_id}: saw unknown rtcp ssrc {:08x}; expected \
-                             {:08x}",
-                            other.ssrc, other.expected
+                            conn = %conn.ctx,
+                            stream = stream_id,
+                            ssrc = format_args!("{:08x}", other.ssrc),
+                            expected_ssrc = format_args!("{:08x}", other.expected),
+                            "saw unknown RTCP SSRC"
                         );
                     }
                     return Ok(None);
@@ -203,7 +227,6 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
-    use crate::ConnectionContext;
     use crate::client::SessionOptions;
     use crate::rtp::ReceiverOptions;
 
