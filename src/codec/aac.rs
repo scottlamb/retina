@@ -220,6 +220,12 @@ impl AudioSpecificConfig {
     }
 }
 
+/// Returns the parameters described by a raw `AudioSpecificConfig`; see
+/// [`AudioParameters::from_aac_config`].
+pub(super) fn parameters_from_config(raw: &[u8]) -> Result<AudioParameters, Error> {
+    Ok(AudioSpecificConfig::parse(raw)?.parameters)
+}
+
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
 /// `config` should be a raw AudioSpecificConfig.
 pub(super) fn make_sample_entry(
@@ -1032,6 +1038,17 @@ mod tests {
         let mut sink = Congested(0);
         p.push_frame(ts(0), b"asdf", &mut sink).unwrap();
         assert_eq!(sink.0, 0);
+    }
+
+    #[test]
+    fn from_aac_config() {
+        // AAC-LC, 16 kHz, mono.
+        let p = AudioParameters::from_aac_config(&[0x14, 0x08]).unwrap();
+        assert_eq!(p.clock_rate(), 16_000);
+        assert_eq!(p.channels().get(), 1);
+        assert_eq!(p.rfc6381_codec(), Some("mp4a.40.2"));
+        assert_eq!(p.frame_length().map(NonZeroU32::get), Some(1024));
+        assert_eq!(p.extra_data(super::super::FrameFormat::MP4), [0x14, 0x08]);
     }
 
     #[test]

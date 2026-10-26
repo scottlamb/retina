@@ -696,6 +696,18 @@ impl std::fmt::Debug for AudioParameters {
 }
 
 impl AudioParameters {
+    /// Returns parameters for the given raw AAC `AudioSpecificConfig` (ISO/IEC
+    /// 14496-3 section 1.6.2.1), as carried by transports Retina doesn't
+    /// handle itself (such as an FLV AAC sequence header).
+    ///
+    /// Frames for these parameters are raw access units, as with
+    /// [`aac::Framing::Raw`].
+    ///
+    /// Returns an error if the config is invalid or unsupported.
+    pub fn from_aac_config(raw: &[u8]) -> Result<Self, Error> {
+        aac::parameters_from_config(raw)
+    }
+
     pub fn rfc6381_codec(&self) -> Option<&str> {
         self.rfc6381_codec.as_deref()
     }
