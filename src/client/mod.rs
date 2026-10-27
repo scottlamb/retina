@@ -96,6 +96,20 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Returns true if the session can't continue after this error.
+    ///
+    /// A non-fatal error affects only one packet, which is dropped: for
+    /// example, a corrupt RTP header or an unparseable RTCP packet. The caller may log it and
+    /// keep calling [`Session::next_item`] (or [`SessionCore::poll_item`]), or
+    /// treat it as fatal anyway.
+    ///
+    /// After a fatal error, such as a connection failure, RTSP framing error,
+    /// or unanswered keepalive, the session is done; [`Session::next_item`]
+    /// returns `None` afterward.
+    pub fn is_fatal(&self) -> bool {
+        !matches!(self.0.as_ref(), ErrorInt::PacketError { .. })
+    }
 }
 
 impl From<crate::error::Error> for Error {
@@ -1551,6 +1565,9 @@ struct SessionInner {
     /// dropped, e.g. by a timeout) partway through, and the session can't be
     /// used further.
     interrupted: bool,
+
+    /// Set after [`Session::poll_next_item`] returns a fatal error.
+    failed: bool,
 }
 
 #[cfg(feature = "tokio")]
@@ -1929,6 +1946,7 @@ impl Session<Described> {
             udp_next_poll_i: 0,
             request_timeout,
             interrupted: false,
+            failed: false,
         });
         inner.core.describe(url)?;
         let event = inner.drive().await?;
@@ -2261,7 +2279,9 @@ impl std::fmt::Debug for RtpPacket<'_> {
 impl Session<Playing> {
     /// Polls for the next RTP or RTCP packet.
     ///
-    /// Returns `Ready(None)` when the server closes the connection.
+    /// Returns `Ready(None)` when the server closes the connection, or after a
+    /// fatal error; see [`Error::is_fatal`]. After a non-fatal error, the
+    /// caller may keep polling.
     ///
     /// The session does I/O, including sending keepalives, only while the
     /// caller polls. The item borrows the session, so it must be dropped
@@ -2295,6 +2315,22 @@ impl Session<Playing> {
 
     /// Does I/O until the core has a validated item or the session ends.
     fn poll_validated(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<playing::ValidatedItem, Error>>> {
+        if self.0.failed {
+            return Poll::Ready(None);
+        }
+        let r = ready!(self.poll_validated_inner(cx));
+        if let Some(Err(e)) = &r
+            && e.is_fatal()
+        {
+            self.0.failed = true;
+        }
+        Poll::Ready(r)
+    }
+
+    fn poll_validated_inner(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<playing::ValidatedItem, Error>>> {
@@ -3478,9 +3514,13 @@ mod tests {
                             matches!(*e.0, ErrorInt::RtspFramingError { .. }),
                             "unexpected error: {e}"
                         );
+                        assert!(e.is_fatal());
                     }
                     o => panic!("unexpected item: {o:#?}"),
                 }
+
+                // The session is fused after a fatal error.
+                assert!(session.next_item().await.is_none());
             },
             async {
                 let msg = server.next().await.unwrap().unwrap();
@@ -4084,6 +4124,36 @@ mod tests {
         }
         let report = recv_data_while_polling(&mut session, &mut server, 1).await;
         receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
+    }
+
+    /// A corrupt RTCP packet is a non-fatal error: the session continues.
+    #[tokio::test(start_paused = true)]
+    async fn non_fatal_error() {
+        init_logging();
+        let (session, mut server) = play_tcp(SessionOptions::default()).await;
+        tokio::pin!(session);
+        tokio::join!(
+            async {
+                match session.next_item().await {
+                    Some(Err(e)) => assert!(!e.is_fatal(), "{e}"),
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+                match session.next_item().await {
+                    Some(Ok(PlayingItem::Rtp(_))) => {}
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            },
+            async {
+                for (channel_id, body) in
+                    [(1, Bytes::from_static(b"\x00")), (0, rtp_pkt(0x41d4, 0))]
+                {
+                    server
+                        .send(OwnedMessage::Data { channel_id, body })
+                        .await
+                        .unwrap();
+                }
+            },
+        );
     }
 
     /// Without `SessionOptions::receiver_reports`, no RTCP is written.

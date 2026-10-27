@@ -1250,6 +1250,9 @@ impl SessionCore {
     /// keepalive responses internally.
     ///
     /// The item borrows the core, so it must be dropped before the next call.
+    ///
+    /// After a non-fatal error (see [`Error::is_fatal`]), the caller may keep
+    /// calling this.
     pub fn poll_item(&mut self, now: Instant) -> Option<Result<super::PlayingItem<'_>, Error>> {
         match &mut self.0 {
             Phase::Playing(c) => c.poll_item(now),
