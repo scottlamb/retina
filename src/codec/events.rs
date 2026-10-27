@@ -634,7 +634,8 @@ pub enum LossReason {
     Corrupt(Corruption),
 
     /// The in-progress frame exceeded the depacketizer's limit; see
-    /// [`super::VideoDepacketizer::set_max_frame_bytes`].
+    /// [`super::VideoDepacketizer::set_max_frame_bytes`] and
+    /// [`super::MessageDepacketizer::set_max_message_bytes`].
     ///
     /// The depacketizer discards it and resynchronizes at the next frame
     /// boundary.

@@ -1219,6 +1219,19 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
         self.0.parameters()
     }
 
+    /// Limits the bytes of an in-progress message.
+    ///
+    /// When a message grows beyond this, the depacketizer discards it, reports
+    /// [`LossReason::TooLarge`] to [`MessageHandler::loss`], and skips the rest
+    /// of it, resynchronizing at the next message boundary.
+    ///
+    /// Unlike video frames, messages are copied out of the
+    /// [`crate::buf::MarkBuf`], so its limit doesn't bound them. The default
+    /// is 1 MiB.
+    pub fn set_max_message_bytes(&mut self, max_message_bytes: usize) {
+        self.0.set_max_message_bytes(max_message_bytes);
+    }
+
     /// Supplies a new packet, delivering any resulting events to `handler`.
     ///
     /// This never fails: lost packets and corrupt data are reported via
@@ -2073,6 +2086,13 @@ mod tests {
         assert_eq!(h.take(), vec![Event::MessageFrame(hex(b"<a></a>"))]);
     }
 
+    #[test]
+    fn onvif_gzip_encoding_name() {
+        let d =
+            MessageDepacketizer::<crate::PacketContext>::new("vnd.onvif.metadata+gzip").unwrap();
+        assert_eq!(d.parameters().0, onvif::CompressionType::GzipCompressed);
+    }
+
     /// A timestamp change mid-message discards the old message, but the new
     /// packet starts a new one.
     #[test]
@@ -2099,11 +2119,42 @@ mod tests {
         );
     }
 
+    /// A message which grows past the limit is abandoned, and the rest of it
+    /// is skipped.
     #[test]
-    fn onvif_gzip_encoding_name() {
-        let d =
-            MessageDepacketizer::<crate::PacketContext>::new("vnd.onvif.metadata+gzip").unwrap();
-        assert_eq!(d.parameters().0, onvif::CompressionType::GzipCompressed);
+    fn message_too_large() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new(&PayloadFormat::new(
+            "application",
+            "vnd.onvif.metadata",
+            90_000,
+        ))
+        .unwrap();
+        let Depacketizer::Message(m) = &mut d else {
+            panic!("expected a message depacketizer");
+        };
+        m.set_max_message_bytes(8);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+        push(&mut d, &mut buf, (0, 0, false, 0), b"<abc>", &mut h);
+        assert_eq!(h.take(), vec![]);
+        push(&mut d, &mut buf, (1, 0, false, 0), b"<def>", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::TooLarge { limit: 8 })]
+        );
+        push(&mut d, &mut buf, (2, 0, true, 0), b"</a>", &mut h);
+        assert_eq!(h.take(), vec![]);
+        push(&mut d, &mut buf, (3, 1, false, 0), b"<a>", &mut h);
+        push(&mut d, &mut buf, (4, 1, true, 0), b"</a>", &mut h);
+        assert_eq!(h.take(), vec![Event::MessageFrame(hex(b"<a></a>"))]);
+
+        // A single packet over the limit.
+        push(&mut d, &mut buf, (5, 2, true, 0), b"<abcdef/>", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![Event::Loss(LossReason::TooLarge { limit: 8 })]
+        );
     }
 
     /// Parses the RTP packets of one channel of an RTSP interleaved dump into
