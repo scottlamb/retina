@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+      - name: Expose runner image OS for cache keys
+        run: echo "IMAGE_OS=$ImageOS" >> "$GITHUB_ENV"
       - name: Cache
         uses: actions/cache@v5
         with:
@@ -28,11 +30,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ env.IMAGE_OS }}-${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
+          cache-key: ${{ env.IMAGE_OS }}
           components: ${{ matrix.extra_components }}
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkgconf
@@ -53,6 +56,24 @@ jobs:
       - name: Clippy (all features)
         if: matrix.rust == 'stable'
         run: cargo clippy --all-features --workspace -- -D warnings
+
+  docs:
+    name: Check docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Expose runner image OS for cache keys
+        run: echo "IMAGE_OS=$ImageOS" >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          cache-key: ${{ env.IMAGE_OS }}
+      - name: Build docs (all features, as on docs.rs)
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
 
   license:
     name: Check copyright/license headers
