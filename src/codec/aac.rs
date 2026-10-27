@@ -594,7 +594,7 @@ impl Depacketizer {
         let au_headers_length_bits = u16::from_be_bytes([payload[0], payload[1]]);
 
         // AAC-hbr requires 16-bit AU headers: 13-bit size, 3-bit index.
-        if (au_headers_length_bits & 0x7) != 0 {
+        if (au_headers_length_bits & 0xF) != 0 {
             return Err(format!("bad au-headers-length {au_headers_length_bits}"));
         }
         let au_headers_count = au_headers_length_bits >> 4;
@@ -1470,6 +1470,46 @@ mod tests {
             ),
             _ => panic!(),
         }
+    }
+
+    /// Tests that an au-headers-length that isn't a multiple of the 16-bit
+    /// AU-header size is rejected, rather than silently ignoring the remainder.
+    #[test]
+    fn bad_au_headers_length() {
+        let mut d = Depacketizer::new(
+            48_000,
+            None,
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let pkt = ReceivedPacketBuilder {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            sequence_number: 0,
+            timestamp: crate::Timestamp {
+                timestamp: 42,
+                clock_rate: NonZeroU32::new(48_000).unwrap(),
+                start: 0,
+            },
+            payload_type: 0,
+            ssrc: 0,
+            mark: true,
+            loss: 0,
+        }
+        .build([
+            0x00, 0x18, // AU-headers-length: 24 bits, 1.5 headers
+            0x00, 0x20, 0x00, // AU-header: AU-size=4 + AU-index=0, half another
+            b'a', b's', b'd', b'f',
+        ])
+        .unwrap();
+        let e = push_via_buf(
+            &mut d,
+            crate::rtp::PacketMeta::from_received(&pkt),
+            pkt.payload(),
+            &mut buf,
+        )
+        .unwrap_err();
+        assert!(e.contains("bad au-headers-length"), "{e}");
     }
 
     /// Tests that ADTS framing reports an error rather than writing a bad
