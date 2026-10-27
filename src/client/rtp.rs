@@ -57,8 +57,10 @@ struct Seq {
 ///
 /// At least [one camera](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-Reolink#reolink-rlc-410-hardware-version-ipc_3816m)
 /// sometimes sends data from old RTSP sessions over new ones. This seems like a
-/// serious bug, and currently `InorderRtpParser` will error in this case,
-/// although it'd be possible to discard the incorrect SSRC instead.
+/// serious bug, and `InorderRtpParser` errors on another SSRC until the
+/// stream's own packets have come. After that it discards them: other cameras
+/// send another stream's packets — audio that was never set up, and its RTCP —
+/// on the same interleaved channel, told apart only by the SSRC.
 ///
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
@@ -77,6 +79,10 @@ pub struct InorderParser {
 
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
+
+    /// Whether an RTP packet of another SSRC was skipped: said once, not for
+    /// every packet of a source that sends fifty a second.
+    seen_foreign_rtp_ssrc: bool,
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -120,6 +126,7 @@ impl InorderParser {
             seen_rtcp_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
+            seen_foreign_rtp_ssrc: false,
         }
     }
 
@@ -150,6 +157,20 @@ impl InorderParser {
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
+            // Once the stream's own packets have come, another SSRC is another
+            // source on the same channel — a camera's audio nobody set up, its
+            // RTCP read as RTP — and not a stale session.
+            if self.seen_rtp_packets > 0 {
+                if !self.seen_foreign_rtp_ssrc {
+                    warn!(
+                        "skipping RTP packets of ssrc {ssrc:08x} on the channel of rtp session ssrc \
+                         {s:08x?}: another source sends on it; further ones are skipped silently",
+                        s = self.ssrc.map(|s| s.ssrc)
+                    );
+                    self.seen_foreign_rtp_ssrc = true;
+                }
+                return Ok(None);
+            }
             note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -554,6 +575,46 @@ mod tests {
             Ok(None) => {}
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    /// One RTP packet of `ssrc` through `parser`: whether it was taken.
+    fn push_rtp(
+        parser: &mut InorderParser,
+        timeline: &mut Timeline,
+        seq: u16,
+        ssrc: u32,
+    ) -> Result<bool, Error> {
+        let pkt =
+            crate::rtp::build_raw_rtp(seq, u32::from(seq) * 3000, 96, ssrc, true, *b"pkt").unwrap();
+        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+        parser
+            .rtp(
+                &SessionOptions::default(),
+                &StreamContext::dummy(),
+                None,
+                &ConnectionContext::dummy(),
+                &PacketContext::dummy(),
+                timeline,
+                0,
+                &header,
+            )
+            .map(|packet| packet.is_some())
+    }
+
+    /// Checks skipping another source's packets on the stream's channel once
+    /// the stream's own have come, as from a camera that sends its audio
+    /// (ssrc 0xf9, G.711 every 20 ms) on the video's interleaved channel
+    /// (ssrc 0xf8) — and refusing them before, as a stale session's.
+    #[test]
+    fn foreign_ssrc_on_the_channel() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0xf8), None, UnknownRtcpSsrcPolicy::Default);
+
+        assert!(push_rtp(&mut parser, &mut timeline, 23161, 0xf9).is_err());
+        assert!(push_rtp(&mut parser, &mut timeline, 1, 0xf8).unwrap());
+        assert!(!push_rtp(&mut parser, &mut timeline, 23162, 0xf9).unwrap());
+        assert!(!push_rtp(&mut parser, &mut timeline, 23163, 0xf9).unwrap());
+        assert!(push_rtp(&mut parser, &mut timeline, 2, 0xf8).unwrap());
     }
 
     /// Sender reports follow the first RTP packet, then come every 2.5–7.5
