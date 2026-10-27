@@ -490,7 +490,7 @@ impl Depacketizer {
 
             // Adding EOI marker if necessary.
             let end = &self.data[self.data.len() - 2..];
-            if end[0] != 0xff && end[1] != 0xd9 {
+            if end != [0xff, 0xd9] {
                 self.data.extend_from_slice(&[0xff, 0xd9]);
             }
 
@@ -854,9 +854,8 @@ mod tests {
     \x31\xc8\xa2\x8a\x60\x1f\xe3\x4a\x4f\x02\x8a\x28\x00\xcf\x14\xb9\xe6\x8a\x29\x00\
     \x51\xd2\x8a\x28\x00\x3c\x52\x03\x45\x14\x01\xff\xd9";
 
-    #[test]
-    fn depacketize() {
-        init_logging();
+    /// Depacketizes a two-packet frame: `START_PACKET` then `end_packet`.
+    fn depacketize_frame(end_packet: &[u8]) -> Vec<u8> {
         let mut d = super::Depacketizer::new();
         let mut buf = MarkBuf::new(65536);
         let timestamp = crate::Timestamp {
@@ -897,7 +896,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(END_PACKET.iter().copied())
+            .build(end_packet.iter().copied())
             .unwrap();
             push_via_buf(
                 &mut d,
@@ -908,10 +907,26 @@ mod tests {
         }
         .unwrap();
 
-        let frame = match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+        match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame.into_data(),
             _ => panic!(),
-        };
-        assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)
+        }
+    }
+
+    #[test]
+    fn depacketize() {
+        init_logging();
+        assert_eq_hex!(depacketize_frame(END_PACKET), VALID_JPEG_IMAGE)
+    }
+
+    /// Data ending in `xx d9` (not an EOI marker) should get one appended.
+    #[test]
+    fn depacketize_adds_eoi() {
+        init_logging();
+        let mut end_packet = END_PACKET[..END_PACKET.len() - 2].to_vec();
+        end_packet.extend_from_slice(&[0x00, 0xd9]);
+        let mut expected = VALID_JPEG_IMAGE[..VALID_JPEG_IMAGE.len() - 2].to_vec();
+        expected.extend_from_slice(&[0x00, 0xd9, 0xff, 0xd9]);
+        assert_eq_hex!(depacketize_frame(&end_packet), expected)
     }
 }

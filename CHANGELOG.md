@@ -29,6 +29,9 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   JPEG: append an end-of-image marker to frames whose data ends in
+    `ff xx` or `xx d9`. Previously the check used the wrong boolean
+    operator and skipped these.
 
 ## `v0.4.21` (2026-10-04)
 
