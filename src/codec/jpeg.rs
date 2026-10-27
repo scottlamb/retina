@@ -154,14 +154,16 @@ const CHM_AC_SYMBOLS: [u8; 162] = [
     0xf9, 0xfa
 ];
 
-fn make_quant_header(p: &mut Vec<u8>, qt: &[u8], table_no: u8) {
+/// Writes a DQT segment; `sixteen_bit` selects 16-bit (128-byte) rather than
+/// 8-bit (64-byte) table values.
+fn make_quant_header(p: &mut Vec<u8>, qt: &[u8], table_no: u8, sixteen_bit: bool) {
     assert!(qt.len() < (u8::MAX - 3) as usize);
 
     p.push(0xff);
     p.push(0xdb); // DQT
     p.push(0); // length msb
     p.push(qt.len() as u8 + 3); // length lsb
-    p.push(table_no);
+    p.push(u8::from(sixteen_bit) << 4 | table_no); // Pq, Tq
     p.extend_from_slice(qt);
 }
 
@@ -202,18 +204,20 @@ fn make_headers(
     p.push(0xff);
     p.push(0xd8); // SOI
 
-    let size = if (precision & 1) > 0 { 128 } else { 64 };
+    let sixteen_bit = (precision & 1) > 0;
+    let size = if sixteen_bit { 128 } else { 64 };
     if qtable.remaining() < size {
         return Err("Qtable too small".to_string());
     }
-    make_quant_header(p, &qtable[..size], 0);
+    make_quant_header(p, &qtable[..size], 0, sixteen_bit);
     qtable.advance(size);
 
-    let size = if (precision & 2) > 0 { 128 } else { 64 };
+    let sixteen_bit = (precision & 2) > 0;
+    let size = if sixteen_bit { 128 } else { 64 };
     if qtable.remaining() < size {
         return Err("Qtable too small".to_string());
     }
-    make_quant_header(p, &qtable[..size], 1);
+    make_quant_header(p, &qtable[..size], 1, sixteen_bit);
     qtable.advance(size);
 
     if dri != 0 {
@@ -294,8 +298,8 @@ pub struct Depacketizer {
     /// Backing storage to the assembled frame.
     data: Vec<u8>,
 
-    /// Cached quantization tables.
-    qtables: Vec<Option<Bytes>>,
+    /// Cached quantization tables, with their precision bits, indexed by Q.
+    qtables: Vec<Option<(u8, Bytes)>>,
 
     /// A complete video frame ready for pull.
     pending: Option<VideoFrame>,
@@ -377,7 +381,6 @@ impl Depacketizer {
         }
 
         if frag_offset == 0 {
-            let precision;
             let qtable;
 
             if q >= 128 {
@@ -394,7 +397,7 @@ impl Depacketizer {
                 // |                              ...                              |
                 // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-                precision = payload[1];
+                let precision = payload[1];
                 let length = (payload[2] as u16) << 8 | payload[3] as u16;
 
                 payload.advance(4);
@@ -419,23 +422,29 @@ impl Depacketizer {
 
                     qtable = self.qtables[q as usize].clone();
                 } else {
-                    qtable = Some(payload.clone());
+                    let table = (precision, payload.slice(..length as usize));
+
+                    // Q values 128-254 are static, so later frames may omit
+                    // the table (Length = 0) and expect the decoder to reuse
+                    // this one.
+                    if q != 255 {
+                        self.qtables[q as usize] = Some(table.clone());
+                    }
+                    qtable = Some(table);
                 }
 
                 payload.advance(length as usize);
             } else {
                 qtable = self.qtables[q as usize].clone().or_else(|| {
-                    let table = Bytes::copy_from_slice(&make_tables(q as i32));
+                    let table = (0, Bytes::copy_from_slice(&make_tables(q as i32)));
                     self.qtables[q as usize].replace(table);
 
                     self.qtables[q as usize].clone()
                 });
-
-                precision = 0;
             }
 
             match qtable {
-                Some(qtable) => {
+                Some((precision, qtable)) => {
                     self.data.clear();
 
                     make_headers(
@@ -858,55 +867,54 @@ mod tests {
     fn depacketize_frame(end_packet: &[u8]) -> Vec<u8> {
         let mut d = super::Depacketizer::new();
         let mut buf = MarkBuf::new(65536);
+        push_frame(&mut d, &mut buf, 0, START_PACKET, end_packet)
+    }
+
+    /// Depacketizes a two-packet frame: `start_packet` then `END_PACKET`.
+    fn depacketize_frame_with_start(start_packet: &[u8]) -> Vec<u8> {
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(65536);
+        push_frame(&mut d, &mut buf, 0, start_packet, END_PACKET)
+    }
+
+    /// Pushes a two-packet frame, the `frame_i`th on this depacketizer, and
+    /// returns its data.
+    fn push_frame(
+        d: &mut super::Depacketizer,
+        buf: &mut MarkBuf,
+        frame_i: u16,
+        start_packet: &[u8],
+        end_packet: &[u8],
+    ) -> Vec<u8> {
         let timestamp = crate::Timestamp {
-            timestamp: 0,
+            timestamp: i64::from(frame_i) * 3000,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
             start: 0,
         };
-        {
+        for (i, payload) in [start_packet, end_packet].into_iter().enumerate() {
             let pkt = ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
                 ssrc: 0,
-                sequence_number: 0,
+                sequence_number: frame_i * 2 + i as u16,
                 loss: 0,
-                mark: false,
+                mark: i == 1,
                 payload_type: 0,
             }
-            .build(START_PACKET.iter().copied())
+            .build(payload.iter().copied())
             .unwrap();
             push_via_buf(
-                &mut d,
+                d,
                 crate::rtp::PacketMeta::from_received(&pkt),
                 pkt.payload(),
-                &mut buf,
+                buf,
             )
-        }
-        .unwrap();
-        assert!(d.pull().is_none());
-        {
-            let pkt = ReceivedPacketBuilder {
-                ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
-                timestamp,
-                ssrc: 0,
-                sequence_number: 1,
-                loss: 0,
-                mark: true,
-                payload_type: 0,
+            .unwrap();
+            if i == 0 {
+                assert!(d.pull().is_none());
             }
-            .build(end_packet.iter().copied())
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::PacketMeta::from_received(&pkt),
-                pkt.payload(),
-                &mut buf,
-            )
         }
-        .unwrap();
-
         match d.pull() {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame.into_data(),
             _ => panic!(),
@@ -928,5 +936,52 @@ mod tests {
         let mut expected = VALID_JPEG_IMAGE[..VALID_JPEG_IMAGE.len() - 2].to_vec();
         expected.extend_from_slice(&[0x00, 0xd9, 0xff, 0xd9]);
         assert_eq_hex!(depacketize_frame(&end_packet), expected)
+    }
+
+    /// A static Q (128-254) table sent once may be omitted (Length = 0) from
+    /// later frames, per RFC 2435 section 3.1.8.
+    #[test]
+    fn depacketize_reuses_static_qtable() {
+        init_logging();
+        // `START_PACKET` has Q = 255, a quantization table header with
+        // Length = 128 at bytes 8..12, then the table.
+        let mut with_table = START_PACKET.to_vec();
+        with_table[5] = 200;
+        let mut without_table = with_table[..8].to_vec();
+        without_table.extend_from_slice(&[0, 0, 0, 0]);
+        without_table.extend_from_slice(&with_table[12 + 128..]);
+
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(65536);
+        assert_eq_hex!(
+            push_frame(&mut d, &mut buf, 0, &with_table, END_PACKET),
+            VALID_JPEG_IMAGE
+        );
+        assert_eq_hex!(
+            push_frame(&mut d, &mut buf, 1, &without_table, END_PACKET),
+            VALID_JPEG_IMAGE
+        );
+    }
+
+    /// A 16-bit quantization table should be written with Pq = 1.
+    #[test]
+    fn depacketize_16bit_qtable() {
+        init_logging();
+        let luma = &START_PACKET[12..12 + 64];
+        let chroma = &START_PACKET[12 + 64..12 + 128];
+        let luma16: Vec<u8> = luma.iter().flat_map(|&b| [0, b]).collect();
+        let mut start = START_PACKET[..8].to_vec();
+        start.extend_from_slice(&[0, 1, 0, 192]); // precision: luma is 16-bit
+        start.extend_from_slice(&luma16);
+        start.extend_from_slice(chroma);
+        start.extend_from_slice(&START_PACKET[12 + 128..]);
+
+        // `VALID_JPEG_IMAGE` starts with SOI, then the 8-bit luma DQT segment
+        // (`ff db 00 43 00` + 64 bytes).
+        let mut expected = VALID_JPEG_IMAGE[..2].to_vec();
+        expected.extend_from_slice(&[0xff, 0xdb, 0x00, 0x83, 0x10]);
+        expected.extend_from_slice(&luma16);
+        expected.extend_from_slice(&VALID_JPEG_IMAGE[2 + 5 + 64..]);
+        assert_eq_hex!(depacketize_frame_with_start(&start), expected);
     }
 }
