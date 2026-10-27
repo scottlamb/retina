@@ -13,6 +13,7 @@
 use bytes::Bytes;
 
 use crate::codec::Error;
+use crate::codec::packetize::{PayloadLimits, serialize_extensions};
 use crate::codec::{
     ParameterSetInsertion, Payload, PayloadFormat, PayloadSink, Position, VideoFrameInfo,
     VideoPacketizerOptions, VideoParameters,
@@ -95,8 +96,12 @@ const FILLER_BODY: [u8; 1] = [0x80];
 /// each input chunk.
 #[derive(Debug)]
 pub(crate) struct Packetizer<C: Codec> {
-    /// The current frame's maximum payload size, from the sink at its start.
-    max_payload_size: usize,
+    /// The current frame's payload size limits, from the sink at its start.
+    limits: PayloadLimits,
+
+    /// The current frame's encoded header extension block, for its first
+    /// payload.
+    encoded_extensions: Vec<u8>,
 
     aggregate: bool,
     parameter_set_insertion: ParameterSetInsertion,
@@ -136,7 +141,8 @@ pub(crate) struct Packetizer<C: Codec> {
 
     frame: Option<VideoFrameInfo>,
 
-    /// True if no payload of `frame` has been delivered yet.
+    /// True if no payload of `frame` has been delivered yet, so the next
+    /// payload delivered is its first, which carries `encoded_extensions`.
     frame_start_pending: bool,
 
     /// The NAL currently being supplied, if any.
@@ -225,7 +231,8 @@ impl<C: Codec> Packetizer<C> {
             )));
         };
         Ok(Self {
-            max_payload_size: 1400, // `PayloadSink::max_payload_size`'s default.
+            limits: PayloadLimits::default(),
+            encoded_extensions: Vec::new(),
             aggregate: options.aggregate,
             parameter_set_insertion: options.parameter_set_insertion,
             parameters: parameters.clone(),
@@ -291,8 +298,9 @@ impl<C: Codec> Packetizer<C> {
         if self.frame.is_some() {
             self.end_frame(sink);
         }
+        serialize_extensions(sink, &frame.extensions, &mut self.encoded_extensions);
         // The minimum makes progress with fragments.
-        self.max_payload_size = usize::from(sink.max_payload_size()).max(Self::FU_HDR_LEN + 1);
+        self.limits = PayloadLimits::new(sink, &self.encoded_extensions, Self::FU_HDR_LEN + 1);
         self.frame = Some(frame);
         self.frame_start_pending = true;
         self.frame_vcl_hdr = None;
@@ -565,11 +573,25 @@ impl<C: Codec> Packetizer<C> {
         }
     }
 
+    /// Returns the size limit of the held payload, or (if nothing is held)
+    /// the payload which will be held next.
+    fn held_limit(&self) -> usize {
+        self.limits.get(self.frame_start_pending)
+    }
+
+    /// Returns the size limit of the next payload after the held one, if any.
+    fn next_limit(&self) -> usize {
+        self.limits
+            .get(self.frame_start_pending && self.held_kind == HeldKind::None)
+    }
+
     /// Supplies body bytes of the current NAL, delivering any fragments
     /// which are known not to be its last.
     fn feed(&mut self, mut input: &[u8], sink: &mut impl PayloadSink) {
-        let max = self.max_payload_size;
         loop {
+            // The NAL's next payload follows any held one, which `flush_held`
+            // below delivers first.
+            let max = self.next_limit();
             let nal = self.nal.as_mut().expect("feed with NAL in progress");
 
             // Body bytes which fit in the current packet type: a fragment
@@ -638,7 +660,7 @@ impl<C: Codec> Packetizer<C> {
         } else {
             self.held.extend_from_slice(hdr.as_ref());
         }
-        let body_limit = self.max_payload_size - self.held.len();
+        let body_limit = self.held_limit() - self.held.len();
         let from_buffered = nal.buffered.len().min(body_limit);
         let from_input = input.len().min(body_limit - from_buffered);
         self.held.extend_from_slice(&nal.buffered[..from_buffered]);
@@ -687,11 +709,11 @@ impl<C: Codec> Packetizer<C> {
             return;
         }
         let len = Self::HDR_LEN + nal.buffered.len();
-        debug_assert!(len <= self.max_payload_size);
+        debug_assert!(len <= self.next_limit());
         match self.held_kind {
             HeldKind::Single
                 if self.aggregate
-                    && Self::HDR_LEN + 2 + self.held.len() + 2 + len <= self.max_payload_size =>
+                    && Self::HDR_LEN + 2 + self.held.len() + 2 + len <= self.held_limit() =>
             {
                 // Convert the held single NAL unit packet into an aggregation packet.
                 let held_len = u16::try_from(self.held.len()).expect("payload fits in u16");
@@ -704,7 +726,7 @@ impl<C: Codec> Packetizer<C> {
                 return;
             }
             HeldKind::Aggregation
-                if self.aggregate && self.held.len() + 2 + len <= self.max_payload_size =>
+                if self.aggregate && self.held.len() + 2 + len <= self.held_limit() =>
             {
                 let hdr = C::aggregation_header(self.held_header(), nal.hdr);
                 self.held[..Self::HDR_LEN].copy_from_slice(hdr.as_ref());
@@ -758,6 +780,7 @@ impl<C: Codec> Packetizer<C> {
             data,
             is_random_access_point: frame.is_random_access_point,
             is_disposable: frame.is_disposable,
+            encoded_extensions: if first { &self.encoded_extensions } else { &[] },
         });
     }
 

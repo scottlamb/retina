@@ -74,6 +74,7 @@ impl Depacketizer {
         };
         handler.audio_frame(&AudioFrameRef {
             ctx: &pkt.meta.ctx,
+            extensions: pkt.meta.extensions,
             timestamp: pkt.meta.timestamp,
             frame_length,
             data,

@@ -465,6 +465,11 @@ pub(crate) struct Depacketizer<Ctx> {
 #[derive(Debug)]
 struct AacFrame<Ctx> {
     ctx: Ctx,
+
+    /// Header extension values: for a fragmented frame, those of its
+    /// packets, merged; for an aggregate packet, the packet's for its first
+    /// frame.
+    extensions: crate::rtp::Extensions,
     frame_length: NonZeroU32,
     timestamp: crate::Timestamp,
     data: FrameData,
@@ -517,6 +522,9 @@ struct Fragment {
 
     size: u16,
     buf: BytesMut,
+
+    /// Header extension values of the fragments so far, merged.
+    extensions: crate::rtp::Extensions,
 }
 
 /// State of the depacketizer between calls to `push` and `pull`.
@@ -610,6 +618,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     };
                     handler.audio_frame(&AudioFrameRef {
                         ctx: &f.ctx,
+                        extensions: f.extensions,
                         timestamp: f.timestamp,
                         frame_length: f.frame_length,
                         data,
@@ -691,6 +700,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             ));
                         }
                         frag.buf.extend_from_slice(data);
+                        frag.extensions.fill_from(&meta.extensions);
                     }
                     std::cmp::Ordering::Equal => {
                         if !meta.mark {
@@ -699,8 +709,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             );
                         }
                         frag.buf.extend_from_slice(data);
+                        let mut extensions = frag.extensions;
+                        extensions.fill_from(&meta.extensions);
                         self.state = DepacketizerState::Ready(AacFrame {
                             ctx: meta.ctx.clone(),
+                            extensions,
                             frame_length: NonZeroU32::from(self.config.frame_length),
                             timestamp: meta.timestamp,
                             data: FrameData::Owned(std::mem::take(&mut frag.buf)),
@@ -775,6 +788,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         loss_since_mark: agg.loss_since_mark,
                         size: size as u16,
                         buf,
+                        extensions: agg.meta.extensions,
                     });
                     return None;
                 }
@@ -786,6 +800,11 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 let agg_timestamp = agg.meta.timestamp;
                 let frame = AacFrame {
                     ctx: agg.meta.ctx.clone(),
+                    extensions: if agg.frame_i == 0 {
+                        agg.meta.extensions
+                    } else {
+                        crate::rtp::Extensions::default()
+                    },
                     frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
@@ -821,6 +840,10 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 #[derive(Debug)]
 pub(super) struct Packetizer {
     parameters: AudioParameters,
+
+    /// The current frame's encoded header extension block; see
+    /// [`super::PayloadSink::serialize_extensions`].
+    encoded_extensions: Vec<u8>,
 }
 
 #[cfg(feature = "unstable-send")]
@@ -834,6 +857,7 @@ impl Packetizer {
     pub(super) fn new(parameters: &AudioParameters) -> Self {
         Self {
             parameters: parameters.clone(),
+            encoded_extensions: Vec::new(),
         }
     }
 
@@ -856,8 +880,9 @@ impl Packetizer {
     }
 
     pub(super) fn push_frame(
-        &self,
+        &mut self,
         timestamp: crate::Timestamp,
+        extensions: &crate::rtp::Extensions,
         data: &[u8],
         sink: &mut impl super::PayloadSink,
     ) -> Result<(), Error> {
@@ -879,18 +904,29 @@ impl Packetizer {
         }
         let au_header = (data.len() as u16) << 3; // AU-index is 0.
         let header = [0x00, 0x10, (au_header >> 8) as u8, au_header as u8];
-        // The minimum makes progress.
-        let max_data =
-            usize::from(sink.max_payload_size().max(Self::HEADER_LEN + 1) - Self::HEADER_LEN);
-        let n = data.len().div_ceil(max_data);
-        for (i, chunk) in data.chunks(max_data).enumerate() {
+        super::packetize::serialize_extensions(sink, extensions, &mut self.encoded_extensions);
+        let limits = super::packetize::PayloadLimits::new(
+            sink,
+            &self.encoded_extensions,
+            usize::from(Self::HEADER_LEN) + 1,
+        );
+        let mut rest = data;
+        let mut first = true;
+        while !rest.is_empty() {
+            let (chunk, after) = rest.split_at(
+                rest.len()
+                    .min(limits.get(first) - usize::from(Self::HEADER_LEN)),
+            );
             sink.payload(&super::Payload {
                 timestamp,
-                position: super::Position::new(i == 0, i + 1 == n),
+                position: super::Position::new(first, after.is_empty()),
                 data: &[&header[..], chunk],
                 is_random_access_point: true,
                 is_disposable: true,
+                encoded_extensions: if first { &self.encoded_extensions } else { &[] },
             });
+            rest = after;
+            first = false;
         }
         Ok(())
     }
@@ -1038,6 +1074,87 @@ mod tests {
         let mut sink = Congested(0);
         p.push_frame(ts(0), b"asdf", &mut sink).unwrap();
         assert_eq!(sink.0, 0);
+    }
+
+    /// A frame's encoded extensions shrink its first payload, and survive
+    /// fragmentation.
+    #[cfg(all(feature = "unstable-send", feature = "unstable-extensions"))]
+    #[test]
+    fn packetize_extensions() {
+        use crate::codec::{AudioPacketizer, AudioPacketizerOptions, Payload, PayloadSink};
+        use crate::rtp::{AbsCaptureTime, ExtensionIds, Extensions};
+
+        let ids =
+            ExtensionIds::default().with::<AbsCaptureTime>(std::num::NonZeroU8::new(1).unwrap());
+
+        #[derive(Default)]
+        struct Collect(Vec<(bool, Vec<u8>, Vec<u8>)>);
+        impl PayloadSink for Collect {
+            fn payload(&mut self, payload: &Payload<'_>) {
+                self.0.push((
+                    payload.mark(),
+                    payload.encoded_extensions().to_vec(),
+                    payload.data().concat(),
+                ));
+            }
+            fn max_payload_size(&self) -> u16 {
+                24
+            }
+            fn serialize_extensions(&self, extensions: &Extensions, out: &mut Vec<u8>) {
+                ExtensionIds::default()
+                    .with::<AbsCaptureTime>(std::num::NonZeroU8::new(1).unwrap())
+                    .encode(extensions, out);
+            }
+        }
+
+        let fmtp = "streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;\
+                    indexdeltalength=3;config=1188";
+        let params = AudioSpecificConfig::parse(&[0x11, 0x88])
+            .unwrap()
+            .parameters;
+        let mut p = AudioPacketizer::new(&params, AudioPacketizerOptions::default()).unwrap();
+        let ts = crate::Timestamp::new(0, NonZeroU32::new(48_000).unwrap(), 0).unwrap();
+        let values = Extensions::default().with(AbsCaptureTime::new(crate::NtpTimestamp(42)));
+        let mut sink = Collect::default();
+        p.push_frame_with_extensions(ts, &values, b"0123456789abcdefghij", &mut sink)
+            .unwrap();
+
+        // The 16-byte block leaves the first payload 8 bytes: a 4-byte header
+        // and 4 bytes of data. The rest have 20 bytes of data.
+        let lens: Vec<_> = sink.0.iter().map(|(_, e, d)| (e.len(), d.len())).collect();
+        assert_eq!(lens, [(16, 8), (0, 20)]);
+
+        // The depacketizer merges the fragments' extensions.
+        let mut d = Depacketizer::new(48_000, NonZeroU16::new(1), Some(fmtp)).unwrap();
+        let mut buf = MarkBuf::new(65536);
+        let mut frames = Vec::new();
+        for (i, (mark, ext, payload)) in sink.0.into_iter().enumerate() {
+            let mut pkt = TestPacket {
+                ctx: PacketContext::dummy(),
+                sequence_number: i as u16,
+                timestamp: ts,
+                payload_type: 0,
+                ssrc: 0,
+                mark,
+                loss: 0,
+            }
+            .write(&mut buf, payload);
+            if !ext.is_empty() {
+                let block = crate::rtp::HeaderExtension::new(
+                    u16::from_be_bytes([ext[0], ext[1]]),
+                    &ext[4..],
+                );
+                pkt.meta.extensions = ids.read(&block);
+            }
+            d.push_collect(&pkt);
+            while let Some(item) = d.pull() {
+                let Ok(Item::Audio(a)) = item else {
+                    panic!("unexpected {item:?}");
+                };
+                frames.push((a.extensions, a.data));
+            }
+        }
+        assert_eq!(frames, [(values, b"0123456789abcdefghij".to_vec())]);
     }
 
     #[test]

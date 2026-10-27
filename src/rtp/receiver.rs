@@ -429,6 +429,7 @@ impl Receiver {
             ssrc,
             mark: header.mark(),
             continuity,
+            extensions: Default::default(),
         })
     }
 

@@ -47,6 +47,12 @@ unstable-send = []
 # experimental: it may change in any release, without regard to semver.
 unstable-server = ["unstable-send"]
 
+# Exposes RTP header extensions (`rtp::Extensions`, `rtp::AbsCaptureTime`, and
+# friends) and their plumbing through the client, depacketizers,
+# packetizers, `rtp::Sender`, and server SDP. It's experimental: it may change
+# in any release, without regard to semver.
+unstable-extensions = []
+
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
 # To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
@@ -63,7 +69,7 @@ h264-reader = { version = "0.9.0", optional = true }
 hex = "0.4.3"
 http-auth = "0.1.2"
 jiff = "0.2.0"
-tracing = "0.1.41"
+tracing = "0.1.40"
 memchr = "2.7.4"
 pretty-hex = "0.4.0"
 rand = "0.8.3"

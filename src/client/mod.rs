@@ -1186,6 +1186,7 @@ pub struct Stream {
     framerate: Option<f32>,
     control: Option<Url>,
     direction: StreamDirection,
+    extension_ids: crate::rtp::ExtensionIds,
 
     /// The format-specific parameters from the SDP `fmtp` attribute.
     fmtp: Option<Box<str>>,
@@ -1205,6 +1206,7 @@ impl std::fmt::Debug for Stream {
             .field("channels", &self.channels)
             .field("framerate", &self.framerate)
             .field("direction", &self.direction)
+            .field("extension_ids", &self.extension_ids)
             .field("fmtp", &self.fmtp)
             .field("parameters", &self.parameters)
             .field("state", &self.state)
@@ -1213,6 +1215,19 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
+    pub_if_unstable_extensions! {
+        /// Returns the IDs of known RTP header extensions, from the SDP media
+        /// description's `a=extmap` attributes.
+        ///
+        /// Retina reads these extensions from each received packet into
+        /// [`crate::rtp::ReceivedPacketMeta::extensions`], so depacketizers
+        /// supply them with frames, e.g. via
+        /// [`crate::codec::VideoFrameEnd::extensions`].
+        #[inline]
+        pub fn extension_ids(&self) -> &crate::rtp::ExtensionIds {
+            &self.extension_ids
+        }
+    }
     /// Returns the media type, as specified in the [IANA SDP parameters media
     /// registry](https://www.iana.org/assignments/sdp-parameters/sdp-parameters.xhtml#sdp-parameters-1).
     #[inline]

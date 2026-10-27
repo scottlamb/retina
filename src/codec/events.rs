@@ -150,6 +150,7 @@ pub enum Accumulate {
 pub struct VideoFrameStart<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) ctx: &'a Ctx,
+    pub(crate) extensions: crate::rtp::Extensions,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
@@ -195,6 +196,19 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
     #[inline]
     pub fn ctx(&self) -> &Ctx {
         self.ctx
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the RTP header extension values of the frame's packets so
+        /// far, the first packet with each extension taking precedence.
+        ///
+        /// Senders typically attach extensions to a frame's first packet, so
+        /// these are usually complete. See [`VideoFrameEnd::extensions`] for
+        /// authoritative values.
+        #[inline]
+        pub fn extensions(&self) -> &crate::rtp::Extensions {
+            &self.extensions
+        }
     }
 
     /// Returns if this frame appears to be a random access point.
@@ -386,6 +400,7 @@ pub struct VideoFrameEnd<'a, Ctx> {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) start_ctx: &'a Ctx,
     pub(crate) end_ctx: &'a Ctx,
+    pub(crate) extensions: crate::rtp::Extensions,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
     pub(crate) has_new_parameters: bool,
@@ -443,6 +458,19 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
     #[inline]
     pub fn end_ctx(&self) -> &Ctx {
         self.end_ctx
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the RTP header extension values of the frame's packets, the
+        /// first packet with each extension taking precedence.
+        ///
+        /// E.g., [`crate::rtp::AbsCaptureTime`] gives the frame's capture time.
+        /// Senders needn't attach it to every frame; extrapolate from the last
+        /// one seen via the RTP timestamp.
+        #[inline]
+        pub fn extensions(&self) -> &crate::rtp::Extensions {
+            &self.extensions
+        }
     }
 
     /// Returns if this is a "random access point (RAP)" picture: one where
@@ -649,6 +677,7 @@ impl std::error::Error for Corruption {}
 /// A complete audio frame, passed to [`AudioHandler::audio_frame`].
 pub struct AudioFrameRef<'a, Ctx> {
     pub(crate) ctx: &'a Ctx,
+    pub(crate) extensions: crate::rtp::Extensions,
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) frame_length: NonZeroU32,
 
@@ -664,6 +693,15 @@ impl<Ctx> AudioFrameRef<'_, Ctx> {
     #[inline]
     pub fn ctx(&self) -> &Ctx {
         self.ctx
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the RTP header extension values of the packet containing the
+        /// start of this frame.
+        #[inline]
+        pub fn extensions(&self) -> &crate::rtp::Extensions {
+            &self.extensions
+        }
     }
 
     /// Returns the frame's timestamp.

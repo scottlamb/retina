@@ -264,7 +264,10 @@ fn sdp_round_trip() {
     let body = sdp(
         "test",
         &[
-            SdpMedia::new(&video, 96, "trackID=0"),
+            SdpMedia::new(&video, 96, "trackID=0").with_extension_ids(
+                crate::rtp::ExtensionIds::default()
+                    .with::<crate::rtp::AbsCaptureTime>(std::num::NonZeroU8::new(3).unwrap()),
+            ),
             SdpMedia::new(&audio, 0, "trackID=1"),
         ],
     );
@@ -291,6 +294,15 @@ fn sdp_round_trip() {
         (v.media(), v.encoding_name(), v.rtp_payload_type()),
         ("video", "h264", 96)
     );
+    #[cfg(feature = "unstable-extensions")]
+    assert_eq!(
+        v.extension_ids()
+            .get::<crate::rtp::AbsCaptureTime>()
+            .map(|i| i.get()),
+        Some(3)
+    );
+    #[cfg(feature = "unstable-extensions")]
+    assert!(p.streams[1].extension_ids().is_empty());
     assert_eq!(v.control().unwrap().as_str(), "rtsp://h/cam/trackID=0");
     assert_eq!(v.parameters().is_some(), cfg!(feature = "h264"));
     let a = &p.streams[1];

@@ -9,6 +9,7 @@ use std::ops::Range;
 use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
 
+mod extension;
 mod receiver;
 mod reorder;
 #[cfg(feature = "unstable-send")]
@@ -16,6 +17,11 @@ mod sender;
 mod seq;
 mod timeline;
 
+pub_if_unstable_extensions! {
+    pub use extension::{
+        AbsCaptureTime, Element, Elements, Extension, ExtensionIds, Extensions, HeaderExtension,
+    };
+}
 pub use receiver::{
     OptionsError, ReceiveError, Receiver, ReceiverOptions, SenderReportInfo, SsrcMatch,
 };
@@ -82,18 +88,28 @@ impl PacketHeader {
         let has_extension = (header.0[0] & 0b0001_0000) != 0;
         let csrc_count = header.0[0] & 0b0000_1111;
         let csrc_end = Self::LEN + (4 * u16::from(csrc_count));
+        let mut extension = None;
         let payload_start = if has_extension {
             if input.len() < usize::from(csrc_end + 4) {
                 return Err(ParseError("extension is after end of packet"));
             }
+            let profile = u16::from_be_bytes([
+                input.byte_at(usize::from(csrc_end)),
+                input.byte_at(usize::from(csrc_end) + 1),
+            ]);
             let extension_len = u16::from_be_bytes([
                 input.byte_at(usize::from(csrc_end) + 2),
                 input.byte_at(usize::from(csrc_end) + 3),
             ]);
-            extension_len
+            let end = extension_len
                 .checked_mul(4)
                 .and_then(|e| e.checked_add(csrc_end + 4))
-                .ok_or(ParseError("extension extends beyond maximum packet size"))?
+                .ok_or(ParseError("extension extends beyond maximum packet size"))?;
+            extension = Some(ExtensionRange {
+                profile,
+                data: csrc_end + 4..end,
+            });
+            end
         } else {
             csrc_end
         };
@@ -120,6 +136,7 @@ impl PacketHeader {
         };
         Ok(ValidatedPacket {
             header,
+            extension,
             payload: payload_start..payload_end,
         })
     }
@@ -171,15 +188,69 @@ impl std::fmt::Debug for PacketHeader {
 /// An RTP packet's layout, as returned by [`PacketHeader::validate`].
 ///
 /// This is `#[non_exhaustive]` so that the locations of other parts of the
-/// packet, such as its header extension, can be added later.
+/// packet can be added later.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ValidatedPacket {
     /// The packet's fixed header.
     pub header: PacketHeader,
 
+    /// The packet's header extension, if any.
+    ///
+    /// See [`ValidatedPacket::extension`] to access it.
+    #[cfg(feature = "unstable-extensions")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+    pub extension: Option<ExtensionRange>,
+    #[cfg(not(feature = "unstable-extensions"))]
+    pub(crate) extension: Option<ExtensionRange>,
+
     /// The byte range of the payload within the packet, excluding any padding.
     pub payload: Range<u16>,
+}
+
+impl ValidatedPacket {
+    pub_if_unstable_extensions! {
+        /// Returns the packet's header extension, given the packet's bytes.
+        ///
+        /// `packet` must be the slice passed to [`PacketHeader::validate`].
+        /// With a [`Split`], use [`crate::inputs::Input::to_cow`] first;
+        /// extensions are small, so copying the rare one which spans a ring
+        /// buffer's wrap is cheap.
+        #[inline]
+        pub fn extension<'a>(&self, packet: &'a [u8]) -> Option<HeaderExtension<'a>> {
+            self.extension.as_ref().map(|e| e.get(packet))
+        }
+    }
+}
+
+pub_if_unstable_extensions! {
+    /// The location of a packet's header extension, as found by
+    /// [`PacketHeader::validate`].
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ExtensionRange {
+        /// The 16-bit "defined by profile" field; see [`HeaderExtension::profile`].
+        pub profile: u16,
+
+        /// The byte range of the extension's data within the packet, excluding
+        /// the 4-byte profile and length header.
+        pub data: Range<u16>,
+    }
+}
+
+impl ExtensionRange {
+    /// Returns the header extension within `packet`.
+    ///
+    /// # Panics
+    ///
+    /// If `packet` is too short, as it may be if it's not the packet this
+    /// range was found in.
+    #[inline]
+    pub fn get<'a>(&self, packet: &'a [u8]) -> HeaderExtension<'a> {
+        HeaderExtension::new(
+            self.profile,
+            &packet[usize::from(self.data.start)..usize::from(self.data.end)],
+        )
+    }
 }
 
 /// Metadata about an RTP packet, as supplied to a depacketizer such as
@@ -212,6 +283,16 @@ pub struct ReceivedPacketMeta<Ctx> {
 
     /// How this packet relates to the previous one in sequence.
     pub continuity: Continuity,
+
+    /// The values of known header extensions, as read via
+    /// [`ExtensionIds::read`]. Empty unless the caller sets them via
+    /// [`ReceivedPacketMeta::with_extensions`]; [`crate::client`] does so
+    /// for extensions declared in the stream's SDP.
+    #[cfg(feature = "unstable-extensions")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+    pub extensions: Extensions,
+    #[cfg(not(feature = "unstable-extensions"))]
+    pub(crate) extensions: Extensions,
 }
 
 impl<Ctx> ReceivedPacketMeta<Ctx> {
@@ -232,6 +313,15 @@ impl<Ctx> ReceivedPacketMeta<Ctx> {
             ssrc,
             mark,
             continuity,
+            extensions: Extensions::default(),
+        }
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns `self` with the given header extension values.
+        #[inline]
+        pub fn with_extensions(self, extensions: Extensions) -> Self {
+            Self { extensions, ..self }
         }
     }
 }
@@ -428,6 +518,9 @@ mod tests {
                      \x20\x00\x00\x07\x90\x80\x00";
         let pkt = PacketHeader::validate(&data[..]).unwrap();
         assert_eq!(pkt.payload, 28..55);
+        let ext = pkt.extension(&data[..]).unwrap();
+        assert_eq!(ext.profile(), 0xABAC); // ONVIF replay extension.
+        assert_eq!(ext.data().len(), 12);
         assert_eq!(data[pkt.payload.start as usize], 0x67);
         assert!(!pkt.header.mark());
     }
@@ -441,6 +534,7 @@ mod tests {
             ssrc: 0,
             mark: false,
             continuity: crate::rtp::Continuity::Contiguous,
+            extensions: Default::default(),
         }
     }
 

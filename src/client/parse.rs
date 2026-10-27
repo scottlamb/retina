@@ -270,6 +270,10 @@ fn parse_media(
     let mut fmtp = None;
     let mut control = None;
     let mut framerate = None;
+    // Without `unstable-extensions`, nothing could read the values, so leave
+    // this empty to skip reading each packet's extension.
+    #[cfg_attr(not(feature = "unstable-extensions"), allow(unused_mut))]
+    let mut extension_ids = crate::rtp::ExtensionIds::default();
     for a in &media_description.attributes {
         match a.attribute.as_str() {
             "rtpmap" => {
@@ -319,6 +323,12 @@ fn parse_media(
                     .map(|c| join_control(base_url, c))
                     .transpose()?;
             }
+            #[cfg(feature = "unstable-extensions")]
+            "extmap" => match a.value.as_deref().map(|v| extension_ids.parse_extmap(v)) {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => warn!(error = %e, "ignoring invalid extmap attribute"),
+                None => warn!("ignoring extmap attribute with no value"),
+            },
             "framerate" => {
                 if let Some(s) = a.value.as_ref()
                     && let Ok(f) = s.parse::<f32>()
@@ -411,6 +421,7 @@ fn parse_media(
         channels,
         framerate,
         direction,
+        extension_ids,
         state: super::StreamState::Uninit,
     })
 }

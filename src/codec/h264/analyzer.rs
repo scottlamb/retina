@@ -74,6 +74,9 @@ struct AuState<Ctx> {
     /// The context of the access unit's first input unit (such as a packet).
     start_ctx: Ctx,
 
+    /// Header extension values of the access unit's input units so far.
+    extensions: crate::rtp::Extensions,
+
     /// True if data was lost just before this access unit, so it may be
     /// missing its beginning.
     after_loss: bool,
@@ -400,6 +403,7 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
         self.au = Some(AuState {
             timestamp,
             start_ctx: ctx,
+            extensions: crate::rtp::Extensions::default(),
             after_loss: std::mem::take(&mut self.lost),
             same_ts_as_prev: self
                 .prev_timestamp
@@ -414,6 +418,11 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
             delivery: Delivery::default(),
             trimmed: false,
         });
+    }
+
+    #[cfg(feature = "unstable-extensions")]
+    fn add_extensions(&mut self, extensions: &crate::rtp::Extensions) {
+        Analyzer::add_extensions(self, extensions)
     }
 
     fn push_nal(&mut self, buf: &MarkBuf, pos: u64, len: usize) -> Result<(), Error> {
@@ -552,6 +561,15 @@ impl<Ctx: Clone> Analyzer<Ctx> {
     /// Changes the current access unit's timestamp, if any, affecting only
     /// events not yet delivered. For senders which erroneously change
     /// timestamps mid-access unit.
+    /// See [`NalAnalyzer::add_extensions`].
+    pub(crate) fn add_extensions(&mut self, extensions: &crate::rtp::Extensions) {
+        self.au
+            .as_mut()
+            .expect("add_extensions requires an access unit in progress")
+            .extensions
+            .fill_from(extensions);
+    }
+
     pub(crate) fn set_au_timestamp(&mut self, timestamp: crate::Timestamp) {
         if let Some(au) = self.au.as_mut() {
             au.timestamp = timestamp;
@@ -796,6 +814,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
+                extensions: au.extensions,
                 is_random_access_point: au.meta.is_random_access_point(),
                 is_disposable: au.meta.is_disposable,
                 has_new_parameters,
@@ -816,6 +835,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             is_rasl,
             timestamp: au.timestamp,
             start_ctx: &au.start_ctx,
+            extensions: au.extensions,
             end_ctx,
             is_random_access_point: au.meta.is_random_access_point(),
             is_disposable: au.meta.is_disposable,
@@ -1165,6 +1185,7 @@ impl AuView<'_> {
                 is_rasl,
                 timestamp: au.timestamp,
                 ctx: &au.start_ctx,
+                extensions: au.extensions,
                 is_random_access_point,
                 is_disposable,
                 has_new_parameters: new_params.is_some(),

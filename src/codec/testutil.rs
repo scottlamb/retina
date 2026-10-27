@@ -119,6 +119,7 @@ pub(crate) struct AudioFrame {
     pub(crate) frame_length: NonZeroU32,
     pub(crate) loss: u16,
     pub(crate) data: Vec<u8>,
+    pub(crate) extensions: crate::rtp::Extensions,
 }
 
 #[cfg_attr(not(feature = "h264"), allow(dead_code))]
@@ -202,6 +203,7 @@ impl AudioHandler<PacketContext> for Collector<'_> {
                 frame_length: frame.frame_length(),
                 loss,
                 data,
+                extensions: frame.extensions,
             })
         });
     }

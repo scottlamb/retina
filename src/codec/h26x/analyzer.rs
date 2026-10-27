@@ -126,6 +126,22 @@ pub trait NalAnalyzer<Ctx> {
     /// Panics if an access unit is already in progress.
     fn start_au(&mut self, timestamp: crate::Timestamp, ctx: Ctx);
 
+    /// Notes RTP header extension values for the access unit in progress,
+    /// as from each of its packets.
+    ///
+    /// Values already noted take precedence. They're supplied as
+    /// [`crate::codec::VideoFrameStart::extensions`] (if the frame hasn't
+    /// started yet) and [`crate::codec::VideoFrameEnd::extensions`]. A
+    /// non-RTP transport can use this to supply equivalent values, such as
+    /// a capture time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no access unit is in progress.
+    #[cfg(feature = "unstable-extensions")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+    fn add_extensions(&mut self, extensions: &crate::rtp::Extensions);
+
     /// Supplies a complete NAL unit, header included, at `[pos, pos + len)`
     /// within `buf`.
     ///

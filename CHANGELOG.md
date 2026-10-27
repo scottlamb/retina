@@ -4,6 +4,24 @@
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
     `Display` is accurate through 2106, not just 2038.
+*   `unstable-extensions`: add RTP header extension support. `rtp::HeaderExtension`
+    parses a packet's raw extension block (via `ValidatedPacket::extension`),
+    including RFC 8285 elements. Known extensions, currently
+    `rtp::AbsCaptureTime` (`abs-capture-time`), are typed: `rtp::ExtensionIds`
+    holds the IDs a session negotiated via SDP `a=extmap`, and
+    `rtp::Extensions` holds values, keyed by type. The client reads them into
+    `ReceivedPacketMeta::extensions`; depacketizers merge each frame's
+    packets' values into `VideoFrameStart::extensions`,
+    `VideoFrameEnd::extensions`, and `AudioFrameRef::extensions`. With
+    `unstable-send`, `VideoFrameInfo::with_extensions` and
+    `AudioPacketizer::push_frame_with_extensions` supply a frame's values.
+    The packetizer has its sink encode them once per frame
+    (`PayloadSink::serialize_extensions`), leaves room for the block in the
+    frame's first payload, and attaches it there
+    (`Payload::encoded_extensions`). `rtp::Sender`'s sink encodes those with
+    IDs from `SenderOptions::extension_ids`, and writes them
+    (`Sender::packet_with_extensions`, `OutgoingPacketRef::extension`); with
+    `unstable-server`, `server::SdpMedia::with_extension_ids` describes them.
 *   `unstable-codec-analyzer`: add `codec::h264::Analyzer` and
     `codec::h265::Analyzer`, the transport-independent layers beneath the
     H.264 and H.265 RTP depacketizers, for transports Retina doesn't handle

@@ -20,6 +20,10 @@ use retina::rtp::{OutgoingPacketRef, PacketHeader, ReceivedPacketMeta, Sender, V
 pub struct Feeder {
     buf: MarkBuf,
     next_seq: Option<u16>,
+
+    /// The header extensions to read into each packet's metadata.
+    #[cfg(feature = "unstable-extensions")]
+    pub extension_ids: retina::rtp::ExtensionIds,
 }
 
 impl Feeder {
@@ -27,6 +31,8 @@ impl Feeder {
         Self {
             buf: MarkBuf::new(1 << 20),
             next_seq: None,
+            #[cfg(feature = "unstable-extensions")]
+            extension_ids: Default::default(),
         }
     }
 
@@ -36,9 +42,15 @@ impl Feeder {
         d: &mut VideoDepacketizer<()>,
         h: &mut impl VideoHandler<()>,
     ) -> PacketHeader {
+        let v = PacketHeader::validate(raw).unwrap();
+        #[cfg(feature = "unstable-extensions")]
+        let extensions = v
+            .extension(raw)
+            .map(|e| self.extension_ids.read(&e))
+            .unwrap_or_default();
         let ValidatedPacket {
             header, payload, ..
-        } = PacketHeader::validate(raw).unwrap();
+        } = v;
         let loss = self
             .next_seq
             .map_or(0, |s| header.sequence_number().wrapping_sub(s));
@@ -56,6 +68,8 @@ impl Feeder {
             header.mark(),
             retina::rtp::Continuity::from_loss(loss),
         );
+        #[cfg(feature = "unstable-extensions")]
+        let meta = meta.with_extensions(extensions);
         let pos = self.buf.end();
         self.buf.extend(raw);
         self.buf.advance_unparsed(self.buf.end());
@@ -202,6 +216,14 @@ impl<'a> Recorder<'a> {
 
 impl PayloadSink for Recorder<'_> {
     fn payload(&mut self, p: &Payload<'_>) {
+        #[cfg(feature = "unstable-extensions")]
+        let pkt = self.sender.packet_with_extensions(
+            p.timestamp(),
+            p.mark(),
+            p.encoded_extensions(),
+            p.data(),
+        );
+        #[cfg(not(feature = "unstable-extensions"))]
         let pkt = self.sender.packet(p.timestamp(), p.mark(), p.data());
         self.out.push(Pkt::new(p, &pkt));
     }
@@ -212,5 +234,10 @@ impl PayloadSink for Recorder<'_> {
 
     fn max_payload_size(&self) -> u16 {
         self.sender.max_payload_size()
+    }
+
+    #[cfg(feature = "unstable-extensions")]
+    fn serialize_extensions(&self, extensions: &retina::rtp::Extensions, out: &mut Vec<u8>) {
+        self.sender.serialize_extensions(extensions, out);
     }
 }

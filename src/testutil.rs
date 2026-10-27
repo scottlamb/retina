@@ -197,6 +197,7 @@ impl TestPacket {
                 ssrc: self.ssrc,
                 mark: self.mark,
                 continuity: crate::rtp::Continuity::from_loss(self.loss),
+                extensions: Default::default(),
             },
             buf,
             pos + u64::from(payload_range.start),
