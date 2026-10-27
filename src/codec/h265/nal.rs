@@ -108,6 +108,13 @@ pub enum UnitType {
 }
 
 impl UnitType {
+    /// Returns true iff this is a VCL NAL unit of a sub-layer non-reference
+    /// picture: `TRAIL_N`, `TSA_N`, `STSA_N`, `RADL_N`, `RASL_N`, or a reserved
+    /// `RSV_VCL_N*` type.
+    pub fn is_sub_layer_non_reference(self) -> bool {
+        (self as u8) < 16 && (self as u8).is_multiple_of(2)
+    }
+
     pub fn unit_type_class(self) -> UnitTypeClass {
         match self {
             UnitType::TrailN

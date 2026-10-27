@@ -657,6 +657,9 @@ struct InternalParameters {
 
     seen_extra_trailing_data: bool,
 
+    /// `sps_max_sub_layers_minus1 + 1`.
+    max_sub_layers: u8,
+
     /// If set via [`VideoFrameStart::set_parameters`], the in-band VPS, SPS,
     /// and PPS which were overridden. Parameter sets received later are
     /// compared against these to detect changes, so that a camera repeating
@@ -852,6 +855,7 @@ impl InternalParameters {
             sps_nal: sps_nal_b,
             pps_nal: pps_nal_b,
             seen_extra_trailing_data,
+            max_sub_layers: sps.max_sub_layers(),
             overridden: None,
         })
     }
@@ -1282,15 +1286,18 @@ mod tests {
         let pps_nal = b64.decode("RAHA8saNA7NA").unwrap();
         let sprop = "profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==";
 
-        for (vcl_nal, want_rap) in [
-            (&b"\x2a\x01cra"[..], true),
-            (&b"\x20\x01bla_w_lp"[..], true),
-            (&b"\x22\x01bla_w_radl"[..], true),
-            (&b"\x24\x01bla_n_lp"[..], true),
-            (&b"\x26\x01idr_w_radl"[..], true),
-            (&b"\x28\x01idr_n_lp"[..], true),
-            (&b"\x02\x01trail_r"[..], false),
-            (&b"\x10\x01rasl_n"[..], false),
+        // The SPS has a single temporal sub-layer, so every sub-layer
+        // non-reference picture is disposable.
+        for (vcl_nal, want_rap, want_disposable) in [
+            (&b"\x2a\x01cra"[..], true, false),
+            (&b"\x20\x01bla_w_lp"[..], true, false),
+            (&b"\x22\x01bla_w_radl"[..], true, false),
+            (&b"\x24\x01bla_n_lp"[..], true, false),
+            (&b"\x26\x01idr_w_radl"[..], true, false),
+            (&b"\x28\x01idr_n_lp"[..], true, false),
+            (&b"\x00\x01trail_n"[..], false, true),
+            (&b"\x02\x01trail_r"[..], false, false),
+            (&b"\x10\x01rasl_n"[..], false, true),
         ] {
             let mut buf = MarkBuf::new(65536);
             let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
@@ -1317,6 +1324,12 @@ mod tests {
             assert_eq!(
                 frame.is_random_access_point(),
                 want_rap,
+                "NAL header {:02x?}",
+                &vcl_nal[..2]
+            );
+            assert_eq!(
+                frame.is_disposable,
+                want_disposable,
                 "NAL header {:02x?}",
                 &vcl_nal[..2]
             );

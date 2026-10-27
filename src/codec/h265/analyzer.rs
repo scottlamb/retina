@@ -21,8 +21,9 @@ use crate::codec::{
 /// This is the codec layer beneath the H.265 RTP depacketizer. Its interface
 /// is [`NalAnalyzer`]; see there for an overview and example.
 ///
-/// It detects leading (RASL) pictures from their NAL unit types and currently
-/// never reports a frame as disposable.
+/// It detects leading (RASL) pictures from their NAL unit types. It reports a
+/// frame as disposable if it's a sub-layer non-reference picture (such as
+/// `TRAIL_N`) in the highest temporal sub-layer the SPS allows.
 #[derive(Debug)]
 pub struct Analyzer<Ctx> {
     parameters: Option<InternalParameters>,
@@ -120,6 +121,13 @@ struct FrameMeta {
     /// True if a VCL NAL has been seen.
     seen_vcl: bool,
 
+    /// True unless a VCL NAL other than a sub-layer non-reference (SLNR) type
+    /// has been seen. See `is_disposable`.
+    all_vcl_slnr: bool,
+
+    /// The lowest `nuh_temporal_id_plus1` of the VCL NALs seen, if any.
+    min_temporal_id_plus1: Option<u8>,
+
     /// Parameter sets for this frame which differ from
     /// `Analyzer::parameters`, if any: `Analyzer::pending`, updated by the
     /// sets preceding the first slice. Boxed because they're rare.
@@ -143,12 +151,39 @@ struct FrameMeta {
     param_override: Option<ParametersOverride>,
 }
 
+impl FrameMeta {
+    /// Updates `all_vcl_slnr` and `min_temporal_id_plus1` for a VCL NAL.
+    fn note_vcl_for_disposable(&mut self, hdr: nal::Header) {
+        self.all_vcl_slnr &= hdr.unit_type().is_sub_layer_non_reference();
+        let tid = hdr.nuh_temporal_id_plus1();
+        self.min_temporal_id_plus1 = Some(self.min_temporal_id_plus1.map_or(tid, |m| m.min(tid)));
+    }
+}
+
+/// Returns true if a frame is disposable: all its VCL NALs are sub-layer
+/// non-reference types, and it's in the highest temporal sub-layer `params`
+/// allows. A lower sub-layer's SLNR picture may still be referenced by
+/// pictures in higher sub-layers.
+fn is_disposable(
+    all_vcl_slnr: bool,
+    min_temporal_id_plus1: Option<u8>,
+    params: Option<&InternalParameters>,
+) -> bool {
+    all_vcl_slnr
+        && match (min_temporal_id_plus1, params) {
+            (Some(tid), Some(p)) => tid >= p.max_sub_layers,
+            _ => false,
+        }
+}
+
 impl Default for FrameMeta {
     fn default() -> Self {
         FrameMeta {
             is_random_access_point: true,
             is_rasl: false,
             seen_vcl: false,
+            all_vcl_slnr: true,
+            min_temporal_id_plus1: None,
             new_params: None,
             deferred: None,
             first_vcl_starts_picture: None,
@@ -706,6 +741,11 @@ impl<Ctx: Clone> Analyzer<Ctx> {
         }
 
         let missing_prefix = au.after_loss && au.meta.first_vcl_starts_picture != Some(true);
+        let is_disposable = is_disposable(
+            au.meta.all_vcl_slnr,
+            au.meta.min_temporal_id_plus1,
+            self.parameters.as_ref(),
+        );
         let accumulate = match au.started {
             Some(a) => a,
             None => handler.frame_start(&mut VideoFrameStart {
@@ -716,7 +756,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
                 ctx: &au.start_ctx,
                 extensions: au.extensions,
                 is_random_access_point: au.meta.is_random_access_point,
-                is_disposable: false,
+                is_disposable,
                 has_new_parameters,
                 parameters: self.parameters.as_ref().map(|p| &p.generic_parameters),
                 param_override: Some(&mut au.meta.param_override),
@@ -738,7 +778,7 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             extensions: au.extensions,
             end_ctx,
             is_random_access_point: au.meta.is_random_access_point,
-            is_disposable: false,
+            is_disposable,
             has_new_parameters,
             body: FrameBody::H265(FrameEndBody {
                 au: (accumulate == Accumulate::Yes && !au.trimmed).then_some(AuData {
@@ -811,6 +851,7 @@ impl AuView<'_> {
                     if is_rasl(nal.hdr) {
                         meta.is_rasl = true;
                     }
+                    meta.note_vcl_for_disposable(nal.hdr);
                 }
                 nal::UnitTypeClass::NonVcl => {}
             }
@@ -863,6 +904,8 @@ impl AuView<'_> {
         }
         let mut is_random_access_point = au.meta.is_random_access_point;
         let mut is_rasl = au.meta.is_rasl;
+        let (mut all_vcl_slnr, mut min_temporal_id_plus1) =
+            (au.meta.all_vcl_slnr, au.meta.min_temporal_id_plus1);
         if let Some(ip) = au.in_progress.as_ref() {
             if matches!(
                 ip.hdr.unit_type().unit_type_class(),
@@ -871,6 +914,11 @@ impl AuView<'_> {
                 is_random_access_point = false;
             }
             is_rasl |= super::is_rasl(ip.hdr);
+            if let nal::UnitTypeClass::Vcl { .. } = ip.hdr.unit_type().unit_type_class() {
+                all_vcl_slnr &= ip.hdr.unit_type().is_sub_layer_non_reference();
+                let tid = ip.hdr.nuh_temporal_id_plus1();
+                min_temporal_id_plus1 = Some(min_temporal_id_plus1.map_or(tid, |m| m.min(tid)));
+            }
         }
         if let Some(np) = au.meta.new_params.as_mut()
             && np.parsed.is_none()
@@ -894,7 +942,11 @@ impl AuView<'_> {
                 ctx: &au.start_ctx,
                 extensions: au.extensions,
                 is_random_access_point,
-                is_disposable: false,
+                is_disposable: is_disposable(
+                    all_vcl_slnr,
+                    min_temporal_id_plus1,
+                    new_params.or(self.parameters.as_ref()),
+                ),
                 has_new_parameters: new_params.is_some(),
                 parameters: new_params
                     .or(self.parameters.as_ref())
