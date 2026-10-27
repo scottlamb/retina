@@ -2211,11 +2211,11 @@ mod tests {
         let p = parse_backchannel_describe("rtsp://192.168.0.1/", raw, true);
         assert_eq!(p.streams.len(), 3);
         assert_eq!(p.streams[0].f().encoding_name(), "jpeg");
-        assert_eq!(p.streams[0].direction(), StreamDirection::Receiving);
+        assert_eq!(p.streams[0].direction, StreamDirection::Receiving);
         assert_eq!(p.streams[1].f().encoding_name(), "pcmu");
-        assert_eq!(p.streams[1].direction(), StreamDirection::Receiving);
+        assert_eq!(p.streams[1].direction, StreamDirection::Receiving);
         let back = &p.streams[2];
-        assert_eq!(back.direction(), StreamDirection::Sending);
+        assert_eq!(back.direction, StreamDirection::Sending);
         assert_eq!(back.media(), "audio");
         assert_eq!(back.f().encoding_name(), "pcmu");
         assert_eq!(back.pt(), 0);
@@ -2236,7 +2236,7 @@ mod tests {
         let p = parse_backchannel_describe("rtsp://192.168.0.1/", raw, false);
         assert_eq!(p.streams.len(), 3);
         for s in &p.streams[..] {
-            assert_eq!(s.direction(), StreamDirection::Receiving);
+            assert_eq!(s.direction, StreamDirection::Receiving);
         }
         assert!(p.streams[2].new_depacketizer::<()>().is_ok());
     }
@@ -2252,10 +2252,10 @@ mod tests {
             true,
         );
         assert_eq!(p.streams.len(), 3);
-        assert_eq!(p.streams[0].direction(), StreamDirection::Receiving);
-        assert_eq!(p.streams[1].direction(), StreamDirection::Receiving);
+        assert_eq!(p.streams[0].direction, StreamDirection::Receiving);
+        assert_eq!(p.streams[1].direction, StreamDirection::Receiving);
         let back = &p.streams[2];
-        assert_eq!(back.direction(), StreamDirection::Sending);
+        assert_eq!(back.direction, StreamDirection::Sending);
 
         // Every format is described, in order.
         let formats: Vec<_> = back
@@ -2291,7 +2291,7 @@ mod tests {
         let (response, body) = sdp_response(sdp);
         let url = Url::parse("rtsp://192.168.0.1/").unwrap();
         let p = super::parse_describe(url, &response, &body, true).unwrap();
-        p.streams.iter().map(Stream::direction).collect()
+        p.streams.iter().map(|s| s.direction).collect()
     }
 
     /// ONVIF Streaming Specification section 5.3.2: every media section marked
