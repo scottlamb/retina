@@ -33,6 +33,9 @@
     `ParameterSetInsertion::OnChange`, prepend parameter sets to any frame
     that changes them, not only to random access points. Previously a
     parameter change on a non-key frame never reached the decoder.
+*   AAC: with `aac::Framing::Adts`, fail frames that ADTS can't represent
+    (audio object types other than 1–4, an explicit sampling frequency, or
+    frames over 8184 bytes) rather than writing a corrupt header.
 *   JPEG: append an end-of-image marker to frames whose data ends in
     `ff xx` or `xx d9`. Previously the check used the wrong boolean
     operator and skipped these.
