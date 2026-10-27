@@ -192,11 +192,13 @@ impl FrameFormat {
 /// into frame data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParameterSetInsertion {
-    /// Prepend to every key frame. Default.
+    /// Prepend to every key frame (random access point), and to any frame
+    /// that changes the parameters. Default.
     #[default]
     EachKeyFrame,
 
-    /// Prepend only when parameters have changed since the last frame.
+    /// Prepend only to frames that change the parameters, whether or not
+    /// they're key frames.
     OnChange,
 
     /// Never insert in-band; caller retrieves them out-of-band via

@@ -29,6 +29,10 @@
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.
+*   H.264/H.265: with `ParameterSetInsertion::EachKeyFrame` or
+    `ParameterSetInsertion::OnChange`, prepend parameter sets to any frame
+    that changes them, not only to random access points. Previously a
+    parameter change on a non-key frame never reached the decoder.
 *   JPEG: append an end-of-image marker to frames whose data ends in
     `ff xx` or `xx d9`. Previously the check used the wrong boolean
     operator and skipped these.

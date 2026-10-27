@@ -651,12 +651,11 @@ impl Depacketizer {
         };
 
         // Determine whether to prepend parameter sets.
-        let prepend_params = is_random_access_point
-            && match self.frame_format.parameter_set_insertion {
-                ParameterSetInsertion::EachKeyFrame => true,
-                ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
-            };
+        let prepend_params = match self.frame_format.parameter_set_insertion {
+            ParameterSetInsertion::EachKeyFrame => is_random_access_point || has_new_parameters,
+            ParameterSetInsertion::OnChange => has_new_parameters,
+            ParameterSetInsertion::Never => false,
+        };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
             retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
