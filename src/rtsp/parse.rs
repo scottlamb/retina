@@ -206,6 +206,9 @@ enum ParserState {
     Head {
         msg: Message,
         head_bytes: usize,
+        /// The start of a header line an interleaved frame cut in two (see
+        /// [`embedded_frame`]), read with the rest of the line once it comes.
+        pending: Vec<u8>,
     },
     Body(Message, usize),
 }
@@ -275,7 +278,11 @@ impl Parser {
                         Ok(Some(msg)) => {
                             let head_bytes = before - input.len();
                             self.check_size(&msg, head_bytes as u64)?;
-                            self.state = ParserState::Head { msg, head_bytes };
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending: Vec::new(),
+                            };
                         }
                         Err(FeedError::Incomplete(inc)) => {
                             *input = checkpoint;
@@ -292,15 +299,52 @@ impl Parser {
                 ParserState::Head {
                     mut msg,
                     mut head_bytes,
+                    mut pending,
                 } => {
                     let context = match &msg {
                         Message::Request(_) => "request",
                         Message::Response(_) => "response",
                         Message::Data(_) => unreachable!(),
                     };
+                    // An interleaved frame written into the middle of the
+                    // line: handed on as the data message it is, and the line
+                    // read around it.
+                    match embedded_frame(input) {
+                        Ok(Some((text_len, channel_id, body_len))) => {
+                            pending.extend_from_slice(&input.next_slice(text_len).to_cow());
+                            head_bytes += text_len;
+                            self.check_size(&msg, head_bytes as u64)?;
+                            input.advance(4);
+                            let body = input.next_slice(usize::from(body_len));
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending,
+                            };
+                            let data = Data {
+                                channel_id,
+                                body_len,
+                            };
+                            return Ok(Some((Message::Data(data), body)));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending,
+                            };
+                            return Err(e);
+                        }
+                    }
                     let checkpoint = *input;
                     let before = input.len();
-                    match parse_header_line(input) {
+                    let parsed = if pending.is_empty() {
+                        parse_header_line(input)
+                    } else {
+                        rest_of_line(input, &mut pending)
+                    };
+                    match parsed {
                         Ok(Some((name, value))) => {
                             head_bytes += before - input.len();
                             self.check_size(&msg, head_bytes as u64)?;
@@ -309,7 +353,11 @@ impl Parser {
                                 Message::Response(resp) => resp.headers.append(name, value),
                                 Message::Data(_) => unreachable!(),
                             }
-                            self.state = ParserState::Head { msg, head_bytes };
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending,
+                            };
                         }
                         Ok(None) => {
                             head_bytes += before - input.len();
@@ -327,11 +375,19 @@ impl Parser {
                             *input = checkpoint;
                             // A header line which never ends.
                             self.check_size(&msg, (head_bytes + before) as u64)?;
-                            self.state = ParserState::Head { msg, head_bytes };
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending,
+                            };
                             return Err(incomplete());
                         }
                         Err(e) => {
-                            self.state = ParserState::Head { msg, head_bytes };
+                            self.state = ParserState::Head {
+                                msg,
+                                head_bytes,
+                                pending,
+                            };
                             return Err(e.context(context));
                         }
                     }
@@ -464,6 +520,54 @@ fn parse_request_line_inner<'i, I: Input<'i>>(input: &mut I) -> Result<Request, 
         request_uri,
         headers: Headers::default(),
     })
+}
+
+/// Where an interleaved frame starts inside the header line at the front of
+/// `input`, with its channel and length, when one does.
+///
+/// Some cameras write their interleaved frames into the socket while a
+/// response is still being written, and one lands in the middle of a header
+/// line: `Public: OPTIONS, DESCRIBE, S$\0\0<\x80…ETUP, …`. Its `$` is told
+/// from one in the text by the frame's first byte, RTP or RTCP version 2
+/// (`0x80`–`0xbf`), which a header never has. Only a frame before the line's
+/// end counts, and only a whole one: until all of it has come, the line is
+/// incomplete — read up to its CRLF, it would end inside the frame.
+fn embedded_frame<'i, I: Input<'i>>(input: &I) -> Result<Option<(usize, u8, u16)>, FeedError> {
+    let Some(at) = input.find_bytes3(b'$', b'\r', b'\n') else {
+        return Ok(None);
+    };
+    if input.byte_at(at) != b'$' {
+        return Ok(None);
+    }
+    if input.len() < at + 5 {
+        return Err(incomplete());
+    }
+    if !(0x80..=0xbf).contains(&input.byte_at(at + 4)) {
+        return Ok(None);
+    }
+    let body_len = u16::from(input.byte_at(at + 2)) << 8 | u16::from(input.byte_at(at + 3));
+    if input.len() < at + 4 + usize::from(body_len) {
+        return Err(incomplete());
+    }
+    Ok(Some((at, input.byte_at(at + 1), body_len)))
+}
+
+/// The rest of a header line an interleaved frame cut in two — up to its
+/// CRLF — parsed together with `pending`, the part before the frame.
+fn rest_of_line<'i, I: Input<'i>>(
+    input: &mut I,
+    pending: &mut Vec<u8>,
+) -> Result<Option<(HeaderName, HeaderValue)>, FeedError> {
+    let end = match input.find_bytes2(b'\r', b'\n') {
+        None => return Err(incomplete()),
+        Some(n) => n,
+    };
+    if input.len() < end + 2 {
+        return Err(incomplete());
+    }
+    let mut line = std::mem::take(pending);
+    line.extend_from_slice(&input.next_slice(end + 2).to_cow());
+    parse_header_line(&mut line.as_slice())
 }
 
 fn parse_header_line<'i, I: Input<'i>>(
@@ -788,6 +892,81 @@ pub(crate) mod tests {
             );
             assert_eq!(body.to_cow().as_ref(), b"12345", "split {split}");
         }
+    }
+
+    /// What `input` yields, message after message, until it needs more.
+    fn messages<'i, I: Input<'i>>(parser: &mut Parser, input: &mut I) -> Vec<String> {
+        let mut seen = Vec::new();
+        loop {
+            match parser.feed(input) {
+                Ok(Some((Message::Data(d), body))) => {
+                    seen.push(format!("data {} {}", d.channel_id, body.to_cow().len()))
+                }
+                Ok(Some((Message::Response(r), _))) => seen.push(format!(
+                    "response {} {}",
+                    r.headers.get("CSeq").unwrap(),
+                    r.headers.get("Public").unwrap()
+                )),
+                Ok(Some((Message::Request(_), _))) => panic!("a request"),
+                Ok(None) | Err(FeedError::Incomplete(_)) => return seen,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    /// A camera that writes its interleaved frames while a response is half
+    /// written puts one in the middle of a header line — here as one did: a
+    /// 60-byte RTP frame after `Public: OPTIONS, DESCRIBE, S`, with a CRLF in
+    /// it. The frame comes out as the data message it is, then the response
+    /// whole, wherever the bytes are split.
+    #[test]
+    fn frame_inside_a_header_line() {
+        let mut frame = vec![
+            b'$', 0, 0, 60, 0x80, 0x60, 0x40, 0x43, 0x60, 0xf5, 0x56, 0xa6,
+        ];
+        frame.extend_from_slice(b"\r\n");
+        frame.resize(4 + 60, 0x2c);
+        let mut data = b"RTSP/1.0 200 OK\r\nCSeq: 5\r\nDate: Tue Feb  1 01:47:58 2000 GMT\r\n\
+                         Public: OPTIONS, DESCRIBE, S"
+            .to_vec();
+        data.extend_from_slice(&frame);
+        data.extend_from_slice(b"ETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER\r\n\r\n");
+        let expected = [
+            "data 0 60",
+            "response 5 OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER",
+        ];
+
+        for split in 0..=data.len() {
+            let (first, second) = data.split_at(split);
+
+            // Discontiguous ring-buffer view, all at once.
+            let mut input = Split::new(first, second);
+            assert_eq!(
+                messages(&mut Parser::default(), &mut input),
+                expected,
+                "split {split}"
+            );
+
+            // The first part, then the rest after what was consumed.
+            let mut parser = Parser::default();
+            let mut p1 = Split::new(first, &[]);
+            let mut seen = messages(&mut parser, &mut p1);
+            let consumed = first.len() - p1.len();
+            let mut p2 = Split::new(&first[consumed..], second);
+            seen.extend(messages(&mut parser, &mut p2));
+            assert_eq!(seen, expected, "split {split}");
+        }
+    }
+
+    /// A `$` in a header's text is text: the byte four after it is no frame's.
+    #[test]
+    fn dollar_in_a_header_is_text() {
+        let data = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nPublic: A$BCD, E\r\n\r\n";
+        let mut input = Split::new(data, &[]);
+        assert_eq!(
+            messages(&mut Parser::default(), &mut input),
+            ["response 7 A$BCD, E"]
+        );
     }
 
     #[test]
