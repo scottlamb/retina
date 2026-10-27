@@ -1886,6 +1886,38 @@ mod tests {
         assert_eq!(h.take(), idr_frame());
     }
 
+    /// In-band parameter sets, which have a non-zero `nal_ref_idc`, don't make
+    /// a non-reference picture non-disposable.
+    #[test]
+    #[cfg(feature = "h264")]
+    fn h264_disposable_with_parameter_sets() {
+        crate::testutil::init_logging();
+        for (slice, want) in [(&b"\x01slice"[..], true), (&b"\x21slice"[..], false)] {
+            let mut d = h264();
+            let mut buf = MarkBuf::new(65536);
+            let mut h = Recorder::new(Accumulate::Yes);
+            push(&mut d, &mut buf, (0, 0, false, 0), b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84", &mut h);
+            push(
+                &mut d,
+                &mut buf,
+                (1, 0, false, 0),
+                b"\x68\xee\x3c\x80",
+                &mut h,
+            );
+            push(&mut d, &mut buf, (2, 0, true, 0), slice, &mut h);
+            let events = h.take();
+            let flags: Vec<bool> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::FrameStart { is_disposable, .. }
+                    | Event::FrameEnd { is_disposable, .. } => Some(*is_disposable),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(flags, [want, want], "{events:#?}");
+        }
+    }
+
     /// Under `Accumulate::No`, the limit covers data before `frame_start`...
     #[test]
     #[cfg(feature = "h264")]

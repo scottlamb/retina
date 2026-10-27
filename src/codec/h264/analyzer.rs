@@ -215,7 +215,10 @@ struct FrameMeta {
     /// has been seen; see `has_recovery_point_sei`.
     has_recovery_point: bool,
 
-    /// True unless a NAL with `nal_ref_idc != 0` has been seen.
+    /// True unless a VCL NAL with `nal_ref_idc != 0` has been seen.
+    ///
+    /// Parameter sets and SEI typically have a non-zero `nal_ref_idc` but
+    /// don't say whether the picture is a reference picture.
     is_disposable: bool,
 
     /// True if a VCL (slice) NAL has been seen.
@@ -924,7 +927,7 @@ impl AuView<'_> {
             if is_non_idr_slice(nal.hdr) {
                 meta.has_non_idr_slice = true;
             }
-            if nal.hdr.nal_ref_idc() != 0 {
+            if is_vcl(nal.hdr) && nal.hdr.nal_ref_idc() != 0 {
                 meta.is_disposable = false;
             }
             meta.last_nal_hdr = Some(nal.hdr);
@@ -1149,7 +1152,7 @@ impl AuView<'_> {
             if is_non_idr_slice(ip.hdr) {
                 is_random_access_point = au.meta.has_recovery_point;
             }
-            if ip.hdr.nal_ref_idc() != 0 {
+            if is_vcl(ip.hdr) && ip.hdr.nal_ref_idc() != 0 {
                 is_disposable = false;
             }
         }
