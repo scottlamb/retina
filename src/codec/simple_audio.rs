@@ -40,14 +40,18 @@ impl Depacketizer {
         Some(super::ParametersRef::Audio(&self.parameters))
     }
 
+    /// Returns the frame length in clock rate units, which count sampling
+    /// instants rather than samples across all channels (RFC 3551 section
+    /// 4).
     fn frame_length(&self, payload_len: usize) -> Option<NonZeroU32> {
         // This calculation could be strength-reduced but it's just once per frame anyway.
         // Let's do it in a straightforward way.
         assert!(payload_len < usize::from(u16::MAX));
         let bits = (payload_len) as u32 * 8;
-        match bits.is_multiple_of(self.bits_per_sample) {
+        let bits_per_instant = self.bits_per_sample * u32::from(self.parameters.channels.get());
+        match bits.is_multiple_of(bits_per_instant) {
             false => None,
-            true => NonZeroU32::new(bits / self.bits_per_sample),
+            true => NonZeroU32::new(bits / bits_per_instant),
         }
     }
 
@@ -56,8 +60,8 @@ impl Depacketizer {
         let payload_len = pkt.payload_len();
         let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
             format!(
-                "invalid length {} for payload of {}-bit audio samples",
-                payload_len, self.bits_per_sample
+                "invalid length {} for payload of {}-bit audio samples in {} channel(s)",
+                payload_len, self.bits_per_sample, self.parameters.channels
             )
         })?;
         let (s1, s2) = pkt.payload().slices();
@@ -119,5 +123,15 @@ mod tests {
         // 321 bytes is not divisible by 2 bytes per sample
         let d = depacketizer_16bit();
         assert_eq!(d.frame_length(321), None);
+    }
+
+    #[test]
+    fn frame_length_stereo_16bit() {
+        // 320 bytes = 80 sampling instants of two 16-bit samples (stereo L16)
+        let d = Depacketizer::new(16000, 16, NonZeroU16::new(2));
+        assert_eq!(d.frame_length(320), Some(NonZeroU32::new(80).unwrap()));
+
+        // 322 bytes would end mid-instant.
+        assert_eq!(d.frame_length(322), None);
     }
 }
