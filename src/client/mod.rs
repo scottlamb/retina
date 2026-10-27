@@ -685,6 +685,8 @@ pub struct SessionOptions {
     receiver_reports: ReceiverReportPolicy,
     #[cfg(feature = "tokio")]
     bind_addr: Option<std::net::IpAddr>,
+    #[cfg(feature = "tokio")]
+    request_timeout: Option<std::time::Duration>,
     backchannel: bool,
 }
 
@@ -926,6 +928,17 @@ impl SessionOptions {
     #[cfg(feature = "tokio")]
     pub fn bind(mut self, bind_addr: Option<std::net::IpAddr>) -> Self {
         self.bind_addr = bind_addr;
+        self
+    }
+
+    /// Fails [`Session::describe`] (including connecting), [`Session::setup`],
+    /// and [`Session::play`] if they take longer than this.
+    ///
+    /// There's no timeout by default. A timed-out `setup` leaves the session
+    /// unusable, as if its future were dropped; see [`Session::setup`].
+    #[cfg(feature = "tokio")]
+    pub fn request_timeout(mut self, request_timeout: Option<std::time::Duration>) -> Self {
+        self.request_timeout = request_timeout;
         self
     }
 
@@ -1529,6 +1542,15 @@ struct SessionInner {
     /// between them rather than always starting at 0 should prevent one stream
     /// from starving the others.
     udp_next_poll_i: usize,
+
+    /// See [`SessionOptions::request_timeout`].
+    request_timeout: Option<std::time::Duration>,
+
+    /// Set while a request's future is in progress. If it's still set when
+    /// the next request starts, the previous one was cancelled (its future
+    /// dropped, e.g. by a timeout) partway through, and the session can't be
+    /// used further.
+    interrupted: bool,
 }
 
 #[cfg(feature = "tokio")]
@@ -1885,8 +1907,11 @@ impl Session<Described> {
     /// `rtsps` URL is refused. Use [`SessionCore`] with a caller-supplied TLS
     /// stream for that.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
-        let conn = connect(&url, &options).await?;
-        Self::describe_with_conn(conn, options, url).await
+        with_timeout(options.request_timeout, async {
+            let conn = connect(&url, &options).await?;
+            Self::describe_with_conn(conn, options, url).await
+        })
+        .await
     }
 
     async fn describe_with_conn(
@@ -1894,6 +1919,7 @@ impl Session<Described> {
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
+        let request_timeout = options.request_timeout;
         let core = SessionCore::from_conn(conn::ConnCore::new(conn.ctx().clone(), options));
         let mut inner = Box::new(SessionInner {
             conn: Some(conn),
@@ -1901,6 +1927,8 @@ impl Session<Described> {
             udp: Box::new([]),
             keepalive_timer: None,
             udp_next_poll_i: 0,
+            request_timeout,
+            interrupted: false,
         });
         inner.core.describe(url)?;
         let event = inner.drive().await?;
@@ -1930,9 +1958,79 @@ impl Session<Described> {
     /// only be set up with [`Transport::Tcp`]; `SETUP` with
     /// [`Transport::Udp`] fails without sending a request.
     ///
+    /// If the returned future is dropped before completion (e.g. by a
+    /// timeout), the session can't be used further: later `setup` and `play`
+    /// calls fail. Drop it and start over. Likewise if `setup` fails after the
+    /// server accepted the `SETUP`, e.g. while connecting a UDP stream's
+    /// sockets. A failure the server reports, such as a `4xx` status, leaves
+    /// the session usable.
+    ///
     /// Panics if `stream_i >= self.streams().len()`.
     pub async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
         let inner = &mut *self.0;
+        inner.check_interrupted()?;
+        with_timeout(inner.request_timeout, inner.setup(stream_i, options)).await
+    }
+
+    /// Sends a `PLAY` request for the entire presentation.
+    ///
+    /// The presentation must support aggregate control, as defined in [RFC 2326
+    /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
+    ///
+    /// If a [`StreamDirection::Sending`] stream has been set up, the request
+    /// carries the ONVIF backchannel `Require` header, and the caller may send
+    /// on it as soon as this returns.
+    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
+        let inner = &mut *self.0;
+        inner.check_interrupted()?;
+        with_timeout(inner.request_timeout, async {
+            inner.core.play(policy)?;
+            let event = inner.drive().await?;
+            debug_assert!(matches!(event, SessionEvent::Playing), "{event:?}");
+            let deadline = inner
+                .core
+                .poll_timeout()
+                .expect("playing core has a timeout");
+            inner.keepalive_timer = Some(Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::from_std(deadline),
+            )));
+            Ok(())
+        })
+        .await?;
+        Ok(Session(self.0, Playing(())))
+    }
+}
+
+/// Runs `f`, failing with [`ErrorInt::Timeout`] if `timeout` elapses first.
+#[cfg(feature = "tokio")]
+async fn with_timeout<T>(
+    timeout: Option<std::time::Duration>,
+    f: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    match timeout {
+        None => f.await,
+        Some(t) => tokio::time::timeout(t, f)
+            .await
+            .unwrap_or_else(|_| Err(wrap!(ErrorInt::Timeout))),
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl SessionInner {
+    /// Fails if an earlier request was interrupted; see [`Session::setup`].
+    fn check_interrupted(&self) -> Result<(), Error> {
+        if self.interrupted {
+            bail!(ErrorInt::FailedPrecondition(
+                "an earlier request was cancelled or timed out partway through; \
+                 this session can't be used further"
+                    .into()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn setup(&mut self, stream_i: usize, options: SetupOptions) -> Result<(), Error> {
+        let inner = self;
         let (transport, pair) = match options.transport {
             Transport::Tcp(_) => (SetupTransport::Tcp, None),
             Transport::Udp(udp_options) => {
@@ -1956,7 +2054,9 @@ impl Session<Described> {
         };
         if let (Some(pair), Some(peer)) = (pair, udp_peer) {
             // The core now treats the stream as UDP, so store its sockets
-            // before anything else can fail or be cancelled.
+            // before anything else can fail or be cancelled. A failure from
+            // here on leaves the session unusable.
+            inner.interrupted = true;
             let sockets = inner.udp[stream_i].insert(UdpSockets {
                 rtp: pair.rtp_socket,
                 rtcp: pair.rtcp_socket,
@@ -1985,31 +2085,9 @@ impl Session<Described> {
                     .await
                     .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
             }
+            inner.interrupted = false;
         }
         Ok(())
-    }
-
-    /// Sends a `PLAY` request for the entire presentation.
-    ///
-    /// The presentation must support aggregate control, as defined in [RFC 2326
-    /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
-    ///
-    /// If a [`StreamDirection::Sending`] stream has been set up, the request
-    /// carries the ONVIF backchannel `Require` header, and the caller may send
-    /// on it as soon as this returns.
-    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
-        let inner = &mut *self.0;
-        inner.core.play(policy)?;
-        let event = inner.drive().await?;
-        debug_assert!(matches!(event, SessionEvent::Playing), "{event:?}");
-        let deadline = inner
-            .core
-            .poll_timeout()
-            .expect("playing core has a timeout");
-        inner.keepalive_timer = Some(Box::pin(tokio::time::sleep_until(
-            tokio::time::Instant::from_std(deadline),
-        )));
-        Ok(Session(self.0, Playing(())))
     }
 }
 
@@ -2019,7 +2097,10 @@ impl SessionInner {
     async fn drive(&mut self) -> Result<SessionEvent, Error> {
         let conn = self.conn.as_mut().expect("conn is present until drop");
         let core = &mut self.core;
-        std::future::poll_fn(|cx| poll_request(cx, conn, core)).await
+        self.interrupted = true;
+        let r = std::future::poll_fn(|cx| poll_request(cx, conn, core)).await;
+        self.interrupted = false;
+        r
     }
 }
 
@@ -2223,6 +2304,7 @@ impl Session<Playing> {
             udp,
             keepalive_timer,
             udp_next_poll_i,
+            ..
         } = &mut *self.0;
         let conn = conn.as_mut().expect("conn is present until drop");
         let core = core
@@ -4047,6 +4129,33 @@ mod tests {
             keepalives += 1;
         }
         assert_eq!(keepalives, 3); // at 30, 60, and 90 s.
+    }
+
+    /// A `SETUP` the server never answers times out per
+    /// `SessionOptions::request_timeout`, and leaves the session unusable.
+    #[tokio::test(start_paused = true)]
+    async fn setup_timeout() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default().request_timeout(Some(std::time::Duration::from_secs(10))),
+                url
+            ),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        let e = session.setup(0, SetupOptions::default()).await.unwrap_err();
+        assert!(e.to_string().contains("Timeout"), "{e}");
+        let e = session.setup(1, SetupOptions::default()).await.unwrap_err();
+        assert!(e.to_string().contains("can't be used further"), "{e}");
+        drop(server);
     }
 
     /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
