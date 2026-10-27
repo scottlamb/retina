@@ -76,13 +76,13 @@ static STATIC_PAYLOAD_TYPES: [Option<StaticPayloadType>; 35] = [
     /* 10 */ Some(StaticPayloadType {
         encoding: "l16",
         media: "audio",
-        clock_rate: 441_000,
+        clock_rate: 44_100,
         channels: NonZeroU16::new(2),
     }),
     /* 11 */ Some(StaticPayloadType {
         encoding: "l16",
         media: "audio",
-        clock_rate: 441_000,
+        clock_rate: 44_1000,
         channels: NonZeroU16::new(1),
     }),
     /* 12 */ Some(StaticPayloadType {
