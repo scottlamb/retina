@@ -3,20 +3,29 @@
 
 //! Sends a tone to a camera's speaker via the ONVIF audio backchannel.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Error, anyhow, bail};
-use bytes::Bytes;
 use clap::Parser;
-use futures::SinkExt as _;
-use log::{error, info};
+use log::{error, info, warn};
 use retina::client::{PlayingItem, SessionGroup, SetupOptions, StreamDirection};
-use retina::rtp::SendingPacket;
+use retina::rtp::{Sender, SenderOptions};
+use retina::{NtpTimestamp, Timestamp};
 
 /// G.711 samples per packet: 20 ms at 8 kHz, the default packetization
 /// interval of RFC 3551 section 4.2 (Table 1's "ms/packet" for PCMU and PCMA).
 const SAMPLES_PER_PACKET: u32 = 160;
+
+/// Above this many bytes queued to write, packets are dropped rather than
+/// queued: about a quarter second of G.711 (8,000 bytes per second plus
+/// headers), beyond what the OS socket buffer holds.
+///
+/// Live audio should stay close to real time, so when the server reads
+/// slowly, it's better to drop packets than to fall further behind. Waiting
+/// for room would also stop the session from reading what the server sends.
+const MAX_QUEUED: usize = 2 << 10;
 
 #[derive(Parser)]
 pub struct Opts {
@@ -72,34 +81,69 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
         })
         .ok_or_else(|| anyhow!("this example only sends PCMU or PCMA at 8 kHz"))?;
     info!("sending to backchannel stream {stream_i}: {stream:?}");
+    let payload_type = stream.rtp_payload_type();
     session.setup(stream_i, SetupOptions::default()).await?;
     let mut session = session.play(retina::client::PlayOptions::default()).await?;
+
+    // The RTP session state of what this example sends: SSRC, sequence
+    // numbers, and the counts that go in sender reports. The session only
+    // carries the packets.
+    let mut sender = Sender::new(payload_type, SenderOptions::default());
+    let cname = retina::rtcp::random_cname();
+    let clock_rate = NonZeroU32::new(8_000).unwrap();
 
     let deadline = tokio::time::sleep(Duration::from_secs(opts.duration_secs));
     tokio::pin!(deadline);
     let mut interval = tokio::time::interval(Duration::from_millis(20));
-    let mut timestamp = 0u32;
+    let mut timestamp = 0i64;
+    let mut dropped = 0u64;
     loop {
         tokio::select! {
             _ = &mut deadline => break,
             _ = interval.tick() => {
-                let payload: Bytes = (0..SAMPLES_PER_PACKET)
+                // The timestamp advances with the sampling clock whether or not
+                // the packet is sent; RFC 3550 section 5.1.
+                let ts = Timestamp::new(timestamp, clock_rate, 0).unwrap();
+                timestamp += i64::from(SAMPLES_PER_PACKET);
+                if session.queued_len() > MAX_QUEUED {
+                    // Skipping a sequence number shows the server the loss.
+                    sender.skip();
+                    dropped += 1;
+                    continue;
+                }
+                let payload: Vec<u8> = (0..SAMPLES_PER_PACKET)
                     .map(|i| {
-                        let t = timestamp.wrapping_add(i);
-                        let phase = 2. * std::f64::consts::PI * opts.frequency * f64::from(t) / 8_000.;
+                        let t = (ts.timestamp() + i64::from(i)) as f64;
+                        let phase = 2. * std::f64::consts::PI * opts.frequency * t / 8_000.;
                         encode((phase.sin() * f64::from(i16::MAX / 4)) as i16)
                     })
                     .collect();
-                let pkt = SendingPacket::new(stream_i, timestamp, payload).mark(timestamp == 0);
-                session.send(pkt).await?;
-                timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
+
+                // RFC 3551 section 4.1: the marker bit is set on the first
+                // packet after silence, here the first packet.
+                session.queue_rtp(stream_i, &sender.packet(ts, ts.timestamp() == 0, &[&payload]))?;
+
+                // RFC 3550 section 6.4.1: the report pairs wall time with the
+                // RTP timestamp of the same instant, here the just-sampled
+                // packet's.
+                let now = Instant::now();
+                if sender.report_due(now) {
+                    let sr = sender.sender_report(NtpTimestamp::now(), ts, &cname);
+                    session.queue_rtcp(stream_i, &sr)?;
+                    sender.report_sent(now);
+                }
             },
+
+            // Polling for items also writes what's been queued.
             item = session.next_item() => {
                 if let PlayingItem::Rtcp(rtcp) = item.ok_or_else(|| anyhow!("EOF"))?? {
                     info!("RTCP from server: {rtcp:?}");
                 }
             },
         }
+    }
+    if dropped > 0 {
+        warn!("dropped {dropped} packets while the server read slowly");
     }
     Ok(())
 }

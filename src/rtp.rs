@@ -6,8 +6,6 @@
 
 use std::ops::Range;
 
-use bytes::Bytes;
-
 use crate::buf::{MarkBuf, Split};
 use crate::inputs::Input;
 
@@ -137,81 +135,6 @@ impl std::fmt::Debug for PacketHeader {
             .field("sequence_number", &self.sequence_number())
             .field("timestamp", &self.timestamp())
             .field("ssrc", &self.ssrc())
-            .finish()
-    }
-}
-
-/// An RTP packet to send, as accepted by the [`futures::Sink`] impl on
-/// [`Session<Playing>`](crate::client::Session).
-///
-/// This is the sending counterpart of [`crate::client::RtpPacket`], without the
-/// received-packet context. The caller supplies the payload and timing;
-/// Retina fills in the rest of the RTP header: the SSRC, the sequence number,
-/// and the payload type, [`Stream::rtp_payload_type`](crate::client::Stream::rtp_payload_type).
-/// When the server offers several formats (ONVIF Streaming Specification
-/// section 5.3.2.3), that's the first one.
-///
-/// Currently the only streams Retina can send are ONVIF backchannels; see
-/// [`SessionOptions::backchannel`](crate::client::SessionOptions::backchannel).
-#[derive(Clone)]
-pub struct SendingPacket {
-    pub(crate) stream_id: usize,
-    pub(crate) timestamp: u32,
-    pub(crate) mark: bool,
-    pub(crate) payload: Bytes,
-}
-
-impl SendingPacket {
-    /// Creates a packet for the stream with index `stream_id` within
-    /// [`Session::streams`](crate::client::Session::streams).
-    ///
-    /// `timestamp` is in units of the stream's
-    /// [clock rate](crate::client::Stream::clock_rate_hz), relative to an
-    /// arbitrary starting point of the caller's choosing (e.g. `0` for the first
-    /// packet), and wraps like an RTP timestamp. Retina adds a random offset, as
-    /// [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1)
-    /// recommends. For G.711 at 8 kHz, a packet of 160 samples advances the
-    /// timestamp by 160.
-    ///
-    /// The timestamp must keep advancing with the sampling clock while nothing
-    /// is sent, e.g. while a doorbell's talk button isn't pressed. RFC 3550
-    /// section 5.1: "If an audio application reads blocks covering 160
-    /// sampling periods from the input device, the timestamp would be
-    /// increased by 160 for each such block, regardless of whether the block
-    /// is transmitted in a packet or dropped as silent." The receiver uses the
-    /// timestamps to schedule playout, and Retina's RTCP sender reports pair
-    /// them with wall-clock time.
-    ///
-    /// `payload` is the RTP payload, already packetized for the codec. Its
-    /// length is checked when sending.
-    #[inline]
-    pub fn new(stream_id: usize, timestamp: u32, payload: Bytes) -> Self {
-        Self {
-            stream_id,
-            timestamp,
-            mark: false,
-            payload,
-        }
-    }
-
-    /// Sets the RTP marker bit; defaults to false.
-    ///
-    /// Its meaning depends on the payload format. For audio, [RFC 3551
-    /// section 4.1](https://datatracker.ietf.org/doc/html/rfc3551#section-4.1)
-    /// sets it on the first packet after a silence period.
-    #[inline]
-    pub fn mark(self, mark: bool) -> Self {
-        Self { mark, ..self }
-    }
-}
-
-impl std::fmt::Debug for SendingPacket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SendingPacket")
-            .field("stream_id", &self.stream_id)
-            .field("timestamp", &self.timestamp)
-            .field("mark", &self.mark)
-            .field("payload", &crate::hex::LimitedHex::new(&self.payload, 64))
             .finish()
     }
 }

@@ -20,18 +20,6 @@ use crate::{Error, ErrorInt, RtspMessageContext};
 
 use super::{ConnectionContext, ReceivedMessage, WallTime};
 
-/// Buffered outgoing bytes at or above which [`Connection::poll_write_ready`]
-/// applies backpressure.
-///
-/// This bounds how much caller-supplied media (such as ONVIF backchannel
-/// audio, queued via [`Connection::queue_write`]) can pile up when the peer
-/// reads slowly, and so how far behind real time it plays out: 4 KiB is about
-/// half a second of G.711 (8,000 bytes per second plus headers). Below the
-/// mark, one item of any size is accepted, so a single large frame (up to the
-/// 64 KiB interleaved data limit) never waits forever. RTSP requests are
-/// always accepted, so the buffer may exceed this briefly.
-const WRITE_HIGH_WATER: usize = 4 * 1024;
-
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
     stream: TcpStream,
@@ -198,6 +186,12 @@ impl Connection {
         self.written
     }
 
+    /// Returns the number of bytes queued but not yet written.
+    #[cfg(feature = "unstable-send")]
+    pub(crate) fn queued_len(&self) -> usize {
+        self.write_buf.len()
+    }
+
     /// Returns an error to report if an earlier write failed.
     fn write_failed_error(&self) -> Option<ErrorInt> {
         self.write_failed.map(|kind| ErrorInt::WriteError {
@@ -216,22 +210,6 @@ impl Connection {
         ErrorInt::WriteError {
             conn_ctx: self.ctx,
             source,
-        }
-    }
-
-    /// Returns `Poll::Ready` when the write buffer is below the high-water
-    /// mark, flushing as necessary.
-    pub(crate) fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ErrorInt>> {
-        if let Some(e) = self.write_failed_error() {
-            return Poll::Ready(Err(e));
-        }
-        if self.write_buf.len() < WRITE_HIGH_WATER {
-            return Poll::Ready(Ok(()));
-        }
-        match std::pin::Pin::new(&mut *self).poll_flush(cx) {
-            Poll::Pending if self.write_buf.len() >= WRITE_HIGH_WATER => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            _ => Poll::Ready(Ok(())),
         }
     }
 }
@@ -304,7 +282,7 @@ impl Stream for Connection {
 /// `poll_ready` is always ready: `start_send` appends to an unbounded write
 /// buffer, after anything queued earlier, so internal callers may send a small
 /// RTSP request without waiting for readiness. Bulk data is queued via
-/// [`Connection::queue_write`] after [`Connection::poll_write_ready`] instead.
+/// [`Connection::queue_write`] instead.
 ///
 /// Once a write fails, the connection is unusable for writing: `start_send`,
 /// `poll_flush`, and `poll_close` return errors without writing anything more.
@@ -567,7 +545,6 @@ mod tests {
             .await,
         );
         check(futures::SinkExt::<OwnedMessage>::flush(&mut conn).await);
-        check(std::future::poll_fn(|cx| conn.poll_write_ready(cx)).await);
         assert!(conn.write_buf.is_empty());
         assert_eq!(conn.written(), written);
     }

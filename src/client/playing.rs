@@ -36,7 +36,7 @@ use crate::{
 /// *   It gets packets out via [`PlayingCore::poll_validated`] and
 ///     [`PlayingCore::item`].
 /// *   It writes keepalive requests, interleaved receiver reports, and
-///     backchannel media (queued via [`PlayingCore::send`]) from
+///     backchannel media (queued via [`PlayingCore::queue_rtp`]) from
 ///     [`PlayingCore::poll_transmit`], reporting how many bytes have been
 ///     written via [`PlayingCore::advance_transmit`].
 /// *   It sends UDP streams' receiver reports from
@@ -123,6 +123,7 @@ impl Transmit {
     ///
     /// The caller must ensure the body fits the 16-bit length field ([RFC 2326
     /// section 10.12](https://datatracker.ietf.org/doc/html/rfc2326#section-10.12)).
+    #[cfg(feature = "unstable-send")]
     fn queue_data(&mut self, channel_id: u8, write_body: impl FnOnce(&mut Vec<u8>)) {
         let buf = self.buf();
         let start = buf.len();
@@ -157,9 +158,9 @@ pub(crate) struct PlayingStream {
     /// Reception statistics for RTCP receiver reports, iff they're enabled.
     pub(crate) reception: Option<ReceptionStats>,
 
-    /// For a [`super::StreamDirection::Sending`] stream, the state of sent RTP
-    /// and RTCP.
-    pub(crate) sender: Option<Box<super::rtp::Sender>>,
+    /// True for a stream Retina sends rather than receives (ONVIF
+    /// backchannel).
+    pub(crate) sending: bool,
 }
 
 /// Session state moved into [`PlayingCore::new`], to be returned by
@@ -654,7 +655,7 @@ impl PlayingCore {
     }
 
     /// Returns the state of the current keepalive request.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "unstable-send"))]
     pub(crate) fn keepalive_state(&self) -> KeepaliveState {
         self.keepalive.state
     }
@@ -693,59 +694,62 @@ impl PlayingCore {
         self.advance_transmit(self.transmit.queued - self.transmit.written);
     }
 
-    /// Queues an RTP packet on sending stream `stream_i`'s interleaved
-    /// channel, plus an RTCP sender report if one is due, for
-    /// [`PlayingCore::poll_transmit`].
+    /// Returns the interleaved RTP channel id of sending stream `stream_i`.
     ///
     /// The caller has checked that the stream is a
-    /// [`super::StreamDirection::Sending`] stream. On error, nothing is queued.
-    pub(crate) fn send(
-        &mut self,
-        stream_i: usize,
-        pkt: &crate::rtp::SendingPacket,
-        now: Instant,
-    ) -> Result<(), Error> {
-        let Some(PlayingStream {
-            ctx: stream_ctx,
-            sender: Some(sender),
-            ..
-        }) = self.streams[stream_i].as_mut()
-        else {
+    /// [`super::StreamDirection::Sending`] stream.
+    #[cfg(feature = "unstable-send")]
+    fn sending_channel(&self, stream_i: usize) -> Result<u8, Error> {
+        let Some(PlayingStream { ctx, .. }) = self.streams[stream_i].as_ref() else {
             bail!(ErrorInt::FailedPrecondition(format!(
                 "can't send on stream {stream_i}: it wasn't set up before PLAY"
             )));
         };
-        let crate::StreamContextInner::Tcp(crate::TcpStreamContext { rtp_channel_id }) =
-            stream_ctx.0
+        let crate::StreamContextInner::Tcp(crate::TcpStreamContext { rtp_channel_id }) = ctx.0
         else {
             bail!(ErrorInt::Internal(
                 "sending stream unexpectedly isn't using TCP".into()
             ));
         };
-        const MAX_PAYLOAD_LEN: usize = (u16::MAX - crate::rtp::PacketHeader::LEN) as usize;
-        if pkt.payload.len() > MAX_PAYLOAD_LEN {
-            bail!(ErrorInt::InvalidArgument(format!(
-                "can't send {}-byte payload on stream {stream_i}: RTSP interleaved data allows at \
-                 most {MAX_PAYLOAD_LEN} bytes after the RTP header",
-                pkt.payload.len()
-            )));
-        }
+        Ok(rtp_channel_id)
+    }
+
+    /// Queues an RTP packet on sending stream `stream_i`'s interleaved
+    /// channel, for [`PlayingCore::poll_transmit`].
+    ///
+    /// The caller has checked that the stream is a
+    /// [`super::StreamDirection::Sending`] stream. On error, nothing is queued.
+    #[cfg(feature = "unstable-send")]
+    pub(crate) fn queue_rtp(
+        &mut self,
+        stream_i: usize,
+        pkt: &crate::rtp::OutgoingPacketRef<'_>,
+    ) -> Result<(), Error> {
+        let channel_id = self.sending_channel(stream_i)?;
+        // `rtp::Sender::packet` ensures the packet fits.
         self.transmit
-            .queue_data(rtp_channel_id, |out| sender.write_rtp(now, pkt, out));
-        if sender.report_due(now) {
-            let ntp = crate::NtpTimestamp::now();
-            self.transmit
-                .queue_data(rtp_channel_id.wrapping_add(1), |out| {
-                    sender.write_sender_report(now, ntp, out)
-                });
-        }
+            .queue_data(channel_id, |out| pkt.write_to(out));
         Ok(())
     }
 
-    /// Returns the sender of stream `stream_i`, if it's a sending stream.
-    #[cfg(test)]
-    pub(crate) fn sender_mut(&mut self, stream_i: usize) -> Option<&mut super::rtp::Sender> {
-        self.streams[stream_i].as_mut()?.sender.as_deref_mut()
+    /// Queues an RTCP packet on sending stream `stream_i`'s interleaved
+    /// channel, for [`PlayingCore::poll_transmit`].
+    ///
+    /// As with [`PlayingCore::queue_rtp`], the caller has checked the stream.
+    /// On error, nothing is queued.
+    #[cfg(feature = "unstable-send")]
+    pub(crate) fn queue_rtcp(&mut self, stream_i: usize, pkt: &[u8]) -> Result<(), Error> {
+        let channel_id = self.sending_channel(stream_i)?;
+        if pkt.len() > usize::from(u16::MAX) {
+            bail!(ErrorInt::InvalidArgument(format!(
+                "can't send {}-byte RTCP packet on stream {stream_i}: RTSP interleaved data \
+                 allows at most 65535 bytes",
+                pkt.len()
+            )));
+        }
+        self.transmit
+            .queue_data(channel_id.wrapping_add(1), |out| out.extend_from_slice(pkt));
+        Ok(())
     }
 
     fn handle_response(
@@ -834,7 +838,7 @@ impl PlayingCore {
             .expect("only set-up streams have packets");
         let buf = stream.udp_buf.as_ref().unwrap_or(self.reader.buf());
         match item.channel_type {
-            ChannelType::Rtp if stream.sender.is_some() => {
+            ChannelType::Rtp if stream.sending => {
                 // Retina sends RTP on this stream; the server shouldn't.
                 log::debug!(
                     "ignoring RTP packet received on sending stream {}",
@@ -963,7 +967,7 @@ mod tests {
                 ctx: StreamContext::dummy(),
                 udp_buf: udp.then(|| MarkBuf::new(65536)),
                 reception: None,
-                sender: None,
+                sending: false,
             })
         };
         let streams = [
