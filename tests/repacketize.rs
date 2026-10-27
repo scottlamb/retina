@@ -493,3 +493,110 @@ fn throttle() {
     }
     assert!(saw_truncation && saw_clean_drop);
 }
+
+/// Header extension values attached to frames survive packetizing, sending,
+/// and depacketizing, arriving on the first packet of each frame.
+#[cfg(feature = "unstable-extensions")]
+#[test]
+fn extensions_round_trip() {
+    use retina::rtp::{AbsCaptureTime, ExtensionIds, Extensions};
+
+    /// Repacketizes, stamping each frame with a capture time derived from its
+    /// timestamp.
+    struct Stamp<'a, S>(Repacketize<'a, S>);
+    impl<S: retina::codec::PayloadSink> VideoHandler<()> for Stamp<'_, S> {
+        fn frame_start(&mut self, fs: &mut VideoFrameStart<'_, ()>) -> Accumulate {
+            if let Some(p) = fs.parameters() {
+                self.0.packetizer.set_parameters(p).unwrap();
+            }
+            let info = retina::codec::VideoFrameInfo::from(&*fs)
+                .with_extensions(Extensions::default().with(stamp(fs.timestamp())));
+            self.0.packetizer.start_frame(info, &mut self.0.sink);
+            Accumulate::No
+        }
+        fn data(&mut self, data: &VideoData<'_>) {
+            VideoHandler::<()>::data(&mut self.0, data)
+        }
+        fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, ()>) {
+            VideoHandler::<()>::frame_end(&mut self.0, fe)
+        }
+        fn loss(&mut self, l: &Loss<'_, ()>) {
+            VideoHandler::<()>::loss(&mut self.0, l)
+        }
+    }
+    fn stamp(ts: retina::Timestamp) -> AbsCaptureTime {
+        AbsCaptureTime {
+            capture_time: retina::NtpTimestamp((ts.timestamp() as u64) << 20),
+            estimated_capture_clock_offset: Some(-1),
+        }
+    }
+
+    /// Checks each frame's extensions.
+    #[derive(Default)]
+    struct Check {
+        frames: usize,
+    }
+    impl VideoHandler<()> for Check {
+        fn frame_start(&mut self, fs: &mut VideoFrameStart<'_, ()>) -> Accumulate {
+            assert_eq!(
+                fs.extensions().get::<AbsCaptureTime>(),
+                Some(&stamp(fs.timestamp()))
+            );
+            Accumulate::No
+        }
+        fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, ()>) {
+            assert_eq!(
+                fe.extensions().get::<AbsCaptureTime>(),
+                Some(&stamp(fe.timestamp()))
+            );
+            self.frames += 1;
+        }
+        fn loss(&mut self, l: &Loss<'_, ()>) {
+            panic!("unexpected loss {:?}", l.reason());
+        }
+    }
+
+    let ids = ExtensionIds::default().with::<AbsCaptureTime>(std::num::NonZeroU8::new(7).unwrap());
+    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    const MAX_PAYLOAD_SIZE: u16 = 500;
+    let mut p =
+        VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
+    let fmtp = p.payload_format().fmtp().unwrap().to_owned();
+    let mut sender = Sender::new(
+        96,
+        SenderOptions::default()
+            .timestamp_offset(0)
+            .extension_ids(ids)
+            .max_payload_size(MAX_PAYLOAD_SIZE),
+    );
+    let mut out = Vec::new();
+    let mut f = Feeder::new();
+    for pkt in bunny_video_packets() {
+        f.push(
+            pkt,
+            &mut d,
+            &mut Stamp(Repacketize {
+                packetizer: &mut p,
+                sink: Recorder::new(&mut sender, &mut out),
+            }),
+        );
+    }
+
+    let mut d = VideoDepacketizer::new("h264", 90_000, Some(&fmtp)).unwrap();
+    let mut f = Feeder::new();
+    f.extension_ids = ids;
+    let mut check = Check::default();
+    let mut saw_full_first = false;
+    for pkt in &out {
+        let v = retina::rtp::PacketHeader::validate(&pkt.raw[..]).unwrap();
+        assert_eq!(v.extension.is_some(), pkt.frame_start);
+
+        // The extension block counts against the payload size limit.
+        let after_header = pkt.raw.len() - 12;
+        assert!(after_header <= usize::from(MAX_PAYLOAD_SIZE));
+        saw_full_first |= pkt.frame_start && after_header == usize::from(MAX_PAYLOAD_SIZE);
+        f.push(&pkt.raw, &mut d, &mut check);
+    }
+    assert!(saw_full_first, "some first packet should fill the limit");
+    assert_eq!(check.frames, reference_frames().len());
+}

@@ -1056,7 +1056,8 @@ impl Pending<Teardown> {
 /// A media description for [`sdp`], created via [`SdpMedia::new`].
 ///
 /// This is `#[non_exhaustive]`, so that fields can be added without breaking
-/// callers.
+/// callers, including fields which exist only with some features, which
+/// Cargo's feature unification may enable.
 #[non_exhaustive]
 pub struct SdpMedia<'a> {
     pub format: &'a crate::codec::PayloadFormat,
@@ -1064,6 +1065,14 @@ pub struct SdpMedia<'a> {
 
     /// The control URL, relative to the `DESCRIBE` response's `Content-Base`.
     pub control: &'a str,
+
+    /// The RTP header extensions sent, described via `a=extmap` attributes.
+    /// These should match [`crate::rtp::SenderOptions::extension_ids`].
+    #[cfg(feature = "unstable-extensions")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+    pub extension_ids: crate::rtp::ExtensionIds,
+    #[cfg(not(feature = "unstable-extensions"))]
+    pub(crate) extension_ids: crate::rtp::ExtensionIds,
 }
 
 impl<'a> SdpMedia<'a> {
@@ -1080,6 +1089,19 @@ impl<'a> SdpMedia<'a> {
             format,
             payload_type,
             control,
+            extension_ids: crate::rtp::ExtensionIds::default(),
+        }
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns `self` with the given RTP header extensions; see
+        /// [`SdpMedia::extension_ids`].
+        #[inline]
+        pub fn with_extension_ids(self, extension_ids: crate::rtp::ExtensionIds) -> Self {
+            Self {
+                extension_ids,
+                ..self
+            }
         }
     }
 }
@@ -1115,6 +1137,9 @@ pub fn sdp(session_name: &str, media: &[SdpMedia<'_>]) -> String {
             write!(&mut out, "a=fmtp:{pt} {fmtp}\r\n").unwrap();
         }
         write!(&mut out, "a=control:{}\r\n", m.control).unwrap();
+        for (id, uri) in m.extension_ids.sdp_extmap() {
+            write!(&mut out, "a=extmap:{id} {uri}\r\n").unwrap();
+        }
     }
     out
 }

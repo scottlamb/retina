@@ -62,6 +62,7 @@ pub struct VideoFrameInfo {
     pub(crate) timestamp: crate::Timestamp,
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
+    pub(crate) extensions: crate::rtp::Extensions,
 }
 
 impl VideoFrameInfo {
@@ -73,6 +74,24 @@ impl VideoFrameInfo {
             timestamp,
             is_random_access_point: false,
             is_disposable: false,
+            extensions: crate::rtp::Extensions::default(),
+        }
+    }
+
+    pub_if_unstable_extensions! {
+        /// Sets the frame's RTP header extension values, which the packetizer
+        /// attaches to the frame's first payload; see [`Payload::encoded_extensions`].
+        #[inline]
+        pub fn with_extensions(self, extensions: crate::rtp::Extensions) -> Self {
+            Self { extensions, ..self }
+        }
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the frame's RTP header extension values.
+        #[inline]
+        pub fn extensions(&self) -> &crate::rtp::Extensions {
+            &self.extensions
         }
     }
 
@@ -119,6 +138,7 @@ impl<Ctx> From<&VideoFrameStart<'_, Ctx>> for VideoFrameInfo {
             timestamp: frame_start.timestamp(),
             is_random_access_point: frame_start.is_random_access_point(),
             is_disposable: frame_start.is_disposable(),
+            extensions: *frame_start.extensions(),
         }
     }
 }
@@ -147,17 +167,95 @@ pub trait PayloadSink {
         false
     }
 
-    /// Returns the largest payload to deliver, in bytes. Defaults to 1400.
+    /// Returns the largest payload to deliver, in bytes, before any header
+    /// extension block. Defaults to 1400.
     ///
-    /// This excludes the RTP header and lower-layer headers. E.g., 1400
-    /// leaves ample room for IP, UDP, and RTP headers on a path with a
-    /// 1500-byte MTU.
+    /// This excludes the RTP fixed header (and CSRCs) and lower-layer
+    /// headers. E.g., 1400 leaves ample room for IP, UDP, and RTP headers on
+    /// a path with a 1500-byte MTU.
+    ///
+    /// The packetizer subtracts the length of the frame's encoded header
+    /// extensions (see [`PayloadSink::serialize_extensions`]) from this for
+    /// the frame's first payload.
     ///
     /// The packetizer asks once per frame, so a change takes effect at the
     /// next frame. If the value is too small for the codec to make progress
     /// (a few bytes), the packetizer exceeds it.
     fn max_payload_size(&self) -> u16 {
         1400
+    }
+
+    /// Encodes `extensions` as an RTP header extension block, replacing the
+    /// contents of `out`, for [`Payload::encoded_extensions`].
+    ///
+    /// The block includes its 4-byte profile and length header, and its
+    /// length is a multiple of 4. It's empty if there's nothing to send,
+    /// which is the default.
+    ///
+    /// The packetizer calls this once per frame with a non-empty
+    /// `extensions`, before delivering any of the frame's payloads.
+    #[cfg(feature = "unstable-extensions")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+    fn serialize_extensions(&self, extensions: &crate::rtp::Extensions, out: &mut Vec<u8>) {
+        let _ = extensions;
+        out.clear();
+    }
+}
+
+/// Calls [`PayloadSink::serialize_extensions`] if there's anything to
+/// serialize, clearing `out` otherwise.
+pub(crate) fn serialize_extensions(
+    sink: &impl PayloadSink,
+    extensions: &crate::rtp::Extensions,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    #[cfg(feature = "unstable-extensions")]
+    if !extensions.is_empty() {
+        sink.serialize_extensions(extensions, out);
+        debug_assert!(
+            out.len().is_multiple_of(4),
+            "extension block must be 4-byte aligned"
+        );
+    }
+    #[cfg(not(feature = "unstable-extensions"))]
+    let _ = (sink, extensions);
+}
+
+/// A frame's payload size limits, from [`PayloadSink::max_payload_size`].
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct PayloadLimits {
+    first: usize,
+    rest: usize,
+}
+
+impl Default for PayloadLimits {
+    /// Returns [`PayloadSink::max_payload_size`]'s default, for before the
+    /// first frame.
+    fn default() -> Self {
+        Self {
+            first: 1400,
+            rest: 1400,
+        }
+    }
+}
+
+impl PayloadLimits {
+    /// Gets limits from `sink` for a frame with the given encoded extension
+    /// block, raising them to at least `min`, the least that lets the codec
+    /// make progress.
+    pub(crate) fn new(sink: &impl PayloadSink, encoded_extensions: &[u8], min: usize) -> Self {
+        let rest = usize::from(sink.max_payload_size());
+        Self {
+            first: rest.saturating_sub(encoded_extensions.len()).max(min),
+            rest: rest.max(min),
+        }
+    }
+
+    /// Returns the limit for the frame's first payload, or for the rest.
+    #[inline]
+    pub(crate) fn get(&self, first: bool) -> usize {
+        if first { self.first } else { self.rest }
     }
 }
 
@@ -181,6 +279,12 @@ impl<S: PayloadSink + ?Sized> PayloadSink for &mut S {
     fn max_payload_size(&self) -> u16 {
         (**self).max_payload_size()
     }
+
+    #[cfg(feature = "unstable-extensions")]
+    #[inline]
+    fn serialize_extensions(&self, extensions: &crate::rtp::Extensions, out: &mut Vec<u8>) {
+        (**self).serialize_extensions(extensions, out)
+    }
 }
 
 /// An RTP payload, passed to [`PayloadSink::payload`].
@@ -191,6 +295,7 @@ pub struct Payload<'a> {
     pub(crate) data: &'a [&'a [u8]],
     pub(crate) is_random_access_point: bool,
     pub(crate) is_disposable: bool,
+    pub(crate) encoded_extensions: &'a [u8],
 }
 
 impl<'a> Payload<'a> {
@@ -235,6 +340,22 @@ impl<'a> Payload<'a> {
     #[inline]
     pub fn is_disposable(&self) -> bool {
         self.is_disposable
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the RTP header extension block to send with this payload,
+        /// as encoded by [`PayloadSink::serialize_extensions`], or empty.
+        ///
+        /// This is the frame's values (see [`VideoFrameInfo::with_extensions`]
+        /// and [`AudioPacketizer::push_frame_with_extensions`]) on its first
+        /// payload, and empty on the rest. Values such as
+        /// [`crate::rtp::AbsCaptureTime`] describe the whole frame, so sending
+        /// them once per frame suffices, as libwebrtc and the ONVIF replay
+        /// extension do.
+        #[inline]
+        pub fn encoded_extensions(&self) -> &'a [u8] {
+            self.encoded_extensions
+        }
     }
 
     /// Returns the total length of [`Payload::data`] in bytes.
@@ -665,14 +786,29 @@ impl AudioPacketizer {
     /// the timestamp's clock rate is wrong, or the frame can't be
     /// packetized (for AAC, if it's empty or exceeds 8,191 bytes). Nothing
     /// has been delivered to `sink` in that case.
+    #[inline]
     pub fn push_frame(
         &mut self,
         timestamp: crate::Timestamp,
         data: &[u8],
         sink: &mut impl PayloadSink,
     ) -> Result<(), Error> {
-        match self.0 {
-            AudioPacketizerInner::Aac(ref p) => p.push_frame(timestamp, data, sink),
+        self.push_frame_with_extensions(timestamp, &crate::rtp::Extensions::default(), data, sink)
+    }
+
+    pub_if_unstable_extensions! {
+        /// As [`AudioPacketizer::push_frame`], attaching RTP header extension
+        /// values to the frame's first payload; see [`Payload::encoded_extensions`].
+        pub fn push_frame_with_extensions(
+            &mut self,
+            timestamp: crate::Timestamp,
+            extensions: &crate::rtp::Extensions,
+            data: &[u8],
+            sink: &mut impl PayloadSink,
+        ) -> Result<(), Error> {
+            match self.0 {
+                AudioPacketizerInner::Aac(ref mut p) => p.push_frame(timestamp, extensions, data, sink),
+            }
         }
     }
 }

@@ -1432,6 +1432,7 @@ mod tests {
             sequence_number,
             mark,
             continuity: crate::rtp::Continuity::from_loss(loss),
+            extensions: Default::default(),
         };
         let pos = buf.end();
         buf.extend(payload);
@@ -1529,6 +1530,7 @@ mod tests {
                 sequence_number: seq,
                 mark: true,
                 continuity: crate::rtp::Continuity::from_loss(loss),
+                extensions: Default::default(),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1597,6 +1599,7 @@ mod tests {
                 sequence_number: seq,
                 mark: true,
                 continuity: crate::rtp::Continuity::from_loss(loss),
+                extensions: Default::default(),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -1662,6 +1665,7 @@ mod tests {
                 sequence_number: seq,
                 mark: true,
                 continuity: crate::rtp::Continuity::from_loss(loss),
+                extensions: Default::default(),
             };
             let pos = buf.end();
             buf.extend(payload);
@@ -2148,6 +2152,7 @@ mod tests {
                 ssrc: header.ssrc(),
                 mark: header.mark(),
                 continuity: crate::rtp::Continuity::from_loss(loss),
+                extensions: Default::default(),
             };
             f(
                 &buf,

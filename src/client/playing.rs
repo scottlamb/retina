@@ -168,6 +168,7 @@ pub(crate) struct ReorderItem {
     body_pos: u64,
     body_len: u16,
     payload_range: std::ops::Range<u16>,
+    extension: Option<crate::rtp::ExtensionRange>,
 }
 
 /// A validated RTP or RTCP packet; [`PlayingCore::item`] turns this into a
@@ -444,8 +445,20 @@ impl PlayingCore {
                     "sender restarted RTP sequence numbers"
                 );
             }
-            let meta = p.meta(p.item.pkt_ctx);
+            let mut meta = p.meta(p.item.pkt_ctx);
             let pin_pos = p.pin_pos();
+            let ids = self.presentation.streams[stream_i].extension_ids();
+            if let Some(ext) = &p.item.extension
+                && !ids.is_empty()
+            {
+                // Copies only if the extension spans the ring buffer's wrap.
+                let data = crate::inputs::Input::to_cow(buf.split(
+                    p.item.body_pos + u64::from(ext.data.start),
+                    usize::from(ext.data.end - ext.data.start),
+                ));
+                let ext = crate::rtp::HeaderExtension::new(ext.profile, &data);
+                meta = meta.with_extensions(ids.read(&ext));
+            }
             return Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
                 stream_id: stream_i,
                 meta,
@@ -920,6 +933,7 @@ impl PlayingCore {
                 let crate::rtp::ValidatedPacket {
                     header,
                     payload: payload_range,
+                    extension,
                     ..
                 } = crate::rtp::PacketHeader::validate(split).map_err(|reason| {
                     wrap!(ErrorInt::PacketError {
@@ -941,6 +955,7 @@ impl PlayingCore {
                         body_pos: item.body_pos,
                         body_len: item.body_len,
                         payload_range,
+                        extension,
                     },
                 );
 

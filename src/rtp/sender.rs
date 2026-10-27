@@ -3,7 +3,7 @@
 
 //! The send side of an RTP session: [`Sender`].
 
-use super::PacketHeader;
+use super::{ExtensionIds, Extensions, PacketHeader};
 
 /// The RTP session state of an outgoing stream.
 ///
@@ -26,6 +26,7 @@ pub struct Sender {
     payload_type: u8,
     next_sequence_number: u16,
     timestamp_offset: u32,
+    extension_ids: ExtensionIds,
     max_payload_size: u16,
     packet_count: u32,
     octet_count: u32,
@@ -44,6 +45,7 @@ pub struct SenderOptions {
     ssrc: Option<u32>,
     initial_sequence_number: Option<u16>,
     timestamp_offset: Option<u32>,
+    extension_ids: ExtensionIds,
     max_payload_size: u16,
 }
 
@@ -53,6 +55,7 @@ impl Default for SenderOptions {
             ssrc: None,
             initial_sequence_number: None,
             timestamp_offset: None,
+            extension_ids: ExtensionIds::default(),
             max_payload_size: 1400,
         }
     }
@@ -99,6 +102,20 @@ impl SenderOptions {
             ..self
         }
     }
+
+    pub_if_unstable_extensions! {
+        /// Sets the IDs of header extensions to write. By default, none are
+        /// written.
+        ///
+        /// Describe them to receivers via [`ExtensionIds::sdp_extmap`].
+        #[inline]
+        pub fn extension_ids(self, extension_ids: ExtensionIds) -> Self {
+            Self {
+                extension_ids,
+                ..self
+            }
+        }
+    }
 }
 
 /// An outgoing RTP packet, as returned by [`Sender::packet`].
@@ -108,6 +125,7 @@ impl SenderOptions {
 #[derive(Copy, Clone, Debug)]
 pub struct OutgoingPacketRef<'a> {
     header: PacketHeader,
+    extension: &'a [u8],
     data: &'a [&'a [u8]],
 }
 
@@ -116,6 +134,15 @@ impl<'a> OutgoingPacketRef<'a> {
     #[inline]
     pub fn header(&self) -> PacketHeader {
         self.header
+    }
+
+    pub_if_unstable_extensions! {
+        /// Returns the packet's header extension block, including its 4-byte
+        /// profile and length header, or empty.
+        #[inline]
+        pub fn extension(&self) -> &'a [u8] {
+            self.extension
+        }
     }
 
     /// Returns the packet's payload, as a sequence of slices to be
@@ -128,7 +155,9 @@ impl<'a> OutgoingPacketRef<'a> {
     /// Returns the packet's total length in bytes, including its RTP header.
     #[inline]
     pub fn len(&self) -> usize {
-        usize::from(PacketHeader::LEN) + self.data.iter().map(|d| d.len()).sum::<usize>()
+        usize::from(PacketHeader::LEN)
+            + self.extension.len()
+            + self.data.iter().map(|d| d.len()).sum::<usize>()
     }
 
     /// Returns false; an RTP packet always has a header.
@@ -140,6 +169,7 @@ impl<'a> OutgoingPacketRef<'a> {
     /// Writes the complete packet to `out`.
     pub fn write_to(&self, out: &mut impl bytes::BufMut) {
         out.put_slice(&self.header.0);
+        out.put_slice(self.extension);
         for d in self.data {
             out.put_slice(d);
         }
@@ -166,6 +196,7 @@ impl Sender {
             payload_type,
             next_sequence_number: options.initial_sequence_number.unwrap_or_else(rand::random),
             timestamp_offset: options.timestamp_offset.unwrap_or_else(rand::random),
+            extension_ids: options.extension_ids,
             max_payload_size: options.max_payload_size,
             packet_count: 0,
             octet_count: 0,
@@ -205,6 +236,21 @@ impl Sender {
         self.max_payload_size = max_payload_size;
     }
 
+    pub_if_unstable_extensions! {
+        /// Encodes those of `extensions` which have IDs (see
+        /// [`SenderOptions::extension_ids`]) as a header extension block,
+        /// replacing the contents of `out`, for
+        /// [`Sender::packet_with_extensions`]. Leaves `out` empty if there's
+        /// nothing to send.
+        ///
+        /// [`Sender::sink`] supplies this to packetizers via
+        /// [`crate::codec::PayloadSink::serialize_extensions`].
+        #[inline]
+        pub fn serialize_extensions(&self, extensions: &Extensions, out: &mut Vec<u8>) {
+            self.extension_ids.encode(extensions, out);
+        }
+    }
+
     /// Returns the number of packets sent so far, for RTCP sender reports.
     #[inline]
     pub fn packet_count(&self) -> u32 {
@@ -223,36 +269,70 @@ impl Sender {
     /// concatenated), returning the packet.
     ///
     /// For a [`crate::codec::Payload`] `p`, pass `p.timestamp()`, `p.mark()`,
-    /// and `p.data()`; or use [`Sender::sink`].
+    /// and `p.data()`; or use [`Sender::sink`], which also writes
+    /// [`crate::codec::Payload::encoded_extensions`].
     ///
     /// # Panics
     ///
     /// If the packet exceeds 65,535 bytes.
+    #[inline]
     pub fn packet<'a>(
         &mut self,
         timestamp: crate::Timestamp,
         mark: bool,
         data: &'a [&'a [u8]],
     ) -> OutgoingPacketRef<'a> {
-        let payload_len: usize = data.iter().map(|d| d.len()).sum();
-        let len = usize::from(PacketHeader::LEN) + payload_len;
-        assert!(
-            len <= usize::from(u16::MAX),
-            "RTP packet of {len} bytes is too long"
-        );
-        let sequence_number = self.next_sequence_number;
-        self.next_sequence_number = sequence_number.wrapping_add(1);
-        self.packet_count = self.packet_count.wrapping_add(1);
-        self.octet_count = self.octet_count.wrapping_add(payload_len as u32);
-        let mut header = [0; PacketHeader::LEN as usize];
-        header[0] = 2 << 6; // version=2, no padding, no extensions, no CSRCs.
-        header[1] = if mark { 0b1000_0000 } else { 0 } | self.payload_type;
-        header[2..4].copy_from_slice(&sequence_number.to_be_bytes());
-        header[4..8].copy_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
-        header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
-        OutgoingPacketRef {
-            header: PacketHeader(header),
-            data,
+        self.packet_with_extensions(timestamp, mark, &[], data)
+    }
+
+    pub_if_unstable_extensions! {
+        /// As [`Sender::packet`], also writing the header extension block
+        /// `extension`, as encoded by [`Sender::serialize_extensions`], if
+        /// it's non-empty.
+        ///
+        /// # Panics
+        ///
+        /// If the packet exceeds 65,535 bytes, or `extension` is non-empty
+        /// but not a well-formed block: a multiple of 4 bytes, whose length
+        /// field matches.
+        pub fn packet_with_extensions<'a>(
+            &mut self,
+            timestamp: crate::Timestamp,
+            mark: bool,
+            extension: &'a [u8],
+            data: &'a [&'a [u8]],
+        ) -> OutgoingPacketRef<'a> {
+            assert!(
+                extension.is_empty()
+                    || (extension.len() >= 4
+                        && extension.len().is_multiple_of(4)
+                        && usize::from(u16::from_be_bytes([extension[2], extension[3]])) * 4 + 4
+                            == extension.len()),
+                "malformed header extension block of {} bytes",
+                extension.len()
+            );
+            let payload_len: usize = data.iter().map(|d| d.len()).sum();
+            let len = usize::from(PacketHeader::LEN) + extension.len() + payload_len;
+            assert!(
+                len <= usize::from(u16::MAX),
+                "RTP packet of {len} bytes is too long"
+            );
+            let sequence_number = self.next_sequence_number;
+            self.next_sequence_number = sequence_number.wrapping_add(1);
+            self.packet_count = self.packet_count.wrapping_add(1);
+            self.octet_count = self.octet_count.wrapping_add(payload_len as u32);
+            let mut header = [0; PacketHeader::LEN as usize];
+            // version=2, no padding, no CSRCs.
+            header[0] = 2 << 6 | if extension.is_empty() { 0 } else { 0b0001_0000 };
+            header[1] = if mark { 0b1000_0000 } else { 0 } | self.payload_type;
+            header[2..4].copy_from_slice(&sequence_number.to_be_bytes());
+            header[4..8].copy_from_slice(&self.rtp_timestamp(timestamp).to_be_bytes());
+            header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+            OutgoingPacketRef {
+                header: PacketHeader(header),
+                extension,
+                data,
+            }
         }
     }
 
@@ -344,11 +424,12 @@ pub struct SenderSink<'a, F> {
 
 impl<F: FnMut(&OutgoingPacketRef<'_>)> crate::codec::PayloadSink for SenderSink<'_, F> {
     fn payload(&mut self, payload: &crate::codec::Payload<'_>) {
-        (self.f)(
-            &self
-                .sender
-                .packet(payload.timestamp(), payload.mark(), payload.data()),
-        );
+        (self.f)(&self.sender.packet_with_extensions(
+            payload.timestamp(),
+            payload.mark(),
+            payload.encoded_extensions(),
+            payload.data(),
+        ));
     }
 
     fn discontinuity(&mut self) {
@@ -358,6 +439,12 @@ impl<F: FnMut(&OutgoingPacketRef<'_>)> crate::codec::PayloadSink for SenderSink<
     #[inline]
     fn max_payload_size(&self) -> u16 {
         self.sender.max_payload_size()
+    }
+
+    #[cfg(feature = "unstable-extensions")]
+    #[inline]
+    fn serialize_extensions(&self, extensions: &Extensions, out: &mut Vec<u8>) {
+        self.sender.serialize_extensions(extensions, out);
     }
 }
 
@@ -393,6 +480,8 @@ mod tests {
         s.skip();
         assert_eq!(s.next_sequence_number(), 1);
 
+        assert!(pkt.extension().is_empty());
+
         let sr = s.sender_report(crate::NtpTimestamp(0x0102_0304_0506_0708), ts, "abc");
         let (pkt, rest) = crate::rtcp::PacketRef::parse(&sr[..]).unwrap();
         let (sdes, rest) = crate::rtcp::PacketRef::parse(rest).unwrap();
@@ -406,5 +495,30 @@ mod tests {
         assert_eq!(sr.ssrc(), 0x1234_5678);
         assert_eq!(sr.ntp_timestamp().0, 0x0102_0304_0506_0708);
         assert_eq!(sr.rtp_timestamp(), 110);
+    }
+
+    #[test]
+    fn sender_extensions() {
+        use crate::rtp::AbsCaptureTime;
+        let id = std::num::NonZeroU8::new(5).unwrap();
+        let ids = ExtensionIds::default().with::<AbsCaptureTime>(id);
+        let mut s = Sender::new(96, SenderOptions::default().extension_ids(ids));
+        let ts = crate::Timestamp::new(100, std::num::NonZeroU32::new(90_000).unwrap(), 0).unwrap();
+        let values = Extensions::default().with(AbsCaptureTime::new(crate::NtpTimestamp(42)));
+
+        let mut ext = Vec::new();
+        s.serialize_extensions(&values, &mut ext);
+        let raw = s
+            .packet_with_extensions(ts, false, &ext, &[b"xyz"])
+            .to_vec();
+        let v = PacketHeader::validate(&raw[..]).unwrap();
+        assert_eq!(&raw[usize::from(v.payload.start)..], b"xyz");
+        assert_eq!(ids.read(&v.extension(&raw).unwrap()), values);
+
+        // Without values, no extension is written.
+        let raw = s.packet(ts, false, &[b"xyz"]).to_vec();
+        let v = PacketHeader::validate(&raw[..]).unwrap();
+        assert_eq!(v.extension, None);
+        assert_eq!(raw.len(), 15);
     }
 }

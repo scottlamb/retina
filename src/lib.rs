@@ -16,6 +16,7 @@
     not(all(
         feature = "tokio",
         feature = "unstable-codec-analyzer",
+        feature = "unstable-extensions",
         feature = "unstable-sans-io",
         feature = "unstable-server"
     )),
@@ -23,6 +24,25 @@
 )]
 // I prefer to use from_str_radix(..., 10) to explicitly note the base.
 #![allow(clippy::from_str_radix_10)]
+
+/// Declares an item `pub` with the `unstable-extensions` feature, or
+/// `pub(crate)` without it.
+///
+/// The extension plumbing is compiled either way, so code which carries
+/// extension values needn't be conditional; only the public API is.
+macro_rules! pub_if_unstable_extensions {
+    ($(#[$m:meta])* pub $($rest:tt)*) => {
+        #[cfg(feature = "unstable-extensions")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "unstable-extensions")))]
+        $(#[$m])*
+        pub $($rest)*
+
+        #[cfg(not(feature = "unstable-extensions"))]
+        #[allow(dead_code, unused_imports)]
+        $(#[$m])*
+        pub(crate) $($rest)*
+    };
+}
 
 use rtsp::msg::Message;
 use std::fmt::{Debug, Display};

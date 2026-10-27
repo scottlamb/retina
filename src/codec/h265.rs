@@ -299,6 +299,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 }
             };
 
+        if !meta.extensions.is_empty() {
+            self.analyzer.add_extensions(&meta.extensions);
+        }
         let mark = meta.mark;
         let timestamp = meta.timestamp;
 
@@ -1676,6 +1679,7 @@ mod tests {
                     sequence_number: seq,
                     mark,
                     continuity: crate::rtp::Continuity::Contiguous,
+                    extensions: Default::default(),
                 };
                 let pos = buf.end();
                 buf.extend(payload);
@@ -1811,6 +1815,7 @@ mod tests {
                     sequence_number: seq,
                     mark,
                     continuity: crate::rtp::Continuity::Contiguous,
+                    extensions: Default::default(),
                 };
                 let pos = buf.end();
                 buf.extend(payload);

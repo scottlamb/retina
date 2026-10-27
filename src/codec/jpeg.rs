@@ -282,6 +282,7 @@ fn make_headers(
 #[derive(Debug)]
 struct JpegFrameMetadata<Ctx> {
     start_ctx: Ctx,
+    extensions: crate::rtp::Extensions,
     timestamp: Timestamp,
     parameters: Option<VideoParameters>,
 
@@ -496,6 +497,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
                     self.metadata.replace(JpegFrameMetadata {
                         start_ctx: ctx.clone(),
+                        extensions: pkt.meta.extensions,
                         timestamp,
                         next_offset: 0,
                         parameters: Some(VideoParameters {
@@ -571,6 +573,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 is_rasl: false,
                 timestamp,
                 ctx: &metadata.start_ctx,
+                extensions: metadata.extensions,
                 is_random_access_point: true,
                 is_disposable: true,
                 has_new_parameters,
@@ -592,6 +595,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 timestamp,
                 start_ctx: &metadata.start_ctx,
                 end_ctx: ctx,
+                extensions: metadata.extensions,
                 is_random_access_point: true,
                 is_disposable: true,
                 has_new_parameters,
