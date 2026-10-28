@@ -1,0 +1,92 @@
+name: Fuzz
+
+# Short runs on every push/PR catch shallow bugs a change introduces; a longer
+# daily run digs deeper. The evolving corpus lives in the Actions cache (not
+# git). Targets that take raw bytes are also seeded from the main crate's
+# testdata. Crashes are uploaded as workflow artifacts; once fixed, add the
+# input as a unit test in the main crate so it's checked on stable by
+# `cargo test`.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target
+        default: '600'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: fuzz-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: depacketize_h264
+          - target: depacketize_h265
+          - target: depacketize_jpeg
+          - target: h265_nal
+          - target: roundtrip_h264
+          - target: roundtrip_rtsp_message
+            seeds: ../src/rtsp/testdata ../src/client/testdata
+    env:
+      SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'schedule' && 1800 || 120) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Expose runner image OS for cache keys
+        run: echo "IMAGE_OS=$ImageOS" >> "$GITHUB_ENV"
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          rustflags: ''  # don't add -D warnings; new nightly lints shouldn't fail fuzzing.
+          cache-key: ${{ env.IMAGE_OS }}
+          cache-workspaces: fuzz -> target
+      # This installs a prebuilt musl binary of cargo-fuzz, which defaults to
+      # building fuzz targets for musl (incompatible with ASan). Thus the
+      # `--target` arguments below.
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Restore corpus
+        uses: actions/cache/restore@v5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }} ${{ matrix.seeds }} -- \
+            -max_total_time=$SECONDS_PER_TARGET -timeout=10 -print_final_stats=1
+      - name: Minimize corpus
+        if: github.event_name == 'schedule'
+        working-directory: fuzz
+        run: cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }}
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

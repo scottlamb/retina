@@ -21,6 +21,7 @@ pub(super) async fn background_teardown(
     base_url: Url,
     tool: Option<Tool>,
     session_id: msg::HeaderValue,
+    backchannel: bool,
     just_try_once: bool,
     options: SessionOptions,
     requested_auth: Option<http_auth::PasswordClient>,
@@ -39,6 +40,7 @@ pub(super) async fn background_teardown(
             base_url,
             tool,
             &session_id,
+            backchannel,
             just_try_once,
             &options,
             requested_auth,
@@ -78,17 +80,26 @@ pub(super) async fn teardown_loop_forever(
     url: Url,
     tool: Option<Tool>,
     session_id: &msg::HeaderValue,
+    backchannel: bool,
     just_try_once: bool,
     options: &SessionOptions,
     mut requested_auth: Option<http_auth::PasswordClient>,
     mut conn: Option<RtspConnection>,
     tx: &mut tokio::sync::watch::Sender<Option<Result<(), Error>>>,
 ) {
+    let mut headers: msg::Headers = [(msg::HeaderName::SESSION, session_id.clone())].into();
+    if backchannel {
+        // ONVIF Streaming Specification section 5.3.1: "An RTSP client that
+        // wants to build up an RTSP connection with a data backchannel shall
+        // include the Require header in its requests." Section 5.3.2.2's
+        // example `TEARDOWN` carries it too.
+        headers.insert(msg::HeaderName::REQUIRE, super::backchannel_require());
+    }
     let mut req = OwnedMessage::Request {
         head: msg::Request {
             method: msg::Method::TEARDOWN,
             request_uri: Some(url.clone()),
-            headers: [(msg::HeaderName::SESSION, session_id.clone())].into(),
+            headers,
         },
         body: Bytes::new(),
     };

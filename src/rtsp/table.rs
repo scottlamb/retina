@@ -69,12 +69,22 @@ const fn is_field_vchar_inner(b: u8) -> bool {
     (b as usize) < TABLE.len() && TABLE[b as usize] & C_FIELD_VCHAR_INNER != 0
 }
 
-pub fn is_valid_header_value(value: &[u8]) -> bool {
+pub const fn is_valid_header_value(value: &[u8]) -> bool {
     match value {
         [] => false,
         &[only] => is_vchar(only),
         &[first, ref middle @ .., last] => {
-            is_vchar(first) && is_vchar(last) && middle.iter().all(|&b| is_field_vchar_inner(b))
+            if !is_vchar(first) || !is_vchar(last) {
+                return false;
+            }
+            let mut i = 0;
+            while i < middle.len() {
+                if !is_field_vchar_inner(middle[i]) {
+                    return false;
+                }
+                i += 1;
+            }
+            true
         }
     }
 }

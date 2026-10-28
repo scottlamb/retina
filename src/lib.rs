@@ -194,13 +194,15 @@ pub const UNIX_EPOCH: NtpTimestamp = NtpTimestamp((2_208_988_800) << 32);
 ///
 /// NTP timestamps are in a fixed-point representation of seconds since
 /// 0h UTC on 1 January 1900. The top 32 bits represent the integer part
-/// (wrapping around every 68 years) and the bottom 32 bits represent the
-/// fractional part.
+/// (wrapping around every 2^32 seconds, about 136 years; NTP era 0 ends in
+/// February 2036) and the bottom 32 bits represent the fractional part.
 ///
 /// This is a simple wrapper around a `u64` in that format, with a `Display`
-/// impl that writes the timestamp as a human-readable string. Currently this
-/// assumes the time is within 68 years of 1970; the string will be incorrect
-/// after `2038-01-19T03:14:07Z`.
+/// impl that writes the timestamp as a human-readable string. As the
+/// timestamp doesn't say which era it's in, `Display` assumes it's between
+/// the Unix epoch (1970) and `2106-02-07T06:28:15Z`; earlier times, such as
+/// those of a misconfigured clock, display as later ones. Conversions to and
+/// from [`SystemTime`] make the same assumption.
 ///
 /// An `NtpTimestamp` isn't necessarily gathered from a real NTP server.
 /// Reported NTP timestamps are allowed to jump backwards and/or be complete
@@ -209,6 +211,53 @@ pub const UNIX_EPOCH: NtpTimestamp = NtpTimestamp((2_208_988_800) << 32);
 /// The NTP timestamp of the Unix epoch is available via the constant [`UNIX_EPOCH`].
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct NtpTimestamp(pub u64);
+
+impl NtpTimestamp {
+    /// Returns the local machine's realtime clock as an NTP timestamp.
+    #[inline]
+    pub fn now() -> Self {
+        Self::from(SystemTime::now())
+    }
+}
+
+/// Converts an unsigned Q32.32 fixed-point number of seconds to a `Duration`,
+/// rounding to the nearest nanosecond.
+fn q32_32_to_duration(v: u64) -> std::time::Duration {
+    // `Duration::new` carries a rounded-up 1_000_000_000 nanoseconds.
+    let nanos = ((v & 0xFFFF_FFFF) * 1_000_000_000 + (1 << 31)) >> 32;
+    std::time::Duration::new(v >> 32, nanos as u32)
+}
+
+/// Converts a `Duration` to an unsigned Q32.32 fixed-point number of seconds,
+/// wrapping every 2^32 seconds and rounding to the fixed-point precision.
+fn duration_to_q32_32(d: std::time::Duration) -> u64 {
+    // Nanoseconds are below 2^30, so the shift can't overflow. Rounding up
+    // yields at most 2^32, which carries into the seconds.
+    let frac = ((u64::from(d.subsec_nanos()) << 32) + 500_000_000) / 1_000_000_000;
+    (d.as_secs() << 32).wrapping_add(frac)
+}
+
+impl From<SystemTime> for NtpTimestamp {
+    /// Converts a [`SystemTime`].
+    ///
+    /// NTP timestamps wrap every 2^32 seconds, so times outside the range
+    /// [`NtpTimestamp`] assumes (1970 through early 2106) have the same
+    /// representation as some time within it, and don't round-trip.
+    fn from(t: SystemTime) -> Self {
+        NtpTimestamp(match t.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => UNIX_EPOCH.0.wrapping_add(duration_to_q32_32(d)),
+            Err(e) => UNIX_EPOCH.0.wrapping_sub(duration_to_q32_32(e.duration())),
+        })
+    }
+}
+
+impl From<NtpTimestamp> for SystemTime {
+    /// Converts to a [`SystemTime`] between the Unix epoch (1970) and early
+    /// 2106, as described at [`NtpTimestamp`].
+    fn from(t: NtpTimestamp) -> Self {
+        SystemTime::UNIX_EPOCH + q32_32_to_duration(t.0.wrapping_sub(UNIX_EPOCH.0))
+    }
+}
 
 impl std::fmt::Display for NtpTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -537,6 +586,7 @@ fn to_u64(v: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use std::net::Ipv4Addr;
+    use std::time::Duration;
 
     use super::*;
 
@@ -544,5 +594,44 @@ mod test {
     fn local_udp_pair() {
         // Just test that it succeeds.
         UdpPair::for_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+    }
+
+    #[test]
+    fn ntp_system_time_round_trip() {
+        let now = SystemTime::UNIX_EPOCH + Duration::new(1_792_000_000, 123_456_789);
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX));
+        for t in [
+            now,
+            SystemTime::UNIX_EPOCH,
+            now + Duration::from_secs(1 << 30), // NTP era 1 (2036+).
+            last,
+        ] {
+            assert_eq!(SystemTime::from(NtpTimestamp::from(t)), t, "{t:?}");
+        }
+        assert_eq!(SystemTime::from(UNIX_EPOCH), SystemTime::UNIX_EPOCH);
+
+        // Times outside 1970 through 2106 wrap into it.
+        assert_eq!(
+            SystemTime::from(NtpTimestamp::from(
+                SystemTime::UNIX_EPOCH - Duration::from_secs(1)
+            )),
+            last
+        );
+
+        // Rounding both ways makes every nanosecond value round-trip exactly.
+        for nanos in (0..1_000_000_000).step_by(997) {
+            let t = now + Duration::from_nanos(nanos);
+            assert_eq!(SystemTime::from(NtpTimestamp::from(t)), t);
+        }
+    }
+
+    #[test]
+    fn ntp_display() {
+        assert_eq!(UNIX_EPOCH.to_string(), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            NtpTimestamp::from(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)))
+                .to_string(),
+            "2106-02-07T06:28:15Z"
+        );
     }
 }

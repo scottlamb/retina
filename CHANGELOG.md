@@ -1,5 +1,18 @@
 ## unreleased
 
+*   add `From<SystemTime> for NtpTimestamp` and
+    `From<NtpTimestamp> for SystemTime`.
+    Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
+    `Display` is accurate through 2106, not just 2038.
+*   H.265: treat all intra random access point (IRAP) pictures as random
+    access points, not just IDR pictures. Previously CRA and BLA pictures
+    were reported with `is_random_access_point() == false`, so e.g.
+    `ParameterSetInsertion::EachKeyFrame` never prepended parameter sets on
+    streams using CRA pictures (such as `libx265` defaults).
+    Fixes [#132](https://github.com/scottlamb/retina/issues/132).
+*   H.264: likewise treat pictures with a recovery point SEI message with
+    `recovery_frame_cnt` 0 (open GOP random access points, as produced by
+    `libx264` with `open-gop=1`) as random access points.
 *   add `retina::codec::StreamDepacketizer`, which depacketizes an RTP stream
     received outside `retina::client`: it checks each packet's header, follows
     the SSRC and sequence numbers, places the 32-bit timestamps on a

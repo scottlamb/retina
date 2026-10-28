@@ -95,12 +95,12 @@ impl AudioSpecificConfig {
     fn parse(raw: &[u8]) -> Result<Self, String> {
         let mut r = bitstream_io::BitReader::endian(raw, bitstream_io::BigEndian);
         let audio_object_type = match r
-            .read::<u8>(5)
+            .read::<5, u8>()
             .map_err(|e| format!("unable to read audio_object_type: {e}"))?
         {
             31 => {
                 32 + r
-                    .read::<u8>(6)
+                    .read::<6, u8>()
                     .map_err(|e| format!("unable to read audio_object_type ext: {e}"))?
             }
             o => o,
@@ -108,7 +108,7 @@ impl AudioSpecificConfig {
 
         // ISO/IEC 14496-3 section 1.6.3.3.
         let sampling_frequency_index = r
-            .read::<u8>(4)
+            .read::<4, u8>()
             .map_err(|e| format!("unable to read sampling_frequency: {e}"))?;
         let sampling_frequency = match sampling_frequency_index {
             0x0 => 96_000,
@@ -128,12 +128,12 @@ impl AudioSpecificConfig {
                 return Err(format!("reserved sampling_frequency_index value 0x{v:x}"));
             }
             0xf => r
-                .read::<u32>(24)
+                .read::<24, u32>()
                 .map_err(|e| format!("unable to read sampling_frequency ext: {e}"))?,
             0x10..=0xff => unreachable!(),
         };
         let channels_config_id = r
-            .read::<u8>(4)
+            .read::<4, u8>()
             .map_err(|e| format!("unable to read channels: {e}"))?;
         let channels = CHANNEL_CONFIGS
             .get(usize::from(channels_config_id))
@@ -143,7 +143,7 @@ impl AudioSpecificConfig {
         let channels_config_id = NonZeroU8::new(channels_config_id).expect("non-zero");
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
-            if r.read::<u8>(4)
+            if r.read::<4, u8>()
                 .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {e}"))?
                 == 0xf
             {
@@ -151,7 +151,7 @@ impl AudioSpecificConfig {
                     .map_err(|e| format!("unable to read extensionSamplingFrequency: {e}"))?;
             }
             // audioObjectType (a different one) + extensionChannelConfiguration.
-            if r.read::<u8>(5)
+            if r.read::<5, u8>()
                 .map_err(|e| format!("unable to read second audioObjectType: {e}"))?
                 == 22
             {
