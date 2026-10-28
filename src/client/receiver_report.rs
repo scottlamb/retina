@@ -31,7 +31,7 @@ const MAX_MISORDER: u16 = 100;
 
 /// `MIN_SEQUENTIAL` from RFC 3550 appendix A.1: the number of sequential
 /// packets required before a new source is considered valid.
-const MIN_SEQUENTIAL: u8 = 2;
+pub(crate) const MIN_SEQUENTIAL: u8 = 2;
 
 /// `RTP_SEQ_MOD` from RFC 3550 appendix A.1.
 const RTP_SEQ_MOD: u32 = 1 << 16;

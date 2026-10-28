@@ -16,7 +16,7 @@ use crate::{
     StreamContextInner,
 };
 
-use super::receiver_report::SeqState;
+use super::receiver_report::{MIN_SEQUENTIAL, SeqState};
 use super::{SessionOptions, Timeline, UnknownRtcpSsrcPolicy, UnknownRtpSsrcPolicy};
 
 /// Describes how Retina formed its initial expectation for the stream's `ssrc` or `seq`.
@@ -86,6 +86,10 @@ pub struct InorderParser {
 
     unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
 
+    /// The stream's payload type. Under [`UnknownRtpSsrcPolicy::FollowNewSsrc`],
+    /// only an SSRC sending this payload type can replace `ssrc`.
+    payload_type: u8,
+
     /// Under [`UnknownRtpSsrcPolicy::FollowNewSsrc`], an SSRC other than
     /// `ssrc` which is on probation to replace it.
     new_ssrc: Option<(u32, SeqState)>,
@@ -120,6 +124,7 @@ impl InorderParser {
     pub fn new(
         ssrc: Option<u32>,
         next_seq: Option<u16>,
+        payload_type: u8,
         unknown_rtcp_session: UnknownRtcpSsrcPolicy,
         unknown_rtp_ssrc: UnknownRtpSsrcPolicy,
     ) -> Self {
@@ -137,6 +142,7 @@ impl InorderParser {
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
             unknown_rtp_ssrc,
+            payload_type,
             new_ssrc: None,
             last_rtp_received: None,
         }
@@ -168,6 +174,13 @@ impl InorderParser {
         let ssrc = header.ssrc();
         let ssrc_changed = matches!(self.ssrc, Some(s) if s.ssrc != ssrc);
         if ssrc_changed && matches!(self.unknown_rtp_ssrc, UnknownRtpSsrcPolicy::FollowNewSsrc) {
+            if header.payload_type() != self.payload_type {
+                debug!(
+                    "skipping seq={sequence_number} from ssrc={ssrc:08x} with pt={}",
+                    header.payload_type()
+                );
+                return Ok(None);
+            }
             if !self.new_ssrc_passes_probation(ssrc, sequence_number) {
                 debug!("skipping seq={sequence_number} from ssrc={ssrc:08x} on probation");
                 return Ok(None);
@@ -184,7 +197,12 @@ impl InorderParser {
                 init: InitialExpectation::RtpPacket,
                 ssrc,
             });
-            self.seq = None;
+            // Counts the packets dropped on probation as lost, so depacketizers
+            // don't take this packet as a continuation of the old ssrc's frame.
+            self.seq = Some(Seq {
+                init: InitialExpectation::RtpPacket,
+                next: sequence_number.wrapping_sub(u16::from(MIN_SEQUENTIAL - 1)),
+            });
             let since_last_packet = self
                 .last_rtp_received
                 .map(|last| pkt_ctx.received().saturating_duration_since(last))
@@ -581,6 +599,7 @@ mod tests {
         let mut parser = InorderParser::new(
             Some(0xd25614e),
             None,
+            96,
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::Default,
         );
@@ -691,6 +710,7 @@ mod tests {
         let mut parser = InorderParser::new(
             Some(0xd25614e),
             None,
+            96,
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::Default,
         );
@@ -765,7 +785,16 @@ mod tests {
     ) -> Result<Option<PacketMeta>, Error> {
         let pkt =
             crate::rtp::build_raw_rtp(sequence_number, timestamp, 96, ssrc, true, *b"pkt").unwrap();
-        let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+        push_rtp_packet(parser, timeline, received, &pkt)
+    }
+
+    fn push_rtp_packet(
+        parser: &mut InorderParser,
+        timeline: &mut Timeline,
+        received: Instant,
+        pkt: &[u8],
+    ) -> Result<Option<PacketMeta>, Error> {
+        let (header, _) = PacketHeader::validate(pkt).unwrap();
         let pkt_ctx = PacketContext(PacketContextInner::Udp {
             received,
             received_wall: crate::WallTime::now(),
@@ -805,6 +834,7 @@ mod tests {
         let mut parser = InorderParser::new(
             None,
             None,
+            96,
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::Default,
         );
@@ -821,6 +851,7 @@ mod tests {
         let mut parser = InorderParser::new(
             None,
             None,
+            96,
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::FollowNewSsrc,
         );
@@ -845,7 +876,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.ssrc, 0x2222);
-        assert_eq!(first.loss, 0);
+        assert_eq!(first.loss, 1);
         // 100 ms between the old ssrc's last packet and this one, at 90 kHz.
         assert_eq!(first.timestamp.elapsed(), old.timestamp.elapsed() + 9_000);
 
@@ -872,6 +903,7 @@ mod tests {
         let mut parser = InorderParser::new(
             None,
             None,
+            96,
             UnknownRtcpSsrcPolicy::Default,
             UnknownRtpSsrcPolicy::FollowNewSsrc,
         );
@@ -888,5 +920,95 @@ mod tests {
             first.timestamp.elapsed(),
             old.timestamp.elapsed() + 30 * 90_000
         );
+    }
+
+    #[test]
+    fn ssrc_with_another_payload_type_not_followed() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(
+            None,
+            None,
+            96,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::FollowNewSsrc,
+        );
+        let start = Instant::now();
+        let push_audio = |parser: &mut InorderParser, timeline: &mut Timeline, seq| {
+            let pkt = crate::rtp::build_raw_rtp(seq, 0, 8, 0x111, false, *b"pcma").unwrap();
+            push_rtp_packet(parser, timeline, start, &pkt)
+        };
+        push_rtp_at(&mut parser, &mut timeline, start, 0x110, 10, 1_000)
+            .unwrap()
+            .unwrap();
+        for seq in 20..23 {
+            assert!(
+                push_audio(&mut parser, &mut timeline, seq)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let video = push_rtp_at(&mut parser, &mut timeline, start, 0x110, 11, 4_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(video.ssrc, 0x110);
+        assert_eq!(video.loss, 0);
+    }
+
+    #[test]
+    fn ssrc_change_mid_fu_a() {
+        crate::testutil::init_logging();
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(
+            None,
+            None,
+            96,
+            UnknownRtcpSsrcPolicy::Default,
+            UnknownRtpSsrcPolicy::FollowNewSsrc,
+        );
+        let mut d = crate::codec::Depacketizer::new(
+            "video",
+            "h264",
+            90_000,
+            None,
+            Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg=="),
+        )
+        .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        let mut buf = crate::testutil::DepacketizeBuf::new(65536);
+        let start = Instant::now();
+        let mut push = |ssrc, sequence_number, timestamp, mark, payload: &[u8]| {
+            let pkt = crate::rtp::build_raw_rtp(
+                sequence_number,
+                timestamp,
+                96,
+                ssrc,
+                mark,
+                payload.iter().copied(),
+            )
+            .unwrap();
+            let Some(meta) = push_rtp_packet(&mut parser, &mut timeline, start, &pkt).unwrap()
+            else {
+                return Ok(());
+            };
+            buf.push(&mut d, meta, &pkt[12..])
+        };
+
+        // FU-A start of a non-IDR slice which the old ssrc never finishes.
+        push(1, 10, 1_000, false, b"\x7c\x81old fu-a start").unwrap();
+        // The new ssrc's FU-A start is dropped on probation, so the parser
+        // passes on its end with no fragment in progress.
+        push(2, 500, 1_000, false, b"\x7c\x81new fu-a start").unwrap();
+        push(2, 501, 1_000, true, b"\x7c\x41new fu-a end").unwrap();
+        push(2, 502, 4_000, true, b"\x01new slice").unwrap();
+        match d.pull() {
+            Some(Ok(crate::codec::CodecItem::VideoFrame(frame))) => {
+                assert_eq!(frame.data(), b"\x00\x00\x00\x0a\x01new slice");
+            }
+            o => panic!("unexpected pull result: {o:#?}"),
+        }
+        assert!(d.pull().is_none());
     }
 }

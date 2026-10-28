@@ -13,9 +13,10 @@
     `UnknownRtpSsrcPolicy::FollowNewSsrc`, a stream whose RTP packets switch to
     a new SSRC mid-session continues from the new SSRC instead of failing with
     `wrong ssrc`, as GStreamer's `rtspsrc` does. The new SSRC takes over once
-    it has sent two sequential packets, its first packet taken reports no
-    loss, and timestamps continue from the old SSRC's last one plus the time
-    between their arrivals. The default still aborts the session.
+    it has sent two sequential packets with the stream's payload type, the
+    packet dropped before then is reported as lost, and timestamps continue
+    from the old SSRC's last one plus the time between their arrivals. The
+    default still aborts the session.
 
 ## `v0.4.21` (2026-10-04)
 

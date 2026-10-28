@@ -477,10 +477,12 @@ pub enum UnknownRtpSsrcPolicy {
     /// server restarts its encoder mid-session.
     ///
     /// The stream continues from the new `ssrc` once it has sent two
-    /// sequential packets, as in RFC 3550 appendix A.1. Packets before then
-    /// are dropped, as is a partial frame from the old `ssrc`. The first packet
-    /// taken from the new `ssrc` reports no loss, and its timestamp follows the
-    /// old `ssrc`'s last one by the time between their arrivals.
+    /// sequential packets with the stream's payload type, as in RFC 3550
+    /// appendix A.1. Packets before then are dropped, as is a partial frame
+    /// from the old `ssrc`, and packets from another `ssrc` with another
+    /// payload type are always dropped. The first packet taken from the new
+    /// `ssrc` reports the packet dropped before it as lost, and its timestamp
+    /// follows the old `ssrc`'s last one by the time between their arrivals.
     #[display("follow-new-ssrc")]
     FollowNewSsrc,
 }
@@ -2218,6 +2220,7 @@ impl Session<Described> {
                         rtp_handler: rtp::InorderParser::new(
                             None,
                             None,
+                            s.rtp_payload_type,
                             policy.unknown_rtcp_ssrc,
                             policy.unknown_rtp_ssrc,
                         ),
@@ -2311,6 +2314,7 @@ impl Session<Described> {
                         rtp_handler: rtp::InorderParser::new(
                             ssrc,
                             initial_seq,
+                            s.rtp_payload_type,
                             policy.unknown_rtcp_ssrc,
                             policy.unknown_rtp_ssrc,
                         ),
