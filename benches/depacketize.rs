@@ -37,11 +37,13 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
         InorderParser::new(
             None,
             Some(1),
+            96,
             retina::client::UnknownRtcpSsrcPolicy::Default,
         ),
         InorderParser::new(
             None,
             Some(1),
+            97,
             retina::client::UnknownRtcpSsrcPolicy::Default,
         ),
     ];

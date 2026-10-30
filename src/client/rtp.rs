@@ -57,10 +57,11 @@ struct Seq {
 ///
 /// At least [one camera](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-Reolink#reolink-rlc-410-hardware-version-ipc_3816m)
 /// sometimes sends data from old RTSP sessions over new ones. This seems like a
-/// serious bug, and `InorderRtpParser` errors on another SSRC until the
-/// stream's own packets have come. After that it discards them: other cameras
-/// send another stream's packets — audio that was never set up, and its RTCP —
-/// on the same interleaved channel, told apart only by the SSRC.
+/// serious bug, and currently `InorderRtpParser` will error in this case,
+/// although it'd be possible to discard the incorrect SSRC instead.
+///
+/// Packets of another stream sent on this stream's channel are skipped; see
+/// `InorderParser::is_other_stream`.
 ///
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
@@ -71,6 +72,9 @@ pub struct InorderParser {
     ssrc: Option<Ssrc>,
     seq: Option<Seq>,
 
+    /// The stream's RTP payload type, from the SDP.
+    payload_type: u8,
+
     /// Total RTP packets seen in this stream.
     seen_rtp_packets: u64,
 
@@ -80,9 +84,9 @@ pub struct InorderParser {
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
 
-    /// Whether an RTP packet of another SSRC was skipped: said once, not for
-    /// every packet of a source that sends fifty a second.
-    seen_foreign_rtp_ssrc: bool,
+    /// Whether a packet of another stream has been skipped, to warn about the
+    /// first one only: a camera's audio comes fifty times a second.
+    seen_other_stream: bool,
 }
 
 fn note_stale_live555_data_if_tcp(
@@ -111,6 +115,7 @@ impl InorderParser {
     pub fn new(
         ssrc: Option<u32>,
         next_seq: Option<u16>,
+        payload_type: u8,
         unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     ) -> Self {
         Self {
@@ -122,12 +127,28 @@ impl InorderParser {
                 init: InitialExpectation::PlayResponseHeader,
                 next,
             }),
+            payload_type,
             seen_rtp_packets: 0,
             seen_rtcp_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
-            seen_foreign_rtp_ssrc: false,
+            seen_other_stream: false,
         }
+    }
+
+    /// Returns true if `header` belongs to another stream sent on this
+    /// stream's channel: its payload type isn't the stream's, and neither is
+    /// its SSRC, or the stream's SSRC isn't known yet.
+    ///
+    /// At least one camera (a Rubetek door intercom) sends audio that wasn't
+    /// set up on the video's interleaved RTP channel, along with that audio's
+    /// RTCP, which read as RTP has a payload type of 72–76. Taking the first
+    /// such packet's SSRC as the stream's would drop the video instead. Stale
+    /// data from an old session has the stream's own payload type, so it's
+    /// still an error.
+    pub(crate) fn is_other_stream(&self, header: &PacketHeader) -> bool {
+        header.payload_type() != self.payload_type
+            && !matches!(self.ssrc, Some(s) if s.ssrc == header.ssrc())
     }
 
     /// Validates an RTP header and checks SSRC/sequence/timestamp ordering.
@@ -152,25 +173,26 @@ impl InorderParser {
             return Ok(None);
         }
 
+        if self.is_other_stream(header) {
+            if !self.seen_other_stream {
+                warn!(
+                    "skipping RTP packets of another stream on stream {stream_id}'s channel: \
+                     ssrc={:08x} pt={} while expecting ssrc={:08x?} pt={}; won't log further ones",
+                    header.ssrc(),
+                    header.payload_type(),
+                    self.ssrc.map(|s| s.ssrc),
+                    self.payload_type,
+                );
+                self.seen_other_stream = true;
+            }
+            return Ok(None);
+        }
+
         let sequence_number = header.sequence_number();
         let ssrc = header.ssrc();
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-            // Once the stream's own packets have come, another SSRC is another
-            // source on the same channel — a camera's audio nobody set up, its
-            // RTCP read as RTP — and not a stale session.
-            if self.seen_rtp_packets > 0 {
-                if !self.seen_foreign_rtp_ssrc {
-                    warn!(
-                        "skipping RTP packets of ssrc {ssrc:08x} on the channel of rtp session ssrc \
-                         {s:08x?}: another source sends on it; further ones are skipped silently",
-                        s = self.ssrc.map(|s| s.ssrc)
-                    );
-                    self.seen_foreign_rtp_ssrc = true;
-                }
-                return Ok(None);
-            }
             note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
             bail!(ErrorInt::RtpPacketError {
                 conn_ctx: *conn_ctx,
@@ -539,7 +561,8 @@ mod tests {
     #[test]
     fn geovision_pt50_packet() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let mut parser =
+            InorderParser::new(Some(0xd25614e), None, 105, UnknownRtcpSsrcPolicy::Default);
         let stream_ctx = StreamContext::dummy();
 
         // Normal packet.
@@ -577,15 +600,23 @@ mod tests {
         }
     }
 
-    /// One RTP packet of `ssrc` through `parser`: whether it was taken.
+    /// Passes one RTP packet through `parser`, returning whether it was taken.
     fn push_rtp(
         parser: &mut InorderParser,
         timeline: &mut Timeline,
         seq: u16,
+        payload_type: u8,
         ssrc: u32,
     ) -> Result<bool, Error> {
-        let pkt =
-            crate::rtp::build_raw_rtp(seq, u32::from(seq) * 3000, 96, ssrc, true, *b"pkt").unwrap();
+        let pkt = crate::rtp::build_raw_rtp(
+            seq,
+            u32::from(seq) * 3000,
+            payload_type,
+            ssrc,
+            true,
+            *b"pkt",
+        )
+        .unwrap();
         let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
         parser
             .rtp(
@@ -601,20 +632,27 @@ mod tests {
             .map(|packet| packet.is_some())
     }
 
-    /// Checks skipping another source's packets on the stream's channel once
-    /// the stream's own have come, as from a camera that sends its audio
-    /// (ssrc 0xf9, G.711 every 20 ms) on the video's interleaved channel
-    /// (ssrc 0xf8) — and refusing them before, as a stale session's.
+    /// Checks skipping another stream's packets on this stream's channel, as
+    /// a Rubetek door intercom sends them: its H.264 video (pt 96, ssrc 0x110)
+    /// is set up alone, yet its PCMA audio (pt 8, ssrc 0x111) and the audio's
+    /// RTCP sender reports (pt 72 when read as RTP) come on the same channel.
+    /// They're skipped even before the video's first packet, and never taken
+    /// as the stream's SSRC. A packet with the stream's payload type and
+    /// another SSRC is still an error, as stale data from an old session.
     #[test]
-    fn foreign_ssrc_on_the_channel() {
+    fn other_stream_on_the_channel() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xf8), None, UnknownRtcpSsrcPolicy::Default);
 
-        assert!(push_rtp(&mut parser, &mut timeline, 23161, 0xf9).is_err());
-        assert!(push_rtp(&mut parser, &mut timeline, 1, 0xf8).unwrap());
-        assert!(!push_rtp(&mut parser, &mut timeline, 23162, 0xf9).unwrap());
-        assert!(!push_rtp(&mut parser, &mut timeline, 23163, 0xf9).unwrap());
-        assert!(push_rtp(&mut parser, &mut timeline, 2, 0xf8).unwrap());
+        // The SETUP response's `ssrc=0x110` isn't understood, so the SSRC
+        // isn't known in advance.
+        let mut parser = InorderParser::new(None, None, 96, UnknownRtcpSsrcPolicy::Default);
+
+        assert!(!push_rtp(&mut parser, &mut timeline, 23161, 8, 0x111).unwrap());
+        assert!(!push_rtp(&mut parser, &mut timeline, 0x1c, 72, 0xec8e_2b37).unwrap());
+        assert!(push_rtp(&mut parser, &mut timeline, 1, 96, 0x110).unwrap());
+        assert!(!push_rtp(&mut parser, &mut timeline, 23162, 8, 0x111).unwrap());
+        assert!(push_rtp(&mut parser, &mut timeline, 2, 96, 0x110).unwrap());
+        assert!(push_rtp(&mut parser, &mut timeline, 3, 96, 0x112).is_err());
     }
 
     /// Sender reports follow the first RTP packet, then come every 2.5–7.5
@@ -684,7 +722,8 @@ mod tests {
     #[test]
     fn out_of_order() {
         let mut timeline = Timeline::new(None, 90_000, None).unwrap();
-        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let mut parser =
+            InorderParser::new(Some(0xd25614e), None, 96, UnknownRtcpSsrcPolicy::Default);
         let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
             local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
