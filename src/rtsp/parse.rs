@@ -202,6 +202,12 @@ impl Default for Parser {
 enum ParserState {
     #[default]
     Idle,
+    /// The first line of a request or response, which an interleaved frame
+    /// cut in two (see [`embedded_frame`]): its start, read with the rest of
+    /// the line once it comes.
+    FirstLine {
+        pending: Vec<u8>,
+    },
     /// Accumulating headers for a request or response.
     Head {
         msg: Message,
@@ -269,6 +275,28 @@ impl Parser {
                 ParserState::Idle => {
                     let checkpoint = *input;
                     let before = input.len();
+                    // An interleaved frame written into the first line of a
+                    // request or response: handed on as the data message it
+                    // is, and the line read around it.
+                    match first_line_frame(input) {
+                        Ok(Some((text_len, channel_id, body_len))) => {
+                            let pending = input.next_slice(text_len).to_cow().into_owned();
+                            input.advance(4);
+                            let body = input.next_slice(usize::from(body_len));
+                            self.state = ParserState::FirstLine { pending };
+                            let data = Data {
+                                channel_id,
+                                body_len,
+                            };
+                            return Ok(Some((Message::Data(data), body)));
+                        }
+                        Ok(None) => {}
+                        Err(FeedError::Incomplete(_)) => {
+                            *input = checkpoint;
+                            return Err(incomplete());
+                        }
+                        Err(e) => return Err(e),
+                    }
                     match parse_head(input) {
                         Ok(None) => return Ok(None), // clean EOF between messages
                         Ok(Some(Message::Data(data))) => {
@@ -295,6 +323,48 @@ impl Parser {
                         }
                         Err(e) => return Err(e),
                     }
+                }
+                ParserState::FirstLine { mut pending } => {
+                    match embedded_frame(input) {
+                        Ok(Some((text_len, channel_id, body_len))) => {
+                            pending.extend_from_slice(&input.next_slice(text_len).to_cow());
+                            input.advance(4);
+                            let body = input.next_slice(usize::from(body_len));
+                            self.state = ParserState::FirstLine { pending };
+                            let data = Data {
+                                channel_id,
+                                body_len,
+                            };
+                            return Ok(Some((Message::Data(data), body)));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.state = ParserState::FirstLine { pending };
+                            return Err(e);
+                        }
+                    }
+                    let Some(end) = input.find_byte(b'\n') else {
+                        let size = pending.len() + input.len();
+                        if size > self.max_message_size {
+                            // The first line alone is already too long.
+                            return Err(too_large(size as u64, self.max_message_size));
+                        }
+                        self.state = ParserState::FirstLine { pending };
+                        return Err(incomplete());
+                    };
+                    pending.extend_from_slice(&input.next_slice(end + 1).to_cow());
+                    let head_bytes = pending.len();
+                    let msg = match parse_head(&mut pending.as_slice())? {
+                        Some(msg @ (Message::Request(_) | Message::Response(_))) => msg,
+                        // `pending` starts with neither a CRLF nor a `$`.
+                        _ => unreachable!(),
+                    };
+                    self.check_size(&msg, head_bytes as u64)?;
+                    self.state = ParserState::Head {
+                        msg,
+                        head_bytes,
+                        pending: Vec::new(),
+                    };
                 }
                 ParserState::Head {
                     mut msg,
@@ -414,32 +484,49 @@ impl Parser {
 /// Returns `Ok(None)` when the input is empty (caller decides if that's
 /// clean EOF or needs more data).
 fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedError> {
-    loop {
-        match input.peek_byte() {
-            None => return Ok(None),
-            Some(b'\r') => {
-                if input.len() < 2 {
-                    return Err(incomplete());
-                }
-                if input.byte_at(1) != b'\n' {
-                    return Err(FeedError::invalid());
-                }
-                input.advance(2);
-            }
-            Some(b'$') => {
-                input.advance(1);
-                return Ok(Some(Message::Data(parse_data(input)?)));
-            }
-            Some(_) => {
-                if input.len() >= 5 && input.starts_with_lit(b"RTSP/") {
-                    return Ok(Some(Message::Response(parse_status_line(input)?)));
-                } else if input.len() < 5 && input.starts_with_lit(&b"RTSP/"[..input.len()]) {
-                    return Err(incomplete());
-                } else {
-                    return Ok(Some(Message::Request(parse_request_line(input)?)));
-                }
+    skip_crlfs(input)?;
+    match input.peek_byte() {
+        None => Ok(None),
+        Some(b'$') => {
+            input.advance(1);
+            Ok(Some(Message::Data(parse_data(input)?)))
+        }
+        Some(_) => {
+            if input.len() >= 5 && input.starts_with_lit(b"RTSP/") {
+                Ok(Some(Message::Response(parse_status_line(input)?)))
+            } else if input.len() < 5 && input.starts_with_lit(&b"RTSP/"[..input.len()]) {
+                Err(incomplete())
+            } else {
+                Ok(Some(Message::Request(parse_request_line(input)?)))
             }
         }
+    }
+}
+
+/// Skips any CRLFs before the next message.
+fn skip_crlfs<'i, I: Input<'i>>(input: &mut I) -> Result<(), FeedError> {
+    while input.peek_byte() == Some(b'\r') {
+        if input.len() < 2 {
+            return Err(incomplete());
+        }
+        if input.byte_at(1) != b'\n' {
+            return Err(FeedError::invalid());
+        }
+        input.advance(2);
+    }
+    Ok(())
+}
+
+/// Where an interleaved frame starts inside the first line of the request or
+/// response at the front of `input`, after any CRLFs before it, which are
+/// consumed; see [`embedded_frame`].
+fn first_line_frame<'i, I: Input<'i>>(
+    input: &mut I,
+) -> Result<Option<(usize, u8, u16)>, FeedError> {
+    skip_crlfs(input)?;
+    match input.peek_byte() {
+        None | Some(b'$') => Ok(None),
+        Some(_) => embedded_frame(input),
     }
 }
 
@@ -522,21 +609,22 @@ fn parse_request_line_inner<'i, I: Input<'i>>(input: &mut I) -> Result<Request, 
     })
 }
 
-/// Where an interleaved frame starts inside the header line at the front of
-/// `input`, with its channel and length, when one does.
+/// Where an interleaved frame starts inside the line at the front of `input`,
+/// with its channel and length, when one does.
 ///
 /// Some cameras write their interleaved frames into the socket while a
-/// response is still being written, and one lands in the middle of a header
-/// line: `Public: OPTIONS, DESCRIBE, S$\0\0<\x80…ETUP, …`. Its `$` is told
-/// from one in the text by the channel byte after it: a control character
-/// other than HT, LF and CR. Header text has none of those (RFC 2326 takes
-/// its grammar from HTTP/1.1, where a field value has no control characters
-/// but linear white space), and interleaved channel ids are small numbers.
-/// Only a frame before the line's end counts, and only a whole one: until all
-/// of it has come, the line is incomplete — read up to its CRLF, it would end
-/// inside the frame.
+/// response is still being written, and a frame lands anywhere in it: in a
+/// header line (`Public: OPTIONS, DESCRIBE, S$\0\0<\x80…ETUP, …`), in the
+/// status line (`RTSP/1.0 20$\0\0<\x80…0 OK`), between a line's CR and LF,
+/// or several frames in a row. Its `$` is told from one in the text by the
+/// channel byte after it: a control character other than HT, LF and CR.
+/// Message text has none of those (RFC 2326 takes its grammar from HTTP/1.1,
+/// where a field value has no control characters but linear white space),
+/// and interleaved channel ids are small numbers. Only a frame before the
+/// line's LF counts, and only a whole one: until all of it has come, the line
+/// is incomplete — read up to its end, it would end inside the frame.
 fn embedded_frame<'i, I: Input<'i>>(input: &I) -> Result<Option<(usize, u8, u16)>, FeedError> {
-    let Some(at) = input.find_bytes3(b'$', b'\r', b'\n') else {
+    let Some(at) = input.find_bytes2(b'$', b'\n') else {
         return Ok(None);
     };
     if input.byte_at(at) != b'$' {
@@ -560,20 +648,17 @@ fn embedded_frame<'i, I: Input<'i>>(input: &I) -> Result<Option<(usize, u8, u16)
 }
 
 /// The rest of a header line an interleaved frame cut in two — up to its
-/// CRLF — parsed together with `pending`, the part before the frame.
+/// LF, as the frame may have come between its CR and LF — parsed together
+/// with `pending`, the part before the frame.
 fn rest_of_line<'i, I: Input<'i>>(
     input: &mut I,
     pending: &mut Vec<u8>,
 ) -> Result<Option<(HeaderName, HeaderValue)>, FeedError> {
-    let end = match input.find_bytes2(b'\r', b'\n') {
-        None => return Err(incomplete()),
-        Some(n) => n,
-    };
-    if input.len() < end + 2 {
+    let Some(end) = input.find_byte(b'\n') else {
         return Err(incomplete());
-    }
+    };
     let mut line = std::mem::take(pending);
-    line.extend_from_slice(&input.next_slice(end + 2).to_cow());
+    line.extend_from_slice(&input.next_slice(end + 1).to_cow());
     parse_header_line(&mut line.as_slice())
 }
 
@@ -947,13 +1032,70 @@ pub(crate) mod tests {
         );
     }
 
-    /// A `$` in a header's text is text: the byte after it is printable, a tab
-    /// or the line's end, never a frame's channel.
+    /// An interleaved RTP frame of `len` bytes on channel 0: an RTP header
+    /// (pt 96), then `payload`, padded.
+    fn rtp_frame(len: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![b'$', 0, (len >> 8) as u8, len as u8];
+        frame.extend_from_slice(&[
+            0x80, 0x60, 0x13, 0x93, 0x66, 0xa5, 0x55, 0x12, 0x44, 0xcc, 0x66, 0xfc,
+        ]);
+        frame.extend_from_slice(payload);
+        frame.resize(4 + usize::from(len), 0x2c);
+        frame
+    }
+
+    /// Frames in the status line, as one camera wrote them: a keyframe's SPS,
+    /// PPS and SEI one after another, right after `RTSP`.
+    #[test]
+    fn frames_inside_the_status_line() {
+        let mut data = b"RTSP".to_vec();
+        data.extend(rtp_frame(
+            25,
+            b"\x67\x4d\x40\x28\x95\xa0\x1e\x00\x89\xf9\x66\xc0\x40",
+        ));
+        data.extend(rtp_frame(16, b"\x68\xee\x3c\x80"));
+        data.extend(rtp_frame(60, b"\x06\xf0\x2c\x0f\x45\xd4\x23\x0b"));
+        data.extend_from_slice(b"/1.0 200 OK\r\nCSeq: 5\r\nPublic: OPTIONS, DESCRIBE\r\n\r\n");
+        messages_at_every_split(
+            &data,
+            &[
+                "data 0 25",
+                "data 0 16",
+                "data 0 60",
+                "response 5 OPTIONS, DESCRIBE",
+            ],
+        );
+    }
+
+    /// Frames between a line's CR and LF: the status line's, a header line's
+    /// and the empty line's that ends the head.
+    #[test]
+    fn frames_between_cr_and_lf() {
+        let mut data = b"RTSP/1.0 200 OK\r".to_vec();
+        data.extend(rtp_frame(60, b"\x06\xf0\x2c"));
+        data.extend_from_slice(b"\nCSeq: 5\r");
+        data.extend(rtp_frame(16, b"\x68\xee\x3c\x80"));
+        data.extend_from_slice(b"\nPublic: OPTIONS, DESCRIBE\r\n\r");
+        data.extend(rtp_frame(25, b"\x67\x4d\x40\x28"));
+        data.extend_from_slice(b"\n");
+        messages_at_every_split(
+            &data,
+            &[
+                "data 0 60",
+                "data 0 16",
+                "data 0 25",
+                "response 5 OPTIONS, DESCRIBE",
+            ],
+        );
+    }
+
+    /// A `$` in a message's text is text: the byte after it is printable, a
+    /// tab or the line's end, never a frame's channel.
     #[test]
     fn dollar_in_a_header_is_text() {
         messages_at_every_split(
             b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nPublic: A$BCD\r\n\r\n\
-              RTSP/1.0 200 OK\r\nCSeq: 8\r\nPublic: E$\tF\r\n\r\n\
+              RTSP/1.0 200 O$K\r\nCSeq: 8\r\nPublic: E$\tF\r\n\r\n\
               RTSP/1.0 200 OK\r\nCSeq: 9\r\nPublic: G$\r\n\r\n",
             &["response 7 A$BCD", "response 8 E$\tF", "response 9 G$"],
         );
