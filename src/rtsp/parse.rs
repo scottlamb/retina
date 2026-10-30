@@ -528,10 +528,13 @@ fn parse_request_line_inner<'i, I: Input<'i>>(input: &mut I) -> Result<Request, 
 /// Some cameras write their interleaved frames into the socket while a
 /// response is still being written, and one lands in the middle of a header
 /// line: `Public: OPTIONS, DESCRIBE, S$\0\0<\x80…ETUP, …`. Its `$` is told
-/// from one in the text by the frame's first byte, RTP or RTCP version 2
-/// (`0x80`–`0xbf`), which a header never has. Only a frame before the line's
-/// end counts, and only a whole one: until all of it has come, the line is
-/// incomplete — read up to its CRLF, it would end inside the frame.
+/// from one in the text by the channel byte after it: a control character
+/// other than HT, LF and CR. Header text has none of those (RFC 2326 takes
+/// its grammar from HTTP/1.1, where a field value has no control characters
+/// but linear white space), and interleaved channel ids are small numbers.
+/// Only a frame before the line's end counts, and only a whole one: until all
+/// of it has come, the line is incomplete — read up to its CRLF, it would end
+/// inside the frame.
 fn embedded_frame<'i, I: Input<'i>>(input: &I) -> Result<Option<(usize, u8, u16)>, FeedError> {
     let Some(at) = input.find_bytes3(b'$', b'\r', b'\n') else {
         return Ok(None);
@@ -539,17 +542,21 @@ fn embedded_frame<'i, I: Input<'i>>(input: &I) -> Result<Option<(usize, u8, u16)
     if input.byte_at(at) != b'$' {
         return Ok(None);
     }
-    if input.len() < at + 5 {
+    if input.len() < at + 2 {
         return Err(incomplete());
     }
-    if !(0x80..=0xbf).contains(&input.byte_at(at + 4)) {
+    let channel_id = input.byte_at(at + 1);
+    if channel_id >= 0x20 || matches!(channel_id, b'\t' | b'\n' | b'\r') {
         return Ok(None);
+    }
+    if input.len() < at + 4 {
+        return Err(incomplete());
     }
     let body_len = u16::from(input.byte_at(at + 2)) << 8 | u16::from(input.byte_at(at + 3));
     if input.len() < at + 4 + usize::from(body_len) {
         return Err(incomplete());
     }
-    Ok(Some((at, input.byte_at(at + 1), body_len)))
+    Ok(Some((at, channel_id, body_len)))
 }
 
 /// The rest of a header line an interleaved frame cut in two — up to its
@@ -931,11 +938,29 @@ pub(crate) mod tests {
             .to_vec();
         data.extend_from_slice(&frame);
         data.extend_from_slice(b"ETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER\r\n\r\n");
-        let expected = [
-            "data 0 60",
-            "response 5 OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER",
-        ];
+        messages_at_every_split(
+            &data,
+            &[
+                "data 0 60",
+                "response 5 OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER",
+            ],
+        );
+    }
 
+    /// A `$` in a header's text is text: the byte after it is printable, a tab
+    /// or the line's end, never a frame's channel.
+    #[test]
+    fn dollar_in_a_header_is_text() {
+        messages_at_every_split(
+            b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nPublic: A$BCD\r\n\r\n\
+              RTSP/1.0 200 OK\r\nCSeq: 8\r\nPublic: E$\tF\r\n\r\n\
+              RTSP/1.0 200 OK\r\nCSeq: 9\r\nPublic: G$\r\n\r\n",
+            &["response 7 A$BCD", "response 8 E$\tF", "response 9 G$"],
+        );
+    }
+
+    /// Checks that `data` yields `expected` wherever its bytes are split.
+    fn messages_at_every_split(data: &[u8], expected: &[&str]) {
         for split in 0..=data.len() {
             let (first, second) = data.split_at(split);
 
@@ -956,17 +981,6 @@ pub(crate) mod tests {
             seen.extend(messages(&mut parser, &mut p2));
             assert_eq!(seen, expected, "split {split}");
         }
-    }
-
-    /// A `$` in a header's text is text: the byte four after it is no frame's.
-    #[test]
-    fn dollar_in_a_header_is_text() {
-        let data = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nPublic: A$BCD, E\r\n\r\n";
-        let mut input = Split::new(data, &[]);
-        assert_eq!(
-            messages(&mut Parser::default(), &mut input),
-            ["response 7 A$BCD, E"]
-        );
     }
 
     #[test]
