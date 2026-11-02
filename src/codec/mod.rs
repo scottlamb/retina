@@ -140,6 +140,7 @@ pub mod h264;
 pub mod h265;
 
 pub(crate) mod onvif;
+pub(crate) mod opus;
 pub(crate) mod simple_audio;
 
 /// Configuration options controlling how depacketized frames are formatted.
@@ -849,6 +850,7 @@ enum DepacketizerInner {
     #[cfg(feature = "h265")]
     H265(Box<h265::Depacketizer>),
     Onvif(Box<onvif::Depacketizer>),
+    Opus(Box<opus::Depacketizer>),
     Jpeg(Box<jpeg::Depacketizer>),
 }
 
@@ -919,6 +921,9 @@ impl Depacketizer {
             ("audio", "g723") => {
                 DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
             }
+            ("audio", "opus") => {
+                DepacketizerInner::Opus(Box::new(opus::Depacketizer::new(clock_rate, channels)?))
+            }
             ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::Uncompressed),
             )),
@@ -952,6 +957,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.check_invariants(),
             DepacketizerInner::Onvif(_) => {}
+            DepacketizerInner::Opus(_) => {}
             DepacketizerInner::SimpleAudio(_) => {}
             DepacketizerInner::Jpeg(_) => {}
         }
@@ -987,6 +993,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.parameters(),
             DepacketizerInner::Onvif(d) => d.parameters(),
+            DepacketizerInner::Opus(d) => d.parameters(),
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
             DepacketizerInner::Jpeg(d) => d.parameters(),
         }
@@ -1005,6 +1012,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.push(pkt),
             DepacketizerInner::Onvif(d) => d.push(pkt),
+            DepacketizerInner::Opus(d) => d.push(pkt),
             DepacketizerInner::SimpleAudio(d) => d.push(pkt),
             DepacketizerInner::Jpeg(d) => d.push(pkt),
         }
@@ -1022,6 +1030,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.pull(),
             DepacketizerInner::Onvif(d) => d.pull(),
+            DepacketizerInner::Opus(d) => d.pull(),
             DepacketizerInner::SimpleAudio(d) => d.pull(),
             DepacketizerInner::Jpeg(d) => d.pull(),
         }

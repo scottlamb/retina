@@ -14,7 +14,8 @@
     digest nonce and refuse a keepalive that reuses an old one, so every keepalive
     after the first rotation was refused and logged a warning. A server that
     refuses the retry too is retried at the normal interval, not every second.
-
+*   add Opus audio depacketization
+    ([RFC 7587](https://datatracker.ietf.org/doc/html/rfc7587)).
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
