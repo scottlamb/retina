@@ -46,6 +46,7 @@ Progress:
     *   audio
         *   [x] AAC
             *   [ ] interleaving
+        *   [x] Opus ([RFC 7587](https://datatracker.ietf.org/doc/html/rfc7587))
         *   [x] [RFC 3551](https://datatracker.ietf.org/doc/html/rfc3551)
             codecs: G.711, G.723, L8/L16
     *   [x] application: ONVIF metadata
