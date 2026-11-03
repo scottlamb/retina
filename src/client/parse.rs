@@ -565,10 +565,15 @@ pub(crate) struct SetupResponse {
     pub(crate) server_port: Option<u16>,
 }
 
+/// Parses a `server_port` value into the RTP port.
+///
+/// RFC 2326 section 12.39: `server_port = "server_port" "=" 1*5(DIGIT)
+/// ["-" 1*5(DIGIT)]`, so the range is optional. A single port `P` is RTP on
+/// `P` and, by the convention of RFC 3550 section 11, RTCP on `P+1`.
 fn parse_server_port(server_port: &str) -> Result<u16, ()> {
     if let Some((a, b)) = server_port.split_once('-') {
-        let a = u16::from_str_radix(a, 10).map_err(|_| ())?;
-        let b = u16::from_str_radix(b, 10).map_err(|_| ())?;
+        let a = u16::from_str_radix(a.trim(), 10).map_err(|_| ())?;
+        let b = u16::from_str_radix(b.trim(), 10).map_err(|_| ())?;
         if a.checked_add(1) != Some(b) {
             // It's unclear what a non-consecutive range means.
             return Err(());
@@ -576,11 +581,10 @@ fn parse_server_port(server_port: &str) -> Result<u16, ()> {
         return Ok(a);
     }
 
-    // Not returning a range is allowed by RFC 2326's grammar, but I'm not sure
-    // what it means. RTSP 2.0 allows "RTCP-mux" for using a single port for
-    // both RTP and RTCP, but it's only by client request, and RTSP 1.0 doesn't
-    // reference this.
-    Err(())
+    let a = u16::from_str_radix(server_port.trim(), 10).map_err(|_| ())?;
+    // RTCP is on the next port, which must exist.
+    a.checked_add(1).ok_or(())?;
+    Ok(a)
 }
 
 /// Parses the id part of a `Session` header, which later requests send back.
@@ -639,8 +643,15 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
     let mut source = None;
     let mut server_port = None;
     let transport_str: &str = transport;
+    // RFC 2326 section 4 (via RFC 2616 section 2.2) allows implied linear
+    // whitespace around the `;` and `=` tokens, so trim both.
     for part in transport_str.split(';') {
-        if let Some(v) = part.strip_prefix("ssrc=") {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name == "ssrc" {
+            let v = value;
             // RFC 2326 section 12.39 asks for eight hex digits without a
             // prefix. Some cameras send a 16-bit value instead: Rubetek sends
             // `ssrc=0x6f7c`, and another camera sends `ssrc=A046` while its
@@ -655,11 +666,15 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
                 Ok(parsed) if v.len() > 4 => ssrc = Some(parsed),
                 _ => warn!("Ignoring nonconforming ssrc in Transport header {transport_str:?}"),
             }
-        } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
-            let mut channels = interleaved.splitn(2, '-');
-            let n = channels.next().expect("splitn returns at least one part");
+        } else if name == "interleaved" {
+            let mut channels = value.splitn(2, '-');
+            let n = channels
+                .next()
+                .expect("splitn returns at least one part")
+                .trim();
             let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {n}"))?;
             if let Some(m) = channels.next() {
+                let m = m.trim();
                 let m = u8::from_str_radix(m, 10)
                     .map_err(|_| format!("bad second channel number {m}"))?;
                 if n.checked_add(1) != Some(m) {
@@ -667,12 +682,14 @@ pub(crate) fn parse_setup(response: &crate::rtsp::msg::Response) -> Result<Setup
                 }
             }
             channel_id = Some(n);
-        } else if let Some(s) = part.strip_prefix("source=") {
+        } else if name == "source" {
+            let s = value;
             source = Some(
                 s.parse()
                     .map_err(|_| format!("Transport header has unparseable source {s:?}"))?,
             );
-        } else if let Some(s) = part.strip_prefix("server_port=") {
+        } else if name == "server_port" {
+            let s = value;
             server_port = Some(parse_server_port(s).map_err(|()| {
                 format!("Transport header {:?} has bad server_port", &**transport)
             })?);
@@ -1826,6 +1843,62 @@ mod tests {
                 server_port: Some(49152),
             }
         );
+    }
+
+    /// Builds a `SETUP` response with the given `Transport` header value.
+    fn setup_with_transport(transport: &str) -> Result<SetupResponse, String> {
+        let raw =
+            format!("RTSP/1.0 200 OK\r\nCSeq: 2\r\nTransport: {transport}\r\nSession: 1\r\n\r\n");
+        // `response` wants `'static` bytes; leaking a few test strings is fine.
+        let raw: &'static str = Box::leak(raw.into_boxed_str());
+        parse_setup(&response(raw.as_bytes()).0)
+    }
+
+    /// RFC 2326 section 12.39: the `server_port` range is optional; a single
+    /// port is RTP, with RTCP on the next one (RFC 3550 section 11).
+    #[test]
+    fn setup_single_server_port() {
+        init_logging();
+        let r = setup_with_transport("RTP/AVP;unicast;server_port=6970").unwrap();
+        assert_eq!(r.server_port, Some(6970));
+        let r = setup_with_transport("RTP/AVP;unicast;server_port=65534").unwrap();
+        assert_eq!(r.server_port, Some(65534));
+        // RTCP would be on port 65536.
+        setup_with_transport("RTP/AVP;unicast;server_port=65535").unwrap_err();
+        setup_with_transport("RTP/AVP;unicast;server_port=").unwrap_err();
+        setup_with_transport("RTP/AVP;unicast;server_port=x").unwrap_err();
+    }
+
+    /// The strict forms still parse, and bad ranges are still rejected.
+    #[test]
+    fn setup_server_port_range_strict_cases() {
+        init_logging();
+        let r = setup_with_transport("RTP/AVP;unicast;server_port=6970-6971").unwrap();
+        assert_eq!(r.server_port, Some(6970));
+        setup_with_transport("RTP/AVP;unicast;server_port=6970-6972").unwrap_err();
+        setup_with_transport("RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=0A1B2C3D").unwrap();
+        let r = setup_with_transport("RTP/AVP/TCP;unicast;interleaved=2-3;ssrc=0A1B2C3D").unwrap();
+        assert_eq!(r.channel_id, Some(2));
+        assert_eq!(r.ssrc, Some(0x0A1B2C3D));
+    }
+
+    /// RFC 2326 section 4 (RFC 2616 section 2.2): whitespace may surround
+    /// `;` and `=`.
+    #[test]
+    fn setup_transport_whitespace_around_separators() {
+        init_logging();
+        let r = setup_with_transport(
+            "RTP/AVP ; unicast ; source = 192.168.1.10 ; server_port = 6970 - 6971 ; ssrc = 0A1B2C3D",
+        )
+        .unwrap();
+        assert_eq!(r.source, Some("192.168.1.10".parse().unwrap()));
+        assert_eq!(r.server_port, Some(6970));
+        assert_eq!(r.ssrc, Some(0x0A1B2C3D));
+        let r = setup_with_transport("RTP/AVP/TCP ; unicast ; interleaved = 4 - 5 ").unwrap();
+        assert_eq!(r.channel_id, Some(4));
+        let r = setup_with_transport(" source=192.168.1.10 ; server_port=6970-6971").unwrap();
+        assert_eq!(r.source, Some("192.168.1.10".parse().unwrap()));
+        assert_eq!(r.server_port, Some(6970));
     }
 
     /// A `Session` header with a space before the `;`. Trim it, so the id can
