@@ -1565,10 +1565,13 @@ fn backchannel_require() -> msg::HeaderValue {
 }
 
 /// Checks that `url` is suitable for `DESCRIBE`, returning its host.
+///
+/// Accepts the `rtsp` and `rtsps` schemes (RFC 7826 section 19.2); the
+/// latter is for callers of the sans-I/O core that terminate TLS themselves.
 fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-    if url.scheme() != "rtsp" {
+    if !matches!(url.scheme(), "rtsp" | "rtsps") {
         return Err(format!(
-            "Bad URL {}; only scheme rtsp supported",
+            "Bad URL {}; only schemes rtsp and rtsps supported",
             url.as_str()
         ));
     }
@@ -1586,6 +1589,13 @@ fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
 /// Connects to the server named in `url`.
 async fn connect(url: &Url, options: &SessionOptions) -> Result<crate::tokio::Connection, Error> {
     let host = validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+    if url.scheme() != "rtsp" {
+        bail!(ErrorInt::InvalidArgument(format!(
+            "Bad URL {}; the tokio Session only opens plain TCP, so scheme rtsps needs the \
+             sans-I/O SessionCore with a caller-supplied TLS stream",
+            url.as_str()
+        )));
+    }
     let port = url.port().unwrap_or(554);
     crate::tokio::Connection::connect(host, port, options.bind_addr)
         .await
@@ -1862,6 +1872,10 @@ impl Session<Described> {
     /// [`Stream::new_depacketizer`].
     ///
     /// Expects to be called from a tokio runtime.
+    ///
+    /// `url` must use the `rtsp` scheme: this opens plain TCP itself, so an
+    /// `rtsps` URL is refused. Use [`SessionCore`] with a caller-supplied TLS
+    /// stream for that.
     pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
         let conn = connect(&url, &options).await?;
         Self::describe_with_conn(conn, options, url).await
@@ -3433,6 +3447,21 @@ mod tests {
             serve,
         );
         session.expect("DESCRIBE should finish rather than buffer forever")
+    }
+
+    /// The tokio `Session` only opens plain TCP, so it refuses `rtsps` with a
+    /// pointer to `SessionCore`.
+    #[tokio::test]
+    async fn describe_refuses_rtsps() {
+        init_logging();
+        let url = Url::parse("rtsps://127.0.0.1/camera").unwrap();
+        let e = Session::describe(url, SessionOptions::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{e}");
+        assert!(e.to_string().contains("SessionCore"), "{e}");
+        assert!(e.to_string().contains("TLS"), "{e}");
     }
 
     fn assert_too_large(r: Result<Session<Described>, Error>) {

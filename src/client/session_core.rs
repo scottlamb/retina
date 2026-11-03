@@ -270,8 +270,10 @@ impl SetupCore {
 
     /// Starts a `DESCRIBE` request for `url`.
     ///
-    /// `url` must use the `rtsp` scheme and must not contain credentials;
-    /// supply those via [`SessionOptions::creds`].
+    /// `url` must use the `rtsp` or `rtsps` scheme and must not contain
+    /// credentials; supply those via [`SessionOptions::creds`]. The core never
+    /// connects, so for `rtsps` (RFC 7826 section 19.2) the caller terminates
+    /// TLS itself; the `rtsps` URL is sent as the Request-URI unchanged.
     pub(crate) fn describe(&mut self, url: Url) -> Result<(), Error> {
         if self.presentation.is_some() {
             bail!(ErrorInt::FailedPrecondition("already described".into()));
@@ -1174,8 +1176,10 @@ impl SessionCore {
 
     /// Starts a `DESCRIBE` request for `url`.
     ///
-    /// `url` must use the `rtsp` scheme and must not contain credentials;
-    /// supply those via [`SessionOptions::creds`].
+    /// `url` must use the `rtsp` or `rtsps` scheme and must not contain
+    /// credentials; supply those via [`SessionOptions::creds`]. The core never
+    /// connects, so for `rtsps` (RFC 7826 section 19.2) the caller terminates
+    /// TLS itself; the `rtsps` URL is sent as the Request-URI unchanged.
     pub fn describe(&mut self, url: Url) -> Result<(), Error> {
         self.setup_core()?.describe(url)
     }
@@ -1414,6 +1418,33 @@ mod tests {
 
     fn url() -> Url {
         Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap()
+    }
+
+    /// `rtsps` is accepted and goes out unchanged in the request line.
+    #[test]
+    fn describe_accepts_rtsps() {
+        let mut core = new_core(SessionOptions::default());
+        core.describe(Url::parse("rtsps://host/path").unwrap())
+            .unwrap();
+        let (a, b) = core.transmit_buf();
+        let data = [a, b].concat();
+        assert!(
+            data.starts_with(b"DESCRIBE rtsps://host/path RTSP/1.0\r\n"),
+            "{}",
+            String::from_utf8_lossy(&data)
+        );
+        let req = transmitted(&mut core);
+        assert_eq!(req.method, msg::Method::DESCRIBE);
+    }
+
+    /// Other schemes are still refused.
+    #[test]
+    fn describe_rejects_other_schemes() {
+        let mut core = new_core(SessionOptions::default());
+        let e = core
+            .describe(Url::parse("http://host/path").unwrap())
+            .unwrap_err();
+        assert!(e.to_string().contains("rtsps"), "{e}");
     }
 
     /// Returns the single request the core wants to send, marking it written.
