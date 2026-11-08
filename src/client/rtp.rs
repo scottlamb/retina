@@ -77,7 +77,21 @@ pub struct InorderParser {
 
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
+
+    /// TCP packets skipped because they were a little behind the expected sequence number
+    /// (a stale copy, as some cameras emit between interleaved packets), in total and in a row.
+    stale_skipped: u64,
+    stale_in_a_row: u32,
 }
+
+/// On TCP, a packet at most this many sequence numbers behind the expected one is a stale copy
+/// and is skipped; one further behind (or a jump ahead past half the sequence space) still ends
+/// the session, as before.
+const TCP_STALE_WINDOW: u16 = 1024;
+
+/// Skips in a row after which a TCP stream is treated as genuinely out of order (a sequence
+/// restart under the same SSRC, say) and the session ends, so a reset can never be skipped forever.
+const TCP_STALE_MAX_IN_A_ROW: u32 = 64;
 
 fn note_stale_live555_data_if_tcp(
     tool: Option<&super::Tool>,
@@ -120,7 +134,14 @@ impl InorderParser {
             seen_rtcp_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
+            stale_skipped: 0,
+            stale_in_a_row: 0,
         }
+    }
+
+    /// TCP packets skipped as stale copies, in total.
+    pub fn stale_skipped(&self) -> u64 {
+        self.stale_skipped
     }
 
     /// Validates an RTP header and checks SSRC/sequence/timestamp ordering.
@@ -170,6 +191,26 @@ impl InorderParser {
             });
         }
         if loss > 0x80_00 {
+            let behind = 0u16.wrapping_sub(loss);
+            if matches!(stream_ctx.0, StreamContextInner::Tcp { .. })
+                && self.seq.is_some()
+                && behind <= TCP_STALE_WINDOW
+                && self.stale_in_a_row < TCP_STALE_MAX_IN_A_ROW
+            {
+                self.stale_skipped += 1;
+                self.stale_in_a_row += 1;
+                if self.stale_skipped == 1 || self.stale_skipped.is_multiple_of(1000) {
+                    log::warn!(
+                        "Skipping stale TCP packet seq={} ({} behind) when expecting ssrc={:08x?} seq={:?}; {} skipped so far",
+                        sequence_number,
+                        behind,
+                        self.ssrc,
+                        self.seq,
+                        self.stale_skipped,
+                    );
+                }
+                return Ok(None);
+            }
             if matches!(stream_ctx.0, StreamContextInner::Tcp { .. }) {
                 bail!(ErrorInt::RtpPacketError {
                     conn_ctx: *conn_ctx,
@@ -213,6 +254,7 @@ impl InorderParser {
             next: sequence_number.wrapping_add(1),
         });
         self.seen_rtp_packets += 1;
+        self.stale_in_a_row = 0;
         Ok(Some((timestamp, loss)))
     }
 
@@ -683,5 +725,53 @@ mod tests {
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    #[test]
+    fn tcp_skips_a_stale_packet_and_still_refuses_real_disorder() {
+        let stream_ctx = StreamContext(StreamContextInner::Tcp(crate::TcpStreamContext {
+            rtp_channel_id: 0,
+        }));
+        let session_options = SessionOptions::default();
+        let push = |parser: &mut InorderParser, timeline: &mut Timeline, seq: u16, ts: u32| {
+            let pkt = crate::rtp::build_raw_rtp(seq, ts, 96, 0xd25614e, true, *b"p").unwrap();
+            let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+            parser
+                .rtp(
+                    &session_options,
+                    &stream_ctx,
+                    None,
+                    &ConnectionContext::dummy(),
+                    &PacketContext::dummy(),
+                    timeline,
+                    0,
+                    &header,
+                )
+                .map(|m| m.map(|m| m.loss))
+        };
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut p = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        assert_eq!(push(&mut p, &mut timeline, 16_619, 1000).unwrap(), Some(0));
+        // 106 behind, as measured on a camera that emits stale bytes between packets.
+        assert_eq!(push(&mut p, &mut timeline, 16_514, 500).unwrap(), None);
+        assert_eq!(p.stale_skipped(), 1);
+        // The stream continues with no loss and its timeline untouched by the stale packet.
+        assert_eq!(push(&mut p, &mut timeline, 16_620, 4000).unwrap(), Some(0));
+        // Further behind than the window still ends the session.
+        assert!(push(&mut p, &mut timeline, 16_620 - 2000, 4000).is_err());
+
+        // A sequence restart under the same SSRC is not skipped forever.
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut p = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        assert_eq!(push(&mut p, &mut timeline, 1000, 0).unwrap(), Some(0));
+        for i in 0..TCP_STALE_MAX_IN_A_ROW {
+            let seq = 500 + i as u16;
+            assert_eq!(
+                push(&mut p, &mut timeline, seq, 3000).unwrap(),
+                None,
+                "skip {i}"
+            );
+        }
+        assert!(push(&mut p, &mut timeline, 600, 3000).is_err());
     }
 }
