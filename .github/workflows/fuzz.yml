@@ -33,6 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - target: depacketize_av1
           - target: depacketize_h264
           - target: depacketize_h265
           - target: depacketize_jpeg

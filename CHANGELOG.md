@@ -1,5 +1,14 @@
 ## unreleased
 
+*   add an AV1 depacketizer ([RTP Payload Format for AV1](https://aomediacodec.github.io/av1-rtp-spec/)),
+    selected for the `video/AV1` encoding name. Frames are temporal units in
+    the Low Overhead Bitstream Format with a leading temporal delimiter, as
+    GStreamer's `rtpav1depay` emits and `isofmp4mux` stores; parameters come
+    from the sequence header (`av1C` via `mp4_sample_entry`, an RFC 6381 codec
+    string, the frame size), and a changed sequence header sets
+    `has_new_parameters`. A malformed packet drops one temporal unit (reported
+    through `loss()`) rather than ending the session. Adds
+    `VideoParametersCodec::Av1` and a `depacketize_av1` fuzz target.
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and

@@ -102,6 +102,7 @@ macro_rules! write_mpeg4_descriptor {
 }
 
 pub mod aac;
+pub(crate) mod av1;
 pub(crate) mod g723;
 pub mod h26x;
 pub(crate) mod jpeg;
@@ -350,6 +351,8 @@ pub enum VideoParametersCodec {
         sps: Bytes,
         pps: Bytes,
     },
+    /// AV1; `extra_data` is the `av1C` record body.
+    Av1,
     Jpeg,
 }
 
@@ -368,6 +371,7 @@ impl std::fmt::Debug for VideoParametersCodec {
                 .field("sps", &crate::hex::LimitedHex::new(sps, 256))
                 .field("pps", &crate::hex::LimitedHex::new(pps, 256))
                 .finish(),
+            Self::Av1 => f.write_str("Av1"),
             Self::Jpeg => write!(f, "Jpeg"),
         }
     }
@@ -379,6 +383,7 @@ impl VideoParametersCodec {
             VideoParametersCodec::H264 { .. } => *b"avc1",
             #[cfg(feature = "h265")]
             VideoParametersCodec::H265 { .. } => *b"hvc1",
+            VideoParametersCodec::Av1 => *b"av01",
             VideoParametersCodec::Jpeg => *b"mp4v",
         }
     }
@@ -444,6 +449,11 @@ impl VideoSampleEntryBuilder<'_> {
                     #[cfg(feature = "h265")]
                     VideoParametersCodec::H265 { .. } => {
                         write_mp4_box!(&mut buf, *b"hvcC", {
+                            buf.extend_from_slice(&self.params.extra_data);
+                        });
+                    }
+                    VideoParametersCodec::Av1 => {
+                        write_mp4_box!(&mut buf, *b"av1C", {
                             buf.extend_from_slice(&self.params.extra_data);
                         });
                     }
@@ -823,6 +833,7 @@ enum DepacketizerInner {
     H265(Box<h265::Depacketizer>),
     Onvif(Box<onvif::Depacketizer>),
     Jpeg(Box<jpeg::Depacketizer>),
+    Av1(Box<av1::Depacketizer>),
 }
 
 /// This is similar to `ErrorInt::RtpPacketError`, but without the connection/stream context, to avoid
@@ -861,6 +872,9 @@ impl Depacketizer {
                 format_specific_params,
             )?)),
             ("image" | "video", "jpeg") => DepacketizerInner::Jpeg(Box::default()),
+            ("video", "av1") => {
+                DepacketizerInner::Av1(Box::new(av1::Depacketizer::new(clock_rate)?))
+            }
             ("audio", "mpeg4-generic") => DepacketizerInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
@@ -927,6 +941,7 @@ impl Depacketizer {
             DepacketizerInner::Onvif(_) => {}
             DepacketizerInner::SimpleAudio(_) => {}
             DepacketizerInner::Jpeg(_) => {}
+            DepacketizerInner::Av1(_) => {}
         }
     }
 
@@ -962,6 +977,7 @@ impl Depacketizer {
             DepacketizerInner::Onvif(d) => d.parameters(),
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
             DepacketizerInner::Jpeg(d) => d.parameters(),
+            DepacketizerInner::Av1(d) => d.parameters(),
         }
     }
 
@@ -980,6 +996,7 @@ impl Depacketizer {
             DepacketizerInner::Onvif(d) => d.push(pkt),
             DepacketizerInner::SimpleAudio(d) => d.push(pkt),
             DepacketizerInner::Jpeg(d) => d.push(pkt),
+            DepacketizerInner::Av1(d) => d.push(pkt),
         }
     }
 
@@ -997,6 +1014,7 @@ impl Depacketizer {
             DepacketizerInner::Onvif(d) => d.pull(),
             DepacketizerInner::SimpleAudio(d) => d.pull(),
             DepacketizerInner::Jpeg(d) => d.pull(),
+            DepacketizerInner::Av1(d) => d.pull(),
         }
     }
 }
