@@ -181,6 +181,9 @@ impl ParserBuilder {
             max_message_size: self.max_message_size,
             state: ParserState::default(),
             stream_pos: 0,
+            resync_skipped: None,
+            resyncs: 0,
+            resync_bytes: 0,
         }
     }
 }
@@ -190,7 +193,15 @@ pub struct Parser {
     state: ParserState,
     /// Cumulative bytes consumed from the stream across all `feed` calls.
     stream_pos: u64,
+    /// Bytes skipped so far in the current resync, if one is in progress.
+    resync_skipped: Option<u64>,
+    /// Completed resyncs and the bytes they skipped, over the connection's life.
+    resyncs: u64,
+    resync_bytes: u64,
 }
+
+/// The most unframed bytes one resync may skip before the connection is given up.
+const MAX_RESYNC_BYTES: u64 = 4 * 1024 * 1024;
 
 impl Default for Parser {
     fn default() -> Self {
@@ -219,6 +230,113 @@ impl Parser {
 
     pub fn stream_pos(&self) -> u64 {
         self.stream_pos
+    }
+
+    /// Resyncs completed over the connection's life, and the bytes they skipped.
+    ///
+    /// Some cameras emit unframed bytes between interleaved packets (measured: a GNS 12 MP
+    /// camera sent 188 bytes with no `$` header after a run of video packets). GStreamer's
+    /// RTSP source skips such bytes; failing the session instead would cost a reconnect and
+    /// the frames it takes each time.
+    pub fn resync_stats(&self) -> (u64, u64) {
+        (self.resyncs, self.resync_bytes)
+    }
+
+    /// Skips unframed bytes until the input starts at a plausible message: an interleaved
+    /// packet (`$`, a channel below 16, a length that holds an RTP header, and an RTP/RTCP
+    /// version-2 first byte) or an RTSP response or server request line. Returns `Ok(true)`
+    /// when the input now starts at one, `Ok(false)` when more input is needed.
+    fn resync<'i, I: Input<'i>>(
+        &mut self,
+        input: &mut I,
+        skip_first: bool,
+    ) -> Result<bool, FeedError> {
+        const STARTS: [&[u8]; 7] = [
+            b"RTSP/1.0 ",
+            b"ANNOUNCE ",
+            b"GET_PARAMETER ",
+            b"SET_PARAMETER ",
+            b"OPTIONS ",
+            b"REDIRECT ",
+            b"PLAY_NOTIFY ",
+        ];
+        let mut skipped = self.resync_skipped.unwrap_or(0);
+        if skip_first && !input.is_empty() {
+            input.advance(1);
+            skipped += 1;
+        }
+        loop {
+            if skipped > MAX_RESYNC_BYTES {
+                self.resync_skipped = None;
+                return Err(invalid("resync: no message start within the limit"));
+            }
+            let Some(k) =
+                input.find_first(|b| matches!(b, b'$' | b'R' | b'A' | b'G' | b'S' | b'O' | b'P'))
+            else {
+                skipped += input.len() as u64;
+                input.advance(input.len());
+                self.resync_skipped = Some(skipped);
+                return Ok(false);
+            };
+            input.advance(k);
+            skipped += k as u64;
+            let plausible = if input.peek_byte() == Some(b'$') {
+                if input.len() < 5 {
+                    self.resync_skipped = Some(skipped);
+                    return Ok(false);
+                }
+                let len = (input.byte_at(2) as u16) << 8 | input.byte_at(3) as u16;
+                let header = input.byte_at(1) < 16 && len >= 8 && input.byte_at(4) & 0xc0 == 0x80;
+                // The packet must also be followed by another message start; wait for those
+                // bytes rather than guess (a header-only match is wrong about 1 time in 16,384
+                // per byte of garbage).
+                let next = 4 + len as usize;
+                if header && input.len() <= next {
+                    self.resync_skipped = Some(skipped);
+                    return Ok(false);
+                }
+                header
+                    && matches!(
+                        input.byte_at(next),
+                        b'$' | b'R' | b'A' | b'G' | b'S' | b'O' | b'P'
+                    )
+            } else {
+                let mut verdict = Some(false);
+                for lit in STARTS {
+                    if input.len() >= lit.len() {
+                        if input.starts_with_lit(lit) {
+                            verdict = Some(true);
+                            break;
+                        }
+                    } else if input.starts_with_lit(&lit[..input.len()]) {
+                        verdict = None; // could still be this start: need more bytes
+                    }
+                }
+                match verdict {
+                    Some(v) => v,
+                    None => {
+                        self.resync_skipped = Some(skipped);
+                        return Ok(false);
+                    }
+                }
+            };
+            if plausible {
+                self.resync_skipped = None;
+                self.resyncs += 1;
+                self.resync_bytes += skipped;
+                if self.resyncs <= 10 || self.resyncs.is_multiple_of(100) {
+                    log::warn!(
+                        "RTSP stream resynced: skipped {skipped} unframed bytes \
+                         (resync {} on this connection, {} bytes in all)",
+                        self.resyncs,
+                        self.resync_bytes
+                    );
+                }
+                return Ok(true);
+            }
+            input.advance(1);
+            skipped += 1;
+        }
     }
 
     /// Returns an error if a request or response of at least `size` bytes
@@ -264,6 +382,14 @@ impl Parser {
         loop {
             match std::mem::take(&mut self.state) {
                 ParserState::Idle => {
+                    // Between messages: unframed bytes are skipped, not fatal.
+                    let garbage = match input.peek_byte() {
+                        None => false,
+                        Some(b) => !(b == b'$' || b == b'\r' || b.is_ascii_uppercase()),
+                    };
+                    if (self.resync_skipped.is_some() || garbage) && !self.resync(input, false)? {
+                        return Err(incomplete());
+                    }
                     let checkpoint = *input;
                     let before = input.len();
                     match parse_head(input) {
@@ -286,7 +412,23 @@ impl Parser {
                             }
                             return Err(incomplete());
                         }
-                        Err(e) => return Err(e),
+                        Err(FeedError::Invalid(e)) => {
+                            // A head that fails to parse: binary bytes are unframed data and are
+                            // skipped; a text line is a malformed RTSP message and stays an error
+                            // (a bad reply to our request is a protocol fault, not noise).
+                            let n = checkpoint.len().min(16);
+                            let text = (0..n).all(|i| {
+                                let b = checkpoint.byte_at(i);
+                                (0x20..0x7f).contains(&b) || b == b'\r' || b == b'\n'
+                            });
+                            if text {
+                                return Err(FeedError::Invalid(e));
+                            }
+                            *input = checkpoint;
+                            if !self.resync(input, true)? {
+                                return Err(incomplete());
+                            }
+                        }
                     }
                 }
                 ParserState::Head {
@@ -616,6 +758,128 @@ fn eat_byte<'i, I: Input<'i>>(input: &mut I, b: u8) -> Result<(), FeedError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    fn frame(ch: u8, payload_len: usize) -> Vec<u8> {
+        let mut v = vec![
+            b'$',
+            ch,
+            (payload_len >> 8) as u8,
+            payload_len as u8,
+            0x80,
+            0x60,
+        ];
+        v.resize(4 + payload_len, 0xab);
+        v
+    }
+
+    fn feed_all(p: &mut Parser, chunks: &[&[u8]]) -> Vec<u8> {
+        // Returns the channel of every data message parsed, feeding the chunks as a stream.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut channels = Vec::new();
+        for c in chunks {
+            pending.extend_from_slice(c);
+            loop {
+                let mut input: &[u8] = &pending;
+                let before = input.len();
+                match p.feed(&mut input) {
+                    Ok(Some((Message::Data(d), _))) => {
+                        channels.push(d.channel_id);
+                        let used = before - input.len();
+                        pending.drain(..used);
+                    }
+                    Ok(Some(_)) => {
+                        let used = before - input.len();
+                        pending.drain(..used);
+                    }
+                    Ok(None) => break,
+                    Err(FeedError::Incomplete(_)) => {
+                        let used = before - input.len();
+                        pending.drain(..used);
+                        break;
+                    }
+                    Err(FeedError::Invalid(e)) => panic!("invalid: {e}"),
+                }
+            }
+        }
+        channels
+    }
+
+    #[test]
+    fn unframed_bytes_between_packets_are_skipped() {
+        // The measured camera: a run of video packets, 188 unframed bytes, more packets.
+        let mut stream = frame(0, 1289);
+        stream.extend(std::iter::repeat_n(0xda, 188));
+        stream.extend(frame(0, 1289));
+        stream.extend(frame(2, 100));
+        let mut p = Parser::default();
+        assert_eq!(feed_all(&mut p, &[&stream]), vec![0, 0, 2]);
+        assert_eq!(p.resync_stats(), (1, 188));
+    }
+
+    #[test]
+    fn a_resync_continues_across_reads_and_skips_a_stray_dollar() {
+        let mut garbage = vec![0x11u8; 50];
+        garbage.extend([b'$', 0x40, 0, 0, 0]); // a '$' that is no packet (channel 64)
+        garbage.extend(vec![0x22u8; 50]);
+        let first = frame(0, 20);
+        let next = frame(1, 30);
+        let after = frame(0, 10);
+        let mut p = Parser::default();
+        let chunks: Vec<&[u8]> = vec![
+            &first,
+            &garbage[..30],
+            &garbage[30..],
+            &next[..3],
+            &next[3..],
+            &after,
+        ];
+        assert_eq!(feed_all(&mut p, &chunks), vec![0, 1, 0]);
+        assert_eq!(p.resync_stats(), (1, garbage.len() as u64));
+    }
+
+    #[test]
+    fn a_plausible_header_not_followed_by_a_message_is_skipped() {
+        // Garbage holding a '$' header that looks like RTP (channel 0, length 16, version 2)
+        // but is followed by more garbage, not by a message start.
+        let mut garbage = vec![0x11u8; 20];
+        garbage.extend([b'$', 0, 0, 16, 0x80]);
+        garbage.extend(vec![0x22u8; 40]);
+        let mut stream = frame(0, 20);
+        stream.extend(&garbage);
+        stream.extend(frame(2, 30));
+        stream.extend(frame(0, 10));
+        let mut p = Parser::default();
+        assert_eq!(feed_all(&mut p, &[&stream]), vec![0, 2, 0]);
+        assert_eq!(p.resync_stats(), (1, garbage.len() as u64));
+    }
+
+    #[test]
+    fn a_response_after_garbage_is_found() {
+        let mut stream = vec![0x00u8, 0x01, 0x02];
+        stream.extend_from_slice(b"RTSP/1.0 200 OK\r\nCSeq: 5\r\n\r\n");
+        stream.extend(frame(0, 16));
+        let mut p = Parser::default();
+        assert_eq!(feed_all(&mut p, &[&stream]), vec![0]);
+        assert_eq!(p.resync_stats(), (1, 3));
+    }
+
+    #[test]
+    fn endless_garbage_still_fails_the_connection() {
+        let garbage = vec![0x33u8; 1024 * 1024];
+        let mut p = Parser::default();
+        let mut failed = false;
+        for _ in 0..6 {
+            let mut input: &[u8] = &garbage;
+            if let Err(FeedError::Invalid(_)) = p.feed(&mut input) {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "more than the resync limit of unframed bytes ends the connection"
+        );
+    }
+
     use url::Url;
 
     use crate::inputs::Split;

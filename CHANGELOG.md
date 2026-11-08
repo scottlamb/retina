@@ -1,5 +1,17 @@
 ## unreleased
 
+*   RTSP over TCP: skip unframed bytes found between interleaved messages
+    instead of failing the session. Some cameras occasionally emit a run of
+    bytes with no `$` header between interleaved packets (seen: a 12 MP camera
+    sending 188 to 1,233 such bytes every few megabytes); the session used to
+    end with "Invalid RTSP message" each time, while GStreamer's RTSP source
+    skips them. The parser now scans to the next plausible interleaved packet
+    (`$`, a channel below 16, a length that holds an RTP header, a version-2
+    first byte, and another message start after it) or RTSP message, skipping
+    at most 4 MiB per event. A malformed text message (a bad reply to a
+    request) is still an error. Each resync is logged, and a lost packet shows
+    as an RTP sequence gap. `Parser::resync_stats` reports the count and bytes.
+
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
