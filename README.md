@@ -42,6 +42,7 @@ Progress:
             *   [x] AAC output format
             *   [ ] Annex B output format ([#44](https://github.com/scottlamb/retina/issues/44))
         * [x] H.265 ([RFC 7798](https://tools.ietf.org/html/rfc7798))
+        * [x] AV1 ([RTP Payload Format for AV1](https://aomediacodec.github.io/av1-rtp-spec/))
         * [x] MJPEG ([RFC 2435](https://datatracker.ietf.org/doc/html/rfc2435))
     *   audio
         *   [x] AAC
