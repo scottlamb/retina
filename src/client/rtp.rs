@@ -75,6 +75,10 @@ pub struct InorderParser {
     /// Total RTCP packets seen in this stream.
     seen_rtcp_packets: u64,
 
+    /// Total RTP packets lost in this stream, as the sum of the sequence-number gaps of the
+    /// packets accepted.
+    lost_packets: u64,
+
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
 }
@@ -102,6 +106,15 @@ fn note_stale_live555_data_if_tcp(
 }
 
 impl InorderParser {
+    /// Counters for [`crate::client::Stream::stats`].
+    pub(crate) fn stats(&self) -> crate::client::StreamStats {
+        crate::client::StreamStats {
+            rtp_packets: self.seen_rtp_packets,
+            rtcp_packets: self.seen_rtcp_packets,
+            lost_packets: self.lost_packets,
+        }
+    }
+
     pub fn new(
         ssrc: Option<u32>,
         next_seq: Option<u16>,
@@ -118,6 +131,7 @@ impl InorderParser {
             }),
             seen_rtp_packets: 0,
             seen_rtcp_packets: 0,
+            lost_packets: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
         }
@@ -213,6 +227,7 @@ impl InorderParser {
             next: sequence_number.wrapping_add(1),
         });
         self.seen_rtp_packets += 1;
+        self.lost_packets += u64::from(loss);
         Ok(Some((timestamp, loss)))
     }
 
@@ -683,5 +698,42 @@ mod tests {
             }
             o => panic!("unexpected packet 2 result: {o:#?}"),
         }
+    }
+
+    #[test]
+    fn stats_count_packets_and_loss() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0xd25614e), None, UnknownRtcpSsrcPolicy::Default);
+        let stream_ctx = StreamContext(StreamContextInner::Udp(UdpStreamContext {
+            local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            peer_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_rtp_port: 0,
+            peer_rtp_port: 0,
+        }));
+        let session_options = SessionOptions::default();
+        assert_eq!(parser.stats(), crate::client::StreamStats::default());
+        // Sequence numbers 1, 2, then 5: two packets lost.
+        for seq in [1u16, 2, 5] {
+            let pkt = crate::rtp::build_raw_rtp(seq, u32::from(seq), 96, 0xd25614e, true, *b"pkt")
+                .unwrap();
+            let (header, _) = PacketHeader::validate(&pkt[..]).unwrap();
+            parser
+                .rtp(
+                    &session_options,
+                    &stream_ctx,
+                    None,
+                    &ConnectionContext::dummy(),
+                    &PacketContext::dummy(),
+                    &mut timeline,
+                    0,
+                    &header,
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let stats = parser.stats();
+        assert_eq!(stats.rtp_packets, 3);
+        assert_eq!(stats.lost_packets, 2);
+        assert_eq!(stats.rtcp_packets, 0);
     }
 }
