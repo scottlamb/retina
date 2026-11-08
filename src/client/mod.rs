@@ -1374,6 +1374,10 @@ enum SessionFlag {
     /// Set if a [`StreamDirection::Sending`] stream has been set up, so the
     /// session uses the ONVIF backchannel.
     Backchannel = 0x20,
+
+    /// Set while a keepalive is being retried at once with a fresh authentication
+    /// challenge, so a server that keeps refusing is not retried every second.
+    KeepaliveAuthRetry = 0x40,
 }
 
 /// The `Require` header value for the ONVIF backchannel, as defined in the
@@ -2644,8 +2648,43 @@ impl Session<Playing> {
                 // timeout or gets angry and closes the connection. (rtsp-simple-server
                 // does the latter as of 2022-08-07, though I'm told this will be fixed.)
                 if !response.status_code.is_success() {
+                    // Some cameras (Axis, measured 2026-11-08) refuse a keepalive that reuses
+                    // the handshake's digest nonce and send a fresh challenge. Adopt it, so the
+                    // next keepalive authenticates; otherwise every keepalive fails and only
+                    // cameras that also count RTCP receiver reports keep the session alive.
+                    if response.status_code == StatusCode::UNAUTHORIZED
+                        && inner.options.creds.is_some()
+                        && let Some(h) = response.headers.get("WWW-Authenticate")
+                    {
+                        let h: &str = h;
+                        match http_auth::PasswordClient::try_from(h) {
+                            Ok(c) => {
+                                *inner.requested_auth = Some(c);
+                                // Retry once, soon, with the fresh challenge, so this keepalive
+                                // window still gets an accepted keepalive; a server that refuses
+                                // the retry too waits for the normal interval.
+                                let retry = SessionFlag::KeepaliveAuthRetry as u8;
+                                if *inner.flags & retry == 0 {
+                                    *inner.flags |= retry;
+                                    if let Some(t) = inner.keepalive_timer.as_mut() {
+                                        t.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + std::time::Duration::from_secs(1),
+                                        );
+                                    }
+                                } else {
+                                    *inner.flags &= !retry;
+                                }
+                            }
+                            Err(e) => {
+                                *inner.flags &= !(SessionFlag::KeepaliveAuthRetry as u8);
+                                warn!("keepalive: can't understand WWW-Authenticate: {e}");
+                            }
+                        }
+                    }
                     warn!("keepalive failed with {:?}", response.status_code);
                 } else {
+                    *inner.flags &= !(SessionFlag::KeepaliveAuthRetry as u8);
                     trace!("keepalive succeeded with {:?}", response.status_code);
                     if matches!(method, KeepaliveMethod::Options) {
                         match parse::parse_options(&response) {
@@ -4050,6 +4089,105 @@ mod tests {
             elapsed,
             std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC)
         );
+    }
+
+    /// Tests that a keepalive refused with 401 and a fresh challenge adopts it and is retried
+    /// at once with credentials, as cameras that refuse a reused digest nonce require.
+    #[tokio::test]
+    async fn keepalive_unauthorized_adopts_challenge_and_retries() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let opts = SessionOptions::default().creds(Some(Credentials {
+            username: "admin".to_owned(),
+            password: "secret".to_owned(),
+        }));
+
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, opts, url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+        session.0.flags |= SessionFlag::GetParameterSupported as u8;
+        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(1),
+        )));
+
+        let server_side = async {
+            // First keepalive: no credentials yet; refuse it with a fresh challenge.
+            let msg = server.next().await.unwrap().unwrap();
+            let req = match msg.msg {
+                msg::Message::Request(r) => r,
+                o => panic!("expected keepalive request, got {o:#?}"),
+            };
+            assert_eq!(req.method, msg::Method::GET_PARAMETER);
+            assert!(req.headers.get("Authorization").is_none());
+            let cseq = req.headers.get("CSeq").unwrap().clone();
+            let mut headers = msg::Headers::default();
+            headers.insert(msg::HeaderName::CSEQ, cseq);
+            headers.insert(
+                msg::HeaderName::try_from("WWW-Authenticate").unwrap(),
+                msg::HeaderValue::try_from(
+                    r#"Digest realm="cam", nonce="fresh-nonce-1""#.to_owned(),
+                )
+                .unwrap(),
+            );
+            server
+                .send(OwnedMessage::Response {
+                    head: msg::Response {
+                        status_code: StatusCode::UNAUTHORIZED,
+                        reason_phrase: "Unauthorized".to_owned(),
+                        headers,
+                    },
+                    body: Bytes::new(),
+                })
+                .await
+                .unwrap();
+            // The retry comes within about a second, answering the fresh challenge.
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), server.next())
+                .await
+                .expect("keepalive retried within 3 s")
+                .unwrap()
+                .unwrap();
+            let req = match msg.msg {
+                msg::Message::Request(r) => r,
+                o => panic!("expected keepalive request, got {o:#?}"),
+            };
+            assert_eq!(req.method, msg::Method::GET_PARAMETER);
+            let auth = req
+                .headers
+                .get("Authorization")
+                .expect("retry carries credentials");
+            assert!(auth.contains("fresh-nonce-1"), "{auth}");
+        };
+        tokio::select! {
+            _ = server_side => {}
+            o = session.next() => panic!("unexpected item: {o:#?}"),
+        }
     }
 
     /// Tests that a keepalive response with an unexpected `CSeq` is a fatal error.
