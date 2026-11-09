@@ -819,8 +819,7 @@ impl InternalParameters {
         let mut pps_nal = None;
         let mut vps_nal = None;
         for p in FmtpParser::new(format_specific_params) {
-            let (key, value) = p.map_err(|p| format!("bad format-specific-param {p}"))?;
-            match (key, value) {
+            match p {
                 ("tx-mode", "SRST") => {}
                 ("tx-mode", v) => {
                     return Err(format!("unsupported/unexpected tx-mode {v}; expected SRST"));

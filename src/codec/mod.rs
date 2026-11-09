@@ -114,7 +114,7 @@ impl<'a> FmtpParser<'a> {
 }
 
 impl<'a> Iterator for FmtpParser<'a> {
-    type Item = Result<(&'a str, &'a str), &'a str>;
+    type Item = (&'a str, &'a str);
 
     fn next(&mut self) -> Option<Self::Item> {
         let p = loop {
@@ -124,7 +124,7 @@ impl<'a> Iterator for FmtpParser<'a> {
             }
             break p;
         };
-        Some(p.split_once('=').ok_or(p))
+        Some(p.split_once('=').unwrap_or((p, "")))
     }
 }
 
@@ -1032,7 +1032,7 @@ impl Depacketizer {
 mod tests {
     use std::assert_matches;
 
-use super::*;
+    use super::*;
 
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
@@ -1084,57 +1084,50 @@ use super::*;
     fn parse_fmtp() {
         crate::testutil::init_logging();
 
-        assert_matches!(
-            FmtpParser::new("").collect::<Vec<_>>().as_slice(),
-            &[]
-        );
-        assert_matches!(
-            FmtpParser::new(";").collect::<Vec<_>>().as_slice(),
-            &[]
-        );
-        assert_matches!(
-            FmtpParser::new(";;").collect::<Vec<_>>().as_slice(),
-            &[]
-        );
+        assert_matches!(FmtpParser::new("").collect::<Vec<_>>().as_slice(), &[]);
+        assert_matches!(FmtpParser::new(";").collect::<Vec<_>>().as_slice(), &[]);
+        assert_matches!(FmtpParser::new(";;").collect::<Vec<_>>().as_slice(), &[]);
         assert_matches!(
             FmtpParser::new("a=b").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", "b"))]
+            &[("a", "b")]
         );
         assert_matches!(
             FmtpParser::new("a=").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", ""))]
+            &[("a", "")]
         );
         assert_matches!(
             FmtpParser::new("a==").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", "="))]
+            &[("a", "=")]
         );
         assert_matches!(
             FmtpParser::new("=a").collect::<Vec<_>>().as_slice(),
-            &[Ok(("", "a"))]
+            &[("", "a")]
         );
         assert_matches!(
             FmtpParser::new("==a").collect::<Vec<_>>().as_slice(),
-            &[Ok(("", "=a"))]
+            &[("", "=a")]
         );
         assert_matches!(
             FmtpParser::new("=").collect::<Vec<_>>().as_slice(),
-            &[Ok(("", ""))]
+            &[("", "")]
         );
         assert_matches!(
             FmtpParser::new("a").collect::<Vec<_>>().as_slice(),
-            &[Err("a")]
+            &[("a", "")]
         );
         assert_matches!(
             FmtpParser::new("a=b=").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", "b="))]
+            &[("a", "b=")]
         );
         assert_matches!(
             FmtpParser::new("a=b;c=d").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", "b")), Ok(("c", "d"))]
+            &[("a", "b"), ("c", "d")]
         );
         assert_matches!(
-            FmtpParser::new(";;a=b;cd;e=f==;;").collect::<Vec<_>>().as_slice(),
-            &[Ok(("a", "b")), Err("cd"), Ok(("e", "f=="))]
+            FmtpParser::new(";;a=b;cd;e=f==;;")
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &[("a", "b"), ("cd", ""), ("e", "f==")]
         );
     }
 }

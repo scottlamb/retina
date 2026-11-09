@@ -311,9 +311,8 @@ fn parse_format_specific_params(
     let mut size_length = None;
     let mut index_length = None;
     let mut index_delta_length = None;
-    for p in FmtpParser::new(format_specific_params) {
-        let (key, value) = p.map_err(|p| format!("bad format-specific-param {p}"))?;
-        match &key.to_ascii_lowercase()[..] {
+    for (attr, value) in FmtpParser::new(format_specific_params) {
+        match &attr.to_ascii_lowercase()[..] {
             "config" => {
                 config = Some(
                     hex::decode(value)

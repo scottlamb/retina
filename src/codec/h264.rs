@@ -1025,9 +1025,8 @@ impl InternalParameters {
     fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
         let mut sprop_parameter_sets = None;
         for p in FmtpParser::new(format_specific_params) {
-            let (key, value) = p.map_err(|p| format!("bad format-specific-param {p}"))?;
-            match (key, value) {
-                ("sprop-parameter-sets", _) => sprop_parameter_sets = Some(value),
+            match p {
+                ("sprop-parameter-sets", value) => sprop_parameter_sets = Some(value),
                 _ => (),
             }
         }
