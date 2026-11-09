@@ -1,5 +1,8 @@
 ## unreleased
 
+*   BREAKING: the gzip ONVIF metadata encoding name is
+    `vnd.onvif.metadata+gzip`, as the ONVIF Streaming Spec spells it, not
+    `vnd.onvif.metadata.gzip`.
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and

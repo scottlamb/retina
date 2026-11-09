@@ -895,7 +895,7 @@ impl Depacketizer {
             ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::Uncompressed),
             )),
-            ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
+            ("application", "vnd.onvif.metadata+gzip") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::GzipCompressed),
             )),
             ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(Box::new(
@@ -1004,6 +1004,18 @@ impl Depacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onvif_gzip_encoding_name() {
+        let d = Depacketizer::new("application", "vnd.onvif.metadata+gzip", 90_000, None, None)
+            .unwrap();
+        match d.parameters() {
+            Some(ParametersRef::Message(p)) => {
+                assert_eq!(p.0, onvif::CompressionType::GzipCompressed)
+            }
+            _ => panic!("expected message parameters"),
+        }
+    }
 
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
