@@ -23,7 +23,7 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoFrame, VideoParameters};
+use super::{CodecItem, FmtpParser, VideoFrame, VideoParameters};
 
 /// Produce [`VideoParameters`] from SPS and PPS NAL units.
 ///
@@ -1024,10 +1024,10 @@ impl InternalParameters {
     /// Parses metadata from the `format-specific-params` of a SDP `fmtp` media attribute.
     fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
         let mut sprop_parameter_sets = None;
-        for p in format_specific_params.split(';') {
-            match p.trim().split_once('=') {
-                Some(("sprop-parameter-sets", value)) => sprop_parameter_sets = Some(value),
-                None => return Err("key without value".into()),
+        for p in FmtpParser::new(format_specific_params) {
+            let (key, value) = p.map_err(|p| format!("bad format-specific-param {p}"))?;
+            match (key, value) {
+                ("sprop-parameter-sets", _) => sprop_parameter_sets = Some(value),
                 _ => (),
             }
         }

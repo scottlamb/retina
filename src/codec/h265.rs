@@ -19,7 +19,7 @@ use log::{debug, log_enabled, trace};
 
 use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
 use crate::codec::h26x::TolerantBitReader;
-use crate::codec::{CodecItem, DepacketizeError};
+use crate::codec::{CodecItem, DepacketizeError, FmtpParser};
 use crate::inputs::Input as _;
 
 use super::VideoFrame;
@@ -818,17 +818,17 @@ impl InternalParameters {
         let mut sps_nal = None;
         let mut pps_nal = None;
         let mut vps_nal = None;
-        for p in format_specific_params.split(';') {
-            match p.trim().split_once('=') {
-                Some(("tx-mode", "SRST")) => {}
-                Some(("tx-mode", v)) => {
+        for p in FmtpParser::new(format_specific_params) {
+            let (key, value) = p.map_err(|p| format!("bad format-specific-param {p}"))?;
+            match (key, value) {
+                ("tx-mode", "SRST") => {}
+                ("tx-mode", v) => {
                     return Err(format!("unsupported/unexpected tx-mode {v}; expected SRST"));
                 }
-                Some(("sprop-vps", v)) => Self::store_sprop_nal("sprop-vps", v, &mut vps_nal)?,
-                Some(("sprop-sps", v)) => Self::store_sprop_nal("sprop-sps", v, &mut sps_nal)?,
-                Some(("sprop-pps", v)) => Self::store_sprop_nal("sprop-pps", v, &mut pps_nal)?,
-                Some((_, _)) => {}
-                None => return Err(format!("key {p} without value")),
+                ("sprop-vps", v) => Self::store_sprop_nal("sprop-vps", v, &mut vps_nal)?,
+                ("sprop-sps", v) => Self::store_sprop_nal("sprop-sps", v, &mut sps_nal)?,
+                ("sprop-pps", v) => Self::store_sprop_nal("sprop-pps", v, &mut pps_nal)?,
+                (_, _) => {}
             }
         }
         let vps_nal = vps_nal.ok_or_else(|| "no vps".to_string())?;
@@ -1769,5 +1769,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.generic_parameters.pixel_dimensions(), (2304, 1296));
+    }
+
+    #[test]
+    fn parse_provision_trailing_semicolon_format_specific_params() {
+        init_logging();
+        let p = super::InternalParameters::parse_format_specific_params(
+            "profile-space=0;\
+             profile-id=1;\
+             tier-flag=0;\
+             level-id=0;\
+             sprop-vps=QAEMAf//AWAAAAMAAAMAAAMAAAMAlqwJ;\
+             sprop-sps=QgEBAWAAAAMAAAMAAAMAAAMAlqACgIAtH+KrTuiS7kIAAAMACACD1gAM3+YAQA==;\
+             sprop-pps=RAHAcvAbJA==;",
+        )
+        .unwrap();
+        assert_eq!(p.generic_parameters.pixel_dimensions(), (1280, 720));
     }
 }
