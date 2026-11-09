@@ -1005,7 +1005,7 @@ impl Stream {
     /// claimed in the
     /// [ONVIF Streaming Spec](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf):
     /// *   `vnd.onvif.metadata`
-    /// *   `vnd.onvif.metadata.gzip`,
+    /// *   `vnd.onvif.metadata+gzip`
     /// *   `vnd.onvif.metadata.exi.onvif`
     /// *   `vnd.onvif.metadata.exi.ext`
     #[inline]
