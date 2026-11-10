@@ -346,6 +346,11 @@ impl Depacketizer {
             }
             48 => {
                 // Aggregation Packet. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.2
+                if access_unit.in_fu {
+                    return Err(format!(
+                        "Aggregation packet {hdr:?} while fragment in progress"
+                    ));
+                }
                 // Skip the 2-byte AP header.
                 let mut payload = payload;
                 payload.advance(2);
@@ -1732,6 +1737,46 @@ mod tests {
             panic!()
         };
         assert_eq!(f.data, *b"\x00\x00\x00\x07\x4e\x01plain");
+        assert_eq!(d.pull(), None);
+    }
+
+    /// An aggregation packet while a fragment is in progress should be rejected rather than
+    /// panic when the access unit is finalized. Found by fuzzing.
+    #[test]
+    fn aggregation_packet_during_fragment() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let mut push = |mark: bool, payload: &[u8]| {
+            let pkt = ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark,
+                payload_type: 0,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        };
+        // FU packet, start, not end.
+        push(false, b"\x62\xed\x92").unwrap();
+        // Aggregation packet with mark, containing one 4-byte NAL.
+        push(true, b"\x60\x6f\x00\x04\x04\x41\xe3\x03").unwrap_err();
+        drop(push);
         assert_eq!(d.pull(), None);
     }
 
