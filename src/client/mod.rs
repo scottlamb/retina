@@ -2166,7 +2166,12 @@ impl Session<Described> {
                         // Handles RTCP receiver reports the server sends about
                         // Retina's packets. These have the server's SSRC, so
                         // don't expect Retina's.
-                        rtp_handler: rtp::InorderParser::new(None, None, policy.unknown_rtcp_ssrc),
+                        rtp_handler: rtp::InorderParser::new(
+                            None,
+                            None,
+                            s.rtp_payload_type,
+                            policy.unknown_rtcp_ssrc,
+                        ),
                         ctx,
                         udp_sockets: None,
 
@@ -2257,6 +2262,7 @@ impl Session<Described> {
                         rtp_handler: rtp::InorderParser::new(
                             ssrc,
                             initial_seq,
+                            s.rtp_payload_type,
                             policy.unknown_rtcp_ssrc,
                         ),
                         ctx,
@@ -2952,9 +2958,11 @@ impl Session<Playing> {
                 // Count the packet for receiver reports as it arrives, before
                 // `rtp_handler` skips or rejects it for being out of order: RFC
                 // 3550 appendix A.1 counts reordered and duplicate packets as
-                // received. Like `rtp_handler`, ignore pt=50 packets.
+                // received. Like `rtp_handler`, ignore pt=50 packets and
+                // another stream's packets.
                 if let Some(reception) = reception
                     && header.payload_type() != 50
+                    && !rtp_handler.is_other_stream(&header)
                 {
                     reception.rtp(
                         header.ssrc(),
