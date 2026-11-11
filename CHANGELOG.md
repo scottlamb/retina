@@ -1,5 +1,10 @@
 ## unreleased
 
+*   H.264, H.265, and JPEG: when an SDP `rtpmap` attribute has a clock rate
+    of 0 or none at all (e.g. `a=rtpmap:96 H264/0`), use 90000 instead of
+    failing `PLAY` or skipping the stream. For other codecs, skip the stream
+    at `DESCRIBE`.
+    Fixes [#169](https://github.com/scottlamb/retina/issues/169).
 *   BREAKING: the gzip ONVIF metadata encoding name is
     `vnd.onvif.metadata+gzip`, as the ONVIF Streaming Spec spells it, not
     `vnd.onvif.metadata.gzip`.

@@ -216,6 +216,14 @@ pub(crate) fn get_cseq(response: &crate::rtsp::msg::Response) -> Option<u32> {
         .and_then(|cseq| u32::from_str_radix(cseq, 10).ok())
 }
 
+/// Returns the clock rate of an encoding whose RTP payload format allows only one.
+fn fixed_clock_rate(media: &str, encoding_name: &str) -> Option<u32> {
+    match (media, encoding_name) {
+        ("video", "h264" | "h265") | ("image" | "video", "jpeg") => Some(90_000),
+        _ => None,
+    }
+}
+
 /// Parses a [MediaDescription] to a [Stream].
 /// On failure, returns an error which is expected to be supplemented with
 /// the [MediaDescription] debug string and packed into a `RtspResponseError`.
@@ -335,16 +343,29 @@ fn parse_media(
     let channels;
     match rtpmap {
         Some(rtpmap) => {
-            let (e, rtpmap) = rtpmap
-                .split_once('/')
-                .ok_or_else(|| "invalid rtpmap attribute".to_string())?;
-            encoding_name = e;
-            let (clock_rate_str, channels_str) = match rtpmap.find('/') {
+            let (e, rtpmap) = match rtpmap.split_once('/') {
+                Some((e, rtpmap)) => (e, Some(rtpmap)),
                 None => (rtpmap, None),
-                Some(i) => (&rtpmap[..i], Some(&rtpmap[i + 1..])),
             };
-            clock_rate = u32::from_str_radix(clock_rate_str, 10)
-                .map_err(|_| "bad clockrate in rtpmap".to_string())?;
+            encoding_name = e;
+            let (clock_rate_str, channels_str) = match rtpmap {
+                None => (None, None),
+                Some(rtpmap) => match rtpmap.split_once('/') {
+                    None => (Some(rtpmap), None),
+                    Some((c, channels)) => (Some(c), Some(channels)),
+                },
+            };
+            let clock_rate_from_rtpmap = clock_rate_str
+                .map(|c| {
+                    u32::from_str_radix(c, 10).map_err(|_| "bad clockrate in rtpmap".to_string())
+                })
+                .transpose()?;
+            clock_rate = match clock_rate_from_rtpmap {
+                Some(c) if c != 0 => c,
+                _ => fixed_clock_rate(&media, &encoding_name.to_ascii_lowercase()).ok_or_else(
+                    || format!("rtpmap has no usable clock rate: {clock_rate_str:?}"),
+                )?,
+            };
             channels = channels_str
                 .map(|c| {
                     u16::from_str_radix(c, 10)
@@ -1315,6 +1336,26 @@ mod tests {
         let p = super::parse_describe(url, &response, &body, false).unwrap();
         assert_eq!(p.streams.len(), 1);
         assert_eq!(p.streams[0].encoding_name(), "h264");
+    }
+
+    /// A single-rate codec whose rtpmap clock rate is 0 or missing falls back to that rate.
+    /// Other codecs' streams are skipped.
+    #[test]
+    fn rtpmap_without_clock_rate() {
+        init_logging();
+        let url = Url::parse("rtsp://127.0.0.1/").unwrap();
+        let (response, body) = sdp_response(
+            b"v=0\n\
+              m=video 0 RTP/AVP 96\na=rtpmap:96 H264/0\n\
+              m=video 0 RTP/AVP 97\na=rtpmap:97 JPEG\n\
+              m=audio 0 RTP/AVP 98\na=rtpmap:98 L16/0\n",
+        );
+        let p = super::parse_describe(url, &response, &body, false).unwrap();
+        assert_eq!(p.streams.len(), 2);
+        assert_eq!(p.streams[0].encoding_name(), "h264");
+        assert_eq!(p.streams[0].clock_rate_hz, 90_000);
+        assert_eq!(p.streams[1].encoding_name(), "jpeg");
+        assert_eq!(p.streams[1].clock_rate_hz, 90_000);
     }
 
     /// Simulates a negative `rtptime` value in the `PLAY` response, as returned by the OMNY M5S2A
