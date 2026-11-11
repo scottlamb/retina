@@ -43,7 +43,7 @@ use std::{
 use crate::buf::PacketRef;
 use crate::{Error, codec::DepacketizeError, error::ErrorInt, rtp::PacketMeta};
 
-use super::{AudioParameters, CodecItem};
+use super::{AudioParameters, CodecItem, FmtpParser};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -311,16 +311,8 @@ fn parse_format_specific_params(
     let mut size_length = None;
     let mut index_length = None;
     let mut index_delta_length = None;
-    for p in format_specific_params.split(';') {
-        let p = p.trim();
-        if p.is_empty() {
-            // Reolink cameras leave a trailing ';'.
-            continue;
-        }
-        let (key, value) = p
-            .split_once('=')
-            .ok_or_else(|| format!("bad format-specific-param {p}"))?;
-        match &key.to_ascii_lowercase()[..] {
+    for (attr, value) in FmtpParser::new(format_specific_params) {
+        match &attr.to_ascii_lowercase()[..] {
             "config" => {
                 config = Some(
                     hex::decode(value)
