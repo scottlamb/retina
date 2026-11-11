@@ -3596,26 +3596,45 @@ mod tests {
     use super::*;
     use crate::testutil::{init_logging, response};
 
-    /// Cross-platform, tokio equivalent of `socketpair(2)`.
-    async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
-        // Another process on the machine could connect to the server and mess
-        // this up, but that's unlikely enough to ignore in test code.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::net::TcpStream::connect(addr);
-        let server = listener.accept();
-        let (client, server) = (client.await.unwrap(), server.await.unwrap().0);
+    /// Bytes each direction of a mock connection holds before writes block.
+    ///
+    /// Tests that exercise backpressure write well past this.
+    const MOCK_BUF_SIZE: usize = 64 * 1024;
 
-        // Without this, Nagle's algorithm holds back a small write until the
-        // peer ACKs the last one, which on Linux it may delay ~40 ms. Tests
-        // that pause time would auto-advance far past their deadlines meanwhile.
-        client.set_nodelay(true).unwrap();
-        server.set_nodelay(true).unwrap();
-        (client, server)
+    /// Fake addresses of the client and server ends of a mock connection.
+    const MOCK_CLIENT_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40000);
+    const MOCK_SERVER_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 554);
+
+    /// Returns the client and server ends of an in-memory RTSP connection.
+    ///
+    /// In-memory rather than loopback TCP so tests are deterministic under
+    /// paused time; see the testing notes in `CONTRIBUTING.md`.
+    fn mock_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        tokio::io::duplex(MOCK_BUF_SIZE)
     }
 
-    /// UDP equivalent of [`socketpair`]: two mutually connected localhost
-    /// sockets, as `setup` establishes for a UDP stream.
+    /// Wraps the client end from [`mock_pair`] as a [`crate::tokio::Connection`].
+    fn mock_client_conn(
+        stream: tokio::io::DuplexStream,
+        max_message_size: usize,
+    ) -> crate::tokio::Connection {
+        crate::tokio::Connection::from_duplex(
+            stream,
+            MOCK_CLIENT_ADDR,
+            MOCK_SERVER_ADDR,
+            max_message_size,
+        )
+    }
+
+    /// Two mutually connected localhost UDP sockets, as `setup` establishes
+    /// for a UDP stream.
+    ///
+    /// Unlike the in-memory RTSP connection from [`mock_pair`], these are
+    /// real sockets, as `Session` reads UDP through `tokio::net::UdpSocket`.
+    /// Paused-time tests that use them may still see auto-advance race with
+    /// datagram delivery.
     async fn udp_socketpair() -> (UdpSocket, UdpSocket) {
         let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3737,9 +3756,14 @@ mod tests {
     }
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
-        let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client, usize::MAX).unwrap();
-        let server = crate::tokio::Connection::from_stream(server, usize::MAX).unwrap();
+        let (client, server) = mock_pair();
+        let client = mock_client_conn(client, usize::MAX);
+        let server = crate::tokio::Connection::from_duplex(
+            server,
+            MOCK_SERVER_ADDR,
+            MOCK_CLIENT_ADDR,
+            usize::MAX,
+        );
         let client = RtspConnection {
             inner: client,
             channels: ChannelMappings::default(),
@@ -3836,11 +3860,6 @@ mod tests {
             let session = session.unwrap();
             tokio::pin!(session);
 
-            // XXX: tokio will "auto-advance" paused time when timers are polled.
-            // This is not great for this test. Disable keepalives to prevent it.
-            // <https://github.com/tokio-rs/tokio/issues/4522>
-            session.0.keepalive_timer = None;
-
             // Packets: first ignored one (unassigned channel), then one passed through.
             tokio::join!(
                 async {
@@ -3881,12 +3900,6 @@ mod tests {
         let stale_sessions = group.stale_sessions();
         assert_eq!(stale_sessions.num_sessions, 1);
 
-        // Resume real time for the TEARDOWN exchange. With paused time,
-        // the runtime may auto-advance through the teardown's I/O timeout
-        // before the I/O exchange with the mock server completes, because
-        // the auto-advance's non-blocking I/O poll can race with kernel
-        // TCP event delivery on localhost.
-        tokio::time::resume();
         tokio::join!(
             group.await_stale_sessions(&stale_sessions),
             req_response(
@@ -3895,7 +3908,6 @@ mod tests {
                 response(include_bytes!("testdata/reolink_teardown.txt"))
             ),
         );
-        tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
     }
 
@@ -3948,7 +3960,6 @@ mod tests {
         {
             let session = session.unwrap();
             tokio::pin!(session);
-            session.0.keepalive_timer = None; // see `simple`.
 
             // Packet.
             tokio::join!(
@@ -3989,12 +4000,9 @@ mod tests {
         group.await_stale_sessions(&stale_sessions).await;
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        // elapsed is not zero because tokio advances the time unnecessarily, grr.
-        // https://github.com/tokio-rs/tokio/issues/3108
-        let elapsed = tokio::time::Instant::now() - drop_time;
-        assert!(
-            elapsed >= std::time::Duration::from_secs(60),
-            "elapsed={elapsed:?}"
+        assert_eq!(
+            tokio::time::Instant::now() - drop_time,
+            std::time::Duration::from_secs(60)
         );
     }
 
@@ -4038,9 +4046,9 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - start;
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        assert!(
-            elapsed >= std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC),
-            "elapsed={elapsed:?}"
+        assert_eq!(
+            elapsed,
+            std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC)
         );
     }
 
@@ -4336,9 +4344,8 @@ mod tests {
         resp: Vec<u8>,
     ) -> Result<Session<Described>, Error> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let (client, mut server) = socketpair().await;
-        let inner =
-            crate::tokio::Connection::from_stream(client, options.get_max_message_size()).unwrap();
+        let (client, mut server) = mock_pair();
+        let inner = mock_client_conn(client, options.get_max_message_size());
         let conn = RtspConnection {
             inner,
             channels: ChannelMappings::default(),
@@ -4553,10 +4560,6 @@ mod tests {
         )
         .await;
         tokio::pin!(session);
-
-        // Keep only the report timer, so paused time auto-advances to it. See
-        // the comment in `simple`.
-        session.0.keepalive_timer = None;
         let reports = session.0.reports.as_ref().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
         let due = tokio::time::Instant::from_std(reports.schedule.next_due());
@@ -4569,16 +4572,16 @@ mod tests {
 
         // Nothing has arrived yet, so the first report is an empty RR.
         let report = recv_data_while_polling(&mut session, &mut server, 1).await;
-        assert!(tokio::time::Instant::now() >= due);
+        // tokio's timers have millisecond resolution, so the report goes out
+        // at the first tick at or after `due`.
+        let now = tokio::time::Instant::now();
+        assert!(
+            now >= due && now < due + std::time::Duration::from_millis(1),
+            "{:?} after due",
+            now.saturating_duration_since(due)
+        );
         receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
 
-        // Hold off reports while packets arrive, so paused time can't
-        // auto-advance into the next one meanwhile. Taking `reports` isn't
-        // enough: paused time auto-advances to any registered timer, polled or
-        // not. Replace the timer with one that isn't registered until polled
-        // or reset below; otherwise packets arrive at different instants.
-        let mut reports = session.0.reports.take().unwrap();
-        reports.timer = Box::pin(tokio::time::sleep(std::time::Duration::ZERO));
         let ntp = 0xe436_2f99_cccc_cccc;
         tokio::join!(
             async {
@@ -4605,20 +4608,18 @@ mod tests {
                 }
             },
         );
-        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
-        reports.timer.as_mut().reset(tokio::time::Instant::now());
-        session.0.reports = Some(reports);
 
-        // A report may have slipped out before the packets arrived; skip any
-        // empty one.
-        let block = loop {
-            let report = recv_data_while_polling(&mut session, &mut server, 1).await;
-            if report[0] & 0x1f == 0 {
-                continue;
-            }
-            let rr = receiver_report::tests::parse_report(&report, ssrc, 1, &cname);
-            break receiver_report::tests::parse_block(rr);
-        };
+        // 1.5 s later, before the next report is due, make it due.
+        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+        let reports = session.0.reports.as_mut().unwrap();
+        assert!(
+            tokio::time::Instant::from_std(reports.schedule.next_due())
+                > tokio::time::Instant::now()
+        );
+        reports.timer.as_mut().reset(tokio::time::Instant::now());
+        let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+        let rr = receiver_report::tests::parse_report(&report, ssrc, 1, &cname);
+        let block = receiver_report::tests::parse_block(rr);
         assert_eq!(
             block,
             receiver_report::ReportBlock {
@@ -4640,7 +4641,6 @@ mod tests {
         let (mut session, mut server) =
             play_tcp(SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always))
                 .await;
-        session.0.keepalive_timer = None;
         let reports = session.0.reports.as_ref().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
         let due = tokio::time::Instant::from_std(reports.schedule.next_due());
@@ -4704,7 +4704,6 @@ mod tests {
         init_logging();
         let (session, mut server) = play_tcp(SessionOptions::default()).await;
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         assert!(session.0.reports.is_none());
         assert!(session.0.presentation.streams.iter().all(|s| !matches!(
             s.state,
@@ -4730,12 +4729,23 @@ mod tests {
                     .unwrap();
             },
         );
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            recv_while_polling(&mut session, &mut server),
-        )
-        .await;
-        assert!(r.is_err(), "unexpected message: {:#?}", r.map(|(m, _)| m));
+        // As in production, only keepalives follow: no RTCP. End between
+        // keepalives, not on one, as two timers due at the same instant fire
+        // in no particular order.
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(100);
+        let mut keepalives = 0;
+        while let Ok((m, _)) =
+            tokio::time::timeout_at(end, recv_while_polling(&mut session, &mut server)).await
+        {
+            let msg::Message::Request(r) = m else {
+                panic!("expected only keepalives, got {m:#?}");
+            };
+            assert_eq!(r.method, msg::Method::OPTIONS);
+            let cseq = r.headers.get("CSeq").unwrap().parse::<u32>().unwrap();
+            send_keepalive_response(&mut server, cseq).await;
+            keepalives += 1;
+        }
+        assert_eq!(keepalives, 3); // at 30, 60, and 90 s.
     }
 
     /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
@@ -4836,7 +4846,6 @@ mod tests {
         );
         let session = session.unwrap();
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         let mut reports = session.0.reports.take().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
 
@@ -5372,9 +5381,7 @@ mod tests {
             session.play(PlayOptions::default()),
             req_response(server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
         );
-        let mut session = session.unwrap();
-        session.0.keepalive_timer = None;
-        session
+        session.unwrap()
     }
 
     /// Sends `server` a response to a keepalive request with the given `CSeq`.
@@ -5496,7 +5503,6 @@ mod tests {
         );
         let session = session.unwrap();
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         assert!(matches!(
             session.0.presentation.streams[0].state,
             StreamState::Playing {
@@ -5547,8 +5553,9 @@ mod tests {
         let mut session = play_backchannel(conn, &mut server).await;
         session.0.flags |= SessionFlag::GetParameterSupported as u8;
 
-        /// Queues 16 MiB of media on the backchannel: more than the socket
-        /// buffers hold.
+        /// Queues 16 MiB of media on the backchannel: far more than the
+        /// mock connection holds (`MOCK_BUF_SIZE`), so writes block until the
+        /// server reads.
         fn queue_media(session: &mut Session<Playing>) {
             let conn = &mut session.0.conn.as_mut().unwrap().inner;
             for _ in 0..1024 {
