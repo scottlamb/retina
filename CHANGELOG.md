@@ -3,6 +3,13 @@
 *   BREAKING: the gzip ONVIF metadata encoding name is
     `vnd.onvif.metadata+gzip`, as the ONVIF Streaming Spec spells it, not
     `vnd.onvif.metadata.gzip`.
+*   Keepalives: when the server refuses a keepalive with `401 Unauthorized` and a
+    fresh `WWW-Authenticate` challenge, adopt the challenge and retry the
+    keepalive once, a second later. Some cameras (Axis, for example) rotate their
+    digest nonce and refuse a keepalive that reuses an old one, so every keepalive
+    after the first rotation was refused and logged a warning. A server that
+    refuses the retry too is retried at the normal interval, not every second.
+
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
