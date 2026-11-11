@@ -13,6 +13,13 @@ use crate::inputs::{Input as _, Split};
 /// We use the 4-byte form everywhere for simplicity.
 pub const ANNEX_B_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// The most RTP payload bytes one access unit may span.
+///
+/// Without a limit, a sender that never sets the marker bit (and never changes the timestamp
+/// after a NAL that can end an access unit) grows the pinned buffer without bound. 64 MiB is
+/// far larger than any camera's coded picture.
+pub(super) const MAX_ACCESS_UNIT_BYTES: usize = 64 << 20;
+
 /// How to frame H.26x NAL units in output (packet format and extra data format).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {

@@ -96,6 +96,9 @@ struct AccessUnit {
     loss: u16,
 
     same_ts_as_prev: bool,
+
+    /// RTP payload bytes of this access unit so far.
+    payload_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -316,6 +319,13 @@ impl Depacketizer {
 
         if payload_len < 2 {
             return Err("Short NAL".into());
+        }
+        access_unit.payload_bytes += usize::from(payload_len);
+        if access_unit.payload_bytes > super::h26x::MAX_ACCESS_UNIT_BYTES {
+            return Err(format!(
+                "access unit exceeds {} bytes",
+                super::h26x::MAX_ACCESS_UNIT_BYTES
+            ));
         }
         if self.mark.is_none() {
             self.mark = Some(pkt.mark());
@@ -759,6 +769,7 @@ impl AccessUnit {
             // TODO: overflow?
             loss: meta.loss + additional_loss,
             same_ts_as_prev,
+            payload_bytes: 0,
         }
     }
 }
@@ -1529,6 +1540,66 @@ mod tests {
         assert_eq!(d.pull(), None);
         // The next access unit comes through.
         push_via_buf(&mut d, meta(3000, 1), b"\x02\x01next", &mut buf).unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x02\x01next");
+    }
+
+    /// Tests that an access unit that never ends is rejected once it exceeds
+    /// `MAX_ACCESS_UNIT_BYTES`, and that the next access unit comes through.
+    #[test]
+    fn oversized_access_unit() {
+        init_logging();
+        const PACKET_LEN: usize = 60_000;
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let meta = |timestamp, sequence_number, mark| crate::rtp::PacketMeta {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark,
+        };
+        // FU fragments of a TRAIL_R slice: a start, then middles that never end.
+        let fragment = |start: bool| {
+            let mut payload = vec![0x62, 0x01, if start { 0x81 } else { 0x01 }];
+            payload.resize(PACKET_LEN, 0xab);
+            payload
+        };
+        let mut sequence_number = 0;
+        let mut accepted = 0;
+        let error = loop {
+            let r = push_via_buf(
+                &mut d,
+                meta(0, sequence_number, false),
+                &fragment(sequence_number == 0),
+                &mut buf,
+            );
+            sequence_number += 1;
+            match r {
+                Ok(()) => accepted += PACKET_LEN,
+                Err(e) => break e,
+            }
+            assert!(accepted <= super::super::h26x::MAX_ACCESS_UNIT_BYTES);
+        };
+        assert!(accepted + PACKET_LEN > super::super::h26x::MAX_ACCESS_UNIT_BYTES);
+        assert!(error.contains("exceeds"), "{error}");
+        assert_eq!(d.pull(), None);
+        push_via_buf(
+            &mut d,
+            meta(3000, sequence_number, true),
+            b"\x02\x01next",
+            &mut buf,
+        )
+        .unwrap();
         let frame = match d.pull() {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("unexpected pull result: {o:?}"),
