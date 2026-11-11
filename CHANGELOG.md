@@ -5,11 +5,10 @@
     `vnd.onvif.metadata.gzip`.
 *   Keepalives: when the server refuses a keepalive with `401 Unauthorized` and a
     fresh `WWW-Authenticate` challenge, adopt the challenge and retry the
-    keepalive once, a second later. Some cameras (Axis, for example) refuse a
-    keepalive that reuses the digest nonce from session setup, so every keepalive
-    failed; sessions survived only on RTCP receiver reports, which servers that
-    time out on RTSP requests alone do not count. A server that refuses the retry
-    too is retried at the normal interval, not every second.
+    keepalive once, a second later. Some cameras (Axis, for example) rotate their
+    digest nonce and refuse a keepalive that reuses an old one, so every keepalive
+    after the first rotation was refused and logged a warning. A server that
+    refuses the retry too is retried at the normal interval, not every second.
 
 *   add `From<SystemTime> for NtpTimestamp` and
     `From<NtpTimestamp> for SystemTime`.

@@ -4141,9 +4141,6 @@ mod tests {
         session.0.requested_auth = Some(
             http_auth::PasswordClient::try_from(r#"Digest realm="cam", nonce="nonce-0""#).unwrap(),
         );
-        session.0.keepalive_timer = Some(Box::pin(tokio::time::sleep(
-            std::time::Duration::from_millis(1),
-        )));
         (session, server)
     }
 
@@ -4202,11 +4199,9 @@ mod tests {
             let refused_at = tokio::time::Instant::now();
             let (_, auth) = next_keepalive(&mut server).await;
             assert!(auth.contains("nonce-1"), "{auth}");
-            let after = tokio::time::Instant::now() - refused_at;
-            assert!(
-                after >= std::time::Duration::from_secs(1)
-                    && after < std::time::Duration::from_secs(2),
-                "retry after {after:?}"
+            assert_eq!(
+                tokio::time::Instant::now() - refused_at,
+                std::time::Duration::from_secs(1)
             );
         };
         tokio::select! {
@@ -4231,10 +4226,11 @@ mod tests {
             let refused_at = tokio::time::Instant::now();
             let (_, auth) = next_keepalive(&mut server).await;
             assert!(auth.contains("nonce-2"), "{auth}");
-            let after = tokio::time::Instant::now() - refused_at;
-            assert!(
-                after >= std::time::Duration::from_secs(29),
-                "next keepalive after {after:?}"
+            // The retry was sent when the timer fired, which reset it to the normal interval;
+            // its refusal leaves that timer alone.
+            assert_eq!(
+                tokio::time::Instant::now() - refused_at,
+                std::time::Duration::from_secs(30)
             );
         };
         tokio::select! {
