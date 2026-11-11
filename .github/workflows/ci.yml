@@ -7,15 +7,17 @@ env:
 
 jobs:
   rust:
-    name: Test
+    # `label` keeps job names stable across MSRV bumps; `main`'s branch
+    # protection requires `Test (stable)` and `Test (MSRV)` by name.
+    name: Test (${{ matrix.label }})
     strategy:
       matrix:
-        rust:
-          - stable
-          - "1.96"
         include:
-          - rust: stable
+          - label: stable
+            rust: stable
             extra_components: clippy, rustfmt
+          - label: MSRV
+            rust: "1.96"
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
