@@ -97,20 +97,13 @@ impl DepacketizeBuf {
         meta: crate::rtp::PacketMeta,
         payload: &[u8],
     ) -> Result<(), String> {
-        let pos = self.0.end();
-        let len = payload.len();
-        {
-            let (s1, s2) = self.0.spare_capacity(len);
-            if len <= s1.len() {
-                s1[..len].copy_from_slice(payload);
-            } else {
-                s1.copy_from_slice(&payload[..s1.len()]);
-                s2[..len - s1.len()].copy_from_slice(&payload[s1.len()..]);
-            }
-            self.0.advance_end(len);
-        }
-        self.0.advance_unparsed(self.0.end());
-        d.push(&crate::buf::PacketRef::new(meta, &self.0, pos, len as u16))
+        let pos = self.0.append(payload);
+        d.push(&crate::buf::PacketRef::new(
+            meta,
+            &self.0,
+            pos,
+            payload.len() as u16,
+        ))
     }
 }
 

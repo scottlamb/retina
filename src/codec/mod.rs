@@ -142,6 +142,9 @@ pub mod h265;
 pub(crate) mod onvif;
 pub(crate) mod opus;
 pub(crate) mod simple_audio;
+mod stream_depacketizer;
+
+pub use stream_depacketizer::StreamDepacketizer;
 
 /// Configuration options controlling how depacketized frames are formatted.
 ///
