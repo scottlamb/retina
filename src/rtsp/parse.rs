@@ -508,11 +508,10 @@ impl Parser {
     }
 }
 
-/// Skips any leading CRLFs, then parses the first line of the next message.
+/// Parses the first line of the next message.
 /// Returns `Ok(None)` when the input is empty (caller decides if that's
 /// clean EOF or needs more data).
 fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedError> {
-    skip_crlfs(input)?;
     match input.peek_byte() {
         None => Ok(None),
         Some(b'$') => {
