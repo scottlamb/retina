@@ -19,7 +19,7 @@ use log::{debug, log_enabled, trace};
 
 use crate::buf::{BufRange, Mark, MarkBuf, PacketRef};
 use crate::codec::h26x::TolerantBitReader;
-use crate::codec::{CodecItem, DepacketizeError};
+use crate::codec::{CodecItem, DepacketizeError, FmtpParser};
 use crate::inputs::Input as _;
 
 use super::VideoFrame;
@@ -220,6 +220,8 @@ impl Depacketizer {
         }
 
         let mut r = Ok(());
+        // A stream joined mid-NAL has no earlier packet to count the loss from.
+        let joining = matches!(self.input_state, DepacketizerInputState::New);
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -344,6 +346,11 @@ impl Depacketizer {
             }
             48 => {
                 // Aggregation Packet. https://datatracker.ietf.org/doc/html/rfc7798#section-4.4.2
+                if access_unit.in_fu {
+                    return Err(format!(
+                        "Aggregation packet {hdr:?} while fragment in progress"
+                    ));
+                }
                 // Skip the 2-byte AP header.
                 let mut payload = payload;
                 payload.advance(2);
@@ -459,7 +466,7 @@ impl Depacketizer {
                         }
                     }
                     (false, false) => {
-                        if loss > 0 {
+                        if loss > 0 || joining {
                             self.discard_au();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
@@ -644,12 +651,11 @@ impl Depacketizer {
         };
 
         // Determine whether to prepend parameter sets.
-        let prepend_params = is_random_access_point
-            && match self.frame_format.parameter_set_insertion {
-                ParameterSetInsertion::EachKeyFrame => true,
-                ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
-            };
+        let prepend_params = match self.frame_format.parameter_set_insertion {
+            ParameterSetInsertion::EachKeyFrame => is_random_access_point || has_new_parameters,
+            ParameterSetInsertion::OnChange => has_new_parameters,
+            ParameterSetInsertion::Never => false,
+        };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
             retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
@@ -816,17 +822,16 @@ impl InternalParameters {
         let mut sps_nal = None;
         let mut pps_nal = None;
         let mut vps_nal = None;
-        for p in format_specific_params.split(';') {
-            match p.trim().split_once('=') {
-                Some(("tx-mode", "SRST")) => {}
-                Some(("tx-mode", v)) => {
+        for p in FmtpParser::new(format_specific_params) {
+            match p {
+                ("tx-mode", "SRST") => {}
+                ("tx-mode", v) => {
                     return Err(format!("unsupported/unexpected tx-mode {v}; expected SRST"));
                 }
-                Some(("sprop-vps", v)) => Self::store_sprop_nal("sprop-vps", v, &mut vps_nal)?,
-                Some(("sprop-sps", v)) => Self::store_sprop_nal("sprop-sps", v, &mut sps_nal)?,
-                Some(("sprop-pps", v)) => Self::store_sprop_nal("sprop-pps", v, &mut pps_nal)?,
-                Some((_, _)) => {}
-                None => return Err(format!("key {p} without value")),
+                ("sprop-vps", v) => Self::store_sprop_nal("sprop-vps", v, &mut vps_nal)?,
+                ("sprop-sps", v) => Self::store_sprop_nal("sprop-sps", v, &mut sps_nal)?,
+                ("sprop-pps", v) => Self::store_sprop_nal("sprop-pps", v, &mut pps_nal)?,
+                (_, _) => {}
             }
         }
         let vps_nal = vps_nal.ok_or_else(|| "no vps".to_string())?;
@@ -1504,6 +1509,36 @@ mod tests {
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
         assert!(d.seen_inconsistent_fu_nal_hdr);
     }
+    /// Tests that a stream joined mid-NAL drops the partial access unit.
+    #[test]
+    fn join_mid_fu() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let meta = |timestamp, sequence_number| crate::rtp::PacketMeta {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark: true,
+        };
+        // FU end fragment (S=0 E=1, TRAIL_R) as the first packet.
+        push_via_buf(&mut d, meta(0, 0), b"\x62\x01\x41tail", &mut buf).unwrap();
+        assert_eq!(d.pull(), None);
+        // The next access unit comes through.
+        push_via_buf(&mut d, meta(3000, 1), b"\x02\x01next", &mut buf).unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x06\x02\x01next");
+    }
 
     /// Tests that a FU with both S and E bits set is treated as a complete NAL
     /// rather than rejected. RFC 7798 section 4.4.3 forbids this, but some cameras
@@ -1704,6 +1739,46 @@ mod tests {
         assert_eq!(d.pull(), None);
     }
 
+    /// An aggregation packet while a fragment is in progress should be rejected rather than
+    /// panic when the access unit is finalized. Found by fuzzing.
+    #[test]
+    fn aggregation_packet_during_fragment() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let mut push = |mark: bool, payload: &[u8]| {
+            let pkt = ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark,
+                payload_type: 0,
+            }
+            .build(payload.iter().copied())
+            .unwrap();
+            push_via_buf(
+                &mut d,
+                crate::rtp::PacketMeta::from_received(&pkt),
+                pkt.payload(),
+                &mut buf,
+            )
+        };
+        // FU packet, start, not end.
+        push(false, b"\x62\xed\x92").unwrap();
+        // Aggregation packet with mark, containing one 4-byte NAL.
+        push(true, b"\x60\x6f\x00\x04\x04\x41\xe3\x03").unwrap_err();
+        drop(push);
+        assert_eq!(d.pull(), None);
+    }
+
     #[test]
     fn parse_tenda_cp3pro_format_specific_params() {
         init_logging();
@@ -1737,5 +1812,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.generic_parameters.pixel_dimensions(), (2304, 1296));
+    }
+
+    #[test]
+    fn parse_provision_trailing_semicolon_format_specific_params() {
+        init_logging();
+        let p = super::InternalParameters::parse_format_specific_params(
+            "profile-space=0;\
+             profile-id=1;\
+             tier-flag=0;\
+             level-id=0;\
+             sprop-vps=QAEMAf//AWAAAAMAAAMAAAMAAAMAlqwJ;\
+             sprop-sps=QgEBAWAAAAMAAAMAAAMAAAMAlqACgIAtH+KrTuiS7kIAAAMACACD1gAM3+YAQA==;\
+             sprop-pps=RAHAcvAbJA==;",
+        )
+        .unwrap();
+        assert_eq!(p.generic_parameters.pixel_dimensions(), (1280, 720));
     }
 }

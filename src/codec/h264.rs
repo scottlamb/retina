@@ -23,7 +23,7 @@ use crate::{
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoFrame, VideoParameters};
+use super::{CodecItem, FmtpParser, VideoFrame, VideoParameters};
 
 /// Produce [`VideoParameters`] from SPS and PPS NAL units.
 ///
@@ -387,6 +387,8 @@ impl Depacketizer {
             panic!("push with data already pending: {p:?}");
         }
 
+        // A stream joined mid-NAL has no earlier packet to count the loss from.
+        let joining = matches!(self.input_state, DepacketizerInputState::New);
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
@@ -629,7 +631,7 @@ impl Depacketizer {
                         }
                     }
                     (false, None) => {
-                        if loss > 0 {
+                        if loss > 0 || joining {
                             self.discard_au();
                             self.input_state = DepacketizerInputState::Loss {
                                 timestamp,
@@ -829,12 +831,11 @@ impl Depacketizer {
         };
 
         // Determine whether to prepend parameter sets.
-        let prepend_params = is_random_access_point
-            && match self.frame_format.parameter_set_insertion {
-                ParameterSetInsertion::EachKeyFrame => true,
-                ParameterSetInsertion::OnChange => has_new_parameters,
-                ParameterSetInsertion::Never => false,
-            };
+        let prepend_params = match self.frame_format.parameter_set_insertion {
+            ParameterSetInsertion::EachKeyFrame => is_random_access_point || has_new_parameters,
+            ParameterSetInsertion::OnChange => has_new_parameters,
+            ParameterSetInsertion::Never => false,
+        };
         if prepend_params && let Some(ref p) = self.parameters {
             // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
             retained_len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
@@ -1022,11 +1023,9 @@ impl InternalParameters {
     /// Parses metadata from the `format-specific-params` of a SDP `fmtp` media attribute.
     fn parse_format_specific_params(format_specific_params: &str) -> Result<Self, String> {
         let mut sprop_parameter_sets = None;
-        for p in format_specific_params.split(';') {
-            match p.trim().split_once('=') {
-                Some(("sprop-parameter-sets", value)) => sprop_parameter_sets = Some(value),
-                None => return Err("key without value".into()),
-                _ => (),
+        for (attr, value) in FmtpParser::new(format_specific_params) {
+            if attr == "sprop-parameter-sets" {
+                sprop_parameter_sets = Some(value);
             }
         }
         let sprop_parameter_sets = sprop_parameter_sets
@@ -2221,6 +2220,82 @@ mod tests {
         }
     }
 
+    /// Tests that a parameter change on a non-IDR frame is prepended to that
+    /// frame, as `ParameterSetInsertion` documents.
+    #[test]
+    fn parameter_change_on_non_idr() {
+        use crate::codec::{FrameFormat, ParameterSetInsertion};
+        init_logging();
+        let new_sps = b"\x67\x4d\x40\x1e\x9a\x64\x05\x01\xef\xf3\x50\x10\x10\x14\x00\x00\x0f\xa0\x00\x01\x38\x80\x10";
+        let pps = b"\x68\xee\x3c\x80";
+        let slice = b"\x41slice";
+        for (insertion, expect_params) in [
+            (ParameterSetInsertion::EachKeyFrame, true),
+            (ParameterSetInsertion::OnChange, true),
+            (ParameterSetInsertion::Never, false),
+        ] {
+            let mut buf = MarkBuf::new(65536);
+            let mut d = super::Depacketizer::new(90_000, Some("a=fmtp:96 packetization-mode=1;profile-level-id=4d002a;sprop-parameter-sets=Z00AKp2oHgCJ+WbgICAoAAADAAgAAAMAfCA=,aO48gA==")).unwrap();
+            d.set_frame_format(FrameFormat {
+                parameter_set_insertion: insertion,
+                ..FrameFormat::MP4
+            });
+            let mut push_frame = |seq: u16, nals: &[&[u8]]| {
+                for (i, nal) in nals.iter().enumerate() {
+                    let pkt = ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp: crate::Timestamp {
+                            timestamp: i64::from(seq),
+                            clock_rate: NonZeroU32::new(90_000).unwrap(),
+                            start: 0,
+                        },
+                        ssrc: 0,
+                        sequence_number: seq + i as u16,
+                        loss: 0,
+                        mark: i == nals.len() - 1,
+                        payload_type: 0,
+                    }
+                    .build(nal.iter().copied())
+                    .unwrap();
+                    push_via_buf(
+                        &mut d,
+                        crate::rtp::PacketMeta::from_received(&pkt),
+                        pkt.payload(),
+                        &mut buf,
+                    )
+                    .unwrap();
+                }
+                match d.pull() {
+                    Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                    o => panic!("unexpected pull result {o:#?}"),
+                }
+            };
+            let frame = push_frame(0, &[&new_sps[..], &pps[..], &slice[..]]);
+            assert!(frame.has_new_parameters());
+            assert!(!frame.is_random_access_point());
+            let mut expected = Vec::new();
+            let nals: &[&[u8]] = if expect_params {
+                &[&new_sps[..], &pps[..], &slice[..]]
+            } else {
+                &[&slice[..]]
+            };
+            for nal in nals {
+                expected.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+                expected.extend_from_slice(nal);
+            }
+            assert_eq_hex!(frame.data(), &expected);
+
+            // A following non-IDR frame without a change gets no parameters.
+            let frame = push_frame(3, &[&slice[..]]);
+            assert!(!frame.has_new_parameters());
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&u32::try_from(slice.len()).unwrap().to_be_bytes());
+            expected.extend_from_slice(slice);
+            assert_eq_hex!(frame.data(), &expected);
+        }
+    }
+
     /// Tests parsing empty parameters, which can for example happen with
     /// v4l2-rtspserver if the hardware hasn't given it a frame with the required data yet.
     /// (Mostly that it should not panic.)
@@ -3003,6 +3078,40 @@ mod tests {
         );
         assert!(d.seen_inconsistent_fu_a_nal_hdr);
     }
+    /// Tests that a stream joined mid-NAL drops the partial access unit.
+    #[test]
+    fn join_mid_fu_a() {
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        let meta = |timestamp, sequence_number| crate::rtp::PacketMeta {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark: true,
+        };
+        // FU-A end fragment (S=0 E=1, non-IDR slice) as the first packet.
+        push_via_buf(&mut d, meta(0, 0), b"\x7c\x41tail", &mut buf).unwrap();
+        assert_eq!(d.pull(), None);
+        // The next access unit comes through.
+        push_via_buf(&mut d, meta(3000, 1), b"\x01next", &mut buf).unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x05\x01next");
+    }
 
     /// Tests that a FU-A with both S and E bits set is treated as a complete NAL
     /// rather than rejected. RFC 6184 section 5.8 forbids this, but some cameras
@@ -3547,8 +3656,8 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             o => panic!("{o:#?}"),
         };
-        // The default `ParameterSetInsertion::OnChange` prepends the initial
-        // parameters to the first random access point.
+        // The default `ParameterSetInsertion::EachKeyFrame` prepends the
+        // parameters to random access points.
         let sps_nal = b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
                         \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84";
         let pps_nal = b"\x68\xee\x3c\x80";

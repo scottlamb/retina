@@ -3,9 +3,12 @@ name: Fuzz
 # Short runs on every push/PR catch shallow bugs a change introduces; a longer
 # daily run digs deeper. The evolving corpus lives in the Actions cache (not
 # git). Targets that take raw bytes are also seeded from the main crate's
-# testdata. Crashes are uploaded as workflow artifacts; once fixed, add the
-# input as a unit test in the main crate so it's checked on stable by
-# `cargo test`.
+# testdata. (The H.26x depacketizer targets decode their input into typed
+# packets; see `fuzz/src/h26x.rs`.)
+# Crashes are uploaded as workflow artifacts and also added to the cached
+# corpus, so later runs on the same branch keep failing until the bug is fixed.
+# Once fixed, add the input as a unit test in the main crate so it's checked on
+# stable by `cargo test`.
 on:
   push:
   pull_request:
@@ -77,6 +80,19 @@ jobs:
         if: github.event_name == 'schedule'
         working-directory: fuzz
         run: cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} corpus/${{ matrix.target }}
+      # libFuzzer writes failing inputs to `artifacts/` and never adds them to
+      # the corpus, so on its own the saved corpus wouldn't reproduce the
+      # failure. Copy them in so the next run replays them while loading the
+      # corpus and fails immediately until the bug is fixed. After the fix they
+      # stay on as ordinary corpus entries (until `cmin` drops them).
+      - name: Add failing inputs to corpus
+        if: failure()
+        working-directory: fuzz
+        run: |
+          shopt -s nullglob
+          for f in artifacts/${{ matrix.target }}/{crash,leak,oom,timeout}-*; do
+            cp -v "$f" corpus/${{ matrix.target }}/
+          done
       - name: Save corpus
         if: always()
         uses: actions/cache/save@v5

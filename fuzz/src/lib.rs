@@ -23,3 +23,5 @@ pub fn init_logging() {
         h.install().unwrap();
     })
 }
+
+pub mod h26x;

@@ -1005,7 +1005,7 @@ impl Stream {
     /// claimed in the
     /// [ONVIF Streaming Spec](https://www.onvif.org/specs/stream/ONVIF-Streaming-Spec.pdf):
     /// *   `vnd.onvif.metadata`
-    /// *   `vnd.onvif.metadata.gzip`,
+    /// *   `vnd.onvif.metadata+gzip`
     /// *   `vnd.onvif.metadata.exi.onvif`
     /// *   `vnd.onvif.metadata.exi.ext`
     #[inline]
@@ -1172,10 +1172,21 @@ struct StreamStateInit {
 }
 
 /// Username and password authentication credentials.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The `Debug` impl omits the password, so credentials don't end up in logs.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Marker trait for the state of a [Session].
@@ -1374,6 +1385,10 @@ enum SessionFlag {
     /// Set if a [`StreamDirection::Sending`] stream has been set up, so the
     /// session uses the ONVIF backchannel.
     Backchannel = 0x20,
+
+    /// Set while a keepalive is being retried at once with a fresh authentication
+    /// challenge, so a server that keeps refusing is not retried every second.
+    KeepaliveAuthRetry = 0x40,
 }
 
 /// The `Require` header value for the ONVIF backchannel, as defined in the
@@ -2166,7 +2181,12 @@ impl Session<Described> {
                         // Handles RTCP receiver reports the server sends about
                         // Retina's packets. These have the server's SSRC, so
                         // don't expect Retina's.
-                        rtp_handler: rtp::InorderParser::new(None, None, policy.unknown_rtcp_ssrc),
+                        rtp_handler: rtp::InorderParser::new(
+                            None,
+                            None,
+                            s.rtp_payload_type,
+                            policy.unknown_rtcp_ssrc,
+                        ),
                         ctx,
                         udp_sockets: None,
 
@@ -2257,6 +2277,7 @@ impl Session<Described> {
                         rtp_handler: rtp::InorderParser::new(
                             ssrc,
                             initial_seq,
+                            s.rtp_payload_type,
                             policy.unknown_rtcp_ssrc,
                         ),
                         ctx,
@@ -2643,8 +2664,50 @@ impl Session<Playing> {
                 // log it, to help debugging if on failure the server doesn't extend the
                 // timeout or gets angry and closes the connection. (rtsp-simple-server
                 // does the latter as of 2022-08-07, though I'm told this will be fixed.)
+                // A keepalive retried with a fresh challenge (below) gets one retry only:
+                // whatever this response is, the flag is spent.
+                let retry = SessionFlag::KeepaliveAuthRetry as u8;
+                let retried = *inner.flags & retry != 0;
+                *inner.flags &= !retry;
+                let mut retrying = false;
                 if !response.status_code.is_success() {
-                    warn!("keepalive failed with {:?}", response.status_code);
+                    // Some cameras (Axis, measured 2026-11-08) refuse a keepalive that reuses
+                    // the handshake's digest nonce and send a fresh challenge. Adopt it, so the
+                    // next keepalive authenticates; otherwise every keepalive fails and only
+                    // cameras that also count RTCP receiver reports keep the session alive.
+                    if response.status_code == StatusCode::UNAUTHORIZED
+                        && inner.options.creds.is_some()
+                        && let Some(h) = response.headers.get("WWW-Authenticate")
+                    {
+                        let h: &str = h;
+                        match http_auth::PasswordClient::try_from(h) {
+                            Ok(c) => {
+                                *inner.requested_auth = Some(c);
+                                if !retried {
+                                    // Retry once, soon, with the fresh challenge, so this
+                                    // keepalive window still gets an accepted keepalive; a
+                                    // server that refuses the retry too waits for the normal
+                                    // interval.
+                                    *inner.flags |= retry;
+                                    if let Some(t) = inner.keepalive_timer.as_mut() {
+                                        t.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + std::time::Duration::from_secs(1),
+                                        );
+                                    }
+                                    retrying = true;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("keepalive: can't understand WWW-Authenticate: {e}");
+                            }
+                        }
+                    }
+                    if retrying {
+                        debug!("keepalive refused with a fresh challenge; retrying in 1 s");
+                    } else {
+                        warn!("keepalive failed with {:?}", response.status_code);
+                    }
                 } else {
                     trace!("keepalive succeeded with {:?}", response.status_code);
                     if matches!(method, KeepaliveMethod::Options) {
@@ -2952,9 +3015,11 @@ impl Session<Playing> {
                 // Count the packet for receiver reports as it arrives, before
                 // `rtp_handler` skips or rejects it for being out of order: RFC
                 // 3550 appendix A.1 counts reordered and duplicate packets as
-                // received. Like `rtp_handler`, ignore pt=50 packets.
+                // received. Like `rtp_handler`, ignore pt=50 packets and
+                // another stream's packets.
                 if let Some(reception) = reception
                     && header.payload_type() != 50
+                    && !rtp_handler.is_other_stream(&header)
                 {
                     reception.rtp(
                         header.ssrc(),
@@ -3596,26 +3661,45 @@ mod tests {
     use super::*;
     use crate::testutil::{init_logging, response};
 
-    /// Cross-platform, tokio equivalent of `socketpair(2)`.
-    async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
-        // Another process on the machine could connect to the server and mess
-        // this up, but that's unlikely enough to ignore in test code.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::net::TcpStream::connect(addr);
-        let server = listener.accept();
-        let (client, server) = (client.await.unwrap(), server.await.unwrap().0);
+    /// Bytes each direction of a mock connection holds before writes block.
+    ///
+    /// Tests that exercise backpressure write well past this.
+    const MOCK_BUF_SIZE: usize = 64 * 1024;
 
-        // Without this, Nagle's algorithm holds back a small write until the
-        // peer ACKs the last one, which on Linux it may delay ~40 ms. Tests
-        // that pause time would auto-advance far past their deadlines meanwhile.
-        client.set_nodelay(true).unwrap();
-        server.set_nodelay(true).unwrap();
-        (client, server)
+    /// Fake addresses of the client and server ends of a mock connection.
+    const MOCK_CLIENT_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40000);
+    const MOCK_SERVER_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 554);
+
+    /// Returns the client and server ends of an in-memory RTSP connection.
+    ///
+    /// In-memory rather than loopback TCP so tests are deterministic under
+    /// paused time; see the testing notes in `CONTRIBUTING.md`.
+    fn mock_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        tokio::io::duplex(MOCK_BUF_SIZE)
     }
 
-    /// UDP equivalent of [`socketpair`]: two mutually connected localhost
-    /// sockets, as `setup` establishes for a UDP stream.
+    /// Wraps the client end from [`mock_pair`] as a [`crate::tokio::Connection`].
+    fn mock_client_conn(
+        stream: tokio::io::DuplexStream,
+        max_message_size: usize,
+    ) -> crate::tokio::Connection {
+        crate::tokio::Connection::from_duplex(
+            stream,
+            MOCK_CLIENT_ADDR,
+            MOCK_SERVER_ADDR,
+            max_message_size,
+        )
+    }
+
+    /// Two mutually connected localhost UDP sockets, as `setup` establishes
+    /// for a UDP stream.
+    ///
+    /// Unlike the in-memory RTSP connection from [`mock_pair`], these are
+    /// real sockets, as `Session` reads UDP through `tokio::net::UdpSocket`.
+    /// Paused-time tests that use them may still see auto-advance race with
+    /// datagram delivery.
     async fn udp_socketpair() -> (UdpSocket, UdpSocket) {
         let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3737,9 +3821,14 @@ mod tests {
     }
 
     async fn connect_to_mock() -> (RtspConnection, crate::tokio::Connection) {
-        let (client, server) = socketpair().await;
-        let client = crate::tokio::Connection::from_stream(client, usize::MAX).unwrap();
-        let server = crate::tokio::Connection::from_stream(server, usize::MAX).unwrap();
+        let (client, server) = mock_pair();
+        let client = mock_client_conn(client, usize::MAX);
+        let server = crate::tokio::Connection::from_duplex(
+            server,
+            MOCK_SERVER_ADDR,
+            MOCK_CLIENT_ADDR,
+            usize::MAX,
+        );
         let client = RtspConnection {
             inner: client,
             channels: ChannelMappings::default(),
@@ -3836,11 +3925,6 @@ mod tests {
             let session = session.unwrap();
             tokio::pin!(session);
 
-            // XXX: tokio will "auto-advance" paused time when timers are polled.
-            // This is not great for this test. Disable keepalives to prevent it.
-            // <https://github.com/tokio-rs/tokio/issues/4522>
-            session.0.keepalive_timer = None;
-
             // Packets: first ignored one (unassigned channel), then one passed through.
             tokio::join!(
                 async {
@@ -3881,12 +3965,6 @@ mod tests {
         let stale_sessions = group.stale_sessions();
         assert_eq!(stale_sessions.num_sessions, 1);
 
-        // Resume real time for the TEARDOWN exchange. With paused time,
-        // the runtime may auto-advance through the teardown's I/O timeout
-        // before the I/O exchange with the mock server completes, because
-        // the auto-advance's non-blocking I/O poll can race with kernel
-        // TCP event delivery on localhost.
-        tokio::time::resume();
         tokio::join!(
             group.await_stale_sessions(&stale_sessions),
             req_response(
@@ -3895,7 +3973,6 @@ mod tests {
                 response(include_bytes!("testdata/reolink_teardown.txt"))
             ),
         );
-        tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
     }
 
@@ -3948,7 +4025,6 @@ mod tests {
         {
             let session = session.unwrap();
             tokio::pin!(session);
-            session.0.keepalive_timer = None; // see `simple`.
 
             // Packet.
             tokio::join!(
@@ -3989,12 +4065,9 @@ mod tests {
         group.await_stale_sessions(&stale_sessions).await;
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        // elapsed is not zero because tokio advances the time unnecessarily, grr.
-        // https://github.com/tokio-rs/tokio/issues/3108
-        let elapsed = tokio::time::Instant::now() - drop_time;
-        assert!(
-            elapsed >= std::time::Duration::from_secs(60),
-            "elapsed={elapsed:?}"
+        assert_eq!(
+            tokio::time::Instant::now() - drop_time,
+            std::time::Duration::from_secs(60)
         );
     }
 
@@ -4038,10 +4111,163 @@ mod tests {
         let elapsed = tokio::time::Instant::now() - start;
         assert_eq!(group.stale_sessions().num_sessions, 0);
 
-        assert!(
-            elapsed >= std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC),
-            "elapsed={elapsed:?}"
+        assert_eq!(
+            elapsed,
+            std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC)
         );
+    }
+
+    #[test]
+    fn credentials_debug_omits_password() {
+        let creds = Credentials {
+            username: "admin".to_owned(),
+            password: "secret".to_owned(),
+        };
+        assert_eq!(
+            format!("{creds:?}"),
+            r#"Credentials { username: "admin", password: <redacted> }"#
+        );
+    }
+
+    /// A playing session with credentials whose digest challenge (nonce `nonce-0`) came from
+    /// session setup, and whose keepalive is due at once.
+    async fn playing_session_with_auth() -> (Session<Playing>, crate::tokio::Connection) {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let opts = SessionOptions::default().creds(Some(Credentials {
+            username: "admin".to_owned(),
+            password: "secret".to_owned(),
+        }));
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, opts, url),
+            req_response(
+                &mut server,
+                msg::Method::DESCRIBE,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                msg::Method::SETUP,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                msg::Method::PLAY,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        session.0.flags |= SessionFlag::GetParameterSupported as u8;
+        // As on Axis cameras: the session is already authenticating, with the nonce from setup.
+        session.0.requested_auth = Some(
+            http_auth::PasswordClient::try_from(r#"Digest realm="cam", nonce="nonce-0""#).unwrap(),
+        );
+        (session, server)
+    }
+
+    /// Reads the next keepalive and returns its `CSeq` and `Authorization` header.
+    async fn next_keepalive(server: &mut crate::tokio::Connection) -> (msg::HeaderValue, String) {
+        let msg = server.next().await.unwrap().unwrap();
+        let req = match msg.msg {
+            msg::Message::Request(r) => r,
+            o => panic!("expected keepalive request, got {o:#?}"),
+        };
+        assert_eq!(req.method, msg::Method::GET_PARAMETER);
+        let cseq = req.headers.get("CSeq").unwrap().clone();
+        let auth = req
+            .headers
+            .get("Authorization")
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        (cseq, auth)
+    }
+
+    /// Refuses a keepalive with `401` and a challenge carrying `nonce`.
+    async fn refuse_keepalive(
+        server: &mut crate::tokio::Connection,
+        cseq: msg::HeaderValue,
+        nonce: &str,
+    ) {
+        let mut headers = msg::Headers::default();
+        headers.insert(msg::HeaderName::CSEQ, cseq);
+        headers.insert(
+            msg::HeaderName::try_from("WWW-Authenticate").unwrap(),
+            msg::HeaderValue::try_from(format!(r#"Digest realm="cam", nonce="{nonce}""#)).unwrap(),
+        );
+        server
+            .send(OwnedMessage::Response {
+                head: msg::Response {
+                    status_code: StatusCode::UNAUTHORIZED,
+                    reason_phrase: "Unauthorized".to_owned(),
+                    headers,
+                },
+                body: Bytes::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Tests that a keepalive refused with 401 and a fresh challenge adopts it and is retried
+    /// one second later with the new nonce, as cameras that rotate their digest nonce require.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_unauthorized_adopts_challenge_and_retries() {
+        let (session, mut server) = playing_session_with_auth().await;
+        tokio::pin!(session);
+        let server_side = async {
+            let (cseq, auth) = next_keepalive(&mut server).await;
+            assert!(auth.contains("nonce-0"), "{auth}");
+            refuse_keepalive(&mut server, cseq, "nonce-1").await;
+            let refused_at = tokio::time::Instant::now();
+            let (_, auth) = next_keepalive(&mut server).await;
+            assert!(auth.contains("nonce-1"), "{auth}");
+            assert_eq!(
+                tokio::time::Instant::now() - refused_at,
+                std::time::Duration::from_secs(1)
+            );
+        };
+        tokio::select! {
+            _ = server_side => {}
+            o = session.next() => panic!("unexpected item: {o:#?}"),
+        }
+    }
+
+    /// Tests that a retry refused again is not retried a second later: the next keepalive waits
+    /// for the normal interval (30 s for the 60 s default session timeout), and then carries the
+    /// latest challenge.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_retry_refused_waits_for_the_normal_interval() {
+        let (session, mut server) = playing_session_with_auth().await;
+        tokio::pin!(session);
+        let server_side = async {
+            let (cseq, _) = next_keepalive(&mut server).await;
+            refuse_keepalive(&mut server, cseq, "nonce-1").await;
+            let (cseq, auth) = next_keepalive(&mut server).await;
+            assert!(auth.contains("nonce-1"), "{auth}");
+            refuse_keepalive(&mut server, cseq, "nonce-2").await;
+            let refused_at = tokio::time::Instant::now();
+            let (_, auth) = next_keepalive(&mut server).await;
+            assert!(auth.contains("nonce-2"), "{auth}");
+            // The retry was sent when the timer fired, which reset it to the normal interval;
+            // its refusal leaves that timer alone.
+            assert_eq!(
+                tokio::time::Instant::now() - refused_at,
+                std::time::Duration::from_secs(30)
+            );
+        };
+        tokio::select! {
+            _ = server_side => {}
+            o = session.next() => panic!("unexpected item: {o:#?}"),
+        }
     }
 
     /// Tests that a keepalive response with an unexpected `CSeq` is a fatal error.
@@ -4336,9 +4562,8 @@ mod tests {
         resp: Vec<u8>,
     ) -> Result<Session<Described>, Error> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let (client, mut server) = socketpair().await;
-        let inner =
-            crate::tokio::Connection::from_stream(client, options.get_max_message_size()).unwrap();
+        let (client, mut server) = mock_pair();
+        let inner = mock_client_conn(client, options.get_max_message_size());
         let conn = RtspConnection {
             inner,
             channels: ChannelMappings::default(),
@@ -4553,10 +4778,6 @@ mod tests {
         )
         .await;
         tokio::pin!(session);
-
-        // Keep only the report timer, so paused time auto-advances to it. See
-        // the comment in `simple`.
-        session.0.keepalive_timer = None;
         let reports = session.0.reports.as_ref().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
         let due = tokio::time::Instant::from_std(reports.schedule.next_due());
@@ -4569,16 +4790,16 @@ mod tests {
 
         // Nothing has arrived yet, so the first report is an empty RR.
         let report = recv_data_while_polling(&mut session, &mut server, 1).await;
-        assert!(tokio::time::Instant::now() >= due);
+        // tokio's timers have millisecond resolution, so the report goes out
+        // at the first tick at or after `due`.
+        let now = tokio::time::Instant::now();
+        assert!(
+            now >= due && now < due + std::time::Duration::from_millis(1),
+            "{:?} after due",
+            now.saturating_duration_since(due)
+        );
         receiver_report::tests::parse_report(&report, ssrc, 0, &cname);
 
-        // Hold off reports while packets arrive, so paused time can't
-        // auto-advance into the next one meanwhile. Taking `reports` isn't
-        // enough: paused time auto-advances to any registered timer, polled or
-        // not. Replace the timer with one that isn't registered until polled
-        // or reset below; otherwise packets arrive at different instants.
-        let mut reports = session.0.reports.take().unwrap();
-        reports.timer = Box::pin(tokio::time::sleep(std::time::Duration::ZERO));
         let ntp = 0xe436_2f99_cccc_cccc;
         tokio::join!(
             async {
@@ -4605,20 +4826,18 @@ mod tests {
                 }
             },
         );
-        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
-        reports.timer.as_mut().reset(tokio::time::Instant::now());
-        session.0.reports = Some(reports);
 
-        // A report may have slipped out before the packets arrived; skip any
-        // empty one.
-        let block = loop {
-            let report = recv_data_while_polling(&mut session, &mut server, 1).await;
-            if report[0] & 0x1f == 0 {
-                continue;
-            }
-            let rr = receiver_report::tests::parse_report(&report, ssrc, 1, &cname);
-            break receiver_report::tests::parse_block(rr);
-        };
+        // 1.5 s later, before the next report is due, make it due.
+        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+        let reports = session.0.reports.as_mut().unwrap();
+        assert!(
+            tokio::time::Instant::from_std(reports.schedule.next_due())
+                > tokio::time::Instant::now()
+        );
+        reports.timer.as_mut().reset(tokio::time::Instant::now());
+        let report = recv_data_while_polling(&mut session, &mut server, 1).await;
+        let rr = receiver_report::tests::parse_report(&report, ssrc, 1, &cname);
+        let block = receiver_report::tests::parse_block(rr);
         assert_eq!(
             block,
             receiver_report::ReportBlock {
@@ -4640,7 +4859,6 @@ mod tests {
         let (mut session, mut server) =
             play_tcp(SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always))
                 .await;
-        session.0.keepalive_timer = None;
         let reports = session.0.reports.as_ref().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
         let due = tokio::time::Instant::from_std(reports.schedule.next_due());
@@ -4704,7 +4922,6 @@ mod tests {
         init_logging();
         let (session, mut server) = play_tcp(SessionOptions::default()).await;
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         assert!(session.0.reports.is_none());
         assert!(session.0.presentation.streams.iter().all(|s| !matches!(
             s.state,
@@ -4730,12 +4947,23 @@ mod tests {
                     .unwrap();
             },
         );
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            recv_while_polling(&mut session, &mut server),
-        )
-        .await;
-        assert!(r.is_err(), "unexpected message: {:#?}", r.map(|(m, _)| m));
+        // As in production, only keepalives follow: no RTCP. End between
+        // keepalives, not on one, as two timers due at the same instant fire
+        // in no particular order.
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(100);
+        let mut keepalives = 0;
+        while let Ok((m, _)) =
+            tokio::time::timeout_at(end, recv_while_polling(&mut session, &mut server)).await
+        {
+            let msg::Message::Request(r) = m else {
+                panic!("expected only keepalives, got {m:#?}");
+            };
+            assert_eq!(r.method, msg::Method::OPTIONS);
+            let cseq = r.headers.get("CSeq").unwrap().parse::<u32>().unwrap();
+            send_keepalive_response(&mut server, cseq).await;
+            keepalives += 1;
+        }
+        assert_eq!(keepalives, 3); // at 30, 60, and 90 s.
     }
 
     /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
@@ -4836,7 +5064,6 @@ mod tests {
         );
         let session = session.unwrap();
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         let mut reports = session.0.reports.take().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
 
@@ -5372,9 +5599,7 @@ mod tests {
             session.play(PlayOptions::default()),
             req_response(server, msg::Method::PLAY, response(BACKCHANNEL_PLAY)),
         );
-        let mut session = session.unwrap();
-        session.0.keepalive_timer = None;
-        session
+        session.unwrap()
     }
 
     /// Sends `server` a response to a keepalive request with the given `CSeq`.
@@ -5496,7 +5721,6 @@ mod tests {
         );
         let session = session.unwrap();
         tokio::pin!(session);
-        session.0.keepalive_timer = None;
         assert!(matches!(
             session.0.presentation.streams[0].state,
             StreamState::Playing {
@@ -5547,8 +5771,9 @@ mod tests {
         let mut session = play_backchannel(conn, &mut server).await;
         session.0.flags |= SessionFlag::GetParameterSupported as u8;
 
-        /// Queues 16 MiB of media on the backchannel: more than the socket
-        /// buffers hold.
+        /// Queues 16 MiB of media on the backchannel: far more than the
+        /// mock connection holds (`MOCK_BUF_SIZE`), so writes block until the
+        /// server reads.
         fn queue_media(session: &mut Session<Playing>) {
             let conn = &mut session.0.conn.as_mut().unwrap().inner;
             for _ in 0..1024 {

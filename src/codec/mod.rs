@@ -101,6 +101,33 @@ macro_rules! write_mpeg4_descriptor {
     }};
 }
 
+struct FmtpParser<'a> {
+    params: std::str::Split<'a, char>,
+}
+
+impl<'a> FmtpParser<'a> {
+    fn new(params: &'a str) -> Self {
+        Self {
+            params: params.split(';'),
+        }
+    }
+}
+
+impl<'a> Iterator for FmtpParser<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let p = loop {
+            let p = self.params.next()?.trim();
+            if p.is_empty() {
+                continue;
+            }
+            break p;
+        };
+        Some(p.split_once('=').unwrap_or((p, "")))
+    }
+}
+
 pub mod aac;
 pub(crate) mod g723;
 pub mod h26x;
@@ -113,6 +140,7 @@ pub mod h264;
 pub mod h265;
 
 pub(crate) mod onvif;
+pub(crate) mod opus;
 pub(crate) mod simple_audio;
 mod stream_depacketizer;
 
@@ -167,11 +195,13 @@ impl FrameFormat {
 /// into frame data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParameterSetInsertion {
-    /// Prepend to every key frame. Default.
+    /// Prepend to every key frame (random access point), and to any frame
+    /// that changes the parameters. Default.
     #[default]
     EachKeyFrame,
 
-    /// Prepend only when parameters have changed since the last frame.
+    /// Prepend only to frames that change the parameters, whether or not
+    /// they're key frames.
     OnChange,
 
     /// Never insert in-band; caller retrieves them out-of-band via
@@ -825,6 +855,7 @@ enum DepacketizerInner {
     #[cfg(feature = "h265")]
     H265(Box<h265::Depacketizer>),
     Onvif(Box<onvif::Depacketizer>),
+    Opus(Box<opus::Depacketizer>),
     Jpeg(Box<jpeg::Depacketizer>),
 }
 
@@ -895,10 +926,13 @@ impl Depacketizer {
             ("audio", "g723") => {
                 DepacketizerInner::G723(Box::new(g723::Depacketizer::new(clock_rate)?))
             }
+            ("audio", "opus") => {
+                DepacketizerInner::Opus(Box::new(opus::Depacketizer::new(clock_rate, channels)?))
+            }
             ("application", "vnd.onvif.metadata") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::Uncompressed),
             )),
-            ("application", "vnd.onvif.metadata.gzip") => DepacketizerInner::Onvif(Box::new(
+            ("application", "vnd.onvif.metadata+gzip") => DepacketizerInner::Onvif(Box::new(
                 onvif::Depacketizer::new(CompressionType::GzipCompressed),
             )),
             ("application", "vnd.onvif.metadata.exi.onvif") => DepacketizerInner::Onvif(Box::new(
@@ -928,6 +962,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.check_invariants(),
             DepacketizerInner::Onvif(_) => {}
+            DepacketizerInner::Opus(_) => {}
             DepacketizerInner::SimpleAudio(_) => {}
             DepacketizerInner::Jpeg(_) => {}
         }
@@ -963,6 +998,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.parameters(),
             DepacketizerInner::Onvif(d) => d.parameters(),
+            DepacketizerInner::Opus(d) => d.parameters(),
             DepacketizerInner::SimpleAudio(d) => d.parameters(),
             DepacketizerInner::Jpeg(d) => d.parameters(),
         }
@@ -981,6 +1017,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.push(pkt),
             DepacketizerInner::Onvif(d) => d.push(pkt),
+            DepacketizerInner::Opus(d) => d.push(pkt),
             DepacketizerInner::SimpleAudio(d) => d.push(pkt),
             DepacketizerInner::Jpeg(d) => d.push(pkt),
         }
@@ -998,6 +1035,7 @@ impl Depacketizer {
             #[cfg(feature = "h265")]
             DepacketizerInner::H265(d) => d.pull(),
             DepacketizerInner::Onvif(d) => d.pull(),
+            DepacketizerInner::Opus(d) => d.pull(),
             DepacketizerInner::SimpleAudio(d) => d.pull(),
             DepacketizerInner::Jpeg(d) => d.pull(),
         }
@@ -1006,7 +1044,21 @@ impl Depacketizer {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
+
+    #[test]
+    fn onvif_gzip_encoding_name() {
+        let d = Depacketizer::new("application", "vnd.onvif.metadata+gzip", 90_000, None, None)
+            .unwrap();
+        match d.parameters() {
+            Some(ParametersRef::Message(p)) => {
+                assert_eq!(p.0, onvif::CompressionType::GzipCompressed)
+            }
+            _ => panic!("expected message parameters"),
+        }
+    }
 
     // See with: cargo test -- --nocapture codec::tests::print_sizes
     #[test]
@@ -1052,5 +1104,56 @@ mod tests {
         ] {
             log::info!("{name:-40} {size:4}");
         }
+    }
+
+    #[test]
+    fn parse_fmtp() {
+        crate::testutil::init_logging();
+
+        assert_matches!(FmtpParser::new("").collect::<Vec<_>>().as_slice(), &[]);
+        assert_matches!(FmtpParser::new(";").collect::<Vec<_>>().as_slice(), &[]);
+        assert_matches!(FmtpParser::new(";;").collect::<Vec<_>>().as_slice(), &[]);
+        assert_matches!(
+            FmtpParser::new("a=b").collect::<Vec<_>>().as_slice(),
+            &[("a", "b")]
+        );
+        assert_matches!(
+            FmtpParser::new("a=").collect::<Vec<_>>().as_slice(),
+            &[("a", "")]
+        );
+        assert_matches!(
+            FmtpParser::new("a==").collect::<Vec<_>>().as_slice(),
+            &[("a", "=")]
+        );
+        assert_matches!(
+            FmtpParser::new("=a").collect::<Vec<_>>().as_slice(),
+            &[("", "a")]
+        );
+        assert_matches!(
+            FmtpParser::new("==a").collect::<Vec<_>>().as_slice(),
+            &[("", "=a")]
+        );
+        assert_matches!(
+            FmtpParser::new("=").collect::<Vec<_>>().as_slice(),
+            &[("", "")]
+        );
+        assert_matches!(
+            FmtpParser::new("a").collect::<Vec<_>>().as_slice(),
+            &[("a", "")]
+        );
+        assert_matches!(
+            FmtpParser::new("a=b=").collect::<Vec<_>>().as_slice(),
+            &[("a", "b=")]
+        );
+        assert_matches!(
+            FmtpParser::new("a=b;c=d").collect::<Vec<_>>().as_slice(),
+            &[("a", "b"), ("c", "d")]
+        );
+        assert_matches!(
+            FmtpParser::new(";;a=b;cd;e=f==;;")
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &[("a", "b"), ("cd", ""), ("e", "f==")]
+        );
     }
 }
