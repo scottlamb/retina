@@ -1,22 +1,75 @@
-## unreleased
+## `v0.4.22` (2026-11-11)
 
+*   bump MSRV to 1.96 (from 1.88).
+*   add ONVIF audio backchannel support via `SessionOptions::backchannel`;
+    sending streams have `Stream::direction` `StreamDirection::Sending` and
+    take packets via a `futures::Sink` impl. Thanks to
+    [@edenhaus](https://github.com/edenhaus) in
+    [#148](https://github.com/scottlamb/retina/pull/148).
+*   add `SessionOptions::receiver_reports` to send RTCP receiver reports. Thanks
+    to [@edenhaus](https://github.com/edenhaus) in
+    [#147](https://github.com/scottlamb/retina/pull/147).
+*   add `SessionOptions::max_message_size` to limit RTSP message size. Thanks
+    to [@edenhaus](https://github.com/edenhaus) in
+    [#144](https://github.com/scottlamb/retina/pull/144).
+*   add `SessionOptions::bind` to choose the local source address. Thanks to
+    [@keesverruijt](https://github.com/keesverruijt) in
+    [#149](https://github.com/scottlamb/retina/pull/149).
+*   fix panics on malformed SDP and media descriptions with no format; trim
+    and validate the `SETUP` response's session id; don't lose unflushed
+    queued RTSP messages. Thanks to [@edenhaus](https://github.com/edenhaus) in
+    [#142](https://github.com/scottlamb/retina/pull/142),
+    [#143](https://github.com/scottlamb/retina/pull/143),
+    [#145](https://github.com/scottlamb/retina/pull/145), and
+    [#146](https://github.com/scottlamb/retina/pull/146).
+*   accept a single `server_port` and whitespace around `Transport`
+    parameters. Thanks to [@edenhaus](https://github.com/edenhaus) in
+    [#158](https://github.com/scottlamb/retina/pull/158).
+*   ignore empty format-specific parameters in SDP `fmtp` attributes. Thanks
+    to [@anti-social](https://github.com/anti-social) in
+    [#168](https://github.com/scottlamb/retina/pull/168).
+*   H.264/H.265: drop a fragmentation unit continuation at stream start
+    rather than failing. Thanks to [@boxerab](https://github.com/boxerab) in
+    [#152](https://github.com/scottlamb/retina/pull/152).
+*   tolerate cameras that interleave data within RTSP responses (seen on OMNY
+    miniDome2EU) or send another stream's packets on a stream's channel (seen
+    on a Rubetek intercom). Thanks to [@C-Format](https://github.com/C-Format)
+    in [#154](https://github.com/scottlamb/retina/pull/154).
+*   fix positions reported in RTSP message contexts and errors after blank
+    lines between messages or messages split across reads. Thanks to
+    [@bgreenway](https://github.com/bgreenway) in
+    [#163](https://github.com/scottlamb/retina/pull/163).
+*   fix the clock rates of static payload types 10 and 11 (L16 stereo and
+    mono), and the duration of multi-channel RFC 3551 audio frames.
+*   AAC: reject an `au-headers-length` that isn't a multiple of 16.
+*   JPEG: cache in-band quantization tables with Q 128–254 for reuse by later
+    frames, and write 16-bit tables with the correct precision.
+*   H.265: fix a panic on an aggregation packet following an incomplete
+    fragmentation unit. Found by the new fuzzing CI job.
 *   H.264, H.265, and JPEG: when an SDP `rtpmap` attribute has a clock rate
     of 0 or none at all (e.g. `a=rtpmap:96 H264/0`), use 90000 instead of
     failing `PLAY` or skipping the stream. For other codecs, skip the stream
     at `DESCRIBE`.
-    Fixes [#169](https://github.com/scottlamb/retina/issues/169).
+    Fixes [#169](https://github.com/scottlamb/retina/issues/169). Thanks to
+    [@boxerab](https://github.com/boxerab) in
+    [#170](https://github.com/scottlamb/retina/pull/170).
 *   BREAKING: the gzip ONVIF metadata encoding name is
     `vnd.onvif.metadata+gzip`, as the ONVIF Streaming Spec spells it, not
-    `vnd.onvif.metadata.gzip`.
+    `vnd.onvif.metadata.gzip`. Thanks to [@boxerab](https://github.com/boxerab)
+    in [#165](https://github.com/scottlamb/retina/pull/165).
 *   Keepalives: when the server refuses a keepalive with `401 Unauthorized` and a
     fresh `WWW-Authenticate` challenge, adopt the challenge and retry the
     keepalive once, a second later. Some cameras (Axis, for example) rotate their
     digest nonce and refuse a keepalive that reuses an old one, so every keepalive
     after the first rotation was refused and logged a warning. A server that
     refuses the retry too is retried at the normal interval, not every second.
+    Thanks to [@bgreenway](https://github.com/bgreenway) in
+    [#161](https://github.com/scottlamb/retina/pull/161).
 *   add Opus audio depacketization
-    ([RFC 7587](https://datatracker.ietf.org/doc/html/rfc7587)).
-*   add `From<SystemTime> for NtpTimestamp` and
+    ([RFC 7587](https://datatracker.ietf.org/doc/html/rfc7587)). Thanks to
+    [@C-Format](https://github.com/C-Format) in
+    [#156](https://github.com/scottlamb/retina/pull/156).
+*   add `NtpTimestamp::now`, `From<SystemTime> for NtpTimestamp`, and
     `From<NtpTimestamp> for SystemTime`.
     Correct `NtpTimestamp`'s docs: its seconds wrap every 136 years, and
     `Display` is accurate through 2106, not just 2038.
@@ -25,7 +78,9 @@
     were reported with `is_random_access_point() == false`, so e.g.
     `ParameterSetInsertion::EachKeyFrame` never prepended parameter sets on
     streams using CRA pictures (such as `libx265` defaults).
-    Fixes [#132](https://github.com/scottlamb/retina/issues/132).
+    Fixes [#132](https://github.com/scottlamb/retina/issues/132). Thanks to
+    [@hsdfat](https://github.com/hsdfat) in
+    [#140](https://github.com/scottlamb/retina/pull/140).
 *   H.264: likewise treat pictures with a recovery point SEI message with
     `recovery_frame_cnt` 0 (open GOP random access points, as produced by
     `libx264` with `open-gop=1`) as random access points.

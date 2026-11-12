@@ -22,10 +22,10 @@ Progress:
     *   [x] RTSP/1.0.
     *   [ ] RTSP/2.0.
     *   [ ] SRTP.
-    *   [ ] ONVIF backchannel support (for sending audio).
+    *   [x] ONVIF backchannel support (for sending audio).
     *   [ ] ONVIF replay mode.
     *   [x] receiving RTCP Sender Reports (currently only uses the timestamp)
-    *   [ ] sending RTCP Receiver Reports
+    *   [x] sending RTCP Receiver Reports
 *   [ ] server support
 *   I/O modes
     *   [x] async with tokio
@@ -33,14 +33,14 @@ Progress:
     *   [ ] synchronous with std only
 *   codec depacketization
     *   [x] video
-        * [x] H.264 (RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
+        * [x] H.264 ([RFC 6184](https://datatracker.ietf.org/doc/html/rfc6184))
             *   [ ] SVC
-            *   [ ] periodic infra refresh
+            *   [ ] periodic intra refresh
             *   [x] multiple slices per picture
             *   [ ] multiple SPS/PPS
             *   [ ] interleaved mode
-            *   [x] AAC output format
-            *   [ ] Annex B output format ([#44](https://github.com/scottlamb/retina/issues/44))
+            *   [x] AVC output format
+            *   [x] Annex B output format ([#44](https://github.com/scottlamb/retina/issues/44))
         * [x] H.265 ([RFC 7798](https://tools.ietf.org/html/rfc7798))
         * [x] MJPEG ([RFC 2435](https://datatracker.ietf.org/doc/html/rfc2435))
     *   audio
@@ -56,7 +56,7 @@ Progress:
 *   *   [ ] programmatically inspectable error type.
 *   [ ] good functional testing coverage. (Currently lightly / unevenly tested.
         Most depacketizers have no tests.)
-*   [ ] fuzz testing. (In progress.)
+*   [ ] fuzz testing. (In progress; depacketizers and RTSP parsing are fuzzed in CI.)
 *   [x] benchmark
 
 Help welcome!

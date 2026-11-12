@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "retina"
-version = "0.4.21"
+version = "0.4.22"
 authors = ["Scott Lamb <slamb@slamb.org>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
