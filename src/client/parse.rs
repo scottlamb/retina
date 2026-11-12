@@ -82,7 +82,7 @@ static STATIC_PAYLOAD_TYPES: [Option<StaticPayloadType>; 35] = [
     /* 11 */ Some(StaticPayloadType {
         encoding: "l16",
         media: "audio",
-        clock_rate: 44_1000,
+        clock_rate: 44_100,
         channels: NonZeroU16::new(1),
     }),
     /* 12 */ Some(StaticPayloadType {
@@ -837,6 +837,20 @@ mod tests {
     use super::super::StreamState;
     use super::*;
     use crate::testutil::{init_logging, response};
+
+    /// Checks static payload types' clock rates against those in RFC 3551 tables 4 and 5.
+    #[test]
+    fn static_payload_type_clock_rates() {
+        for (pt, t) in STATIC_PAYLOAD_TYPES.iter().enumerate() {
+            let Some(t) = t else { continue };
+            assert!(
+                [8_000, 11_025, 16_000, 22_050, 44_100, 90_000].contains(&t.clock_rate),
+                "payload type {pt} ({}) has clock rate {}",
+                t.encoding,
+                t.clock_rate,
+            );
+        }
+    }
 
     fn parse_describe(
         raw_url: &str,
