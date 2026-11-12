@@ -1172,10 +1172,21 @@ struct StreamStateInit {
 }
 
 /// Username and password authentication credentials.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The `Debug` impl omits the password, so credentials don't end up in logs.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &format_args!("<redacted>"))
+            .finish()
+    }
 }
 
 /// Marker trait for the state of a [Session].
@@ -4103,6 +4114,18 @@ mod tests {
         assert_eq!(
             elapsed,
             std::time::Duration::from_secs(LIVE555_EXPIRATION_SEC)
+        );
+    }
+
+    #[test]
+    fn credentials_debug_omits_password() {
+        let creds = Credentials {
+            username: "admin".to_owned(),
+            password: "secret".to_owned(),
+        };
+        assert_eq!(
+            format!("{creds:?}"),
+            r#"Credentials { username: "admin", password: <redacted> }"#
         );
     }
 

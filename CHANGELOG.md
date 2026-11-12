@@ -46,6 +46,8 @@
     `PlayOptions::enforce_timestamps_with_max_jump_secs`, a sender report that
     sets the epoch before the first RTP packet no longer makes that packet
     fail as a backward time jump when it's stamped slightly earlier.
+*   `Credentials`'s `Debug` impl omits the password, so logging options or
+    credentials with `{:?}` no longer reveals it.
 
 ## `v0.4.21` (2026-10-04)
 
