@@ -48,6 +48,11 @@
     fail as a backward time jump when it's stamped slightly earlier.
 *   `Credentials`'s `Debug` impl omits the password, so logging options or
     credentials with `{:?}` no longer reveals it.
+*   JPEG: handle packet loss as the other codecs do. A frame missing a packet
+    is dropped rather than returned with a gap in its data, and
+    `VideoFrame::loss` counts all packets lost since the previous frame
+    returned. Previously it counted only the loss just before the frame's
+    final packet.
 
 ## `v0.4.21` (2026-10-04)
 

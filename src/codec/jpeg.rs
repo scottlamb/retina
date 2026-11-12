@@ -305,6 +305,9 @@ pub struct Depacketizer {
     pending: Option<VideoFrame>,
 
     parameters: Option<VideoParameters>,
+
+    /// RTP packets lost since the last frame returned, to report on the next.
+    loss: u16,
 }
 
 impl Depacketizer {
@@ -315,6 +318,7 @@ impl Depacketizer {
             pending: None,
             qtables: vec![None; 255],
             parameters: None,
+            loss: 0,
         }
     }
 
@@ -323,12 +327,26 @@ impl Depacketizer {
             panic!("push with data already pending: {p:?}");
         }
 
+        self.loss = self.loss.saturating_add(pkt.meta.loss);
+        if pkt.meta.loss > 0 && self.metadata.is_some() {
+            // As with the other codecs, discard a frame with interior loss
+            // rather than returning it with a gap. If this packet starts a
+            // new frame, it's handled below; otherwise the rest of this
+            // frame's packets are ignored as having no header.
+            log::debug!(
+                "Discarding {}-byte JPEG frame prefix due to loss of {} RTP packets",
+                self.data.len(),
+                pkt.meta.loss,
+            );
+            self.metadata = None;
+            self.data.clear();
+        }
+
         if (pkt.payload_len() as usize) < 8 {
             return Err("Too short RTP/JPEG packet".to_string());
         }
 
         let ctx = pkt.meta.ctx;
-        let loss = pkt.meta.loss;
         let stream_id = pkt.meta.stream_id;
         let timestamp = pkt.meta.timestamp;
         let last_packet_in_frame = pkt.meta.mark;
@@ -509,7 +527,7 @@ impl Depacketizer {
                 start_ctx: metadata.start_ctx,
                 end_ctx: ctx,
                 has_new_parameters,
-                loss,
+                loss: std::mem::take(&mut self.loss),
                 timestamp,
                 stream_id,
                 is_random_access_point: true,
@@ -919,6 +937,73 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame.into_data(),
             _ => panic!(),
         }
+    }
+
+    /// Pushes one packet of the `frame_i`th frame, returning the frame it
+    /// completes, if any.
+    fn push_packet(
+        d: &mut super::Depacketizer,
+        buf: &mut MarkBuf,
+        frame_i: u16,
+        sequence_number: u16,
+        loss: u16,
+        payload: &[u8],
+    ) -> Option<crate::codec::VideoFrame> {
+        let pkt = ReceivedPacketBuilder {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp: i64::from(frame_i) * 3000,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss,
+            mark: payload == END_PACKET,
+            payload_type: 0,
+        }
+        .build(payload.iter().copied())
+        .unwrap();
+        push_via_buf(
+            d,
+            crate::rtp::PacketMeta::from_received(&pkt),
+            pkt.payload(),
+            buf,
+        )
+        .unwrap();
+        match d.pull() {
+            None => None,
+            Some(Ok(CodecItem::VideoFrame(frame))) => Some(frame),
+            o => panic!("unexpected pull result: {o:?}"),
+        }
+    }
+
+    /// Like the other codecs, a frame with packet loss is dropped rather than
+    /// returned with a gap, and the loss is reported on the next frame.
+    #[test]
+    fn depacketize_loss() {
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(65536);
+
+        // Frame 0 loses a packet between its start and end.
+        assert!(push_packet(&mut d, &mut buf, 0, 0, 0, START_PACKET).is_none());
+        assert!(push_packet(&mut d, &mut buf, 0, 2, 1, END_PACKET).is_none());
+
+        // Frame 1 loses its start.
+        assert!(push_packet(&mut d, &mut buf, 1, 4, 1, END_PACKET).is_none());
+
+        // Frame 2 is complete and reports both losses.
+        assert!(push_packet(&mut d, &mut buf, 2, 5, 0, START_PACKET).is_none());
+        let frame = push_packet(&mut d, &mut buf, 2, 6, 0, END_PACKET).unwrap();
+        assert_eq!(frame.loss(), 2);
+        assert_eq_hex!(frame.into_data(), VALID_JPEG_IMAGE);
+
+        // Frame 3 has no loss to report.
+        assert!(push_packet(&mut d, &mut buf, 3, 7, 0, START_PACKET).is_none());
+        let frame = push_packet(&mut d, &mut buf, 3, 8, 0, END_PACKET).unwrap();
+        assert_eq!(frame.loss(), 0);
     }
 
     #[test]
