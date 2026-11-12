@@ -412,7 +412,6 @@ fn try_decode(
 ) -> Result<Option<ReceivedMessage>, CodecError> {
     use crate::rtsp::parse::FeedError;
 
-    let pos = parser.stream_pos();
     let unparsed = read_buf.unparsed();
     let mut input = {
         let split = read_buf.unparsed_split();
@@ -441,7 +440,9 @@ fn try_decode(
                 body_pos,
                 body_len: body_len as u32,
                 ctx: RtspMessageContext {
-                    pos,
+                    // Where the message began, which can be in an earlier read than this one when
+                    // its head arrived in pieces; the parser's position at this call's start is not.
+                    pos: parser.msg_start_pos(),
                     received_wall: WallTime::now(),
                     received: Instant::now(),
                 },
@@ -463,7 +464,8 @@ fn try_decode(
                     "Incomplete RTSP message at EOF ({inc}); buffered:\n{:#?}",
                     crate::hex::LimitedHex::from_split(read_buf.unparsed_split(), 128),
                 ),
-                pos,
+                // The truncated message's own start (it may have begun in an earlier read).
+                pos: parser.msg_start_pos(),
             })
         }
         Err(FeedError::Invalid(inv)) => Err(CodecError::ParseError {
@@ -912,6 +914,50 @@ mod tests {
         read_buf.advance_end(data.len());
     }
 
+    /// A message's `pos` is where it began in the stream, even when its head arrives in pieces
+    /// and the parser stably consumed part of it on an earlier read, and after the blank line some
+    /// servers send between messages.
+    #[test]
+    fn message_pos_is_the_message_start_across_reads() {
+        let mut read_buf = MarkBuf::new(256);
+        let mut parser = crate::rtsp::parse::Parser::default();
+
+        // An interleaved frame at stream position 0.
+        push(&mut read_buf, b"$\x00\x00\x04asdf");
+        let data = try_decode(&mut parser, &mut read_buf, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.ctx.pos, 0);
+
+        // A blank line, then a response whose head arrives over three reads. It starts at
+        // 8 + 2 = 10. The first read ends mid-header, so the parser stably consumes the
+        // status line before returning `Incomplete`.
+        push(&mut read_buf, b"\r\nRTSP/1.0 200 OK\r\nCSe");
+        assert!(
+            try_decode(&mut parser, &mut read_buf, false)
+                .unwrap()
+                .is_none()
+        );
+        push(&mut read_buf, b"q: 1\r\n");
+        assert!(
+            try_decode(&mut parser, &mut read_buf, false)
+                .unwrap()
+                .is_none()
+        );
+        push(&mut read_buf, b"\r\n$\x00\x00\x02hi");
+        let resp = try_decode(&mut parser, &mut read_buf, false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(resp.msg, crate::rtsp::msg::Message::Response(_)));
+        assert_eq!(resp.ctx.pos, 10);
+
+        // The next frame starts right after the response's head (10 + 17 + 9 + 2 = 38).
+        let data = try_decode(&mut parser, &mut read_buf, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.ctx.pos, 38);
+    }
+
     /// Blank lines right before the end of the stream close it cleanly: they are not a truncated
     /// message.
     #[test]
@@ -949,6 +995,30 @@ mod tests {
         );
         assert_eq!(read_buf.unparsed_len(), 0);
         assert_eq!(parser.stream_pos(), 4);
+    }
+
+    /// A message truncated by EOF reports its own start, not where the final read began.
+    #[test]
+    fn truncated_message_pos_is_its_start() {
+        let mut read_buf = MarkBuf::new(256);
+        let mut parser = crate::rtsp::parse::Parser::default();
+        push(
+            &mut read_buf,
+            b"$\x00\x00\x01xRTSP/1.0 200 OK\r\nCSeq: 1\r\n",
+        );
+        let data = try_decode(&mut parser, &mut read_buf, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.ctx.pos, 0);
+        assert!(
+            try_decode(&mut parser, &mut read_buf, false)
+                .unwrap()
+                .is_none()
+        );
+        match try_decode(&mut parser, &mut read_buf, true) {
+            Err(CodecError::ParseError { pos, .. }) => assert_eq!(pos, 5),
+            other => panic!("expected a truncation error, got {other:?}"),
+        }
     }
 
     #[test]
