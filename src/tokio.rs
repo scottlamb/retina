@@ -422,7 +422,15 @@ fn try_decode(
     let initial_len = input.len();
 
     match parser.feed(&mut input) {
-        Ok(None) => Ok(None), // idle, no data; caller distinguishes EOF from "need more"
+        Ok(None) => {
+            // Idle between messages. Blank lines before here may have been consumed: advance past
+            // them so they are not parsed again. The caller tells a clean EOF from "need more".
+            let consumed = initial_len - input.len();
+            if consumed > 0 {
+                read_buf.advance_unparsed(unparsed + consumed as u64);
+            }
+            Ok(None)
+        }
         Ok(Some((msg, body_slice))) => {
             let consumed = initial_len - input.len();
             let body_len = body_slice.len();
@@ -895,6 +903,52 @@ mod tests {
         );
         assert!(conn.write_buf.is_empty());
         assert_eq!(conn.written(), written);
+    }
+
+    /// Puts `data` at the end of `read_buf`'s buffered bytes.
+    fn push(read_buf: &mut MarkBuf, data: &[u8]) {
+        let (first, _) = read_buf.spare_capacity(data.len());
+        first[..data.len()].copy_from_slice(data);
+        read_buf.advance_end(data.len());
+    }
+
+    /// Blank lines right before the end of the stream close it cleanly: they are not a truncated
+    /// message.
+    #[test]
+    fn blank_lines_before_eof_close_cleanly() {
+        let mut read_buf = MarkBuf::new(256);
+        let mut parser = crate::rtsp::parse::Parser::default();
+        push(&mut read_buf, b"$\x00\x00\x02hi\r\n\r\n");
+        let data = try_decode(&mut parser, &mut read_buf, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.ctx.pos, 0);
+        // The blank lines are consumed, once.
+        assert!(
+            try_decode(&mut parser, &mut read_buf, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read_buf.unparsed_len(), 0);
+        assert_eq!(parser.stream_pos(), 6 + 4);
+        // EOF now is a clean close, not an error.
+        assert!(
+            try_decode(&mut parser, &mut read_buf, true)
+                .unwrap()
+                .is_none()
+        );
+
+        // The same when the blank lines and EOF arrive together.
+        let mut read_buf = MarkBuf::new(256);
+        let mut parser = crate::rtsp::parse::Parser::default();
+        push(&mut read_buf, b"\r\n\r\n");
+        assert!(
+            try_decode(&mut parser, &mut read_buf, true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read_buf.unparsed_len(), 0);
+        assert_eq!(parser.stream_pos(), 4);
     }
 
     #[test]
