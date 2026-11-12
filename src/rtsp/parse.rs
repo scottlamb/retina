@@ -181,6 +181,7 @@ impl ParserBuilder {
             max_message_size: self.max_message_size,
             state: ParserState::default(),
             stream_pos: 0,
+            msg_start_pos: 0,
         }
     }
 }
@@ -190,6 +191,8 @@ pub struct Parser {
     state: ParserState,
     /// Cumulative bytes consumed from the stream across all `feed` calls.
     stream_pos: u64,
+    /// See [`Parser::msg_start_pos`].
+    msg_start_pos: u64,
 }
 
 impl Default for Parser {
@@ -230,6 +233,15 @@ impl Parser {
         self.stream_pos
     }
 
+    /// Stream position where the current message begins (its `$` or the first byte of its start
+    /// line), past any blank lines before it, however many `feed` calls it has taken so far.
+    ///
+    /// After `feed` returns a message, that message. After `Incomplete` or an error, the message in
+    /// progress. After `Ok(None)`, where the next message will begin.
+    pub fn msg_start_pos(&self) -> u64 {
+        self.msg_start_pos
+    }
+
     /// Returns an error if a request or response of at least `size` bytes
     /// exceeds the configured maximum.
     fn check_size(&self, msg: &Message, size: u64) -> Result<(), FeedError> {
@@ -264,7 +276,7 @@ impl Parser {
     ) -> Result<Option<(Message, I)>, FeedError> {
         let start_pos = self.stream_pos;
         let initial_len = input.len();
-        let result = self.feed_inner(input);
+        let result = self.feed_inner(input, start_pos, initial_len);
         let consumed = (initial_len - input.len()) as u64;
         self.stream_pos += consumed;
         result.map_err(|e| e.with_pos(start_pos + consumed))
@@ -273,10 +285,22 @@ impl Parser {
     fn feed_inner<'i, I: Input<'i>>(
         &mut self,
         input: &mut I,
+        start_pos: u64,
+        initial_len: usize,
     ) -> Result<Option<(Message, I)>, FeedError> {
         loop {
             match std::mem::take(&mut self.state) {
                 ParserState::Idle => {
+                    // Blank lines between messages belong to no message: step over them so the
+                    // next message's start is its own first byte. A lone `\r` or a `\r` not
+                    // followed by `\n` is left for `parse_head` to judge.
+                    while input.len() >= 2
+                        && input.peek_byte() == Some(b'\r')
+                        && input.byte_at(1) == b'\n'
+                    {
+                        input.advance(2);
+                    }
+                    self.msg_start_pos = start_pos + (initial_len - input.len()) as u64;
                     let checkpoint = *input;
                     let before = input.len();
                     // An interleaved frame written into the first line of a
