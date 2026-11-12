@@ -1075,7 +1075,36 @@ impl std::fmt::Debug for UdpSockets {
     }
 }
 
+/// Reception counters for one stream, from [`Stream::stats`].
+///
+/// New counters may be added in a minor release.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamStats {
+    /// RTP packets accepted.
+    pub rtp_packets: u64,
+
+    /// RTCP packets received.
+    pub rtcp_packets: u64,
+
+    /// RTP packets lost: the sum of the sequence-number gaps before each accepted packet. A
+    /// caller recording or monitoring a stream can report it without counting frames' `loss`
+    /// itself, and without missing loss in packets that never formed a frame.
+    pub lost_packets: u64,
+}
+
 impl Stream {
+    /// Returns the stream's reception counters, once it is playing; `None` before `PLAY`.
+    ///
+    /// Available through [`Session::streams`] and [`Demuxed::streams`] while packets flow, so a
+    /// caller can report reception health without parsing log messages.
+    pub fn stats(&self) -> Option<StreamStats> {
+        match &self.state {
+            StreamState::Playing { rtp_handler, .. } => Some(rtp_handler.stats()),
+            _ => None,
+        }
+    }
+
     /// Returns codec-specified parameters for this stream, if available.
     ///
     /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't (yet) known.
