@@ -39,6 +39,13 @@
 *   JPEG: append an end-of-image marker to frames whose data ends in
     `ff xx` or `xx d9`. Previously the check used the wrong boolean
     operator and skipped these.
+*   RTCP sender reports: check the SSRC before placing the report's RTP
+    timestamp on the stream's timeline. Previously a sender report from
+    another SSRC, dropped under the default `UnknownRtcpSsrcPolicy`, could
+    still set the stream's NPT epoch. Also, with
+    `PlayOptions::enforce_timestamps_with_max_jump_secs`, a sender report that
+    sets the epoch before the first RTP packet no longer makes that packet
+    fail as a backward time jump when it's stamped slightly earlier.
 
 ## `v0.4.21` (2026-10-04)
 

@@ -327,13 +327,8 @@ impl InorderParser {
         let first_pkt = crate::rtcp::ReceivedCompoundPacket::validate(&data[..])?;
         let mut rtp_timestamp = None;
         if let Ok(Some(sr)) = first_pkt.as_sender_report() {
-            rtp_timestamp = Some(timeline.place(sr.rtp_timestamp()).map_err(
-                |mut description| {
-                    description.push_str(" in RTCP SR");
-                    description
-                },
-            )?);
-
+            // Check the SSRC before placing the timestamp: placing can set
+            // the NPT epoch, which a stray sender report shouldn't.
             let ssrc = sr.ssrc();
             if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
                 match self.unknown_rtcp_session {
@@ -373,6 +368,12 @@ impl InorderParser {
                     ssrc,
                 });
             }
+            rtp_timestamp = Some(timeline.place(sr.rtp_timestamp()).map_err(
+                |mut description| {
+                    description.push_str(" in RTCP SR");
+                    description
+                },
+            )?);
         }
         self.seen_rtcp_packets += 1;
         Ok(Some(PacketItem::Rtcp(ReceivedCompoundPacket {
@@ -653,6 +654,33 @@ mod tests {
         assert!(!push_rtp(&mut parser, &mut timeline, 23162, 8, 0x111).unwrap());
         assert!(push_rtp(&mut parser, &mut timeline, 2, 96, 0x110).unwrap());
         assert!(push_rtp(&mut parser, &mut timeline, 3, 96, 0x112).is_err());
+    }
+
+    /// A sender report from an unexpected SSRC is dropped without setting the
+    /// NPT epoch; the first RTP packet sets it instead.
+    #[test]
+    fn stray_sender_report() {
+        let mut timeline = Timeline::new(None, 90_000, None).unwrap();
+        let mut parser = InorderParser::new(Some(0x110), None, 96, UnknownRtcpSsrcPolicy::Default);
+        let mut sender = Sender::new(96, 90_000);
+        sender.ssrc = 0x111;
+        sender.timestamp_offset = 1_000_000;
+        let mut sr = bytes::BytesMut::new();
+        sender.write_sender_report(tokio::time::Instant::now(), crate::NtpTimestamp(0), &mut sr);
+        let item = parser
+            .rtcp(
+                &SessionOptions::default(),
+                &StreamContext::dummy(),
+                None,
+                &ConnectionContext::dummy(),
+                &PacketContext::dummy(),
+                &mut timeline,
+                0,
+                sr.freeze(),
+            )
+            .unwrap();
+        assert!(item.is_none());
+        assert_eq!(timeline.advance_to(3_000).unwrap().elapsed(), 0);
     }
 
     /// Sender reports follow the first RTP packet, then come every 2.5–7.5
