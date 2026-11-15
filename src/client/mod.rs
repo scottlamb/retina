@@ -705,6 +705,7 @@ pub struct TcpTransportOptions;
 pub struct UdpTransportOptions {
     reorder_packets: usize,
     reorder_delay: std::time::Duration,
+    reorder_max_bytes: Option<usize>,
 }
 
 impl UdpTransportOptions {
@@ -717,10 +718,23 @@ impl UdpTransportOptions {
     /// latency. Packets that arrive after their place has passed are still
     /// dropped.
     ///
+    /// A `delay` of zero reorders only packets read in one go: held packets
+    /// are released as soon as the sockets have nothing more to read.
+    ///
     /// The default, `packets` of 0, holds nothing.
     pub fn reorder(mut self, packets: usize, delay: std::time::Duration) -> Self {
         self.reorder_packets = packets;
         self.reorder_delay = delay;
+        self
+    }
+
+    /// Limits the RTP bytes the [reorder window](Self::reorder) holds at once.
+    ///
+    /// A packet that takes the window past `bytes` gives up on the missing
+    /// packet, as a packet past the window does. The default is no limit
+    /// beyond the window's packet count.
+    pub fn reorder_max_bytes(mut self, bytes: usize) -> Self {
+        self.reorder_max_bytes = Some(bytes);
         self
     }
 }
@@ -1152,8 +1166,12 @@ impl UdpSockets {
             return Some(item);
         };
         let mark = self.read_buf.add_mark_at(item.body_pos);
-        self.reorder
-            .push(sequence_number, tokio::time::Instant::now(), (item, mark));
+        self.reorder.push(
+            sequence_number,
+            usize::from(item.body_len),
+            tokio::time::Instant::now(),
+            (item, mark),
+        );
         self.next_released()
     }
 }
@@ -1996,6 +2014,7 @@ impl Session<Described> {
                         read_buf: crate::buf::MarkBuf::new(65536),
                         reorder: reorder::Reorder::new(
                             udp_options.reorder_packets,
+                            udp_options.reorder_max_bytes.unwrap_or(usize::MAX),
                             udp_options.reorder_delay,
                         ),
                         reorder_timer: None,
