@@ -35,6 +35,7 @@ use crate::{
 mod channel_mapping;
 mod parse;
 mod receiver_report;
+mod reorder;
 
 /// Internal API, public for a benchmark only.
 #[doc(hidden)]
@@ -469,6 +470,17 @@ fn keepalive_interval(session: &SessionHeader) -> std::time::Duration {
     std::time::Duration::from_secs(std::cmp::min(u64::from(session.timeout_sec), 60)) / 2
 }
 
+/// Returns the sequence number of a UDP datagram that looks like an RTP
+/// packet, leaving anything else for [`crate::rtp::PacketHeader::validate`]
+/// to reject.
+fn rtp_sequence_number(datagram: crate::inputs::Split<'_>) -> Option<u16> {
+    let (first, second) = datagram.slices();
+    let mut bytes = first.iter().chain(second).copied();
+    let start: [u8; 4] = std::array::from_fn(|_| bytes.next().unwrap_or_default());
+    (first.len() + second.len() >= 12 && start[0] >> 6 == 2)
+        .then(|| u16::from_be_bytes([start[2], start[3]]))
+}
+
 /// Returns the current time for RTCP receiver reports' statistics and schedule.
 ///
 /// This reads tokio's clock, as the report timer does, so the two agree even
@@ -652,7 +664,8 @@ pub enum Transport {
     /// Sends RTP packets over UDP (experimental).
     ///
     /// This support is currently only suitable for a LAN for a couple reasons:
-    /// *   There's no reorder buffer, so out-of-order packets are all dropped.
+    /// *   There's no reorder buffer by default, so out-of-order packets are
+    ///     all dropped. See [`UdpTransportOptions::reorder`].
     /// *   RTCP RRs (receiver reports) aren't sent by default, so servers won't
     ///     have the correct information to measure packet loss and pace packets
     ///     appropriately. See [`SessionOptions::receiver_reports`].
@@ -686,10 +699,30 @@ impl std::str::FromStr for Transport {
 #[non_exhaustive]
 pub struct TcpTransportOptions;
 
-/// Per-stream UDP transport options (placeholder for future expansion).
+/// Per-stream UDP transport options.
 #[derive(Clone, Default, Debug)]
 #[non_exhaustive]
-pub struct UdpTransportOptions;
+pub struct UdpTransportOptions {
+    reorder_packets: usize,
+    reorder_delay: std::time::Duration,
+}
+
+impl UdpTransportOptions {
+    /// Puts RTP packets that arrive out of order back in sequence.
+    ///
+    /// A packet that arrives ahead of a missing one is held until the missing
+    /// one arrives, until a packet `packets` or more sequence numbers past
+    /// it arrives, or until it has waited `delay`, whichever comes first. A
+    /// missing packet therefore adds at most `delay` of latency. Packets
+    /// that arrive after their place has passed are still dropped.
+    ///
+    /// The default, `packets` of 0, holds nothing.
+    pub fn reorder(mut self, packets: usize, delay: std::time::Duration) -> Self {
+        self.reorder_packets = packets;
+        self.reorder_delay = delay;
+        self
+    }
+}
 
 impl SessionOptions {
     /// Uses the given credentials when/if the server requests digest authentication.
@@ -1066,6 +1099,8 @@ struct UdpSockets {
     rtp: UdpSocket,
     rtcp: UdpSocket,
     read_buf: crate::buf::MarkBuf,
+    reorder: reorder::Reorder<(StreamItem, crate::buf::Mark)>,
+    reorder_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 /// Placeholder `Debug` impl to allow `UdpSockets` to be a field within a `#[derive(Debug)]` struct.
@@ -1877,7 +1912,7 @@ impl Session<Described> {
                 *inner.flags |= SessionFlag::TcpStreams as u8;
                 None
             }
-            Transport::Udp(_) => {
+            Transport::Udp(udp_options) => {
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
                 let local_ip = conn.inner.ctx().local_addr.ip();
@@ -1904,6 +1939,11 @@ impl Session<Described> {
                         rtp: pair.rtp_socket,
                         rtcp: pair.rtcp_socket,
                         read_buf: crate::buf::MarkBuf::new(65536),
+                        reorder: reorder::Reorder::new(
+                            udp_options.reorder_packets,
+                            udp_options.reorder_delay,
+                        ),
+                        reorder_timer: None,
                     },
                 ))
             }
@@ -2905,35 +2945,91 @@ impl Session<Playing> {
             .inner
             .ctx();
 
+        if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+            return Poll::Ready(Some(Ok(item)));
+        }
+
         // Prioritize RTCP over RTP within a stream.
         for channel_type in [ChannelType::Rtcp, ChannelType::Rtp] {
-            let socket = match channel_type {
-                ChannelType::Rtcp => &udp_sockets.rtcp,
-                ChannelType::Rtp => &udp_sockets.rtp,
-            };
-            let body_pos = udp_sockets.read_buf.end();
-            match Self::poll_udp_recv(socket, cx, &mut udp_sockets.read_buf, conn_ctx, stream_ctx) {
-                Poll::Ready(Ok(n)) => {
-                    udp_sockets.read_buf.advance_end(usize::from(n));
-                    udp_sockets
-                        .read_buf
-                        .advance_unparsed(udp_sockets.read_buf.end());
-                    return Poll::Ready(Some(Ok(StreamItem {
-                        pkt_ctx: crate::PacketContext(crate::PacketContextInner::Udp {
-                            received: Instant::now(),
-                            received_wall: crate::WallTime::now(),
-                        }),
-                        stream_i: i,
-                        channel_type,
-                        body_pos,
-                        body_len: n,
-                    })));
+            loop {
+                let socket = match channel_type {
+                    ChannelType::Rtcp => &udp_sockets.rtcp,
+                    ChannelType::Rtp => &udp_sockets.rtp,
+                };
+                let body_pos = udp_sockets.read_buf.end();
+                match Self::poll_udp_recv(
+                    socket,
+                    cx,
+                    &mut udp_sockets.read_buf,
+                    conn_ctx,
+                    stream_ctx,
+                ) {
+                    Poll::Ready(Ok(n)) => {
+                        udp_sockets.read_buf.advance_end(usize::from(n));
+                        udp_sockets
+                            .read_buf
+                            .advance_unparsed(udp_sockets.read_buf.end());
+                        let item = StreamItem {
+                            pkt_ctx: crate::PacketContext(crate::PacketContextInner::Udp {
+                                received: Instant::now(),
+                                received_wall: crate::WallTime::now(),
+                            }),
+                            stream_i: i,
+                            channel_type,
+                            body_pos,
+                            body_len: n,
+                        };
+                        let sequence_number = match channel_type {
+                            ChannelType::Rtp if udp_sockets.reorder.enabled() => {
+                                rtp_sequence_number(
+                                    udp_sockets.read_buf.split(body_pos, usize::from(n)),
+                                )
+                            }
+                            _ => None,
+                        };
+                        let Some(sequence_number) = sequence_number else {
+                            return Poll::Ready(Some(Ok(item)));
+                        };
+                        let mark = udp_sockets.read_buf.add_mark_at(body_pos);
+                        udp_sockets.reorder.push(
+                            sequence_number,
+                            tokio::time::Instant::now(),
+                            (item, mark),
+                        );
+                        if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+                            return Poll::Ready(Some(Ok(item)));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Poll::Pending => break,
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                Poll::Pending => {}
             }
         }
-        Poll::Pending
+        Self::poll_reorder_timer(udp_sockets, cx)
+    }
+
+    /// Releases held packets whose wait in the reorder window has run out.
+    fn poll_reorder_timer(
+        udp_sockets: &mut UdpSockets,
+        cx: &mut std::task::Context,
+    ) -> Poll<Option<Result<StreamItem, Error>>> {
+        loop {
+            let Some(deadline) = udp_sockets.reorder.deadline() else {
+                udp_sockets.reorder_timer = None;
+                return Poll::Pending;
+            };
+            let timer = udp_sockets
+                .reorder_timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+            if timer.deadline() != deadline {
+                timer.as_mut().reset(deadline);
+            }
+            ready!(timer.as_mut().poll(cx));
+            udp_sockets.reorder.expire(tokio::time::Instant::now());
+            if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+                return Poll::Ready(Some(Ok(item)));
+            }
+        }
     }
 
     /// Polls all UDP streams, round-robining between them to avoid starvation.
@@ -4966,21 +5062,24 @@ mod tests {
         assert_eq!(keepalives, 3); // at 30, 60, and 90 s.
     }
 
-    /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
-    /// port.
-    #[tokio::test]
-    async fn receiver_reports_udp() {
-        init_logging();
+    /// Plays the Reolink stream over UDP from the mock server, returning the
+    /// session, the mock RTSP connection (to keep it open), the server's UDP
+    /// sockets, and the client's RTP port.
+    async fn play_reolink_over_udp(
+        session_options: SessionOptions,
+        udp_options: UdpTransportOptions,
+    ) -> (
+        Session<Playing>,
+        crate::tokio::Connection,
+        crate::tokio::UdpPair,
+        u16,
+    ) {
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
 
         // DESCRIBE.
         let (session, _) = tokio::join!(
-            Session::describe_with_conn(
-                conn,
-                SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always),
-                url
-            ),
+            Session::describe_with_conn(conn, session_options, url),
             req_response(
                 &mut server,
                 msg::Method::DESCRIBE,
@@ -4996,7 +5095,7 @@ mod tests {
                 session
                     .setup(
                         0,
-                        SetupOptions::default().transport(Transport::Udp(Default::default())),
+                        SetupOptions::default().transport(Transport::Udp(udp_options)),
                     )
                     .await
                     .unwrap();
@@ -5062,7 +5161,59 @@ mod tests {
                 response(include_bytes!("testdata/reolink_play.txt"))
             ),
         );
-        let session = session.unwrap();
+        (session.unwrap(), server, server_udp, client_rtp_port)
+    }
+
+    /// With a reorder window, RTP packets swapped on the way arrive in order,
+    /// and one held behind a lost packet arrives once its wait runs out.
+    #[tokio::test]
+    async fn udp_reorder() {
+        init_logging();
+        let delay = std::time::Duration::from_millis(20);
+        let (session, _server, server_udp, client_rtp_port) = play_reolink_over_udp(
+            SessionOptions::default(),
+            UdpTransportOptions::default().reorder(8, delay),
+        )
+        .await;
+        tokio::pin!(session);
+        let client_rtp_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_rtp_port);
+        for seq in [0x41d4, 0x41d6, 0x41d5, 0x41d8] {
+            server_udp
+                .rtp_socket
+                .send_to(&rtp_pkt(seq, 0), client_rtp_addr)
+                .await
+                .unwrap();
+        }
+        for seq in [0x41d4, 0x41d5, 0x41d6] {
+            match session.next().await {
+                Some(Ok(PacketItem::Rtp(p))) => assert_eq!(p.sequence_number(), seq),
+                o => panic!("unexpected item: {o:#?}"),
+            }
+        }
+        let held = tokio::time::timeout(std::time::Duration::from_secs(5), session.next());
+        match held
+            .await
+            .expect("the held packet is released once its wait runs out")
+        {
+            Some(Ok(PacketItem::Rtp(p))) => {
+                assert_eq!((p.sequence_number(), p.loss()), (0x41d8, 1));
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        }
+    }
+
+    /// Over UDP, reports go from the stream's RTCP socket to the server's RTCP
+    /// port.
+    #[tokio::test]
+    async fn receiver_reports_udp() {
+        init_logging();
+        let (session, _server, server_udp, client_rtp_port) = play_reolink_over_udp(
+            SessionOptions::default().receiver_reports(ReceiverReportPolicy::Always),
+            UdpTransportOptions::default(),
+        )
+        .await;
+        let client_rtcp_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_rtp_port + 1);
+        let mut buf = [0u8; 1500];
         tokio::pin!(session);
         let mut reports = session.0.reports.take().unwrap();
         let (ssrc, cname) = (reports.writer.ssrc, reports.writer.cname.clone());
