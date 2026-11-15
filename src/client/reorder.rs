@@ -1,3 +1,6 @@
+// Copyright (C) The Retina Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::VecDeque;
 use std::time::Duration;
 
