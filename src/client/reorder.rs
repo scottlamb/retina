@@ -33,6 +33,10 @@ impl<T> Reorder<T> {
         }
     }
 
+    pub(super) fn start_at(&mut self, sequence_number: u16) {
+        self.next = Some(sequence_number);
+    }
+
     pub(super) fn enabled(&self) -> bool {
         self.max_packets > 0
     }
@@ -177,6 +181,14 @@ mod tests {
             "a jump past the window releases what is held and starts over"
         );
         assert_eq!(pushed(&mut reorder, now, &[5001]), [5001]);
+    }
+
+    #[test]
+    fn the_first_packets_are_reordered_when_the_starting_sequence_number_is_known() {
+        let now = Instant::now();
+        let mut reorder = Reorder::new(8, DELAY);
+        reorder.start_at(40);
+        assert_eq!(pushed(&mut reorder, now, &[41, 40]), [40, 41]);
     }
 
     #[test]

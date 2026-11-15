@@ -712,9 +712,10 @@ impl UdpTransportOptions {
     ///
     /// A packet that arrives ahead of a missing one is held until the missing
     /// one arrives, until a packet `packets` or more sequence numbers past
-    /// it arrives, or until it has waited `delay`, whichever comes first. A
-    /// missing packet therefore adds at most `delay` of latency. Packets
-    /// that arrive after their place has passed are still dropped.
+    /// the missing one arrives, or until it has waited `delay`, whichever
+    /// comes first. A missing packet therefore adds at most `delay` of
+    /// latency. Packets that arrive after their place has passed are still
+    /// dropped.
     ///
     /// The default, `packets` of 0, holds nothing.
     pub fn reorder(mut self, packets: usize, delay: std::time::Duration) -> Self {
@@ -1101,6 +1102,60 @@ struct UdpSockets {
     read_buf: crate::buf::MarkBuf,
     reorder: reorder::Reorder<(StreamItem, crate::buf::Mark)>,
     reorder_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// Buffer position of the last RTP packet the reorder window handed out.
+    released: u64,
+}
+
+impl UdpSockets {
+    /// Hands out an RTP packet the reorder window released.
+    ///
+    /// Depacketizers pin a frame's data with one [`crate::buf::Mark`] at its
+    /// first packet, so packets must be handed out at increasing buffer
+    /// positions. A packet that arrived before the last one handed out is
+    /// copied to the end of the buffer first.
+    fn released(&mut self, (mut item, mark): (StreamItem, crate::buf::Mark)) -> StreamItem {
+        if item.body_pos < self.released {
+            let body = self
+                .read_buf
+                .split(item.body_pos, usize::from(item.body_len))
+                .to_owned();
+            drop(mark);
+            item.body_pos = self.read_buf.end();
+            self.read_buf.extend(&body);
+            self.read_buf.advance_unparsed(self.read_buf.end());
+        }
+        self.released = item.body_pos;
+        item
+    }
+
+    /// Returns the next packet the reorder window has released, if any.
+    fn next_released(&mut self) -> Option<StreamItem> {
+        self.reorder.pop().map(|held| self.released(held))
+    }
+
+    /// Takes a received RTP packet, returning a packet to hand out now: this
+    /// one, or one it let the reorder window release. Returns `None` while
+    /// the window holds it behind a missing packet.
+    fn received_rtp(&mut self, item: StreamItem) -> Option<StreamItem> {
+        let sequence_number = self
+            .reorder
+            .enabled()
+            .then(|| {
+                rtp_sequence_number(
+                    self.read_buf
+                        .split(item.body_pos, usize::from(item.body_len)),
+                )
+            })
+            .flatten();
+        let Some(sequence_number) = sequence_number else {
+            return Some(item);
+        };
+        let mark = self.read_buf.add_mark_at(item.body_pos);
+        self.reorder
+            .push(sequence_number, tokio::time::Instant::now(), (item, mark));
+        self.next_released()
+    }
 }
 
 /// Placeholder `Debug` impl to allow `UdpSockets` to be a field within a `#[derive(Debug)]` struct.
@@ -1944,6 +1999,7 @@ impl Session<Described> {
                             udp_options.reorder_delay,
                         ),
                         reorder_timer: None,
+                        released: 0,
                     },
                 ))
             }
@@ -2298,6 +2354,12 @@ impl Session<Described> {
                         }
                     };
                     let conn_ctx = conn.inner.ctx();
+                    let udp_sockets = udp_sockets.map(|mut sockets| {
+                        if let Some(seq) = initial_seq {
+                            sockets.reorder.start_at(seq);
+                        }
+                        sockets
+                    });
                     s.state = StreamState::Playing {
                         timeline: Timeline::new(
                             initial_rtptime,
@@ -2821,6 +2883,7 @@ impl Session<Playing> {
             channel_type: m.channel_type,
             body_pos,
             body_len,
+            arrived: report_now(),
         }))
     }
 
@@ -2945,7 +3008,7 @@ impl Session<Playing> {
             .inner
             .ctx();
 
-        if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+        if let Some(item) = udp_sockets.next_released() {
             return Poll::Ready(Some(Ok(item)));
         }
 
@@ -2978,25 +3041,13 @@ impl Session<Playing> {
                             channel_type,
                             body_pos,
                             body_len: n,
+                            arrived: report_now(),
                         };
-                        let sequence_number = match channel_type {
-                            ChannelType::Rtp if udp_sockets.reorder.enabled() => {
-                                rtp_sequence_number(
-                                    udp_sockets.read_buf.split(body_pos, usize::from(n)),
-                                )
-                            }
-                            _ => None,
+                        let item = match channel_type {
+                            ChannelType::Rtcp => Some(item),
+                            ChannelType::Rtp => udp_sockets.received_rtp(item),
                         };
-                        let Some(sequence_number) = sequence_number else {
-                            return Poll::Ready(Some(Ok(item)));
-                        };
-                        let mark = udp_sockets.read_buf.add_mark_at(body_pos);
-                        udp_sockets.reorder.push(
-                            sequence_number,
-                            tokio::time::Instant::now(),
-                            (item, mark),
-                        );
-                        if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+                        if let Some(item) = item {
                             return Poll::Ready(Some(Ok(item)));
                         }
                     }
@@ -3026,7 +3077,7 @@ impl Session<Playing> {
             }
             ready!(timer.as_mut().poll(cx));
             udp_sockets.reorder.expire(tokio::time::Instant::now());
-            if let Some((item, _mark)) = udp_sockets.reorder.pop() {
+            if let Some(item) = udp_sockets.next_released() {
                 return Poll::Ready(Some(Ok(item)));
             }
         }
@@ -3121,7 +3172,7 @@ impl Session<Playing> {
                         header.ssrc(),
                         header.sequence_number(),
                         header.timestamp(),
-                        report_now(),
+                        item.arrived,
                     );
                 }
                 let Some(meta) = rtp_handler.rtp(
@@ -3540,6 +3591,10 @@ struct StreamItem {
     channel_type: ChannelType,
     body_pos: u64,
     body_len: u16,
+
+    /// When the packet arrived, for receiver reports' jitter. A packet held
+    /// in a reorder window is validated later than this.
+    arrived: Instant,
 }
 
 /// Validated stream data (RTP or RTCP), ready for consumption.
@@ -5197,6 +5252,53 @@ mod tests {
         {
             Some(Ok(PacketItem::Rtp(p))) => {
                 assert_eq!((p.sequence_number(), p.loss()), (0x41d8, 1));
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        }
+    }
+
+    /// A frame whose fragments the reorder window hands out in a different
+    /// order than they arrived still demuxes whole, even though the buffer
+    /// reclaims space between them.
+    #[tokio::test]
+    async fn udp_reorder_demuxed_h264() {
+        init_logging();
+        let (session, _server, server_udp, client_rtp_port) = play_reolink_over_udp(
+            SessionOptions::default(),
+            UdpTransportOptions::default().reorder(8, std::time::Duration::from_secs(1)),
+        )
+        .await;
+        let session = session.demuxed().unwrap();
+        tokio::pin!(session);
+        let client_rtp_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), client_rtp_port);
+        let fragment = |seq: u16, fu_header: u8, body: &[u8]| {
+            let mark = if fu_header & 0x40 != 0 { 0x80 } else { 0 };
+            let mut pkt = vec![0x80, mark | 96];
+            pkt.extend_from_slice(&seq.to_be_bytes());
+            pkt.extend_from_slice(&0u32.to_be_bytes());
+            pkt.extend_from_slice(&REOLINK_SSRC.to_be_bytes());
+            pkt.extend_from_slice(&[0x7c, fu_header]);
+            pkt.extend_from_slice(body);
+            pkt
+        };
+        for pkt in [
+            fragment(0x41d5, 0x05, b"middle "),
+            fragment(0x41d4, 0x85, b"start "),
+            fragment(0x41d6, 0x45, b"end"),
+        ] {
+            server_udp
+                .rtp_socket
+                .send_to(&pkt, client_rtp_addr)
+                .await
+                .unwrap();
+        }
+        match session.next().await {
+            Some(Ok(CodecItem::VideoFrame(f))) => {
+                assert!(
+                    f.data().ends_with(b"\x65start middle end"),
+                    "{:?}",
+                    f.data()
+                );
             }
             o => panic!("unexpected item: {o:#?}"),
         }
