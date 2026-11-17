@@ -198,7 +198,8 @@ pub(crate) trait NalHandler {
 /// Some H.264 cameras send them anyway, and we accept them in "single", aggregated,
 /// and fragmented payloads. This may become necessary for H.265 as well.
 ///
-/// Also ignores trailing zero bytes in NAL bodies.
+/// Also ignores trailing zero bytes in NAL bodies, and discards stray bytes
+/// after `00 00 00` up to the next separator (see [`AnnexBScanner::Discard`]).
 ///
 /// Parameterized by the NAL header array type.
 #[derive(Debug)]
@@ -214,6 +215,19 @@ pub(super) enum AnnexBScanner<A: U8Array> {
     },
 
     Mid(Mid),
+
+    /// After `00 00 00` followed by a byte other than `00` or `01`, which is
+    /// neither valid within a NAL body nor an Annex B separator. The NAL ended
+    /// at the zeros; the bytes up to the next separator (or the end of the
+    /// payload) belong to no NAL and are discarded, as an Annex B parser such
+    /// as ffmpeg's discards them. TP-Link Tapo cameras (seen on a C100) end
+    /// some slices with `00 00 00 21 0c ff 80`.
+    ///
+    /// `zeros` counts the consecutive zero bytes just seen, so a separator
+    /// split across fragments is still found.
+    Discard {
+        zeros: u8,
+    },
 }
 
 impl<A: U8Array> Default for AnnexBScanner<A> {
@@ -311,6 +325,28 @@ impl<A: U8Array> AnnexBScanner<A> {
                     }
                 }
                 AnnexBScanner::Mid(mid) => mid,
+                AnnexBScanner::Discard { zeros } => {
+                    let mut seen = *zeros;
+                    while let Some(next) = data.peek_byte() {
+                        data.advance(1);
+                        pos += 1;
+                        match next {
+                            0 => seen = seen.saturating_add(1),
+                            1 if seen >= 2 => {
+                                // A separator: the next NAL starts after it.
+                                *self = Self::default();
+                                continue 'nal;
+                            }
+                            _ => seen = 0,
+                        }
+                    }
+                    *self = if end {
+                        Self::default()
+                    } else {
+                        AnnexBScanner::Discard { zeros: seen }
+                    };
+                    return Ok(());
+                }
             };
 
             let mut cur_pos = pos;
@@ -338,7 +374,14 @@ impl<A: U8Array> AnnexBScanner<A> {
                             continue 'nal;
                         }
                         _ => {
-                            return Err(format!("invalid sequence 00 00 00 {next_byte:02x}"));
+                            // Not a separator; the NAL ended at the zeros. See `Discard`.
+                            mid.seen_three_zeros = false;
+                            handler.end()?;
+                            cur.advance(1);
+                            data = cur;
+                            pos = cur_pos + 1;
+                            *self = AnnexBScanner::Discard { zeros: 0 };
+                            continue 'nal;
                         }
                     }
                 }
