@@ -1,3 +1,12 @@
+## unreleased
+
+*   H.264/H.265: when `00 00 00` is followed by a byte other than `00` or `01`
+    within a NAL, end the NAL at the zeros and discard the bytes up to the next
+    start code, as ffmpeg does, rather than failing with
+    `invalid sequence 00 00 00 ..`. Some TP-Link Tapo cameras (seen on a C100)
+    end about one slice in 60 with `00 00 00 21 0c ff 80`, which made sessions
+    fail every few seconds.
+
 ## `v0.4.22` (2026-11-11)
 
 *   bump MSRV to 1.96 (from 1.88).
