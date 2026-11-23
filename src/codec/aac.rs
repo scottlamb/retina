@@ -19,6 +19,7 @@ use bytes::{BufMut, BytesMut};
 
 /// How to frame AAC audio in output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Framing {
     /// Raw access units with `AudioSpecificConfig` as
     /// [`AudioParameters::extra_data`](super::AudioParameters::extra_data). Default.

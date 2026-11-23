@@ -282,6 +282,7 @@ impl FrameFormat {
 /// Either way, they're also available out of band via [`VideoParameters`]
 /// (and, for an RTP stream, the SDP; see [`VideoPacketizer::payload_format`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ParameterSetInsertion {
     /// Insert at each key frame (random access point), and at any frame
     /// that changes the parameters. Default.
@@ -312,6 +313,7 @@ pub enum ParameterSetInsertion {
 ///
 /// Currently audio and message streams' parameters never change mid-stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ParametersRef<'a> {
     Video(&'a VideoParameters),
     Audio(&'a AudioParameters),

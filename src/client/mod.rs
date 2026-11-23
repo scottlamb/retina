@@ -478,6 +478,7 @@ impl SessionGroupInner {
 ///
 /// Specify via [`SessionOptions::teardown`].
 #[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
 pub enum TeardownPolicy {
     /// Automatic.
     ///
@@ -544,6 +545,7 @@ impl std::str::FromStr for TeardownPolicy {
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
 #[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
 pub enum InitialTimestampPolicy {
     /// Default policy: currently `Require` when playing multiple streams,
     /// `Ignore` otherwise.
@@ -705,7 +707,8 @@ pub struct SessionOptions {
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
-#[derive(Copy, Clone, Default, derive_more::Display)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
 pub enum UnassignedChannelDataPolicy {
     /// Automatic (default).
     ///
@@ -764,6 +767,7 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
 /// Policy for handling the session ID returned by the server in response to
 /// `SETUP` requests.
 #[derive(Copy, Clone, Debug, Default, derive_more::Display)]
+#[non_exhaustive]
 pub enum SessionIdPolicy {
     /// Default policy: currently `RequireMatch`.
     #[default]

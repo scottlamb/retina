@@ -116,6 +116,7 @@ pub const ANNEX_B_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 /// How to frame H.26x NAL units in output (packet format and extra data format).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Framing {
     /// AVCC/HCC style: NALs use 4-byte big-endian length prefix, extra data in `AvcDecoderConfigurationRecord` or `HevcDecoderConfigurationRecord`. Default.
     #[default]

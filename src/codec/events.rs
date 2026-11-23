@@ -132,6 +132,7 @@ impl<Ctx, H: MessageHandler<Ctx> + ?Sized> MessageHandler<Ctx> for &mut H {
 ///
 /// Returned from [`VideoHandler::frame_start`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Accumulate {
     /// Retain the frame, so that [`VideoFrameEnd::complete_frame`] and
     /// [`VideoFrameEnd::visit_frame_data`] can supply it.
@@ -315,6 +316,7 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
 /// are instead reflected in the stream's parameters; see
 /// [`VideoFrameStart::has_new_parameters`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct VideoData<'a> {
     /// The position of this chunk within its codec unit.
     ///
@@ -353,6 +355,7 @@ impl VideoData<'_> {
 ///     may have many codec units; frame boundaries are marked separately.
 /// *   [`super::Payload::position`]: an RTP payload within its frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Position {
     /// The whole thing, in one chunk.
     Complete,
