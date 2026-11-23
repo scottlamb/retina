@@ -50,7 +50,7 @@ async fn run_inner(opts: Opts, session_group: Arc<SessionGroup>) -> Result<(), E
         .setup(onvif_stream_i, SetupOptions::default())
         .await?;
     let mut session = session.play(retina::client::PlayOptions::default()).await?;
-    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::default())?;
+    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::MP4)?;
 
     tokio::pin!(stop);
     loop {

@@ -1159,7 +1159,7 @@ mod tests {
             let data = fe
                 .complete_frame(FrameFormat {
                     parameter_set_insertion: ParameterSetInsertion::Never,
-                    ..Default::default()
+                    ..crate::codec::FrameFormat::TEST
                 })
                 .unwrap();
             self.frames.push((

@@ -157,7 +157,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             seen_single_fragment_fu: false,
             max_frame_bytes: usize::MAX,
             #[cfg(test)]
-            test_format: Default::default(),
+            test_format: super::FrameFormat::TEST,
         })
     }
 
@@ -1024,7 +1024,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -1799,7 +1799,7 @@ mod tests {
             }
             fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, PacketContext>) {
                 let (start_new, start_sps) = self.start.take().unwrap();
-                let data = fe.complete_frame(FrameFormat::default()).unwrap();
+                let data = fe.complete_frame(FrameFormat::TEST).unwrap();
                 self.frames
                     .push((start_new, start_sps, fe.has_new_parameters(), data));
             }

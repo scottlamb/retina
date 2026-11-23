@@ -56,7 +56,7 @@ async fn write_jpeg(
     let mut session = session
         .play(retina::client::PlayOptions::default().initial_timestamp(opts.initial_timestamp))
         .await?;
-    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::default())?;
+    let mut demuxer = Demuxer::new(&session, retina::codec::FrameFormat::MP4)?;
 
     std::fs::create_dir_all(&opts.out_dir)?;
 

@@ -617,7 +617,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             adts,
             payload: Vec::new(),
             #[cfg(test)]
-            test_format: Default::default(),
+            test_format: super::FrameFormat::TEST,
             #[cfg(test)]
             pending: Default::default(),
         })
@@ -1831,11 +1831,11 @@ mod tests {
         use crate::codec::{FrameFormat, events::AudioFrameRef};
         let raw = FrameFormat {
             aac_framing: Framing::Raw,
-            ..FrameFormat::default()
+            ..FrameFormat::TEST
         };
         let adts = FrameFormat {
             aac_framing: Framing::Adts,
-            ..FrameFormat::default()
+            ..FrameFormat::TEST
         };
         let frame = |config: &[u8], data| AudioFrameRef {
             ctx: &(),
@@ -1980,7 +1980,7 @@ mod tests {
         let mut buf = MarkBuf::new(65536);
         let get_extra_data =
             |d: &Depacketizer<PacketContext>, format| d.parameters().extra_data(format).to_vec();
-        assert!(!get_extra_data(&d, crate::codec::FrameFormat::default()).is_empty());
+        assert!(!get_extra_data(&d, crate::codec::FrameFormat::TEST).is_empty());
         assert!(get_extra_data(&d, crate::codec::FrameFormat::SIMPLE).is_empty());
         d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
         let timestamp = crate::Timestamp {

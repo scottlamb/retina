@@ -877,7 +877,7 @@ impl Depacketizer<crate::PacketContext> {
     /// until it returns `None`.
     fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        pending.push(pkt, super::FrameFormat::default(), |c| self.push(pkt, c));
+        pending.push(pkt, super::FrameFormat::TEST, |c| self.push(pkt, c));
         self.pending = pending;
     }
 

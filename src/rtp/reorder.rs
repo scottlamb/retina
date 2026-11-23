@@ -927,7 +927,7 @@ mod tests {
             fn data(&mut self, _: &VideoData<'_>) {}
             fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, ()>) {
                 self.0
-                    .push(frame_end.complete_frame(FrameFormat::default()).unwrap());
+                    .push(frame_end.complete_frame(FrameFormat::TEST).unwrap());
             }
         }
 

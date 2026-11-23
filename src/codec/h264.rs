@@ -223,7 +223,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             seen_single_fragment_fu_a: false,
             max_frame_bytes: usize::MAX,
             #[cfg(test)]
-            test_format: Default::default(),
+            test_format: super::FrameFormat::TEST,
         })
     }
 
@@ -1254,7 +1254,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -1361,7 +1361,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -2387,7 +2387,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let pkt = |timestamp, sequence_number| TestPacket {
             ctx: crate::PacketContext::dummy(),
@@ -2424,7 +2424,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -2465,7 +2465,7 @@ mod tests {
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
         d.set_frame_format(crate::codec::FrameFormat {
             parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
-            ..Default::default()
+            ..crate::codec::FrameFormat::TEST
         });
         let timestamp = crate::Timestamp {
             timestamp: 0,
@@ -3452,7 +3452,7 @@ mod tests {
             }
             fn frame_end(&mut self, fe: &mut VideoFrameEnd<'_, crate::PacketContext>) {
                 let (start_new, start_sps) = self.start.take().unwrap();
-                let data = fe.complete_frame(FrameFormat::default()).unwrap();
+                let data = fe.complete_frame(FrameFormat::TEST).unwrap();
                 self.frames
                     .push((start_new, start_sps, fe.has_new_parameters(), data));
             }

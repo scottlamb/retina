@@ -94,7 +94,7 @@ impl AudioHandler<Ctx> for Printer {
     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, Ctx>) {
         // The default (raw) format can represent any frame.
         let data = frame
-            .data(retina::codec::FrameFormat::default())
+            .data(retina::codec::FrameFormat::MP4)
             .expect("raw format is infallible");
         println!(
             "audio ts={} offset={} bytes={}",

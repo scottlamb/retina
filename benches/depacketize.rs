@@ -43,7 +43,7 @@ impl<F: FnMut(&[u8])> VideoHandler<PacketContext> for BenchHandler<F> {
     }
 
     fn frame_end(&mut self, frame_end: &mut VideoFrameEnd<'_, PacketContext>) {
-        if let Some(frame) = frame_end.complete_frame(FrameFormat::default()) {
+        if let Some(frame) = frame_end.complete_frame(FrameFormat::MP4) {
             (self.f)(&frame);
         } else {
             (self.f)(&self.frame);
@@ -53,7 +53,7 @@ impl<F: FnMut(&[u8])> VideoHandler<PacketContext> for BenchHandler<F> {
 
 impl<F> AudioHandler<PacketContext> for BenchHandler<F> {
     fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
-        std::hint::black_box(frame.data(FrameFormat::default()).unwrap());
+        std::hint::black_box(frame.data(FrameFormat::MP4).unwrap());
     }
 }
 

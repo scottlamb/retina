@@ -203,15 +203,15 @@ pub use packetize::{
 ///   without needing to handle extra data separately.
 ///
 /// This is `#[non_exhaustive]` so that knobs for more codecs can be added
-/// later. Start from a preset (or `Default::default()`) and adjust it with
-/// the `with_*` methods or by assigning fields:
+/// later. Start from a preset and adjust it with the `with_*` methods or by
+/// assigning fields:
 ///
 /// ```
 /// use retina::codec::{FrameFormat, ParameterSetInsertion};
 /// const FORMAT: FrameFormat =
 ///     FrameFormat::SIMPLE.with_parameter_set_insertion(ParameterSetInsertion::OnChange);
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FrameFormat {
     /// How to frame H.26x NAL units.
@@ -232,6 +232,17 @@ impl FrameFormat {
         #[cfg(any(feature = "h264", feature = "h265"))]
         h26x_framing: h26x::Framing::FourByteLength,
         parameter_set_insertion: ParameterSetInsertion::Never,
+        aac_framing: aac::Framing::Raw,
+    };
+
+    /// For unit tests: 4-byte length-prefixed NALs, parameter sets prepended
+    /// to every key frame, raw AAC. (This was `FrameFormat::default()`
+    /// before that was removed.)
+    #[cfg(test)]
+    pub(crate) const TEST: Self = Self {
+        #[cfg(any(feature = "h264", feature = "h265"))]
+        h26x_framing: h26x::Framing::FourByteLength,
+        parameter_set_insertion: ParameterSetInsertion::EachKeyFrame,
         aac_framing: aac::Framing::Raw,
     };
 
@@ -2311,7 +2322,7 @@ mod tests {
             replay(BUNNY, channel, clock_rate, |buf, meta, pos, len| {
                 d.push(
                     &ReceivedPacketRef::new(meta, buf, pos, len),
-                    &mut testutil::Collector::new(&mut pending, FrameFormat::default()),
+                    &mut testutil::Collector::new(&mut pending, FrameFormat::TEST),
                 );
                 while let Some(item) = pending.pull() {
                     collected.push(match item.unwrap() {
@@ -2325,7 +2336,7 @@ mod tests {
 
             // Handler, accumulating in the default format and in `MP4` (which
             // checks streamed data against the accumulated frame).
-            for format in [FrameFormat::default(), FrameFormat::MP4] {
+            for format in [FrameFormat::TEST, FrameFormat::MP4] {
                 let mut d = new();
                 let mut h = Recorder::new(Accumulate::Yes);
                 h.format = format;
@@ -2343,7 +2354,7 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(frames.len(), collected.len());
-                if format == FrameFormat::default() {
+                if format == FrameFormat::TEST {
                     for (i, (a, b)) in frames.iter().zip(&collected).enumerate() {
                         assert!(a == b, "frame {i} differs");
                     }
