@@ -336,6 +336,11 @@ impl Sps {
         }
         let bit_depth_chroma_minus8 = bit_depth_chroma_minus8 as u8;
         let log2_max_pic_order_cnt_lsb_minus4 = r.read_ue("log2_max_pic_order_cnt_lsb_minus4")?;
+        if log2_max_pic_order_cnt_lsb_minus4 > 12 {
+            return Err(Error(
+                "log2_max_pic_order_cnt_lsb_minus4 must be in [0, 12]".to_owned(),
+            ));
+        }
         let sps_sub_layer_ordering_info_present_flag =
             r.read_bit("sps_sub_layer_ordering_info_present_flag")?;
         {
@@ -1519,6 +1524,25 @@ mod tests {
         let timing = vui.timing_info().unwrap();
         assert_eq!(timing.num_units_in_tick(), 1);
         assert_eq!(timing.time_scale(), 12);
+    }
+
+    /// An out-of-range `log2_max_pic_order_cnt_lsb_minus4` is rejected rather
+    /// than overflowing when computing the `lt_ref_pic_poc_lsb_sps` length.
+    /// Found by the `h265_nal` fuzz target.
+    #[test]
+    fn parse_sps_log2_max_pic_order_cnt_lsb_out_of_range() {
+        init_logging();
+        let data = &b"\x42\xcb\x00\x23\x11\xff\xfe\xff\x2c\xff\xff\xff\x05\xc1\xff\xff\
+                      \x1f\x80\x00\x00\x03\x00\xff\xff\xff\xff\xff\x41\x00\x42\xcb\x00\
+                      \x23\x11\xff\xfe\xff\x2c\xff\xff\xff\x05\xc1\xff\xff\x1f\x80\x00\
+                      \x00\x03\x00\x00"[..];
+        let (h, bits) = split(data).unwrap();
+        assert_eq!(h.unit_type(), UnitType::SpsNut);
+        let e = Sps::from_bits(LoggingBitReader(bits)).unwrap_err();
+        assert!(
+            e.to_string().contains("log2_max_pic_order_cnt_lsb_minus4"),
+            "{e}"
+        );
     }
 
     #[test]

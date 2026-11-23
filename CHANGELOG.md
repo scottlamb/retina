@@ -45,6 +45,9 @@
     but which some constant bitrate cameras send in quantity. Depacketizers
     omit them from frame data and don't retain them; packetizers don't send
     those supplied by the caller.
+*   H.265: reject an SPS with an out-of-range
+    `log2_max_pic_order_cnt_lsb_minus4` rather than overflowing (a panic in
+    debug builds) while parsing its long-term reference pictures.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   BREAKING: replace the crate-wide `retina::Error` with module-scoped error
