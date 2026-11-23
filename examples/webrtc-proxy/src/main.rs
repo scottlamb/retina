@@ -92,6 +92,7 @@ fn read_offer() -> Result<RTCSessionDescription, Error> {
 #[derive(Clone)]
 struct Frame {
     stream_id: usize,
+    is_random_access_point: bool,
     annexb_data: bytes::Bytes,
 }
 
@@ -138,6 +139,7 @@ impl VideoHandler<PacketContext> for UpstreamHandler {
         }
         let _ = self.tx.send(Frame {
             stream_id: self.stream_id,
+            is_random_access_point: frame_end.is_random_access_point(),
             annexb_data: self.buf.split().freeze(),
         });
     }
@@ -355,11 +357,22 @@ async fn run() -> Result<(), Error> {
         bail!("downstream_conn has no local_description");
     }
 
+    // Per upstream stream, whether to wait for a random access point before
+    // sending: at the start, and after dropping frames.
+    let mut need_rap = vec![true; tracks.len()];
     loop {
         tokio::select! {
             r = upstream_frames_rx.recv(), if matches!(*peer_conn_state_rx.borrow(), RTCPeerConnectionState::Connected) => {
                 match r {
                     Ok(f) => {
+                        // Start, and resume after lagging, at a random access point.
+                        let Some(need_rap) = need_rap.get_mut(f.stream_id) else {
+                            continue;
+                        };
+                        if *need_rap && !f.is_random_access_point {
+                            continue;
+                        }
+                        *need_rap = false;
                         if let Some(t) = tracks.get(f.stream_id).and_then(Option::as_ref) {
                             t.write_sample(&Sample {
                                 data: f.annexb_data,
@@ -383,6 +396,7 @@ async fn run() -> Result<(), Error> {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(frames)) => {
                         warn!("discarded {frames} frames because the downstream was not open or was too slow");
+                        need_rap.fill(true);
                     }
                 }
             },
