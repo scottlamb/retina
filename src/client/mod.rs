@@ -1365,7 +1365,9 @@ impl Stream {
     /// in the SDP.
     ///
     /// This is equivalent to [`crate::codec::Depacketizer::new`] with the
-    /// first of [`Stream::payload_formats`].
+    /// first of [`Stream::payload_formats`], then
+    /// [`crate::codec::Depacketizer::with_payload_type`] with its payload
+    /// type, so packets of the stream's other formats are skipped.
     ///
     /// The depacketizer's [`crate::codec::Depacketizer::parameters`] are
     /// those described in the SDP, if any, until the stream supplies its own.
@@ -1393,7 +1395,8 @@ impl Stream {
                 "can't depacketize a sending stream (ONVIF backchannel)",
             ));
         }
-        crate::codec::Depacketizer::new(self.default_format())
+        let f = &self.payload_formats[0];
+        crate::codec::Depacketizer::new(&f.format).map(|d| d.with_payload_type(f.payload_type))
     }
 
     /// Returns true if this stream has been set up via [`Session::setup`].

@@ -755,7 +755,7 @@ impl SetupCore {
             else {
                 continue;
             };
-            let clock_rate = std::num::NonZeroU32::new(s.payload_formats[0].format.clock_rate())
+            let clock_rate = std::num::NonZeroU32::new(s.default_format().clock_rate())
                 .ok_or_else(|| {
                     r.error(
                         &conn_ctx,

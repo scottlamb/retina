@@ -392,6 +392,21 @@ impl Continuity {
             Continuity::Discontinuity => 1,
         }
     }
+
+    /// Returns the continuity of a packet whose stream skipped packets with
+    /// continuity `self`, before one with continuity `next`: everything lost
+    /// before either.
+    pub(crate) fn then(self, next: Continuity) -> Continuity {
+        match (self, next) {
+            (Continuity::Discontinuity, _) | (_, Continuity::Discontinuity) => {
+                Continuity::Discontinuity
+            }
+            (Continuity::Contiguous, c) | (c, Continuity::Contiguous) => c,
+            (Continuity::Lost(a), Continuity::Lost(b)) => {
+                Continuity::Lost(a.saturating_add(b.get()))
+            }
+        }
+    }
 }
 
 /// An RTP packet whose payload is in a [`MarkBuf`].
@@ -465,6 +480,20 @@ impl<'a, Ctx> ReceivedPacketRef<'a, Ctx> {
             self.payload_pos,
         );
         Self { pin_pos, ..self }
+    }
+
+    /// Returns a copy of this packet with `continuity` instead.
+    pub(crate) fn with_continuity(&self, continuity: Continuity) -> Self
+    where
+        Ctx: Clone,
+    {
+        Self {
+            meta: ReceivedPacketMeta {
+                continuity,
+                ..self.meta.clone()
+            },
+            ..*self
+        }
     }
 
     /// The position to pin to retain this packet's data and that of every
@@ -551,9 +580,9 @@ mod tests {
     fn meta() -> ReceivedPacketMeta<()> {
         crate::rtp::ReceivedPacketMeta {
             ctx: (),
-            payload_type: 96,
             timestamp: crate::Timestamp::new(0, std::num::NonZeroU32::new(90_000).unwrap(), 0)
                 .unwrap(),
+            payload_type: 96,
             sequence_number: 0,
             ssrc: 0,
             mark: false,

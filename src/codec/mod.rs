@@ -841,6 +841,42 @@ fn report_corrupt<Ctx>(
     });
 }
 
+/// Skips packets of another payload type, for
+/// [`VideoDepacketizer::with_payload_type`] and its audio and message
+/// counterparts.
+#[derive(Copy, Clone, Debug, Default)]
+struct PayloadTypeFilter {
+    /// The payload type to depacketize, if set.
+    payload_type: Option<u8>,
+
+    /// What was lost before or among the packets skipped since the last one
+    /// depacketized, to report with the next.
+    skipped: crate::rtp::Continuity,
+}
+
+impl PayloadTypeFilter {
+    /// Calls `push` with `pkt` unless it should be skipped. A packet
+    /// following skipped ones carries their loss.
+    fn push<'a, Ctx: Clone>(
+        &mut self,
+        pkt: &ReceivedPacketRef<'a, Ctx>,
+        push: impl FnOnce(&ReceivedPacketRef<'a, Ctx>),
+    ) {
+        if self
+            .payload_type
+            .is_some_and(|pt| pkt.meta.payload_type != pt)
+        {
+            self.skipped = self.skipped.then(pkt.meta.continuity);
+            return;
+        }
+        if self.skipped.is_contiguous() {
+            return push(pkt);
+        }
+        let continuity = std::mem::take(&mut self.skipped).then(pkt.meta.continuity);
+        push(&pkt.with_continuity(continuity))
+    }
+}
+
 /// Turns RTP packets into video frames, delivering them to a [`VideoHandler`].
 ///
 /// This is a sans-I/O interface: it's up to the caller to receive packets
@@ -852,6 +888,7 @@ fn report_corrupt<Ctx>(
 #[derive(Debug)]
 pub struct VideoDepacketizer<Ctx> {
     inner: VideoInner<Ctx>,
+    filter: PayloadTypeFilter,
 
     /// For JPEG; the H.264 and H.265 analyzers track their own.
     decodability: DecodabilityState,
@@ -1017,8 +1054,25 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         };
         Ok(Self {
             inner,
+            filter: PayloadTypeFilter::default(),
             decodability: DecodabilityState::default(),
         })
+    }
+
+    /// Depacketizes only packets with RTP payload type `payload_type`,
+    /// skipping others, such as those of a stream's other formats (e.g. RFC
+    /// 3389 comfort noise or RFC 4733 telephone events alongside audio).
+    ///
+    /// [`crate::client::Stream::new_depacketizer`] sets this to the
+    /// default format's payload type. By default, every packet is
+    /// depacketized.
+    ///
+    /// Skipped packets aren't loss; loss reported on them is reported with
+    /// the next packet depacketized.
+    #[must_use]
+    pub fn with_payload_type(mut self, payload_type: u8) -> Self {
+        self.filter.payload_type = Some(payload_type);
+        self
     }
 
     #[doc(hidden)]
@@ -1084,7 +1138,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// Panics if a depacketizer which has retained data from one
     /// [`crate::buf::MarkBuf`] is supplied a packet from another.
     pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut impl VideoHandler<Ctx>) {
-        match &mut self.inner {
+        self.filter.push(pkt, |pkt| match &mut self.inner {
             // These report loss and track decodability via their analyzers.
             #[cfg(feature = "h264")]
             VideoInner::H264(d) => d.push(pkt, handler),
@@ -1098,7 +1152,7 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
                 report_packet_loss(pkt, |l| handler.loss(l));
                 d.push(pkt, handler)
             }
-        }
+        })
     }
 }
 
@@ -1106,7 +1160,10 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
 ///
 /// See [`VideoDepacketizer`] for an overview.
 #[derive(Debug)]
-pub struct AudioDepacketizer<Ctx>(AudioInner<Ctx>);
+pub struct AudioDepacketizer<Ctx> {
+    inner: AudioInner<Ctx>,
+    filter: PayloadTypeFilter,
+}
 
 #[derive(Debug)]
 enum AudioInner<Ctx> {
@@ -1147,7 +1204,7 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
                 channels,
             )))
         };
-        Ok(Self(match encoding_name {
+        let inner = match encoding_name {
             "mpeg4-generic" => AudioInner::Aac(Box::new(aac::Depacketizer::new(
                 clock_rate,
                 channels,
@@ -1169,12 +1226,24 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
                     "no audio depacketizer for encoding_name {encoding_name}"
                 )));
             }
-        }))
+        };
+        Ok(Self {
+            inner,
+            filter: PayloadTypeFilter::default(),
+        })
+    }
+
+    /// Depacketizes only packets with RTP payload type `payload_type`; see
+    /// [`VideoDepacketizer::with_payload_type`].
+    #[must_use]
+    pub fn with_payload_type(mut self, payload_type: u8) -> Self {
+        self.filter.payload_type = Some(payload_type);
+        self
     }
 
     /// Returns the parameters.
     pub fn parameters(&self) -> &AudioParameters {
-        match &self.0 {
+        match &self.inner {
             AudioInner::Aac(d) => d.parameters(),
             AudioInner::SimpleAudio(d) => d.parameters(),
             AudioInner::G723(d) => d.parameters(),
@@ -1187,13 +1256,15 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
     /// This never fails: lost packets and corrupt data are reported via
     /// [`AudioHandler::loss`].
     pub fn push(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>, handler: &mut impl AudioHandler<Ctx>) {
-        report_packet_loss(pkt, |l| handler.loss(l));
-        match &mut self.0 {
-            AudioInner::Aac(d) => d.push(pkt, handler),
-            AudioInner::SimpleAudio(d) => d.push(pkt, handler),
-            AudioInner::G723(d) => d.push(pkt, handler),
-            AudioInner::Opus(d) => d.push(pkt, handler),
-        }
+        self.filter.push(pkt, |pkt| {
+            report_packet_loss(pkt, |l| handler.loss(l));
+            match &mut self.inner {
+                AudioInner::Aac(d) => d.push(pkt, handler),
+                AudioInner::SimpleAudio(d) => d.push(pkt, handler),
+                AudioInner::G723(d) => d.push(pkt, handler),
+                AudioInner::Opus(d) => d.push(pkt, handler),
+            }
+        })
     }
 }
 
@@ -1202,7 +1273,10 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
 ///
 /// See [`VideoDepacketizer`] for an overview.
 #[derive(Debug)]
-pub struct MessageDepacketizer<Ctx>(Box<onvif::Depacketizer<Ctx>>);
+pub struct MessageDepacketizer<Ctx> {
+    inner: Box<onvif::Depacketizer<Ctx>>,
+    filter: PayloadTypeFilter,
+}
 
 impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     /// Creates a depacketizer for the given message RTP payload format.
@@ -1226,12 +1300,23 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
                 )));
             }
         };
-        Ok(Self(Box::new(onvif::Depacketizer::new(compression_type))))
+        Ok(Self {
+            inner: Box::new(onvif::Depacketizer::new(compression_type)),
+            filter: PayloadTypeFilter::default(),
+        })
+    }
+
+    /// Depacketizes only packets with RTP payload type `payload_type`; see
+    /// [`VideoDepacketizer::with_payload_type`].
+    #[must_use]
+    pub fn with_payload_type(mut self, payload_type: u8) -> Self {
+        self.filter.payload_type = Some(payload_type);
+        self
     }
 
     /// Returns the parameters.
     pub fn parameters(&self) -> &MessageParameters {
-        self.0.parameters()
+        self.inner.parameters()
     }
 
     /// Limits the bytes of an in-progress message.
@@ -1244,7 +1329,7 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     /// [`crate::buf::MarkBuf`], so its limit doesn't bound them. The default
     /// is 1 MiB.
     pub fn set_max_message_bytes(&mut self, max_message_bytes: usize) {
-        self.0.set_max_message_bytes(max_message_bytes);
+        self.inner.set_max_message_bytes(max_message_bytes);
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
@@ -1256,8 +1341,10 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl MessageHandler<Ctx>,
     ) {
-        report_packet_loss(pkt, |l| handler.loss(l));
-        self.0.push(pkt, handler);
+        self.filter.push(pkt, |pkt| {
+            report_packet_loss(pkt, |l| handler.loss(l));
+            self.inner.push(pkt, handler);
+        })
     }
 }
 
@@ -1389,6 +1476,17 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         }
     }
 
+    /// Depacketizes only packets with RTP payload type `payload_type`; see
+    /// [`VideoDepacketizer::with_payload_type`].
+    #[must_use]
+    pub fn with_payload_type(self, payload_type: u8) -> Self {
+        match self {
+            Self::Video(d) => Self::Video(d.with_payload_type(payload_type)),
+            Self::Audio(d) => Self::Audio(d.with_payload_type(payload_type)),
+            Self::Message(d) => Self::Message(d.with_payload_type(payload_type)),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn check_invariants(&self) {
         if let Self::Video(d) = self {
@@ -1440,13 +1538,25 @@ mod tests {
     fn push(
         d: &mut Depacketizer<crate::PacketContext>,
         buf: &mut MarkBuf,
+        packet: (u16, i64, bool, u16),
+        payload: &[u8],
+        h: &mut Recorder,
+    ) {
+        push_pt(d, buf, 96, packet, payload, h)
+    }
+
+    /// Like [`push`], with payload type `payload_type`.
+    fn push_pt(
+        d: &mut Depacketizer<crate::PacketContext>,
+        buf: &mut MarkBuf,
+        payload_type: u8,
         (sequence_number, timestamp, mark, loss): (u16, i64, bool, u16),
         payload: &[u8],
         h: &mut Recorder,
     ) {
         let meta = crate::rtp::ReceivedPacketMeta {
             ctx: crate::PacketContext::dummy(),
-            payload_type: 96,
+            payload_type,
             timestamp: crate::Timestamp::new(timestamp, NonZeroU32::new(90_000).unwrap(), 0)
                 .unwrap(),
             ssrc: 0,
@@ -2091,6 +2201,39 @@ mod tests {
                 Event::AudioFrame(hex(b"abcd")),
                 Event::Loss(LossReason::PacketLoss { packets: 2 }),
                 Event::AudioFrame(hex(b"efgh")),
+            ]
+        );
+    }
+
+    /// With a payload type set, packets of other payload types (here comfort
+    /// noise, payload type 13) are skipped, and loss reported on a skipped
+    /// packet is reported with the next one depacketized.
+    #[test]
+    fn payload_type_filter() {
+        crate::testutil::init_logging();
+        let mut d = Depacketizer::new(&PayloadFormat::new("audio", "pcmu", 8_000))
+            .unwrap()
+            .with_payload_type(0);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::new(Accumulate::Yes);
+
+        // Skipped packets aren't counted as loss, but loss before them is
+        // reported.
+        push_pt(&mut d, &mut buf, 13, (0, 0, true, 0), b"cn", &mut h);
+        push_pt(&mut d, &mut buf, 0, (1, 2, true, 0), b"abcd", &mut h);
+        assert_eq!(h.take(), vec![Event::AudioFrame(hex(b"abcd"))]);
+        push_pt(&mut d, &mut buf, 13, (2, 6, true, 0), b"cn", &mut h);
+        assert_eq!(h.take(), vec![]);
+        push_pt(&mut d, &mut buf, 0, (3, 10, true, 0), b"efgh", &mut h);
+        push_pt(&mut d, &mut buf, 13, (6, 14, true, 2), b"cn", &mut h);
+        push_pt(&mut d, &mut buf, 13, (8, 16, true, 1), b"cn", &mut h);
+        assert_eq!(h.take(), vec![Event::AudioFrame(hex(b"efgh"))]);
+        push_pt(&mut d, &mut buf, 0, (9, 18, true, 0), b"ijkl", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::Loss(LossReason::PacketLoss { packets: 3 }),
+                Event::AudioFrame(hex(b"ijkl")),
             ]
         );
     }

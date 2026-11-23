@@ -100,7 +100,11 @@
     `rtp_payload_type`, `clock_rate_hz`, and `channels`, which described
     only the first. An ONVIF backchannel caller can choose which format to
     send. `Stream::parameters` is also removed: use
-    `Stream::new_depacketizer` and its `parameters`.
+    `Stream::new_depacketizer` and its `parameters`. That depacketizer
+    skips packets of the stream's other formats, such as comfort noise
+    alongside audio: see `codec::Depacketizer::with_payload_type` (and the
+    per-type counterparts), which uses `rtp::ReceivedPacketMeta`'s
+    `payload_type`.
 *   add `client::UdpTransportOptions::reorder`, taking an `rtp::ReorderOptions`
     (`max_delay`, `max_packets`), to put RTP packets received via UDP back in
     sequence order. Over TCP, packets are never held for reordering.
