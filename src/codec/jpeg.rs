@@ -306,16 +306,11 @@ pub struct Depacketizer<Ctx> {
     /// Cached quantization tables, with their precision bits, indexed by Q.
     qtables: Vec<Option<(u8, Bytes)>>,
 
-    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
-    pending: std::collections::VecDeque<
-        Result<crate::client::CodecItem, crate::client::DepacketizeError>,
-    >,
+    pending: super::testutil::Pending,
 
     parameters: Option<VideoParameters>,
-
-    /// RTP packets lost since the last frame returned, to report on the next.
-    loss: u16,
 }
 
 impl<Ctx: Clone> Depacketizer<Ctx> {
@@ -327,17 +322,25 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             pending: Default::default(),
             qtables: vec![None; 255],
             parameters: None,
-            loss: 0,
         }
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
+    pub(super) fn push(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
+        if let Err(description) = self.push_inner(pkt, handler) {
+            super::report_corrupt(pkt, description, |l| handler.loss(l));
+        }
+    }
+
+    fn push_inner(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
-        self.loss = self.loss.saturating_add(pkt.meta.loss);
         if pkt.meta.loss > 0 && self.metadata.is_some() {
             // As with the other codecs, discard a frame with interior loss
             // rather than returning it with a gap. If this packet starts a
@@ -554,7 +557,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 self.parameters = metadata.parameters;
             }
             let parameters = self.parameters.as_ref();
-            let loss = std::mem::take(&mut self.loss);
 
             let accumulate = handler.frame_start(&VideoFrameStart {
                 is_decodable: true,
@@ -582,7 +584,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 timestamp,
                 start_ctx: &metadata.start_ctx,
                 end_ctx: ctx,
-                loss,
                 is_random_access_point: true,
                 is_disposable: true,
                 has_new_parameters,
@@ -666,29 +667,18 @@ impl<Ctx: Clone> Default for Depacketizer<Ctx> {
 
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
-    /// Supplies a new packet via the legacy `push`/`pull` interface.
-    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
+    ///
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let r = self.push_with(
-            pkt,
-            &mut crate::client::LegacyHandler {
-                pending: &mut pending,
-                meta: &pkt.meta,
-                stream_id: 0,
-                format: super::FrameFormat::default(),
-            },
-        );
+        pending.push(pkt, super::FrameFormat::default(), |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
-    fn pull(
-        &mut self,
-    ) -> Option<Result<crate::client::CodecItem, crate::client::DepacketizeError>> {
-        self.pending.pop_front()
+    fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
+        self.pending.pull()
     }
 }
 
@@ -697,27 +687,9 @@ mod tests {
     use std::num::NonZeroU32;
 
     use crate::buf::MarkBuf;
-    use crate::rtp::ReceivedPacketRef;
+    use crate::codec::testutil::Item;
+    use crate::testutil::TestPacket;
     use crate::testutil::{assert_eq_hex, init_logging};
-    use crate::{client::CodecItem, client::ReceivedPacketBuilder};
-
-    /// Helper: writes payload into `buf`, then pushes to depacketizer.
-    fn push_via_buf(
-        d: &mut super::Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
-        payload: &[u8],
-        buf: &mut MarkBuf,
-    ) -> Result<(), String> {
-        let pos = buf.end();
-        buf.extend(payload);
-        buf.advance_unparsed(buf.end());
-        d.push(&ReceivedPacketRef::new(
-            meta,
-            buf,
-            pos,
-            payload.len() as u16,
-        ))
-    }
 
     // Raw RTP payload from a MJPEG encoded Big Buck Bunny stream
     // Big Buck Bunny is (c) copyright 2008, Blender Foundation, licensed via
@@ -1000,9 +972,8 @@ mod tests {
             start: 0,
         };
         for (i, payload) in [start_packet, end_packet].into_iter().enumerate() {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: frame_i * 2 + i as u16,
@@ -1010,21 +981,14 @@ mod tests {
                 mark: i == 1,
                 payload_type: 0,
             }
-            .build(payload.iter().copied())
-            .unwrap();
-            push_via_buf(
-                d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
-                buf,
-            )
-            .unwrap();
+            .write(buf, payload.iter().copied());
+            d.push_collect(&pkt);
             if i == 0 {
                 assert!(d.pull().is_none());
             }
         }
         match d.pull() {
-            Some(Ok(CodecItem::VideoFrame(frame))) => frame.into_data(),
+            Some(Ok(Item::Video(frame))) => frame.into_data(),
             _ => panic!(),
         }
     }
@@ -1038,10 +1002,9 @@ mod tests {
         sequence_number: u16,
         loss: u16,
         payload: &[u8],
-    ) -> Option<crate::client::VideoFrame> {
-        let pkt = ReceivedPacketBuilder {
+    ) -> Option<crate::codec::testutil::VideoFrame> {
+        let pkt = TestPacket {
             ctx: crate::PacketContext::dummy(),
-            stream_id: 0,
             timestamp: crate::Timestamp {
                 timestamp: i64::from(frame_i) * 3000,
                 clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -1053,18 +1016,11 @@ mod tests {
             mark: payload == END_PACKET,
             payload_type: 0,
         }
-        .build(payload.iter().copied())
-        .unwrap();
-        push_via_buf(
-            d,
-            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-            pkt.payload(),
-            buf,
-        )
-        .unwrap();
+        .write(buf, payload.iter().copied());
+        d.push_collect(&pkt);
         match d.pull() {
             None => None,
-            Some(Ok(CodecItem::VideoFrame(frame))) => Some(frame),
+            Some(Ok(Item::Video(frame))) => Some(frame),
             o => panic!("unexpected pull result: {o:?}"),
         }
     }
@@ -1087,13 +1043,13 @@ mod tests {
         // Frame 2 is complete and reports both losses.
         assert!(push_packet(&mut d, &mut buf, 2, 5, 0, START_PACKET).is_none());
         let frame = push_packet(&mut d, &mut buf, 2, 6, 0, END_PACKET).unwrap();
-        assert_eq!(frame.loss(), 2);
+        assert_eq!(frame.loss, 2);
         assert_eq_hex!(frame.into_data(), VALID_JPEG_IMAGE);
 
         // Frame 3 has no loss to report.
         assert!(push_packet(&mut d, &mut buf, 3, 7, 0, START_PACKET).is_none());
         let frame = push_packet(&mut d, &mut buf, 3, 8, 0, END_PACKET).unwrap();
-        assert_eq!(frame.loss(), 0);
+        assert_eq!(frame.loss, 0);
     }
 
     #[test]

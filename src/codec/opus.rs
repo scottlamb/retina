@@ -74,11 +74,11 @@ impl Depacketizer {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with<Ctx>(
+    pub(super) fn push<Ctx>(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         let (s1, s2) = pkt.payload().slices();
         let joined;
         let payload = if s2.is_empty() {
@@ -87,21 +87,23 @@ impl Depacketizer {
             joined = [s1, s2].concat();
             &joined[..]
         };
-        let frame_length = samples_in_packet(payload).ok_or_else(|| {
-            format!(
-                "Invalid Opus packet: {:#?}",
-                crate::hex::LimitedHex::new(payload, 64),
-            )
-        })?;
+        let Some(frame_length) = samples_in_packet(payload) else {
+            return super::report_corrupt(
+                pkt,
+                format!(
+                    "Invalid Opus packet: {:#?}",
+                    crate::hex::LimitedHex::new(payload, 64),
+                ),
+                |l| handler.loss(l),
+            );
+        };
         handler.audio_frame(&AudioFrameRef {
             ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length,
-            loss: pkt.meta.loss,
             data: payload,
             adts: None,
         });
-        Ok(())
     }
 }
 
@@ -109,19 +111,27 @@ impl Depacketizer {
 mod tests {
     use super::*;
     use crate::buf::MarkBuf;
-    use crate::{PacketContext, client::ReceivedPacketBuilder};
+    use crate::codec::{Loss, LossReason};
+    use crate::{PacketContext, testutil::TestPacket};
 
-    /// Records audio frames as `(timestamp, frame_length, data)`.
+    /// Records audio frames as `(timestamp, frame_length, data)`, and losses.
     #[derive(Default)]
-    struct Frames(Vec<(crate::Timestamp, u32, Vec<u8>)>);
+    struct Frames {
+        frames: Vec<(crate::Timestamp, u32, Vec<u8>)>,
+        losses: Vec<LossReason>,
+    }
 
     impl AudioHandler<PacketContext> for Frames {
         fn audio_frame(&mut self, frame: &AudioFrameRef<'_, PacketContext>) {
-            self.0.push((
+            self.frames.push((
                 frame.timestamp,
                 frame.frame_length.get(),
                 frame.data.to_vec(),
             ));
+        }
+
+        fn loss(&mut self, loss: &Loss<'_, PacketContext>) {
+            self.losses.push(loss.reason().clone());
         }
     }
 
@@ -138,15 +148,9 @@ mod tests {
         start: 0,
     };
 
-    fn push(
-        d: &mut Depacketizer,
-        buf: &mut MarkBuf,
-        payload: &[u8],
-        h: &mut Frames,
-    ) -> Result<(), String> {
-        let pkt = ReceivedPacketBuilder {
+    fn push(d: &mut Depacketizer, buf: &mut MarkBuf, payload: &[u8], h: &mut Frames) {
+        let pkt = TestPacket {
             ctx: PacketContext::dummy(),
-            stream_id: 0,
             sequence_number: 0,
             timestamp: TIMESTAMP,
             payload_type: 111,
@@ -154,16 +158,8 @@ mod tests {
             mark: false,
             loss: 0,
         }
-        .build(payload.iter().copied())
-        .unwrap();
-        let pos = buf.end();
-        buf.extend(pkt.payload());
-        buf.advance_unparsed(buf.end());
-        let meta = crate::rtp::ReceivedPacketMeta::from_received(&pkt);
-        d.push_with(
-            &ReceivedPacketRef::new(meta, buf, pos, payload.len() as u16),
-            h,
-        )
+        .write(buf, payload.iter().copied());
+        d.push(&pkt, h);
     }
 
     #[test]
@@ -232,21 +228,25 @@ mod tests {
         let payload = packet(31, 0, &[1, 2, 3]);
 
         let mut h = Frames::default();
-        push(&mut d, &mut buf, &payload, &mut h).unwrap();
+        push(&mut d, &mut buf, &payload, &mut h);
 
-        assert_eq!(h.0, [(TIMESTAMP, 960, payload)]);
+        assert_eq!(h.frames, [(TIMESTAMP, 960, payload)]);
+        assert!(h.losses.is_empty());
     }
 
     #[test]
-    fn a_malformed_packet_is_refused() {
+    fn a_malformed_packet_is_corrupt() {
         let mut d = Depacketizer::new(48_000, None).unwrap();
         let mut buf = MarkBuf::new(65536);
 
         let mut h = Frames::default();
-        let e = push(&mut d, &mut buf, &packet(31, 3, &[0]), &mut h).unwrap_err();
+        push(&mut d, &mut buf, &packet(31, 3, &[0]), &mut h);
 
-        assert!(e.starts_with("Invalid Opus packet"), "{e}");
-        assert!(h.0.is_empty());
+        assert!(h.frames.is_empty());
+        let [LossReason::Corrupt(c)] = &h.losses[..] else {
+            panic!("{:?}", h.losses);
+        };
+        assert!(c.to_string().starts_with("Invalid Opus packet"), "{c}");
     }
 
     #[test]

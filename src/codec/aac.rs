@@ -47,7 +47,7 @@ use std::{
 use crate::rtp::ReceivedPacketRef;
 use crate::{Error, error::ErrorInt, rtp::ReceivedPacketMeta};
 
-use super::{AudioFrameRef, AudioHandler, AudioParameters, FmtpParser, Loss, LossReason};
+use super::{AudioFrameRef, AudioHandler, AudioParameters, FmtpParser};
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
 ///
@@ -464,22 +464,19 @@ pub(crate) struct Depacketizer<Ctx> {
     /// re-use the allocation.
     payload: Vec<u8>,
 
-    /// The format used by the test-only `push`/`pull` interface.
+    /// The format used by the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
     test_format: super::FrameFormat,
 
-    /// Completed items ready to be pulled via the test-only `push`/`pull` interface.
+    /// Completed items ready to be pulled via the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
-    pending: std::collections::VecDeque<
-        Result<crate::client::CodecItem, crate::client::DepacketizeError>,
-    >,
+    pending: super::testutil::Pending,
 }
 
 /// A complete AAC frame.
 #[derive(Debug)]
 struct AacFrame<Ctx> {
     ctx: Ctx,
-    loss: u16,
     frame_length: NonZeroU32,
     timestamp: crate::Timestamp,
     data: FrameData,
@@ -504,11 +501,6 @@ enum FrameData {
 struct Aggregate<Ctx> {
     meta: ReceivedPacketMeta<Ctx>,
 
-    /// RTP packets lost before the next frame in this aggregate. Includes old
-    /// loss that caused a previous fragment to be too short.
-    /// This should be 0 when `frame_i > 0`.
-    loss: u16,
-
     /// True iff there was loss immediately before the packet that started this
     /// aggregate. The distinction between old and recent loss is relevant
     /// because only the latter should be capable of causing following fragments
@@ -531,10 +523,6 @@ struct Aggregate<Ctx> {
 struct Fragment {
     rtp_timestamp: u16,
 
-    /// Number of RTP packets lost before between the previous output AudioFrame
-    /// and now.
-    loss: u16,
-
     /// True iff packets have been lost since the last mark. If so, this
     /// fragment may be incomplete.
     loss_since_mark: bool,
@@ -549,7 +537,6 @@ struct Fragment {
 enum DepacketizerState<Ctx> {
     /// State when there's no buffered data.
     Idle {
-        prev_loss: u16,
         loss_since_mark: bool,
     },
 
@@ -566,7 +553,6 @@ enum DepacketizerState<Ctx> {
 impl<Ctx> Default for DepacketizerState<Ctx> {
     fn default() -> Self {
         DepacketizerState::Idle {
-            prev_loss: 0,
             loss_since_mark: false,
         }
     }
@@ -600,7 +586,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         })
     }
 
-    /// Sets the format used by the test-only `push`/`pull` interface.
+    /// Sets the format used by the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
     fn set_frame_format(&mut self, format: super::FrameFormat) {
         self.test_format = format;
@@ -611,25 +597,18 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with(
+    pub(super) fn push(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         if let Err(description) = self.push_inner(pkt) {
             // Abandon any in-progress fragment, so the next packet can start
-            // afresh rather than failing the same way. Keep loss already
-            // counted, to report with the next frame.
-            let prev_loss = match &self.state {
-                DepacketizerState::Idle { prev_loss, .. } => *prev_loss,
-                DepacketizerState::Fragmented(f) => f.loss,
-                _ => 0,
-            };
+            // afresh rather than failing the same way.
             self.state = DepacketizerState::Idle {
-                prev_loss,
                 loss_since_mark: true,
             };
-            return Err(description);
+            return super::report_corrupt(pkt, description, |l| handler.loss(l));
         }
         while let Some(r) = self.pull_inner() {
             match r {
@@ -642,18 +621,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         ctx: &f.ctx,
                         timestamp: f.timestamp,
                         frame_length: f.frame_length,
-                        loss: f.loss,
                         data,
                         adts: Some(self.adts),
                     })
                 }
-                Err(description) => handler.loss(&Loss {
-                    ctx: &pkt.meta.ctx,
-                    reason: LossReason::Corrupt(super::Corruption::new(description)),
-                }),
+                Err(description) => super::report_corrupt(pkt, description, |l| handler.loss(l)),
             }
         }
-        Ok(())
     }
 
     fn push_inner(&mut self, pkt: &ReceivedPacketRef<'_, Ctx>) -> Result<(), String> {
@@ -663,15 +637,12 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         self.payload.extend_from_slice(s1);
         self.payload.extend_from_slice(s2);
         let payload = &self.payload;
-        if meta.loss > 0
-            && let DepacketizerState::Fragmented(ref mut f) = self.state
-        {
+        if meta.loss > 0 && matches!(self.state, DepacketizerState::Fragmented(_)) {
             log::debug!(
                 "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
                 meta.loss,
             );
             self.state = DepacketizerState::Idle {
-                prev_loss: f.loss, // note this packet's loss will be added in later.
                 loss_since_mark: true,
             };
         }
@@ -715,7 +686,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         if meta.mark {
                             if frag.loss_since_mark {
                                 self.state = DepacketizerState::Idle {
-                                    prev_loss: frag.loss,
                                     loss_since_mark: false,
                                 };
                                 return Ok(());
@@ -738,7 +708,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                         frag.buf.extend_from_slice(data);
                         self.state = DepacketizerState::Ready(AacFrame {
                             ctx: meta.ctx.clone(),
-                            loss: frag.loss,
                             frame_length: NonZeroU32::from(self.config.frame_length),
                             timestamp: meta.timestamp,
                             data: FrameData::Owned(std::mem::take(&mut frag.buf)),
@@ -748,18 +717,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 }
             }
             DepacketizerState::Aggregated(_) => panic!("push when already in state aggregated"),
-            DepacketizerState::Idle {
-                prev_loss,
-                loss_since_mark,
-            } => {
+            DepacketizerState::Idle { loss_since_mark } => {
                 if au_headers_count == 0 {
                     return Err("aggregate with no headers".to_string());
                 }
-                let loss = meta.loss;
                 self.state = DepacketizerState::Aggregated(Aggregate {
                     meta: meta.clone(),
-                    loss: *prev_loss + loss,
-                    loss_since_mark: *loss_since_mark || loss > 0,
+                    loss_since_mark: *loss_since_mark || meta.loss > 0,
                     frame_i: 0,
                     frame_count: au_headers_count,
                     data_off,
@@ -802,11 +766,9 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     if mark {
                         if agg.loss_since_mark {
                             log::debug!(
-                                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                                agg.loss
+                                "Discarding in-progress fragmented AAC frame due to earlier loss."
                             );
                             self.state = DepacketizerState::Idle {
-                                prev_loss: agg.loss,
                                 loss_since_mark: false,
                             };
                             return None;
@@ -817,7 +779,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     buf.extend_from_slice(&payload[agg.data_off..]);
                     self.state = DepacketizerState::Fragmented(Fragment {
                         rtp_timestamp: agg.meta.timestamp.timestamp as u16,
-                        loss: agg.loss,
                         loss_since_mark: agg.loss_since_mark,
                         size: size as u16,
                         buf,
@@ -832,7 +793,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                 let agg_timestamp = agg.meta.timestamp;
                 let frame = AacFrame {
                     ctx: agg.meta.ctx.clone(),
-                    loss: agg.loss,
                     frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
@@ -846,7 +806,6 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                     },
                     data: FrameData::Payload(agg.data_off..agg.data_off + size),
                 };
-                agg.loss = 0;
                 agg.data_off += size;
                 agg.frame_i += 1;
                 if agg.frame_i < agg.frame_count {
@@ -860,58 +819,29 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
 
 #[cfg(test)]
 impl Depacketizer<crate::PacketContext> {
-    /// Supplies a new packet via the legacy `push`/`pull` interface.
-    fn push(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) -> Result<(), String> {
-        if let Some(p) = self.pending.front() {
-            panic!("push with data already pending: {p:?}");
-        }
+    /// Supplies a new packet via the test-only `push_collect`/`pull` interface.
+    ///
+    /// Between any two calls to `push_collect`, the caller must call `pull`
+    /// until it returns `None`.
+    fn push_collect(&mut self, pkt: &ReceivedPacketRef<'_, crate::PacketContext>) {
         let mut pending = std::mem::take(&mut self.pending);
-        let r = self.push_with(
-            pkt,
-            &mut crate::client::LegacyHandler {
-                pending: &mut pending,
-                meta: &pkt.meta,
-                stream_id: 0,
-                format: self.test_format,
-            },
-        );
+        pending.push(pkt, self.test_format, |c| self.push(pkt, c));
         self.pending = pending;
-        r
     }
 
-    fn pull(
-        &mut self,
-    ) -> Option<Result<crate::client::CodecItem, crate::client::DepacketizeError>> {
-        self.pending.pop_front()
+    fn pull(&mut self) -> Option<Result<super::testutil::Item, String>> {
+        self.pending.pull()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::PacketContext;
     use crate::buf::MarkBuf;
-    use crate::client::CodecItem;
-    use crate::rtp::ReceivedPacketRef;
-    use crate::{PacketContext, client::ReceivedPacketBuilder};
+    use crate::codec::testutil::Item;
+    use crate::testutil::TestPacket;
 
     use super::*;
-
-    /// Helper: writes payload into `buf`, then pushes to depacketizer.
-    fn push_via_buf(
-        d: &mut super::Depacketizer<crate::PacketContext>,
-        meta: crate::rtp::ReceivedPacketMeta<crate::PacketContext>,
-        payload: &[u8],
-        buf: &mut MarkBuf,
-    ) -> Result<(), String> {
-        let pos = buf.end();
-        buf.extend(payload);
-        buf.advance_unparsed(buf.end());
-        d.push(&ReceivedPacketRef::new(
-            meta,
-            buf,
-            pos,
-            payload.len() as u16,
-        ))
-    }
 
     #[test]
     fn parse_audio_specific_config() {
@@ -947,9 +877,8 @@ mod tests {
 
         // Single frame.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: PacketContext::dummy(),
-                stream_id: 0,
                 sequence_number: 0,
                 timestamp,
                 payload_type: 0,
@@ -957,24 +886,20 @@ mod tests {
                 mark: true,
                 loss: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
@@ -983,9 +908,8 @@ mod tests {
 
         // Aggregate of 3 frames.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -993,38 +917,34 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x30, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 3 headers
-                0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
-                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
-                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
-                b'f', b'o', b'o', b'b', b'a', b'r', b'b', b'a', b'z',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x30, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 3 headers
+                    0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
+                    0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                    0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                    b'f', b'o', b'o', b'b', b'a', b'r', b'b', b'a', b'z',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foo");
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(1_024).unwrap());
         assert_eq!(&a.data[..], b"bar");
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
@@ -1033,10 +953,9 @@ mod tests {
 
         // Fragment across 3 packets.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // fragment 1/3.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1044,28 +963,23 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'f', b'o', b'o',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'f', b'o', b'o',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // fragment 2/3.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1073,28 +987,23 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // fragment 3/3.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1102,24 +1011,20 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'z',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'z',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
@@ -1144,9 +1049,8 @@ mod tests {
 
         // Fragment
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1154,27 +1058,22 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1182,30 +1081,25 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'z',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'z',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1213,24 +1107,20 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
@@ -1254,10 +1144,9 @@ mod tests {
         };
 
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // 1/3
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1265,29 +1154,24 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'f', b'o', b'o',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'f', b'o', b'o',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // 3/3 reports the loss
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1295,30 +1179,25 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'z',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'z',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1326,24 +1205,20 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
@@ -1367,10 +1242,9 @@ mod tests {
         };
 
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // 1/3
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1378,29 +1252,24 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'f', b'o', b'o',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'f', b'o', b'o',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // 3/3 reports the loss
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1408,30 +1277,25 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'z',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'z',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // single frame.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1439,24 +1303,20 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
@@ -1466,7 +1326,7 @@ mod tests {
 
     /// Tests the distinction between `loss` and `loss_since_last_mark`.
     ///
-    /// Old loss should get reported via the CodecItem but shouldn't suppress
+    /// Old loss should get reported via the frame but shouldn't suppress
     /// error checking.
     #[test]
     fn depacketize_fragment_old_loss_doesnt_prevent_error() {
@@ -1483,10 +1343,9 @@ mod tests {
         };
 
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // end of previous fragment, first parts missing.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1494,30 +1353,25 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Incomplete fragment with no reported loss.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 // end of previous fragment, first parts missing.
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 0,
@@ -1525,26 +1379,21 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
-                0x00,
-                0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    // https://datatracker.ietf.org/doc/html/rfc3640#section-3.2.1
+                    0x00,
+                    0x10, // AU-headers-length: 16 bits (13-bit size + 3-bit index) => 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         match d.pull() {
             Some(Err(e)) => assert!(
-                e.description
-                    .contains("mark can't be set on beginning of fragment"),
+                e.contains("mark can't be set on beginning of fragment"),
                 "{e:?}",
             ),
             _ => panic!(),
@@ -1561,9 +1410,8 @@ mod tests {
             Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
         ).unwrap();
         let mut buf = MarkBuf::new(65536);
-        let pkt = ReceivedPacketBuilder {
+        let pkt = TestPacket {
             ctx: PacketContext::dummy(),
-            stream_id: 0,
             sequence_number: 0,
             timestamp: crate::Timestamp {
                 timestamp: 42,
@@ -1575,20 +1423,19 @@ mod tests {
             mark: true,
             loss: 0,
         }
-        .build([
-            0x00, 0x18, // AU-headers-length: 24 bits, 1.5 headers
-            0x00, 0x20, 0x00, // AU-header: AU-size=4 + AU-index=0, half another
-            b'a', b's', b'd', b'f',
-        ])
-        .unwrap();
-        let e = push_via_buf(
-            &mut d,
-            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-            pkt.payload(),
+        .write(
             &mut buf,
-        )
-        .unwrap_err();
-        assert!(e.contains("bad au-headers-length"), "{e}");
+            [
+                0x00, 0x18, // AU-headers-length: 24 bits, 1.5 headers
+                0x00, 0x20, 0x00, // AU-header: AU-size=4 + AU-index=0, half another
+                b'a', b's', b'd', b'f',
+            ],
+        );
+        d.push_collect(&pkt);
+        match d.pull() {
+            Some(Err(e)) => assert!(e.contains("bad au-headers-length"), "{e}"),
+            o => panic!("{o:?}"),
+        }
     }
 
     /// Tests that ADTS framing reports an error rather than writing a bad
@@ -1604,9 +1451,8 @@ mod tests {
         ).unwrap();
         d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
         let mut buf = MarkBuf::new(65536);
-        let pkt = ReceivedPacketBuilder {
+        let pkt = TestPacket {
             ctx: PacketContext::dummy(),
-            stream_id: 0,
             sequence_number: 0,
             timestamp: crate::Timestamp {
                 timestamp: 42,
@@ -1618,21 +1464,17 @@ mod tests {
             mark: true,
             loss: 0,
         }
-        .build([
-            0x00, 0x10, // AU-headers-length: 1 header
-            0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-            b'a', b's', b'd', b'f',
-        ])
-        .unwrap();
-        push_via_buf(
-            &mut d,
-            crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-            pkt.payload(),
+        .write(
             &mut buf,
-        )
-        .unwrap();
+            [
+                0x00, 0x10, // AU-headers-length: 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ],
+        );
+        d.push_collect(&pkt);
         match d.pull() {
-            Some(Err(e)) => assert!(e.description.contains("audio_object_type 23"), "{e:?}"),
+            Some(Err(e)) => assert!(e.contains("audio_object_type 23"), "{e:?}"),
             o => panic!("{o:?}"),
         }
     }
@@ -1654,7 +1496,6 @@ mod tests {
             ctx: &(),
             timestamp: crate::Timestamp::new(0, NonZeroU32::new(48_000).unwrap(), 0).unwrap(),
             frame_length: NonZeroU32::new(1024).unwrap(),
-            loss: 0,
             data,
             adts: Some(AdtsParams::new(
                 &AudioSpecificConfig::parse(config).unwrap(),
@@ -1702,9 +1543,8 @@ mod tests {
 
         // Start of a fragment.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts(42),
                 ssrc: 0,
                 sequence_number: 0,
@@ -1712,27 +1552,22 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x10, // AU-headers-length: 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'f', b'o', b'o',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // AU-headers-length: 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'f', b'o', b'o',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
 
         // Continuation with a changed timestamp.
-        let e = {
-            let pkt = ReceivedPacketBuilder {
+        {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts(43),
                 ssrc: 0,
                 sequence_number: 1,
@@ -1740,28 +1575,26 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x10, // AU-headers-length: 1 header
-                0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // AU-headers-length: 1 header
+                    0x00, 0x48, // AU-header: AU-size=9 + AU-index=0
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap_err();
-        assert!(e.contains("Timestamp changed"), "{e:?}");
+        match d.pull() {
+            Some(Err(e)) => assert!(e.contains("Timestamp changed"), "{e:?}"),
+            o => panic!("{o:?}"),
+        }
         assert_eq!(d.pull(), None);
 
         // A complete frame afterward is delivered.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: crate::PacketContext::dummy(),
-                stream_id: 0,
                 timestamp: ts(44),
                 ssrc: 0,
                 sequence_number: 2,
@@ -1769,22 +1602,18 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x10, // AU-headers-length: 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // AU-headers-length: 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
         };
         assert_eq!(a.timestamp, ts(44));
@@ -1816,9 +1645,8 @@ mod tests {
 
         // Single frame.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: PacketContext::dummy(),
-                stream_id: 0,
                 sequence_number: 0,
                 timestamp,
                 payload_type: 0,
@@ -1826,22 +1654,18 @@ mod tests {
                 mark: true,
                 loss: 0,
             }
-            .build([
-                0x00, 0x10, // AU-headers-length: 1 header
-                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
-                b'a', b's', b'd', b'f',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // AU-headers-length: 1 header
+                    0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                    b'a', b's', b'd', b'f',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
         };
         // 7-byte ADTS header + 4-byte payload.
@@ -1866,9 +1690,8 @@ mod tests {
 
         // Aggregate of 2 frames — each should get its own ADTS header.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 1,
@@ -1876,30 +1699,26 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x20, // AU-headers-length: 2 headers
-                0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
-                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
-                b'f', b'o', b'o', b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x20, // AU-headers-length: 2 headers
+                    0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
+                    0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                    b'f', b'o', b'o', b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a1 = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
         };
         assert_eq!(a1.data.len(), 7 + 3);
         assert_eq!(&a1.data[..2], &[0xFF, 0xF1]);
         assert_eq!(&a1.data[7..], b"foo");
         let a2 = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
         };
         assert_eq!(a2.data.len(), 7 + 3);
@@ -1908,9 +1727,8 @@ mod tests {
 
         // Fragment across 2 packets.
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 2,
@@ -1918,25 +1736,20 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x10, // 1 header
-                0x00, 0x30, // AU-size=6
-                b'f', b'o', b'o',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // 1 header
+                    0x00, 0x30, // AU-size=6
+                    b'f', b'o', b'o',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         assert_eq!(d.pull(), None);
         {
-            let pkt = ReceivedPacketBuilder {
+            let pkt = TestPacket {
                 ctx: PacketContext::dummy(),
-                stream_id: 0,
                 timestamp,
                 ssrc: 0,
                 sequence_number: 3,
@@ -1944,22 +1757,18 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build([
-                0x00, 0x10, // 1 header
-                0x00, 0x30, // AU-size=6
-                b'b', b'a', b'r',
-            ])
-            .unwrap();
-            push_via_buf(
-                &mut d,
-                crate::rtp::ReceivedPacketMeta::from_received(&pkt),
-                pkt.payload(),
+            .write(
                 &mut buf,
-            )
+                [
+                    0x00, 0x10, // 1 header
+                    0x00, 0x30, // AU-size=6
+                    b'b', b'a', b'r',
+                ],
+            );
+            d.push_collect(&pkt);
         }
-        .unwrap();
         let a = match d.pull() {
-            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            Some(Ok(Item::Audio(a))) => a,
             o => panic!("{o:?}"),
         };
         assert_eq!(a.data.len(), 7 + 6);

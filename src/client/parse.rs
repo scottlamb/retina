@@ -364,26 +364,9 @@ fn parse_media(
         }
     }
 
-    let format = &payload_formats[0].format;
-    let depacketizer = match direction {
-        StreamDirection::Receiving => {
-            let d = crate::codec::Depacketizer::new(format).map_err(|e| e.to_string());
-            if let Err(e) = &d {
-                log::info!(
-                    "no depacketizer for media/encoding_name {media}/{}: {e}",
-                    format.encoding_name()
-                );
-            }
-            d
-        }
-        StreamDirection::Sending => Err("can't depacketize a sending stream".to_owned()),
-    };
-
     Ok(Stream {
-        frame_format: Default::default(),
         media,
         payload_formats: payload_formats.into(),
-        depacketizer,
         control,
         framerate,
         direction,
@@ -2237,7 +2220,7 @@ mod tests {
         assert_eq!(back.f().encoding_name(), "pcmu");
         assert_eq!(back.pt(), 0);
         assert_eq!(back.f().clock_rate(), 8_000);
-        assert!(back.depacketizer.is_err());
+        assert!(back.new_depacketizer::<()>().is_err());
         assert!(
             back.depacketizer()
                 .as_ref()
@@ -2255,7 +2238,7 @@ mod tests {
         for s in &p.streams[..] {
             assert_eq!(s.direction(), StreamDirection::Receiving);
         }
-        assert!(p.streams[2].depacketizer.is_ok());
+        assert!(p.streams[2].new_depacketizer::<()>().is_ok());
     }
 
     /// Tests the ONVIF Streaming Specification section 5.3.2.3 example: a

@@ -39,11 +39,10 @@ impl Depacketizer {
     /// Returns the frame length in clock rate units, which count sampling
     /// instants rather than samples across all channels (RFC 3551 section
     /// 4).
-    fn frame_length(&self, payload_len: usize) -> Option<NonZeroU32> {
+    fn frame_length(&self, payload_len: u16) -> Option<NonZeroU32> {
         // This calculation could be strength-reduced but it's just once per frame anyway.
         // Let's do it in a straightforward way.
-        assert!(payload_len < usize::from(u16::MAX));
-        let bits = (payload_len) as u32 * 8;
+        let bits = u32::from(payload_len) * 8;
         let bits_per_instant = self.bits_per_sample * u32::from(self.parameters.channels.get());
         match bits.is_multiple_of(bits_per_instant) {
             false => None,
@@ -52,18 +51,22 @@ impl Depacketizer {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
-    pub(super) fn push_with<Ctx>(
+    pub(super) fn push<Ctx>(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl AudioHandler<Ctx>,
-    ) -> Result<(), String> {
+    ) {
         let payload_len = pkt.payload_len();
-        let frame_length = self.frame_length(payload_len as usize).ok_or_else(|| {
-            format!(
-                "invalid length {} for payload of {}-bit audio samples in {} channel(s)",
-                payload_len, self.bits_per_sample, self.parameters.channels
-            )
-        })?;
+        let Some(frame_length) = self.frame_length(payload_len) else {
+            return super::report_corrupt(
+                pkt,
+                format!(
+                    "invalid length {} for payload of {}-bit audio samples in {} channel(s)",
+                    payload_len, self.bits_per_sample, self.parameters.channels
+                ),
+                |l| handler.loss(l),
+            );
+        };
         let (s1, s2) = pkt.payload().slices();
         let joined;
         let data = if s2.is_empty() {
@@ -76,11 +79,9 @@ impl Depacketizer {
             ctx: &pkt.meta.ctx,
             timestamp: pkt.meta.timestamp,
             frame_length,
-            loss: pkt.meta.loss,
             data,
             adts: None,
         });
-        Ok(())
     }
 }
 
@@ -133,5 +134,12 @@ mod tests {
 
         // 322 bytes would end mid-instant.
         assert_eq!(d.frame_length(322), None);
+    }
+
+    #[test]
+    fn frame_length_max_payload() {
+        // The largest payload a `ReceivedPacketRef` can carry.
+        let d = depacketizer_8bit();
+        assert_eq!(d.frame_length(u16::MAX), NonZeroU32::new(65535));
     }
 }
