@@ -43,10 +43,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkgconf
       - name: Build (no features, main crate only)
         run: cargo build --no-default-features --all-targets
+      - name: Build (default features, main crate only)
+        run: cargo build --all-targets
       - name: Build (all features)
         run: cargo build --all-features --all-targets --workspace
       - name: Test (no features, main crate only)
         run: cargo test --no-default-features --all-targets
+      - name: Test (default features, main crate only)
+        run: cargo test --all-targets
       - name: Test (all features)
         run: cargo test --all-features --all-targets --workspace --exclude retina-fuzz
       - name: Check formatting
@@ -54,10 +58,44 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy (no features, main crate only)
         if: matrix.rust == 'stable'
-        run: cargo clippy --no-default-features -- -D warnings
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
       - name: Clippy (all features)
         if: matrix.rust == 'stable'
-        run: cargo clippy --all-features --workspace -- -D warnings
+        run: cargo clippy --all-features --workspace --all-targets -- -D warnings
+
+  # Lints the main crate with no features, each feature alone, and each pair
+  # of features (`default` counting as one), about 50 combinations. This
+  # catches `cfg` mistakes such as code that's dead, or doesn't compile, unless
+  # some other feature is on. Higher depths or the full powerset cost far more
+  # and rarely find more. Not required by branch protection.
+  features:
+    name: Clippy (feature pairs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Expose runner image OS for cache keys
+        run: echo "IMAGE_OS=$ImageOS" >> "$GITHUB_ENV"
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ env.IMAGE_OS }}-stable-features-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache-key: ${{ env.IMAGE_OS }}-features
+          components: clippy
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Clippy (feature pairs, main crate only)
+        run: cargo hack clippy --feature-powerset --depth 2 --all-targets --keep-going -- -D warnings
 
   docs:
     name: Check docs
