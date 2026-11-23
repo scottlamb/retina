@@ -570,6 +570,50 @@ fn to_u64(v: usize) -> u64 {
     v as u64
 }
 
+/// Compile-time checks that public types are `Send` and `Sync`, so that
+/// losing either is a deliberate, breaking change.
+#[cfg(test)]
+#[allow(dead_code)]
+mod auto_traits {
+    fn send_sync<T: Send + Sync>() {}
+
+    fn types() {
+        send_sync::<crate::PacketContext>();
+        send_sync::<crate::buf::MarkBuf>();
+        send_sync::<crate::rtp::Receiver<()>>();
+        send_sync::<crate::rtp::ReceivedPacketRef<'_, crate::PacketContext>>();
+        send_sync::<crate::codec::Error>();
+        send_sync::<crate::codec::Depacketizer<crate::PacketContext>>();
+        send_sync::<crate::codec::VideoDepacketizer<crate::PacketContext>>();
+        send_sync::<crate::codec::AudioDepacketizer<crate::PacketContext>>();
+        send_sync::<crate::codec::MessageDepacketizer<crate::PacketContext>>();
+        send_sync::<crate::codec::VideoFrameStart<'_, crate::PacketContext>>();
+        send_sync::<crate::codec::VideoFrameEnd<'_, crate::PacketContext>>();
+        send_sync::<crate::codec::AudioFrameRef<'_, crate::PacketContext>>();
+        send_sync::<crate::codec::MessageFrameRef<'_, crate::PacketContext>>();
+        send_sync::<crate::codec::Loss<'_, crate::PacketContext>>();
+        send_sync::<crate::client::Error>();
+        send_sync::<crate::client::PlayingItem<'_>>();
+    }
+
+    #[cfg(feature = "unstable-sans-io")]
+    fn sans_io() {
+        send_sync::<crate::client::SessionCore>();
+    }
+
+    #[cfg(feature = "tokio")]
+    fn session(
+        described: crate::client::Session<crate::client::Described>,
+        playing: &mut crate::client::Session<crate::client::Playing>,
+    ) {
+        fn send<T: Send>(_: &T) {}
+        send_sync::<crate::client::Session<crate::client::Described>>();
+        send_sync::<crate::client::Session<crate::client::Playing>>();
+        send(&described.play(crate::client::PlayOptions::default()));
+        send(&playing.next_item());
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
