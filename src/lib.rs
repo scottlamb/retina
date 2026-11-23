@@ -557,7 +557,6 @@ impl Display for PacketContext {
 
 // Let's assume pointers are either 32-bit or 64-bit so we can do the following
 // infallible conversions.
-#[cfg(any(feature = "h264", feature = "h265"))]
 fn to_usize<V: Into<u32>>(v: V) -> usize {
     const {
         assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());

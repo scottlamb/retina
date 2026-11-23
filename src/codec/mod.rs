@@ -1026,12 +1026,14 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// [`LossReason::TooLarge`] to [`VideoHandler::loss`], and skips the rest
     /// of it, resynchronizing at the next frame boundary.
     ///
-    /// For H.264 and H.265, this counts RTP payload bytes the depacketizer
-    /// retains in the [`crate::buf::MarkBuf`]. That's the whole frame if the
-    /// handler returns [`Accumulate::Yes`] from [`VideoHandler::frame_start`].
-    /// With [`Accumulate::No`], it's the data before `frame_start` (such as
-    /// parameter sets and SEI), plus at most about a packet after it, so only
-    /// that part is limited.
+    /// This counts RTP payload bytes the depacketizer retains in the
+    /// [`crate::buf::MarkBuf`]. That's the whole frame if the handler returns
+    /// [`Accumulate::Yes`] from [`VideoHandler::frame_start`]. With
+    /// [`Accumulate::No`], it's the data before `frame_start`, plus at most
+    /// about a packet after it, so only that part is limited. For H.264 and
+    /// H.265, the data before `frame_start` includes parameter sets and SEI.
+    /// JPEG calls `frame_start` on a frame's first packet and with
+    /// `Accumulate::No` retains nothing, so it isn't limited at all.
     ///
     /// There's no limit by default. A [`crate::buf::MarkBuf`] limit set via
     /// [`crate::buf::MarkBuf::set_max_retained`] bounds memory regardless.
@@ -1758,18 +1760,19 @@ mod tests {
 
         // Complete.
         push(&mut d, &mut buf, (0, 0, false, 0), &pkt(0, b"abcd"), &mut h);
+        assert_eq!(kinds(h.take()), ["start", "data"]);
         push(&mut d, &mut buf, (1, 0, true, 0), &pkt(4, b"efgh"), &mut h);
-        assert_eq!(kinds(h.take()), ["start", "data", "end"]);
+        assert_eq!(kinds(h.take()), ["data", "end"]);
 
         // Interior loss.
         push(&mut d, &mut buf, (2, 1, false, 0), &pkt(0, b"abcd"), &mut h);
         push(&mut d, &mut buf, (4, 1, true, 1), &pkt(8, b"ijkl"), &mut h);
-        assert_eq!(kinds(h.take()), ["packet loss"]);
+        assert_eq!(kinds(h.take()), ["start", "data", "packet loss"]);
 
         // Misplaced fragment without loss.
         push(&mut d, &mut buf, (5, 2, false, 0), &pkt(0, b"abcd"), &mut h);
         push(&mut d, &mut buf, (6, 2, true, 0), &pkt(5, b"efgh"), &mut h);
-        assert_eq!(kinds(h.take()), ["corrupt"]);
+        assert_eq!(kinds(h.take()), ["start", "data", "corrupt"]);
 
         // Recovers.
         push(&mut d, &mut buf, (7, 3, true, 0), &pkt(0, b"abcd"), &mut h);

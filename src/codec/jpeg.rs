@@ -17,10 +17,11 @@
 //!
 //! Retina matches this.
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
+use crate::buf::{BufRange, Mark, MarkBuf};
+use crate::inputs::{Input as _, Split};
 use crate::rtp::ReceivedPacketRef;
-
 use crate::{Timestamp, codec::AllPixelDimensions};
 
 use super::{Accumulate, FrameBody, Position, VideoData, VideoFrameEnd, VideoFrameStart};
@@ -155,7 +156,7 @@ const CHM_AC_SYMBOLS: [u8; 162] = [
 
 /// Writes a DQT segment; `sixteen_bit` selects 16-bit (128-byte) rather than
 /// 8-bit (64-byte) table values.
-fn make_quant_header(p: &mut Vec<u8>, qt: &[u8], table_no: u8, sixteen_bit: bool) {
+fn make_quant_header(p: &mut Vec<u8>, qt: Split<'_>, table_no: u8, sixteen_bit: bool) {
     assert!(qt.len() < (u8::MAX - 3) as usize);
 
     p.push(0xff);
@@ -163,7 +164,9 @@ fn make_quant_header(p: &mut Vec<u8>, qt: &[u8], table_no: u8, sixteen_bit: bool
     p.push(0); // length msb
     p.push(qt.len() as u8 + 3); // length lsb
     p.push(u8::from(sixteen_bit) << 4 | table_no); // Pq, Tq
-    p.extend_from_slice(qt);
+    let (s1, s2) = qt.slices();
+    p.extend_from_slice(s1);
+    p.extend_from_slice(s2);
 }
 
 fn make_huffman_header(
@@ -191,33 +194,29 @@ fn make_dri_header(p: &mut Vec<u8>, dri: u16) {
     p.push((dri & 0xff) as u8); // dri lsb
 }
 
+/// Writes the JPEG headers, from SOI through SOS, to `p`.
+///
+/// These are the same for every frame with the same RTP/JPEG header fields and
+/// quantization tables, so callers needn't rebuild them for each frame.
 fn make_headers(
     p: &mut Vec<u8>,
     image_type: u8,
     width: u16,
     height: u16,
-    mut qtable: Bytes,
+    mut qtable: Split<'_>,
     precision: u8,
     dri: u16,
 ) -> Result<(), String> {
     p.push(0xff);
     p.push(0xd8); // SOI
 
-    let sixteen_bit = (precision & 1) > 0;
-    let size = if sixteen_bit { 128 } else { 64 };
-    if qtable.remaining() < size {
-        return Err("Qtable too small".to_string());
+    for (table_no, sixteen_bit) in [(0, (precision & 1) > 0), (1, (precision & 2) > 0)] {
+        let size = if sixteen_bit { 128 } else { 64 };
+        if qtable.len() < size {
+            return Err("Qtable too small".to_string());
+        }
+        make_quant_header(p, qtable.next_slice(size), table_no, sixteen_bit);
     }
-    make_quant_header(p, &qtable[..size], 0, sixteen_bit);
-    qtable.advance(size);
-
-    let sixteen_bit = (precision & 2) > 0;
-    let size = if sixteen_bit { 128 } else { 64 };
-    if qtable.remaining() < size {
-        return Err("Qtable too small".to_string());
-    }
-    make_quant_header(p, &qtable[..size], 1, sixteen_bit);
-    qtable.advance(size);
 
     if dri != 0 {
         make_dri_header(p, dri);
@@ -279,31 +278,83 @@ fn make_headers(
 
 // End of Appendix B.
 
+/// The EOI marker, which ends a JPEG image.
+const EOI: [u8; 2] = [0xff, 0xd9];
+
+/// The RTP/JPEG header fields which determine [`make_headers`]'s output, for a
+/// frame without an in-band quantization table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct HeaderKey {
+    image_type: u8,
+    q: u8,
+    width: u16,
+    height: u16,
+    dri: u16,
+}
+
+/// A frame in progress.
 #[derive(Debug)]
-struct JpegFrameMetadata<Ctx> {
+struct Frame<Ctx> {
     start_ctx: Ctx,
     extensions: crate::rtp::Extensions,
     timestamp: Timestamp,
-    parameters: Option<VideoParameters>,
+
+    /// The frame's parameters, if they differ from [`Depacketizer::parameters`].
+    /// They're committed when the frame ends.
+    new_parameters: Option<VideoParameters>,
 
     /// The fragment offset expected of the next packet: the number of bytes
     /// of JPEG scan data received so far.
     next_offset: u32,
+
+    /// If the handler requested accumulation, pins the scan data referenced
+    /// by [`Depacketizer::pieces`].
+    mark: Option<Mark>,
+
+    /// RTP payload bytes retained, for [`Depacketizer::max_frame_bytes`].
+    retained: usize,
+
+    /// The last two bytes of the frame's data so far, to decide whether to
+    /// append an EOI marker.
+    tail: [u8; 2],
 }
 
 /// A [super::Depacketizer] implementation which combines fragmented RTP/JPEG
 /// into complete image frames as specified in [RFC
 /// 2435](https://www.rfc-editor.org/rfc/rfc2435.txt).
+///
+/// Like the H.264 and H.265 depacketizers, this calls
+/// [`VideoHandler::frame_start`] on a frame's first packet and delivers each
+/// packet's data as it arrives, referring to it in place within the
+/// [`MarkBuf`]. It retains the data (by pinning the buffer) only if the
+/// handler requests [`Accumulate::Yes`].
+///
+/// RTP/JPEG has no JPEG headers on the wire; the depacketizer synthesizes them
+/// from the RTP/JPEG headers into [`Depacketizer::header`] and prepends them to
+/// each frame, much as the H.26x depacketizers prepend parameter sets they
+/// hold.
 #[derive(Debug)]
 pub struct Depacketizer<Ctx> {
-    /// Holds metadata for the current frame.
-    metadata: Option<JpegFrameMetadata<Ctx>>,
+    /// The frame in progress, if any.
+    frame: Option<Frame<Ctx>>,
 
-    /// Backing storage to the assembled frame.
-    data: Vec<u8>,
+    /// The in-progress frame's scan data within the buffer, if accumulating.
+    ///
+    /// This is kept between frames to reuse the allocation.
+    pieces: Vec<BufRange>,
 
-    /// Cached quantization tables, with their precision bits, indexed by Q.
-    qtables: Vec<Option<(u8, Bytes)>>,
+    /// The JPEG headers (SOI through SOS) for the in-progress or most recent
+    /// frame.
+    header: Vec<u8>,
+
+    /// The inputs `header` was built from, if it can be reused for a frame
+    /// with the same inputs; `None` if it was built from an in-band
+    /// quantization table, or not built successfully.
+    header_key: Option<HeaderKey>,
+
+    /// Cached static quantization tables (Q 128–254) received in-band, with
+    /// their precision bits, indexed by Q - 128.
+    qtables: Vec<Option<(u8, Vec<u8>)>>,
 
     /// Completed items ready to be pulled via the test-only `push_collect`/`pull` interface.
     #[cfg(test)]
@@ -318,11 +369,13 @@ pub struct Depacketizer<Ctx> {
 impl<Ctx: Clone> Depacketizer<Ctx> {
     pub(super) fn new() -> Self {
         Depacketizer {
-            metadata: None,
-            data: Vec::new(),
+            frame: None,
+            pieces: Vec::new(),
+            header: Vec::new(),
+            header_key: None,
             #[cfg(test)]
             pending: Default::default(),
-            qtables: vec![None; 255],
+            qtables: vec![None; 127],
             parameters: None,
             max_frame_bytes: usize::MAX,
         }
@@ -333,14 +386,25 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     }
 
     /// Supplies a new packet, delivering any resulting events to `handler`.
+    ///
+    /// The caller is expected to have reported any packet loss before this
+    /// packet to `handler`.
     pub(super) fn push(
         &mut self,
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) {
         if let Err(description) = self.push_inner(pkt, handler) {
+            // Reporting the corruption abandons any frame in progress.
+            self.abandon();
             super::report_corrupt(pkt, description, |l| handler.loss(l));
         }
+    }
+
+    /// Discards the frame in progress, if any, without reporting it.
+    fn abandon(&mut self) {
+        self.frame = None;
+        self.pieces.clear();
     }
 
     fn push_inner(
@@ -348,34 +412,34 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
-        let loss = pkt.meta.continuity.loss_count();
-        if !pkt.meta.continuity.is_contiguous() && self.metadata.is_some() {
-            // As with the other codecs, discard a frame with interior loss
-            // rather than returning it with a gap. If this packet starts a
-            // new frame, it's handled below; otherwise the rest of this
-            // frame's packets are ignored as having no header.
-            tracing::debug!(
-                bytes = self.data.len(),
-                continuity = ?pkt.meta.continuity,
-                "discarding JPEG frame prefix after packet loss"
-            );
-            self.metadata = None;
-            self.data.clear();
+        let meta = &pkt.meta;
+        if let Some(frame) = &self.frame {
+            if !meta.continuity.is_contiguous() {
+                // As with the other codecs, discard a frame with interior loss
+                // rather than returning it with a gap. The caller has already
+                // reported the loss, which abandons the frame. If this packet
+                // starts a new frame, it's handled below; otherwise the rest
+                // of this frame's packets are ignored as having no header.
+                tracing::debug!(
+                    scan_bytes = frame.next_offset,
+                    continuity = ?meta.continuity,
+                    "discarding JPEG frame prefix after packet loss"
+                );
+                self.abandon();
+            } else if frame.mark.as_ref().is_some_and(Mark::is_revoked) {
+                // The rest of this frame's packets are ignored, as above.
+                self.abandon();
+                handler.loss(&super::Loss {
+                    ctx: &meta.ctx,
+                    reason: super::LossReason::Evicted,
+                });
+            }
         }
 
-        if (pkt.payload_len() as usize) < 8 {
+        let mut payload = pkt.payload();
+        if payload.len() < 8 {
             return Err("Too short RTP/JPEG packet".to_string());
         }
-
-        let ctx = &pkt.meta.ctx;
-        let timestamp = pkt.meta.timestamp;
-        let last_packet_in_frame = pkt.meta.mark;
-
-        let (s1, s2) = pkt.payload().slices();
-        let mut v = Vec::with_capacity(pkt.payload_len() as usize);
-        v.extend_from_slice(s1);
-        v.extend_from_slice(s2);
-        let mut payload = Bytes::from(v);
 
         //  0                   1                   2                   3
         //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -384,27 +448,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         // |      Type     |       Q       |     Width     |     Height    |
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-        let frag_offset = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
-        let type_specific = payload[4];
-        let q = payload[5];
-        let width = payload[6] as u16 * 8;
-        let height = payload[7] as u16 * 8;
+        let [_, o1, o2, o3, image_type, q, width, height] = payload.peek_array::<8>();
+        payload.advance(8);
+        let frag_offset = u32::from_be_bytes([0, o1, o2, o3]);
+        let width = u16::from(width) * 8;
+        let height = u16::from(height) * 8;
 
         let mut dri: u16 = 0;
-
-        if frag_offset > 0 && self.metadata.is_none() {
-            let _ = self.metadata.take();
-            self.data.clear();
-
-            // This can happen if we somehow drop the first packet in a frame
-            tracing::debug!("Got JPEG fragment when we have no header");
-            return Ok(());
-        }
-
-        payload.advance(8);
-
-        if type_specific > 63 {
-            if payload.remaining() < 4 {
+        if image_type > 63 {
+            if payload.len() < 4 {
                 return Err("Too short RTP/JPEG packet".to_string());
             }
 
@@ -413,227 +465,361 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
             // |       Restart Interval        |F|L|       Restart Count       |
             // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            dri = (payload[0] as u16) << 8 | payload[1] as u16;
-
+            let [d1, d2, _, _] = payload.peek_array::<4>();
+            dri = u16::from_be_bytes([d1, d2]);
             payload.advance(4);
         }
 
-        if frag_offset == 0 {
-            let qtable;
-
-            if q >= 128 {
-                if payload.len() < 4 {
-                    return Err("Too short RTP/JPEG packet".to_string());
-                }
-
-                //  0                   1                   2                   3
-                //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-                // |      MBZ      |   Precision   |             Length            |
-                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-                // |                    Quantization Table Data                    |
-                // |                              ...                              |
-                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-                let precision = payload[1];
-                let length = (payload[2] as u16) << 8 | payload[3] as u16;
-
-                payload.advance(4);
-
-                if length as usize > payload.len() {
-                    return Err(format!(
-                        "Invalid RTP/JPEG packet. Length {length} larger than payload {}",
-                        payload.len()
-                    ));
-                }
-
-                if length == 0 {
-                    // RFC 2435 section 3.1.8:
-                    // "A Q value of 255 denotes that the quantization table mapping is dynamic and can change on every frame.
-                    // Decoders MUST NOT depend on any previous version of the tables, and need to reload these tables on every frame.
-                    // Packets MUST NOT contain Q = 255 and Length = 0."
-                    if q == 255 {
-                        return Err(
-                            "Invalid RTP/JPEG packet. Quantization tables not found".to_string()
-                        );
-                    }
-
-                    qtable = self.qtables[q as usize].clone();
-                } else {
-                    let table = (precision, payload.slice(..length as usize));
-
-                    // Q values 128-254 are static, so later frames may omit
-                    // the table (Length = 0) and expect the decoder to reuse
-                    // this one.
-                    if q != 255 {
-                        self.qtables[q as usize] = Some(table.clone());
-                    }
-                    qtable = Some(table);
-                }
-
-                payload.advance(length as usize);
-            } else {
-                qtable = self.qtables[q as usize].clone().or_else(|| {
-                    let table = (0, Bytes::copy_from_slice(&make_tables(q as i32)));
-                    self.qtables[q as usize].replace(table);
-
-                    self.qtables[q as usize].clone()
-                });
+        let first = frag_offset == 0;
+        if first {
+            if self.frame.is_some() {
+                // A new frame without loss, so the last one's final packet
+                // lacked the mark bit.
+                self.abandon();
+                super::report_corrupt(
+                    pkt,
+                    "RTP/JPEG frame ended without mark bit".to_string(),
+                    |l| handler.loss(l),
+                );
             }
-
-            match qtable {
-                Some((precision, qtable)) => {
-                    self.data.clear();
-
-                    make_headers(
-                        &mut self.data,
-                        type_specific,
-                        width,
-                        height,
-                        qtable,
-                        precision,
-                        dri,
-                    )?;
-
-                    self.metadata.replace(JpegFrameMetadata {
-                        start_ctx: ctx.clone(),
-                        extensions: pkt.meta.extensions,
-                        timestamp,
-                        next_offset: 0,
-                        parameters: Some(VideoParameters {
-                            all_pixel_dimensions: AllPixelDimensions {
-                                coded: (width, height),
-                                display: (width, height),
-                            },
-                            rfc6381_codec: "mp4v.6C".to_owned(),
-                            pixel_aspect_ratio: None,
-                            frame_rate: None,
-                            decoder_config_record: Bytes::new(),
-                            #[cfg(any(feature = "h264", feature = "h265"))]
-                            annex_b_parameter_sets: Bytes::new(),
-                            codec: super::VideoParametersCodec::Jpeg,
-                        }),
-                    });
-                }
-                None => {
-                    return Err("Invalid RTP/JPEG packet. Missing quantization tables".to_string());
-                }
-            }
-        }
-
-        let metadata = match &mut self.metadata {
-            Some(metadata) => metadata,
-            None => return Err("Invalid RTP/JPEG packet. Missing start packet".to_string()),
-        };
-
-        if metadata.timestamp.timestamp != timestamp.timestamp {
-            // This seems to happen when you connect to certain cameras.
-            // We return Ok here instead of an error to not spam the log.
-            return Ok(());
-        }
-
-        if frag_offset != metadata.next_offset {
-            // Discard the incomplete frame. If packets were lost, that's
-            // expected and has already been reported.
-            let expected = metadata.next_offset;
-            self.metadata = None;
-            self.data.clear();
-            if loss > 0 {
+            self.prepare_header(image_type, q, width, height, dri, &mut payload)?;
+            self.start_frame(pkt, width, height, handler);
+        } else {
+            let Some(frame) = &mut self.frame else {
+                // This can happen if we somehow drop the first packet in a frame
+                tracing::debug!("Got JPEG fragment when we have no header");
+                return Ok(());
+            };
+            if frame.timestamp.timestamp != meta.timestamp.timestamp {
+                // This seems to happen when you connect to certain cameras.
+                // We return Ok here instead of an error to not spam the log.
                 return Ok(());
             }
+            frame.extensions.fill_from(&meta.extensions);
+        }
+
+        let frame = self.frame.as_mut().expect("frame is in progress");
+        if frag_offset != frame.next_offset {
+            // Discard the incomplete frame. (Packet loss has been handled
+            // above, so this frame's packets were misplaced.)
             return Err(format!(
-                "RTP/JPEG fragment offset {frag_offset}, expected {expected}"
+                "RTP/JPEG fragment offset {frag_offset}, expected {}",
+                frame.next_offset
             ));
         }
-        metadata.next_offset = frag_offset + payload.len() as u32;
+        let scan_len = payload.len();
+        frame.next_offset = frag_offset + scan_len as u32;
 
-        self.data.extend_from_slice(&payload);
-
-        if last_packet_in_frame {
-            if self.data.len() < 2 {
+        if let Some(mark) = &frame.mark {
+            assert!(
+                mark.belongs_to(pkt.buf()),
+                "depacketizer holding data from one MarkBuf was supplied data from another"
+            );
+            frame.retained += usize::from(pkt.payload_len());
+            if frame.retained > self.max_frame_bytes {
+                // The rest of this frame's packets are ignored as having no header.
+                self.abandon();
+                handler.loss(&super::Loss {
+                    ctx: &meta.ctx,
+                    reason: super::LossReason::TooLarge {
+                        limit: self.max_frame_bytes,
+                    },
+                });
                 return Ok(());
             }
-
-            // Adding EOI marker if necessary.
-            let end = &self.data[self.data.len() - 2..];
-            if end != [0xff, 0xd9] {
-                self.data.extend_from_slice(&[0xff, 0xd9]);
-            }
-
-            let has_new_parameters = self.parameters != metadata.parameters;
-            let metadata = self.metadata.take().expect("metadata is present");
-            if has_new_parameters {
-                self.parameters = metadata.parameters;
-            }
-            let parameters = self.parameters.as_ref();
-
-            let accumulate = handler.frame_start(&mut VideoFrameStart {
-                is_decodable: true,
-                missing_prefix: false,
-                is_rasl: false,
-                timestamp,
-                ctx: &metadata.start_ctx,
-                extensions: metadata.extensions,
-                is_random_access_point: true,
-                is_disposable: true,
-                has_new_parameters,
-                parameters,
-                param_override: None,
-            });
-            handler.data(&VideoData {
-                position: Position::Complete,
-                data: &[&self.data],
-            });
-            let data = match accumulate {
-                Accumulate::Yes => std::mem::take(&mut self.data),
-                Accumulate::No => Vec::new(),
-            };
-            let mut frame_end = VideoFrameEnd {
-                is_decodable: true,
-                missing_prefix: false,
-                is_rasl: false,
-                timestamp,
-                start_ctx: &metadata.start_ctx,
-                end_ctx: ctx,
-                extensions: metadata.extensions,
-                is_random_access_point: true,
-                is_disposable: true,
-                has_new_parameters,
-                body: FrameBody::Owned {
-                    data: (accumulate == Accumulate::Yes).then_some(data),
-                    parameters,
-                },
-            };
-            handler.frame_end(&mut frame_end);
-            if let FrameBody::Owned {
-                data: Some(mut data),
-                ..
-            } = frame_end.body
-            {
-                // The handler didn't take the data; reuse the allocation.
-                data.clear();
-                self.data = data;
-            } else {
-                self.data.clear();
+            if scan_len > 0 {
+                self.pieces.push(BufRange {
+                    pos: pkt.payload_pos()
+                        + crate::to_u64(usize::from(pkt.payload_len()) - scan_len),
+                    len: scan_len as u32,
+                });
             }
         }
 
-        if self.data.len() > self.max_frame_bytes {
-            self.metadata = None;
-            self.data.clear();
-            handler.loss(&super::Loss {
-                ctx,
-                reason: super::LossReason::TooLarge {
-                    limit: self.max_frame_bytes,
-                },
+        let (s1, s2) = payload.slices();
+        for s in [s1, s2] {
+            frame.tail = match *s {
+                [] => frame.tail,
+                [b] => [frame.tail[1], b],
+                [.., a, b] => [a, b],
+            };
+        }
+
+        // Deliver this packet's data, adding an EOI marker if necessary.
+        let last = meta.mark;
+        let eoi = last && frame.tail != EOI;
+        let mut slices: [&[u8]; 4] = [&[]; 4];
+        let mut n = 0;
+        for s in [
+            if first { &self.header[..] } else { &[] },
+            s1,
+            s2,
+            if eoi { &EOI[..] } else { &[] },
+        ] {
+            if !s.is_empty() {
+                slices[n] = s;
+                n += 1;
+            }
+        }
+        if n > 0 || last {
+            handler.data(&VideoData {
+                position: Position::new(first, last),
+                data: &slices[..n],
             });
+        }
+
+        if last {
+            let frame = self.frame.take().expect("frame is in progress");
+            let has_new_parameters = frame.new_parameters.is_some();
+            if let Some(p) = frame.new_parameters {
+                self.parameters = Some(p);
+            }
+            handler.frame_end(&mut VideoFrameEnd {
+                is_decodable: true,
+                missing_prefix: false,
+                is_rasl: false,
+                timestamp: frame.timestamp,
+                start_ctx: &frame.start_ctx,
+                end_ctx: &meta.ctx,
+                extensions: frame.extensions,
+                is_random_access_point: true,
+                is_disposable: true,
+                has_new_parameters,
+                body: FrameBody::Jpeg(FrameEndBody {
+                    data: frame.mark.is_some().then_some(FrameData {
+                        header: &self.header,
+                        pieces: &self.pieces,
+                        buf: pkt.buf(),
+                        eoi,
+                    }),
+                    parameters: self.parameters.as_ref(),
+                }),
+            });
+            self.pieces.clear();
         }
 
         Ok(())
     }
 
+    /// Ensures [`Depacketizer::header`] matches a frame's first packet,
+    /// consuming its quantization table header from `payload`, if any.
+    fn prepare_header(
+        &mut self,
+        image_type: u8,
+        q: u8,
+        width: u16,
+        height: u16,
+        dri: u16,
+        payload: &mut Split<'_>,
+    ) -> Result<(), String> {
+        let mut in_band = None;
+        if q >= 128 {
+            if payload.len() < 4 {
+                return Err("Too short RTP/JPEG packet".to_string());
+            }
+
+            //  0                   1                   2                   3
+            //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            // |      MBZ      |   Precision   |             Length            |
+            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            // |                    Quantization Table Data                    |
+            // |                              ...                              |
+            // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+            let [_, precision, l1, l2] = payload.peek_array::<4>();
+            let length = usize::from(u16::from_be_bytes([l1, l2]));
+            payload.advance(4);
+            if length > payload.len() {
+                return Err(format!(
+                    "Invalid RTP/JPEG packet. Length {length} larger than payload {}",
+                    payload.len()
+                ));
+            }
+            let table = payload.next_slice(length);
+            if length > 0 {
+                if q != 255 {
+                    // Q values 128-254 are static, so later frames may omit
+                    // the table (Length = 0) and expect the decoder to reuse
+                    // this one.
+                    let (p, t) = self.qtables[usize::from(q - 128)].get_or_insert_default();
+                    *p = precision;
+                    t.clear();
+                    let (s1, s2) = table.slices();
+                    t.extend_from_slice(s1);
+                    t.extend_from_slice(s2);
+                }
+                in_band = Some((precision, table));
+            } else if q == 255 {
+                // RFC 2435 section 3.1.8:
+                // "A Q value of 255 denotes that the quantization table mapping is dynamic and can change on every frame.
+                // Decoders MUST NOT depend on any previous version of the tables, and need to reload these tables on every frame.
+                // Packets MUST NOT contain Q = 255 and Length = 0."
+                return Err("Invalid RTP/JPEG packet. Quantization tables not found".to_string());
+            }
+        }
+
+        let key = in_band.is_none().then_some(HeaderKey {
+            image_type,
+            q,
+            width,
+            height,
+            dri,
+        });
+        if key.is_some() && key == self.header_key {
+            return Ok(());
+        }
+        let computed;
+        let (precision, qtable) = match in_band {
+            Some(t) => t,
+            None if q < 128 => {
+                computed = make_tables(i32::from(q));
+                (0, Split::new(&computed, &[]))
+            }
+            None => match &self.qtables[usize::from(q - 128)] {
+                Some((precision, table)) => (*precision, Split::new(table, &[])),
+                None => {
+                    return Err("Invalid RTP/JPEG packet. Missing quantization tables".to_string());
+                }
+            },
+        };
+        self.header_key = None;
+        self.header.clear();
+        make_headers(
+            &mut self.header,
+            image_type,
+            width,
+            height,
+            qtable,
+            precision,
+            dri,
+        )?;
+        self.header_key = key;
+        Ok(())
+    }
+
+    /// Starts a frame with the given packet, calling
+    /// [`VideoHandler::frame_start`].
+    fn start_frame(
+        &mut self,
+        pkt: &ReceivedPacketRef<'_, Ctx>,
+        width: u16,
+        height: u16,
+        handler: &mut impl VideoHandler<Ctx>,
+    ) {
+        let meta = &pkt.meta;
+        let new_parameters = match &self.parameters {
+            Some(p) if p.all_pixel_dimensions.coded == (width, height) => None,
+            _ => Some(VideoParameters {
+                all_pixel_dimensions: AllPixelDimensions {
+                    coded: (width, height),
+                    display: (width, height),
+                },
+                rfc6381_codec: "mp4v.6C".to_owned(),
+                pixel_aspect_ratio: None,
+                frame_rate: None,
+                decoder_config_record: Bytes::new(),
+                #[cfg(any(feature = "h264", feature = "h265"))]
+                annex_b_parameter_sets: Bytes::new(),
+                codec: super::VideoParametersCodec::Jpeg,
+            }),
+        };
+        let accumulate = handler.frame_start(&mut VideoFrameStart {
+            is_decodable: true,
+            missing_prefix: false,
+            is_rasl: false,
+            timestamp: meta.timestamp,
+            ctx: &meta.ctx,
+            extensions: meta.extensions,
+            is_random_access_point: true,
+            is_disposable: true,
+            has_new_parameters: new_parameters.is_some(),
+            parameters: new_parameters.as_ref().or(self.parameters.as_ref()),
+            param_override: None,
+        });
+        let mark = (accumulate == Accumulate::Yes).then(|| pkt.buf().add_mark_at(pkt.pin_pos()));
+        self.frame = Some(Frame {
+            start_ctx: meta.ctx.clone(),
+            extensions: meta.extensions,
+            timestamp: meta.timestamp,
+            new_parameters,
+            next_offset: 0,
+            mark,
+            retained: 0,
+            tail: [0; 2],
+        });
+    }
+
     pub(super) fn parameters(&self) -> Option<&VideoParameters> {
         self.parameters.as_ref()
+    }
+}
+
+/// Access to a finished frame, for [`VideoFrameEnd`].
+pub(crate) struct FrameEndBody<'a> {
+    /// The frame's data, if accumulated and not yet taken.
+    data: Option<FrameData<'a>>,
+    parameters: Option<&'a VideoParameters>,
+}
+
+struct FrameData<'a> {
+    header: &'a [u8],
+    pieces: &'a [BufRange],
+    buf: &'a MarkBuf,
+
+    /// True if an EOI marker should follow the scan data.
+    eoi: bool,
+}
+
+impl FrameData<'_> {
+    fn len(&self) -> usize {
+        self.header.len()
+            + self
+                .pieces
+                .iter()
+                .map(|p| crate::to_usize(p.len))
+                .sum::<usize>()
+            + if self.eoi { EOI.len() } else { 0 }
+    }
+
+    fn visit(&self, visitor: &mut impl FnMut(&[u8])) {
+        visitor(self.header);
+        for piece in self.pieces {
+            let (s1, s2) = self
+                .buf
+                .split(piece.pos, crate::to_usize(piece.len))
+                .slices();
+            visitor(s1);
+            if !s2.is_empty() {
+                visitor(s2);
+            }
+        }
+        if self.eoi {
+            visitor(&EOI);
+        }
+    }
+}
+
+impl FrameEndBody<'_> {
+    pub(super) fn parameters(&self) -> Option<&VideoParameters> {
+        self.parameters
+    }
+
+    pub(super) fn visit(&self, visitor: &mut impl FnMut(&[u8])) -> bool {
+        match &self.data {
+            Some(d) => {
+                d.visit(visitor);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn build(&mut self) -> Option<Vec<u8>> {
+        let d = self.data.take()?;
+        let mut data = Vec::with_capacity(d.len());
+        d.visit(&mut |chunk| data.extend_from_slice(chunk));
+        debug_assert_eq!(data.len(), d.len());
+        Some(data)
     }
 }
 
@@ -1132,5 +1318,391 @@ mod tests {
         expected.extend_from_slice(&luma16);
         expected.extend_from_slice(&VALID_JPEG_IMAGE[2 + 5 + 64..]);
         assert_eq_hex!(depacketize_frame_with_start(&start), expected);
+    }
+
+    /// Returns a RTP/JPEG packet: type 1, Q 50, `width8` x 8 pixels, then the
+    /// given scan data.
+    fn small_pkt(frag_offset: u32, width8: u8, data: &[u8]) -> Vec<u8> {
+        let mut p = vec![0];
+        p.extend_from_slice(&frag_offset.to_be_bytes()[1..]);
+        p.extend_from_slice(&[1, 50, width8, 1]);
+        p.extend_from_slice(data);
+        p
+    }
+
+    /// Returns the headers the depacketizer synthesizes for `small_pkt`.
+    fn small_header(width8: u8) -> Vec<u8> {
+        let mut h = Vec::new();
+        super::make_headers(
+            &mut h,
+            1,
+            u16::from(width8) * 8,
+            8,
+            crate::inputs::Split::new(&super::make_tables(50), &[]),
+            0,
+            0,
+        )
+        .unwrap();
+        h
+    }
+
+    /// Pushes a packet directly to the codec's depacketizer, which doesn't
+    /// report packet loss itself; see `Pending::push`.
+    fn push_events(
+        d: &mut super::Depacketizer<crate::PacketContext>,
+        buf: &mut MarkBuf,
+        (sequence_number, frame_i, mark): (u16, i64, bool),
+        payload: &[u8],
+        h: &mut crate::codec::events::testutil::Recorder,
+    ) {
+        let pkt = TestPacket {
+            ctx: crate::PacketContext::dummy(),
+            timestamp: crate::Timestamp::new(frame_i * 3000, NonZeroU32::new(90_000).unwrap(), 0)
+                .unwrap(),
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark,
+            payload_type: 0,
+        }
+        .write(buf, payload.iter().copied());
+        d.push(&pkt, h);
+    }
+
+    /// Frames start on their first packet, and each packet's data is
+    /// delivered as it arrives. Data is retained only when accumulating.
+    #[test]
+    fn events_stream() {
+        use crate::codec::Accumulate;
+        use crate::codec::Position;
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        init_logging();
+        for accumulate in [Accumulate::Yes, Accumulate::No] {
+            let mut d = super::Depacketizer::new();
+            let mut buf = MarkBuf::new(65536);
+            let mut h = Recorder::unframed(accumulate);
+            let start = |has_new_parameters| Event::FrameStart {
+                is_random_access_point: true,
+                is_disposable: true,
+                has_new_parameters,
+            };
+            let end = |has_new_parameters, data: &[&[u8]]| Event::FrameEnd {
+                is_random_access_point: true,
+                is_disposable: true,
+                has_new_parameters,
+                data: (accumulate == Accumulate::Yes).then(|| hex(&data.concat())),
+            };
+
+            push_events(
+                &mut d,
+                &mut buf,
+                (0, 0, false),
+                &small_pkt(0, 1, b"abcd"),
+                &mut h,
+            );
+            let header = small_header(1);
+            assert_eq!(
+                h.take(),
+                [
+                    start(true),
+                    Event::Data(Position::Start, hex(&[&header[..], b"abcd"].concat())),
+                ]
+            );
+            let pinned = d.frame.as_ref().unwrap().mark.is_some();
+            assert_eq!(pinned, accumulate == Accumulate::Yes);
+            assert_eq!(
+                d.parameters(),
+                None,
+                "parameters are committed at frame end"
+            );
+
+            push_events(
+                &mut d,
+                &mut buf,
+                (1, 0, false),
+                &small_pkt(4, 1, b"efgh"),
+                &mut h,
+            );
+            assert_eq!(h.take(), [Event::Data(Position::Middle, hex(b"efgh"))]);
+
+            // The EOI marker is added.
+            push_events(
+                &mut d,
+                &mut buf,
+                (2, 0, true),
+                &small_pkt(8, 1, b"ij"),
+                &mut h,
+            );
+            assert_eq!(
+                h.take(),
+                [
+                    Event::Data(Position::End, hex(b"ij\xff\xd9")),
+                    end(true, &[&header, b"abcdefghij\xff\xd9"]),
+                ]
+            );
+            assert!(d.frame.is_none());
+            assert_eq!(d.parameters().unwrap().pixel_dimensions(), (8, 8),);
+
+            // A single-packet frame with the same parameters, already ending
+            // in an EOI marker.
+            push_events(
+                &mut d,
+                &mut buf,
+                (3, 1, true),
+                &small_pkt(0, 1, b"k\xff\xd9"),
+                &mut h,
+            );
+            assert_eq!(
+                h.take(),
+                [
+                    start(false),
+                    Event::Data(
+                        Position::Complete,
+                        hex(&[&header[..], b"k\xff\xd9"].concat())
+                    ),
+                    end(false, &[&header, b"k\xff\xd9"]),
+                ]
+            );
+
+            // An EOI marker split across packets is recognized; a frame with
+            // new dimensions has new parameters and headers.
+            push_events(
+                &mut d,
+                &mut buf,
+                (4, 2, false),
+                &small_pkt(0, 2, b"l\xff"),
+                &mut h,
+            );
+            push_events(
+                &mut d,
+                &mut buf,
+                (5, 2, true),
+                &small_pkt(2, 2, b"\xd9"),
+                &mut h,
+            );
+            let header2 = small_header(2);
+            assert_eq!(
+                h.take(),
+                [
+                    start(true),
+                    Event::Data(Position::Start, hex(&[&header2[..], b"l\xff"].concat())),
+                    Event::Data(Position::End, hex(b"\xd9")),
+                    end(true, &[&header2, b"l\xff\xd9"]),
+                ]
+            );
+            assert_eq!(d.parameters().unwrap().pixel_dimensions(), (16, 8),);
+        }
+    }
+
+    /// A frame whose retained data exceeds the limit is abandoned, and the
+    /// rest of it skipped.
+    #[test]
+    fn too_large() {
+        use crate::codec::events::testutil::{Event, Recorder};
+        use crate::codec::{Accumulate, LossReason, Position};
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        d.set_max_frame_bytes(20);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::unframed(Accumulate::Yes);
+
+        // 16 bytes: within the limit.
+        push_events(
+            &mut d,
+            &mut buf,
+            (0, 0, false),
+            &small_pkt(0, 1, b"abcdefgh"),
+            &mut h,
+        );
+        assert!(matches!(
+            &h.take()[..],
+            [Event::FrameStart { .. }, Event::Data(Position::Start, _)]
+        ));
+
+        // 32 bytes: beyond it.
+        push_events(
+            &mut d,
+            &mut buf,
+            (1, 0, false),
+            &small_pkt(8, 1, b"ijklmnop"),
+            &mut h,
+        );
+        assert_eq!(h.take(), [Event::Loss(LossReason::TooLarge { limit: 20 })]);
+        assert!(d.frame.is_none(), "the frame's data is released");
+
+        // The rest of the frame is skipped.
+        push_events(
+            &mut d,
+            &mut buf,
+            (2, 0, true),
+            &small_pkt(16, 1, b"qr"),
+            &mut h,
+        );
+        assert_eq!(h.take(), []);
+
+        // The next frame is fine.
+        push_events(
+            &mut d,
+            &mut buf,
+            (3, 1, true),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        assert!(matches!(
+            &h.take()[..],
+            [
+                Event::FrameStart { .. },
+                Event::Data(Position::Complete, _),
+                Event::FrameEnd { data: Some(_), .. },
+            ]
+        ));
+    }
+
+    /// Without accumulation, nothing is retained, so there's no limit.
+    #[test]
+    fn streaming_unlimited() {
+        use crate::codec::Accumulate;
+        use crate::codec::events::testutil::{Event, Recorder};
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        d.set_max_frame_bytes(20);
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::unframed(Accumulate::No);
+        for i in 0..10 {
+            push_events(
+                &mut d,
+                &mut buf,
+                (i, 0, i == 9),
+                &small_pkt(u32::from(i) * 16, 1, &[0; 16]),
+                &mut h,
+            );
+        }
+        let events = h.take();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Loss(_))),
+            "{events:#?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Event::FrameEnd { data: None, .. })),
+            "{events:#?}"
+        );
+    }
+
+    /// If the buffer discards a frame's retained data, the frame is abandoned.
+    #[test]
+    fn evicted() {
+        use crate::codec::events::testutil::{Event, Recorder};
+        use crate::codec::{Accumulate, LossReason};
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(64);
+        buf.set_max_retained(256);
+        let mut h = Recorder::unframed(Accumulate::Yes);
+        push_events(
+            &mut d,
+            &mut buf,
+            (0, 0, false),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        h.take();
+
+        // Another stream's packets.
+        for _ in 0..16 {
+            buf.extend(&[0u8; 32]);
+            buf.advance_unparsed(buf.end());
+        }
+
+        push_events(
+            &mut d,
+            &mut buf,
+            (1, 0, true),
+            &small_pkt(4, 1, b"efgh"),
+            &mut h,
+        );
+        assert_eq!(h.take(), [Event::Loss(LossReason::Evicted)]);
+        push_events(
+            &mut d,
+            &mut buf,
+            (2, 1, true),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        assert!(matches!(
+            &h.take()[..],
+            [
+                Event::FrameStart { .. },
+                Event::Data(..),
+                Event::FrameEnd { data: Some(_), .. },
+            ]
+        ));
+    }
+
+    /// A frame which starts before the last one ended abandons the last one.
+    #[test]
+    fn missing_mark() {
+        use crate::codec::events::testutil::{Event, Recorder};
+        use crate::codec::{Accumulate, LossReason};
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::unframed(Accumulate::Yes);
+        push_events(
+            &mut d,
+            &mut buf,
+            (0, 0, false),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        h.take();
+        push_events(
+            &mut d,
+            &mut buf,
+            (1, 1, true),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        assert!(matches!(
+            &h.take()[..],
+            [
+                Event::Loss(LossReason::Corrupt(_)),
+                Event::FrameStart { .. },
+                Event::Data(..),
+                Event::FrameEnd { data: Some(_), .. },
+            ]
+        ));
+    }
+
+    /// Corrupt data mid-frame abandons the frame; the rest of it is skipped.
+    #[test]
+    fn corrupt_mid_frame() {
+        use crate::codec::events::testutil::{Event, Recorder};
+        use crate::codec::{Accumulate, LossReason};
+        init_logging();
+        let mut d = super::Depacketizer::new();
+        let mut buf = MarkBuf::new(65536);
+        let mut h = Recorder::unframed(Accumulate::Yes);
+        push_events(
+            &mut d,
+            &mut buf,
+            (0, 0, false),
+            &small_pkt(0, 1, b"abcd"),
+            &mut h,
+        );
+        h.take();
+        push_events(&mut d, &mut buf, (1, 0, false), b"short", &mut h);
+        assert!(matches!(
+            &h.take()[..],
+            [Event::Loss(LossReason::Corrupt(_))]
+        ));
+        assert!(d.frame.is_none());
+        push_events(
+            &mut d,
+            &mut buf,
+            (2, 0, true),
+            &small_pkt(4, 1, b"efgh"),
+            &mut h,
+        );
+        assert_eq!(h.take(), []);
     }
 }

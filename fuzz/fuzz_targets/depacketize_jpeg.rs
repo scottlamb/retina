@@ -65,4 +65,21 @@ fuzz_target!(|pkts: Vec<Pkt<'_>>| {
         sequence_number = sequence_number.wrapping_add(1);
     }
     assert_eq!(accumulating_h.events, streaming_h.events);
+
+    // Each frame is streamed as a single unit, which `CheckingHandler` gives a
+    // length prefix; the rest should match the accumulated frame.
+    let streamed = accumulating_h.events.iter().filter_map(|e| match e {
+        retina_fuzz::Event::Frame { streamed, .. } => Some(streamed),
+        _ => None,
+    });
+    let mut n = 0;
+    for (streamed, frame) in streamed.zip(&accumulating_h.frames) {
+        assert_eq!(
+            &streamed[4..],
+            &frame[..],
+            "streamed data should match frame"
+        );
+        n += 1;
+    }
+    assert_eq!(n, accumulating_h.frames.len());
 });

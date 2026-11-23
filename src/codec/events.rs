@@ -370,7 +370,6 @@ pub enum Position {
 impl Position {
     /// Returns the position of a chunk given whether it's the first and/or last chunk.
     #[inline]
-    #[cfg(any(feature = "h264", feature = "h265", feature = "unstable-send"))]
     pub(crate) fn new(first: bool, last: bool) -> Self {
         match (first, last) {
             (true, true) => Position::Complete,
@@ -428,12 +427,7 @@ pub(crate) enum FrameBody<'a> {
     #[cfg(feature = "h265")]
     H265(super::h265::FrameEndBody<'a>),
 
-    /// A frame which the depacketizer assembled itself, in a fixed format.
-    Owned {
-        /// The data, if accumulated and not yet taken.
-        data: Option<Vec<u8>>,
-        parameters: Option<&'a VideoParameters>,
-    },
+    Jpeg(super::jpeg::FrameEndBody<'a>),
 }
 
 // Only the H.26x codecs use `format`.
@@ -551,7 +545,7 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.parameters(),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.parameters(),
-            FrameBody::Owned { parameters, .. } => *parameters,
+            FrameBody::Jpeg(b) => b.parameters(),
         }
     }
 
@@ -565,7 +559,7 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.build(format),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.build(format),
-            FrameBody::Owned { data, .. } => data.take(),
+            FrameBody::Jpeg(b) => b.build(),
         }
     }
 
@@ -580,13 +574,7 @@ impl<Ctx> VideoFrameEnd<'_, Ctx> {
             FrameBody::H264(b) => b.visit(format, visitor),
             #[cfg(feature = "h265")]
             FrameBody::H265(b) => b.visit(format, visitor),
-            FrameBody::Owned { data, .. } => match data {
-                Some(d) => {
-                    visitor(d);
-                    true
-                }
-                None => false,
-            },
+            FrameBody::Jpeg(b) => b.visit(visitor),
         }
     }
 }
@@ -816,8 +804,13 @@ pub(crate) mod testutil {
         pub(crate) format: FrameFormat,
 
         /// The current frame as reassembled from `data` events, with 4-byte
-        /// length prefixes, for comparison with the accumulated frame.
+        /// length prefixes (unless `unframed`), for comparison with the
+        /// accumulated frame.
         streamed: Vec<u8>,
+
+        /// True if the codec's accumulated frames are the plain concatenation
+        /// of its units, as with JPEG, rather than length-prefixed.
+        unframed: bool,
 
         /// The start of the current unit within `streamed`, if one is in progress.
         unit_start: Option<usize>,
@@ -830,7 +823,17 @@ pub(crate) mod testutil {
                 accumulate,
                 format: FrameFormat::MP4,
                 streamed: Vec::new(),
+                unframed: false,
                 unit_start: None,
+            }
+        }
+
+        /// Returns a recorder for a codec whose frames aren't length-prefixed,
+        /// such as JPEG.
+        pub(crate) fn unframed(accumulate: Accumulate) -> Self {
+            Self {
+                unframed: true,
+                ..Self::new(accumulate)
             }
         }
 
@@ -861,13 +864,17 @@ pub(crate) mod testutil {
             assert_eq!(data.position.is_first(), self.unit_start.is_none());
             if data.position.is_first() {
                 self.unit_start = Some(self.streamed.len());
-                self.streamed.extend_from_slice(&[0; 4]);
+                if !self.unframed {
+                    self.streamed.extend_from_slice(&[0; 4]);
+                }
             }
             self.streamed.extend_from_slice(&flat);
             if data.position.is_last() {
                 let start = self.unit_start.take().unwrap();
-                let len = u32::try_from(self.streamed.len() - start - 4).unwrap();
-                self.streamed[start..start + 4].copy_from_slice(&len.to_be_bytes());
+                if !self.unframed {
+                    let len = u32::try_from(self.streamed.len() - start - 4).unwrap();
+                    self.streamed[start..start + 4].copy_from_slice(&len.to_be_bytes());
+                }
             }
             self.events
                 .push(Event::Data(data.position, crate::testutil::HexDebug(flat)));

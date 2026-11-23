@@ -384,6 +384,7 @@ impl Continuity {
     /// distinguishes zero from nonzero: the packets lost, or 1 at a
     /// discontinuity.
     #[inline]
+    #[cfg(any(feature = "h264", feature = "h265"))]
     pub(crate) fn loss_count(self) -> u16 {
         match self {
             Continuity::Contiguous => 0,

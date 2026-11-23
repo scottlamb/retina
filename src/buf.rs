@@ -66,7 +66,6 @@ use std::sync::{Arc, Mutex};
 /// A reference to a byte range within a [`MarkBuf`].
 ///
 /// 12 bytes of data (16 with padding).
-#[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BufRange {
     pub pos: u64,
@@ -432,7 +431,6 @@ impl Drop for Mark {
 impl Mark {
     /// Returns true if this mark was created by `buf`.
     #[inline]
-    #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(dead_code))]
     pub(crate) fn belongs_to(&self, buf: &MarkBuf) -> bool {
         Arc::ptr_eq(&self.registry, &buf.registry)
     }
