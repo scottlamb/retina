@@ -41,6 +41,10 @@
     `VideoParameters::parameter_sets` and the extra data hold the sets
     without it.
 *   H.265: fix parsing of SPSs with `sps_3d_extension` or `sps_scc_extension`.
+*   H.264 and H.265: drop filler data NALs, which have no effect on decoding
+    but which some constant bitrate cameras send in quantity. Depacketizers
+    omit them from frame data and don't retain them; packetizers don't send
+    those supplied by the caller.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   BREAKING: replace the crate-wide `retina::Error` with module-scoped error

@@ -588,7 +588,9 @@ impl VideoPacketizer {
     /// can't be packetized is discarded (logged once per packetizer): one with
     /// its F bit (`forbidden_zero_bit`) set, or with a type the RTP payload
     /// format reserves for its own packets. To mark lost or damaged data, use
-    /// [`VideoPacketizer::discontinuity`] instead.
+    /// [`VideoPacketizer::discontinuity`] instead. Filler data NAL units are
+    /// silently dropped, as they have no effect on decoding. (When the marker
+    /// bit needs a NAL unit to carry it, the packetizer sends a minimal one.)
     ///
     /// Misuse is logged (once per packetizer) and tolerated: a chunk supplied
     /// outside a frame, or continuing a unit which wasn't started, is
@@ -663,7 +665,7 @@ impl VideoPacketizer {
     ///
     /// Returns an [`ErrorKind::Invalid`](super::ErrorKind::Invalid) error if
     /// the data isn't validly framed, or (for H.264 and H.265) contains a NAL
-    /// unit which `push_unit` would discard. Such an error is about this frame
+    /// unit which `push_unit` would discard as unpacketizable. Such an error is about this frame
     /// only: nothing has been delivered to `sink`, and the packetizer is
     /// unchanged, so the caller can drop the frame and continue with the
     /// next. Later frames may reference the dropped one, though, so unless

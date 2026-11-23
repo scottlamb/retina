@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! As in `roundtrip_h264`, tests that decode(encode(max_payload_size, frame))
-//! == frame with an arbitrary max_payload_size, for H.265.
+//! == frame (less filler data) with an arbitrary max_payload_size, for H.265.
 
 #![no_main]
 use derive_more::Debug;
@@ -51,6 +51,14 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         .any(|n| matches!(n[0] >> 1 & 0b11_1111, 32..=34))
     {
         return Corpus::Reject;
+    }
+
+    // Filler data (`FD_NUT`, type 38) is dropped in both directions, so it's
+    // absent from the round trip's output.
+    let mut expected = Vec::with_capacity(input.data.len());
+    for n in nals.iter().filter(|n| n[0] >> 1 & 0b11_1111 != 38) {
+        expected.extend_from_slice(&u32::try_from(n.len()).unwrap().to_be_bytes());
+        expected.extend_from_slice(n);
     }
 
     // Truncated headers, the F bit, types 48–63, and a zero TID are invalid;
@@ -105,7 +113,12 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
     let mut pkts = pkts.into_iter();
     let frame = loop {
         let Some(pkt) = pkts.next() else {
-            panic!("packetizer ran out of packets before depacketizer produced frame");
+            // A frame of only filler produces no packets, as it's discarded.
+            assert!(
+                expected.is_empty(),
+                "packetizer ran out of packets before depacketizer produced frame"
+            );
+            return Corpus::Keep;
         };
         assert!(pkt.len() <= 12 + usize::from(input.max_payload_size));
 
@@ -146,7 +159,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
             return Corpus::Keep;
         }
     };
-    assert_eq!(input.data, &frame[..]);
+    assert_eq!(&expected[..], &frame[..]);
     assert!(pkts.next().is_none());
     Corpus::Keep
 });

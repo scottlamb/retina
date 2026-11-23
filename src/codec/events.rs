@@ -315,6 +315,8 @@ impl<Ctx> VideoFrameStart<'_, Ctx> {
 /// H.264 and H.265 parameter set NAL units (VPS, SPS, PPS) are omitted. They
 /// are instead reflected in the stream's parameters; see
 /// [`VideoFrameStart::has_new_parameters`].
+/// Filler data NAL units (H.264 type 12, H.265 `FD_NUT`) are omitted too, as
+/// they have no effect on decoding; some constant bitrate cameras send many.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct VideoData<'a> {

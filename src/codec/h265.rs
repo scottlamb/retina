@@ -87,11 +87,19 @@ impl super::h26x::NalHeader for nal::Header {
     }
 
     #[inline]
-    fn is_parameter_set(self) -> bool {
+    fn is_stripped(self) -> bool {
         matches!(
             self.unit_type(),
-            nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            nal::UnitType::VpsNut
+                | nal::UnitType::SpsNut
+                | nal::UnitType::PpsNut
+                | nal::UnitType::FdNut
         )
+    }
+
+    #[inline]
+    fn is_filler(self) -> bool {
+        self.unit_type() == nal::UnitType::FdNut
     }
 }
 
@@ -984,6 +992,10 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
         unit_type(hdr) == nal::UnitType::AudNut
     }
 
+    fn is_filler(hdr: [u8; 2]) -> bool {
+        unit_type(hdr) == nal::UnitType::FdNut
+    }
+
     fn ends_sequence(hdr: [u8; 2]) -> bool {
         matches!(
             unit_type(hdr),
@@ -1271,6 +1283,54 @@ mod tests {
             }
             assert_eq_hex!(frame.data(), &expected);
         }
+    }
+
+    /// Filler data NALs (`FD_NUT`) aren't included in the frame data.
+    #[test]
+    fn filler_dropped() {
+        init_logging();
+        let mut d = super::Depacketizer::new(
+            90_000,
+            Some(
+                "profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;\
+                 sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==",
+            ),
+        )
+        .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..crate::codec::FrameFormat::MP4
+        });
+        let mut buf = MarkBuf::new(65536);
+        // An IDR, then filler as a single NAL packet and as a fragmentation unit.
+        let payloads: [&[u8]; 4] = [
+            b"\x26\x01idr",
+            b"\x4c\x01\xff\x80",
+            b"\x62\x01\xa6\xff",
+            b"\x62\x01\x66\xff\x80",
+        ];
+        for (i, payload) in payloads.iter().enumerate() {
+            let pkt = TestPacket {
+                ctx: PacketContext::dummy(),
+                timestamp: crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                },
+                ssrc: 0,
+                sequence_number: i as u16,
+                loss: 0,
+                mark: i == payloads.len() - 1,
+                payload_type: 0,
+            }
+            .write(&mut buf, payload.iter().copied());
+            d.push_collect(&pkt);
+        }
+        let frame = match d.pull() {
+            Some(Ok(Item::Video(frame))) => frame,
+            o => panic!("unexpected pull result {o:#?}"),
+        };
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x05\x26\x01idr");
     }
 
     /// SPSs and PPSs which differ only in trailing data are the same

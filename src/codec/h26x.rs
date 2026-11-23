@@ -272,11 +272,17 @@ pub(super) trait NalHeader: Copy + std::fmt::Debug {
 
     fn bytes(self) -> Self::Bytes;
 
-    /// Returns true for parameter sets, which are stripped from frame data.
+    /// Returns true for parameter sets and filler data, which are stripped
+    /// from frame data.
     ///
-    /// These are instead reflected in the stream's parameters and optionally
-    /// prepended to frames; see [`super::ParameterSetInsertion`].
-    fn is_parameter_set(self) -> bool;
+    /// Parameter sets are instead reflected in the stream's parameters and
+    /// optionally prepended to frames; see [`super::ParameterSetInsertion`].
+    /// Filler data (as sent by some constant bitrate cameras) has no effect on
+    /// decoding, so it's simply dropped. The analyzers don't even store it.
+    fn is_stripped(self) -> bool;
+
+    /// Returns true for filler data.
+    fn is_filler(self) -> bool;
 }
 
 #[cfg(feature = "h264")]
@@ -289,12 +295,17 @@ impl NalHeader for h264_reader::nal::NalHeader {
     }
 
     #[inline]
-    fn is_parameter_set(self) -> bool {
+    fn is_stripped(self) -> bool {
         use h264_reader::nal::UnitType;
         matches!(
             self.nal_unit_type(),
-            UnitType::SeqParameterSet | UnitType::PicParameterSet
+            UnitType::SeqParameterSet | UnitType::PicParameterSet | UnitType::FillerData
         )
+    }
+
+    #[inline]
+    fn is_filler(self) -> bool {
+        self.nal_unit_type() == h264_reader::nal::UnitType::FillerData
     }
 }
 
@@ -342,7 +353,7 @@ impl Delivery {
         let mut piece_idx = crate::to_usize(self.pieces);
         for nal in &nals[crate::to_usize(self.nals)..] {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            if !nal.hdr.is_parameter_set() {
+            if !nal.hdr.is_stripped() {
                 let hdr = nal.hdr.bytes();
                 let first = !self.in_progress_started;
                 deliver(
@@ -359,7 +370,7 @@ impl Delivery {
         }
         self.nals = u32::try_from(nals.len()).expect("NAL count fits in u32");
         if let Some(hdr) = in_progress
-            && !hdr.is_parameter_set()
+            && !hdr.is_stripped()
             && (!self.in_progress_started || piece_idx < pieces.len())
         {
             let bytes = hdr.bytes();
@@ -400,7 +411,7 @@ pub(super) fn frame_len<H: NalHeader>(nals: &[Nal<H>], params: &[&[u8]]) -> usiz
         len += 4 + p.len();
     }
     for nal in nals {
-        if !nal.hdr.is_parameter_set() {
+        if !nal.hdr.is_stripped() {
             len += 4 + crate::to_usize(nal.len);
         }
     }
@@ -410,7 +421,7 @@ pub(super) fn frame_len<H: NalHeader>(nals: &[Nal<H>], params: &[&[u8]]) -> usiz
 /// Visits an access unit's data with the given framing.
 ///
 /// `params` are parameter set NALs to prepend. Parameter sets within `nals`
-/// are skipped.
+/// are skipped, as is filler (though the analyzers don't store it).
 pub(super) fn visit_frame<H: NalHeader>(
     nals: &[Nal<H>],
     pieces: &[BufRange],
@@ -430,7 +441,7 @@ pub(super) fn visit_frame<H: NalHeader>(
     let mut piece_idx = 0;
     for nal in nals {
         let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-        if !nal.hdr.is_parameter_set() {
+        if !nal.hdr.is_stripped() {
             let prefix = match framing {
                 Framing::FourByteLength => nal.len.to_be_bytes(),
                 Framing::AnnexB => ANNEX_B_START_CODE,

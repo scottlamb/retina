@@ -5,6 +5,7 @@
 
 use std::fmt::Write as _;
 
+use crate::codec::h26x::NalHeader as _;
 use bytes::Bytes;
 use tracing::{debug, enabled, trace};
 
@@ -439,6 +440,9 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
             .as_mut()
             .and_then(|au| au.in_progress.take())
             .expect("finish_nal without start_nal");
+        if ip.hdr.is_filler() {
+            return Ok(()); // filler is dropped; see `NalHeader::is_stripped`.
+        }
         self.nals.push(Nal {
             hdr: ip.hdr,
             next_piece_idx: u32::try_from(self.pieces.len()).expect("piece count fits in u32"),
@@ -644,6 +648,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .len
             .checked_add(piece_len)
             .ok_or_else(|| Error::invalid("excessively long NAL"))?;
+        if ip.hdr.is_filler() {
+            return Ok(()); // filler is dropped; don't retain it.
+        }
         crate::codec::h26x::pin(&mut self.mark, buf, pos);
         self.pieces.push(BufRange {
             pos,

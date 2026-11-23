@@ -76,6 +76,9 @@ pub(crate) trait Codec {
     /// delimiter, which must be first in its access unit.
     fn is_access_unit_delimiter(hdr: Self::Header) -> bool;
 
+    /// Returns true if a NAL with the given header is filler data.
+    fn is_filler(hdr: Self::Header) -> bool;
+
     /// Returns true if a NAL with the given header is an end of sequence or
     /// end of stream NAL, which can be followed by nothing else in its access
     /// unit (except an end of stream NAL).
@@ -485,7 +488,7 @@ impl<C: Codec> Packetizer<C> {
                 }
                 return;
             }
-            if !hdr.is_some_and(C::is_access_unit_delimiter) {
+            if !hdr.is_some_and(|h| C::is_access_unit_delimiter(h) || C::is_filler(h)) {
                 self.insert_parameter_sets(sink);
             }
         } else if let Some((_, set)) = &mut self.set_unit {
@@ -542,6 +545,13 @@ impl<C: Codec> Packetizer<C> {
                     );
                     self.seen_invalid_nal = true;
                 }
+                self.discarding_unit = !position.is_last();
+                return;
+            }
+            if C::is_filler(hdr) {
+                // Filler has no effect on decoding, so don't spend bandwidth
+                // on it. If the frame's marker bit needs a NAL to carry it,
+                // `end_frame` creates a minimal one.
                 self.discarding_unit = !position.is_last();
                 return;
             }

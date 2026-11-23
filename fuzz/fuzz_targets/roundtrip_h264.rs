@@ -5,7 +5,8 @@
 //! an arbitrary max_payload_size. Ensures the following:
 //!
 //! *   there are no crashes.
-//! *   the round trip produces an error, nothing (see note about `can_end_au`), or identical data.
+//! *   the round trip produces an error, nothing (see note about `can_end_au`), or identical data
+//!     (except for filler data, which is dropped).
 //!
 //! This is not expected to exercise all the depacketizer paths because the packetizer will only emit
 //! a strict, normalized form, where the depacketizer is expected to accept garbage.
@@ -42,6 +43,20 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
             let nal_type = rest[0] & 0x1f;
             if nal_type == 7 || nal_type == 8 {
                 return Corpus::Reject;
+            }
+            remaining = &rest[len..];
+        }
+    }
+
+    // Filler data (type 12) is dropped in both directions, so it's absent
+    // from the round trip's output.
+    let mut expected = Vec::with_capacity(input.data.len());
+    {
+        let mut remaining = input.data;
+        while let Some((len_bytes, rest)) = remaining.split_first_chunk::<4>() {
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            if rest[0] & 0x1f != 12 {
+                expected.extend_from_slice(&remaining[..4 + len]);
             }
             remaining = &rest[len..];
         }
@@ -110,7 +125,12 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
     let mut pkts = pkts.into_iter();
     let frame = loop {
         let Some(pkt) = pkts.next() else {
-            panic!("packetizer ran out of packets before depacketizer produced frame");
+            // A frame of only filler produces no packets, as it's discarded.
+            assert!(
+                expected.is_empty(),
+                "packetizer ran out of packets before depacketizer produced frame"
+            );
+            return Corpus::Keep;
         };
         assert!(pkt.len() <= 12 + usize::from(input.max_payload_size));
 
@@ -152,7 +172,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
             return Corpus::Keep;
         }
     };
-    assert_eq!(input.data, &frame[..]);
+    assert_eq!(&expected[..], &frame[..]);
     assert!(pkts.next().is_none());
     Corpus::Keep
 });

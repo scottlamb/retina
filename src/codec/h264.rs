@@ -1219,6 +1219,10 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
         unit_type(hdr) == UnitType::AccessUnitDelimiter
     }
 
+    fn is_filler([hdr]: [u8; 1]) -> bool {
+        unit_type(hdr) == UnitType::FillerData
+    }
+
     fn ends_sequence([hdr]: [u8; 1]) -> bool {
         matches!(unit_type(hdr), UnitType::EndOfSeq | UnitType::EndOfStream)
     }
@@ -3227,6 +3231,57 @@ mod tests {
         );
     }
 
+    /// Filler data NALs, whether single or fragmented, are neither streamed
+    /// nor included in the frame data.
+    #[test]
+    fn events_filler_dropped() {
+        use crate::codec::events::testutil::{Event, Recorder, hex};
+        use crate::codec::{Accumulate, Position};
+        init_logging();
+        let mut buf = MarkBuf::new(65536);
+        let mut d = Depacketizer::new(90_000, Some(EVENTS_FMTP)).unwrap();
+        let mut h = Recorder::new(Accumulate::Yes);
+        push_events(&mut d, &mut buf, 0, 0, false, 0, b"\x65slice", &mut h);
+        push_events(
+            &mut d,
+            &mut buf,
+            1,
+            0,
+            false,
+            0,
+            b"\x1c\x8c\xff\xff",
+            &mut h,
+        );
+        push_events(
+            &mut d,
+            &mut buf,
+            2,
+            0,
+            false,
+            0,
+            b"\x1c\x4c\xff\x80",
+            &mut h,
+        );
+        push_events(&mut d, &mut buf, 3, 0, true, 0, b"\x0c\xff\x80", &mut h);
+        assert_eq!(
+            h.take(),
+            vec![
+                Event::FrameStart {
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                },
+                Event::Data(Position::Complete, hex(b"\x65slice")),
+                Event::FrameEnd {
+                    is_random_access_point: true,
+                    is_disposable: false,
+                    has_new_parameters: false,
+                    data: Some(hex(b"\x00\x00\x00\x06\x65slice")),
+                },
+            ]
+        );
+    }
+
     /// Multi-slice pictures sent as single-NAL packets stream per packet;
     /// earlier non-VCL NALs are held until the first slice.
     #[test]
@@ -4276,6 +4331,20 @@ mod packetizer_tests {
             r.take(),
             [rec(true, true, &stap_a_of(0x58, &[b"\x06sei", b"\x41p"]))]
         );
+    }
+
+    /// Filler data supplied by the caller, whole or in chunks, isn't sent.
+    #[test]
+    fn filler_dropped() {
+        let mut p = packetizer(ParameterSetInsertion::OnChange);
+        let mut r = Recorder::default();
+        p.start_frame(frame(0, false), &mut r);
+        p.push_unit(Position::Complete, &[b"\x41p"], &mut r);
+        p.push_unit(Position::Start, &[b"\x0c\xff"], &mut r);
+        p.push_unit(Position::End, &[b"\xff\x80"], &mut r);
+        p.push_unit(Position::Complete, &[b"\x0c\xff\x80"], &mut r);
+        p.end_frame(&mut r);
+        assert_eq!(r.take(), [rec(true, true, b"\x41p")]);
     }
 
     /// An in-band SPS which differs from the current one only in trailing

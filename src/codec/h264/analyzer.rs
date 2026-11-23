@@ -5,6 +5,7 @@
 
 use std::fmt::Write as _;
 
+use crate::codec::h26x::NalHeader as _;
 use bytes::Bytes;
 use h264_reader::nal::{NalHeader, UnitType};
 use tracing::{debug, enabled, trace};
@@ -483,6 +484,9 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
             .as_mut()
             .and_then(|au| au.in_progress.take())
             .expect("finish_nal without start_nal");
+        if ip.hdr.is_filler() {
+            return Ok(()); // filler is dropped; see `NalHeader::is_stripped`.
+        }
         self.nals.push(Nal {
             hdr: ip.hdr,
             next_piece_idx: u32::try_from(self.pieces.len()).expect("piece count fits in u32"),
@@ -703,6 +707,9 @@ impl<Ctx: Clone> Analyzer<Ctx> {
             .len
             .checked_add(piece_len)
             .ok_or_else(|| Error::invalid("excessively long NAL"))?;
+        if ip.hdr.is_filler() {
+            return Ok(()); // filler is dropped; don't retain it.
+        }
         crate::codec::h26x::pin(&mut self.mark, buf, pos);
         self.pieces.push(BufRange {
             pos,
@@ -1245,7 +1252,7 @@ fn log_access_unit<Ctx>(nals: &[Nal], au: &AuState<Ctx>) {
 /// after they've been delivered.
 ///
 /// Parameter sets are also read, but they're never delivered (see
-/// `NalHeader::is_parameter_set`), so `Delivery` doesn't consider them caught up.
+/// `NalHeader::is_stripped`), so `Delivery` doesn't consider them caught up.
 fn needs_scan(hdr: NalHeader, meta: &FrameMeta) -> bool {
     hdr.nal_unit_type() == UnitType::SEI && !meta.has_recovery_point
 }
