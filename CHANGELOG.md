@@ -48,6 +48,9 @@
 *   H.265: reject an SPS with an out-of-range
     `log2_max_pic_order_cnt_lsb_minus4` rather than overflowing (a panic in
     debug builds) while parsing its long-term reference pictures.
+*   H.265: reject an SPS or PPS whose scaling list data has an invalid
+    `scaling_list_delta_coef`, rather than ignoring the error and parsing the
+    rest of the set from the wrong position.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   BREAKING: replace the crate-wide `retina::Error` with module-scoped error

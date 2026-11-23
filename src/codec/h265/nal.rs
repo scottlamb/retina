@@ -904,7 +904,7 @@ impl ScalingListData {
                         let _ = r.read_se("scaling_list_dc_coef_minus8")?;
                     }
                     for _ in 0..coef_num {
-                        let _ = r.read_se("scaling_list_delta_coef");
+                        let _ = r.read_se("scaling_list_delta_coef")?;
                     }
                 }
             }
@@ -1543,6 +1543,24 @@ mod tests {
             e.to_string().contains("log2_max_pic_order_cnt_lsb_minus4"),
             "{e}"
         );
+    }
+
+    /// A `scaling_list_delta_coef` read error fails the parse rather than being
+    /// ignored, which would leave the parse at a position that doesn't
+    /// correspond to the bits read. Found by the `depacketize_h265` fuzz target.
+    #[test]
+    fn parse_pps_scaling_list_error() {
+        init_logging();
+        let data = &b"\x44\x02\xc6\x41\x45\x57\x57\x57\x53\x53\x53\x53\x53\xb1\xb1\x57\
+                      \x57\x01\x01\x00\x60\x00\x03\x00\x04\x00\x00\x03\x00\x00\x03\x00\
+                      \x5a\xa0\x05\x82\xfe\xe1\x63\x6b\x92\x13\x53\x53\x53\x52\x53\x53\
+                      \x53\x53\x5d\x53\x53\x53\x53\x53\x53\x53\x53\x53\x53\x51\x53\x53\
+                      \x53\x53\x53\xad\x45\x53\x57\xa2\x57\x57\x18\x57\x57\x57\x5b\x57\
+                      \xb3\xa8\x57\x57\x57\x57\x57\x57\x00\x57\x18\x57\x57\x57\x5b"[..];
+        let (h, bits) = split(data).unwrap();
+        assert_eq!(h.unit_type(), UnitType::PpsNut);
+        let e = Pps::from_bits(LoggingBitReader(bits)).unwrap_err();
+        assert!(e.to_string().contains("scaling_list_delta_coef"), "{e}");
     }
 
     #[test]
