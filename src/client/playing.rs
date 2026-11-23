@@ -1181,10 +1181,10 @@ mod tests {
     /// A session authenticating with digest, as Axis cameras do after setup.
     fn auth_fixture() -> Fixture {
         let mut f = fixture_with(
-            SessionOptions::default().creds(Some(crate::client::Credentials {
-                username: "admin".to_owned(),
-                password: "secret".to_owned(),
-            })),
+            SessionOptions::default().creds(Some(crate::client::Credentials::password(
+                "admin".to_owned(),
+                "secret".to_owned(),
+            ))),
             true,
         );
         f.core.conn.requested_auth = Some(

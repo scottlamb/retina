@@ -195,13 +195,9 @@ async fn setup_rtsp(
     ),
     Error,
 > {
-    let creds = opts
-        .username
-        .clone()
-        .map(|username| retina::client::Credentials {
-            username,
-            password: opts.password.clone().unwrap_or_default(),
-        });
+    let creds = opts.username.clone().map(|username| {
+        retina::client::Credentials::password(username, opts.password.clone().unwrap_or_default())
+    });
     let mut session = retina::client::Session::describe(
         url.clone(),
         retina::client::SessionOptions::default()

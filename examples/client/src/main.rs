@@ -74,10 +74,10 @@ fn creds(
     password: Option<String>,
 ) -> Option<retina::client::Credentials> {
     match (username, password) {
-        (Some(username), password) => Some(retina::client::Credentials {
+        (Some(username), password) => Some(retina::client::Credentials::password(
             username,
-            password: password.unwrap_or_default(),
-        }),
+            password.unwrap_or_default(),
+        )),
         (None, None) => None,
         _ => unreachable!(), // clap enforces that password requires username.
     }

@@ -1469,21 +1469,40 @@ struct StreamStateInit {
     reorder: Option<crate::rtp::ReorderOptions>,
 }
 
-/// Username and password authentication credentials.
+/// Credentials for authenticating to the server.
 ///
-/// The `Debug` impl omits the password, so credentials don't end up in logs.
+/// Currently the only kind is a username and password, used for HTTP Basic
+/// or Digest authentication as the server requests. Other kinds may be added
+/// later via new constructors.
+///
+/// The `Debug` impl omits secrets, so credentials don't end up in logs.
 #[derive(Clone, Eq, PartialEq)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
+pub struct Credentials(CredentialsInner);
+
+#[derive(Clone, Eq, PartialEq)]
+enum CredentialsInner {
+    Password { username: String, password: String },
+}
+
+impl Credentials {
+    /// Creates username and password credentials.
+    pub fn password(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self(CredentialsInner::Password {
+            username: username.into(),
+            password: password.into(),
+        })
+    }
 }
 
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("username", &self.username)
-            .field("password", &format_args!("<redacted>"))
-            .finish()
+        match &self.0 {
+            CredentialsInner::Password { username, .. } => f
+                .debug_struct("Credentials")
+                .field("username", username)
+                .field("password", &format_args!("<redacted>"))
+                .finish(),
+        }
     }
 }
 
@@ -1854,10 +1873,11 @@ fn fill_req(
             .creds
             .as_ref()
             .expect("creds were checked when filling request_auth");
+        let CredentialsInner::Password { username, password } = &creds.0;
         let authorization = auth
             .respond(&http_auth::PasswordParams {
-                username: &creds.username,
-                password: &creds.password,
+                username,
+                password,
                 uri: req.request_uri_str(),
                 method: req.method_str(),
                 body: Some(&[]),
@@ -2936,10 +2956,10 @@ mod tests {
         init_logging();
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
-        let options = SessionOptions::default().creds(Some(Credentials {
-            username: "admin".to_owned(),
-            password: "secret".to_owned(),
-        }));
+        let options = SessionOptions::default().creds(Some(Credentials::password(
+            "admin".to_owned(),
+            "secret".to_owned(),
+        )));
         let (session, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(Session::describe_with_conn(conn, options, url), async {
                 let req = req_response_returning_req(
@@ -3305,10 +3325,7 @@ mod tests {
 
     #[test]
     fn credentials_debug_omits_password() {
-        let creds = Credentials {
-            username: "admin".to_owned(),
-            password: "secret".to_owned(),
-        };
+        let creds = Credentials::password("admin".to_owned(), "secret".to_owned());
         assert_eq!(
             format!("{creds:?}"),
             r#"Credentials { username: "admin", password: <redacted> }"#
@@ -3321,10 +3338,10 @@ mod tests {
         init_logging();
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
-        let opts = SessionOptions::default().creds(Some(Credentials {
-            username: "admin".to_owned(),
-            password: "secret".to_owned(),
-        }));
+        let opts = SessionOptions::default().creds(Some(Credentials::password(
+            "admin".to_owned(),
+            "secret".to_owned(),
+        )));
         let (session, _) = tokio::join!(
             Session::describe_with_conn(conn, opts, url),
             req_response(

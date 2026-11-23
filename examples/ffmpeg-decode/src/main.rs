@@ -201,10 +201,10 @@ async fn run() -> Result<(), Error> {
     ffmpeg::init().unwrap();
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Trace);
     let creds = match (opts.username, opts.password) {
-        (Some(username), password) => Some(retina::client::Credentials {
+        (Some(username), password) => Some(retina::client::Credentials::password(
             username,
-            password: password.unwrap_or_default(),
-        }),
+            password.unwrap_or_default(),
+        )),
         (None, None) => None,
         _ => unreachable!(), // structopt/clap enforce that password requires username.
     };

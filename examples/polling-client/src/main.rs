@@ -580,10 +580,9 @@ impl MessageHandler<PacketContext> for Printer<'_> {
 }
 
 fn run(opts: Opts) -> Result<(), Error> {
-    let creds = opts.username.map(|username| Credentials {
-        username,
-        password: opts.password.unwrap_or_default(),
-    });
+    let creds = opts
+        .username
+        .map(|username| Credentials::password(username, opts.password.unwrap_or_default()));
     let tcp = connect_tcp(&opts.url, REQUEST_TIMEOUT)
         .with_context(|| format!("unable to connect to {}", opts.url))?;
     let mut io = Io::new(tcp)?;

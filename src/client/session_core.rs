@@ -1952,10 +1952,10 @@ mod tests {
     /// A `401 Unauthorized` causes a retry with Digest authentication.
     #[test]
     fn auth_retry() {
-        let mut core = new_core(SessionOptions::default().creds(Some(Credentials {
-            username: "admin".to_owned(),
-            password: "secret".to_owned(),
-        })));
+        let mut core = new_core(SessionOptions::default().creds(Some(Credentials::password(
+            "admin".to_owned(),
+            "secret".to_owned(),
+        ))));
         let t0 = Instant::now();
         core.describe(url()).unwrap();
         let req = respond(

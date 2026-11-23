@@ -150,10 +150,10 @@ impl VideoHandler<PacketContext> for UpstreamHandler {
 async fn run() -> Result<(), Error> {
     let opts = Opts::parse();
     let creds = match (opts.username, opts.password) {
-        (Some(username), password) => Some(retina::client::Credentials {
+        (Some(username), password) => Some(retina::client::Credentials::password(
             username,
-            password: password.unwrap_or_default(),
-        }),
+            password.unwrap_or_default(),
+        )),
         (None, None) => None,
         _ => unreachable!(), // structopt/clap enforce that password requires username.
     };
