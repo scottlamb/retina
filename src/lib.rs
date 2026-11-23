@@ -33,8 +33,6 @@ mod hex;
 #[doc(hidden)]
 pub mod inputs;
 mod mostly_ascii;
-pub mod rtcp;
-pub mod rtp;
 
 /// This is exposed for the fuzz tests. It is not a stable interface.
 #[doc(hidden)]
@@ -57,6 +55,8 @@ macro_rules! wrap {
 
 pub mod client;
 pub mod codec;
+pub mod rtcp;
+pub mod rtp;
 //mod error;
 #[doc(hidden)]
 pub mod rtsp;
@@ -85,15 +85,17 @@ struct ReceivedMessage {
 /// This couples together three pieces of information:
 ///
 /// *   The stream's starting time. In client use, this is often as received in the RTSP
-///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`].
+///     `RTP-Info` header but may be controlled via [`crate::client::InitialTimestampPolicy`];
+///     otherwise it's the first packet's (or sender report's) timestamp from the source the
+///     stream plays.
 ///     According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1), "the initial
 ///     value of the timestamp SHOULD be random".
 ///
 /// *   The codec-specific clock rate.
 ///
-/// *   The timestamp as an `i64`. In client use, its top bits should be inferred from wraparounds
-///     of 32-bit RTP timestamps. The Retina client's policy is that timestamps that differ by more
-///     than `i32::MAX` from previous timestamps are treated as backwards jumps. It's allowed for
+/// *   The timestamp as an `i64`. When receiving, its top bits are inferred from wraparounds
+///     of 32-bit RTP timestamps: timestamps that differ by more than `i32::MAX` from the
+///     previous one are taken as backwards jumps. It's allowed for
 ///     a timestamp to indicate a time *before* the stream's starting point.
 ///
 /// In combination, these allow conversion to "normal play time" (NPT): seconds since start of
@@ -101,14 +103,13 @@ struct ReceivedMessage {
 ///
 /// According to [RFC 3550 section 5.1](https://datatracker.ietf.org/doc/html/rfc3550#section-5.1),
 /// RTP timestamps "MUST be derived from a clock that increments monotonically". In practice,
-/// many RTP servers violate this. The Retina client allows any jump, forward or backward; how
-/// strictly to require monotonic timestamps is up to the caller, which can check the
-/// `Timestamp`s it gets.
+/// many RTP servers violate this. Retina allows any jump, forward or backward; how strictly to
+/// require monotonic timestamps is up to the caller, which can check the `Timestamp`s it gets.
 ///
-/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` can't be constructed or
-/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. The client will return
-/// error in these cases. This should rarely cause problems. It'd take ~2^32 packets (~4 billion)
-/// to advance the time this far forward or backward even with a hostile server.
+/// [`Timestamp`] can't represent timestamps which overflow/underflow `i64` or
+/// elapsed times (`elapsed = timestamp - start`) which underflow `i64`. When receiving, Retina
+/// drops and counts such packets. It'd take ~2^32 packets (~4 billion) to advance the time this
+/// far forward or backward, which only a hostile server could do.
 ///
 /// The [`Display`] and [`Debug`] implementations currently display:
 /// *   the bottom 32 bits, as seen in RTP packet headers. This advances at a

@@ -1,17 +1,17 @@
 // Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use retina::PacketContext;
 use retina::buf::MarkBuf;
-use retina::client::{Timeline, rtp::InorderParser};
 use retina::codec::{
     Accumulate, AudioDepacketizer, AudioFrameRef, AudioHandler, FrameFormat, VideoData,
     VideoDepacketizer, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
-use retina::rtp::ReceivedPacketRef;
+use retina::rtp::{Receiver, ReceiverOptions, ReorderOptions};
 use std::convert::TryFrom;
 use std::io::Write;
 
@@ -67,24 +67,15 @@ const BUNNY: &[u8] = include_bytes!("bunny.rtsp");
 // For now, this builds state via several internal interfaces.
 fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
     let mut remaining = BUNNY;
-    let mut timelines = [
-        Timeline::new(Some(0), 12_000, None).unwrap(),
-        Timeline::new(Some(0), 90_000, None).unwrap(),
-    ];
-    let mut rtps = [
-        InorderParser::new(
-            None,
-            Some(1),
-            96,
-            retina::client::UnknownRtcpSsrcPolicy::Default,
-        ),
-        InorderParser::new(
-            None,
-            Some(1),
-            97,
-            retina::client::UnknownRtcpSsrcPolicy::Default,
-        ),
-    ];
+    let opts = ReceiverOptions::default()
+        .reorder(ReorderOptions::default().max_delay(Duration::ZERO))
+        .initial_rtptime(0)
+        .initial_sequence_number(1);
+    let rates = [12_000, 90_000].map(|r| NonZeroU32::new(r).unwrap());
+
+    // Created on each stream's first packet, which gives its payload type.
+    let mut rtps: [Option<Receiver<(u64, u16)>>; 2] = [None, None];
+    let now = Instant::now();
     let mut audio = AudioDepacketizer::new("mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap();
     let mut video = VideoDepacketizer::new("h264", 90_000, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap();
     let mut bufs = [MarkBuf::new(65536), MarkBuf::new(65536)];
@@ -93,8 +84,6 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
         f,
         frame: Vec::new(),
     };
-    let conn_ctx = retina::ConnectionContext::dummy();
-    let stream_ctx = retina::StreamContext::dummy();
     let pkt_ctx = retina::PacketContext::dummy();
     while !remaining.is_empty() {
         assert!(remaining.len() > 4);
@@ -111,34 +100,34 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
             _ => unreachable!(),
         };
         let (header, payload_range) = retina::rtp::PacketHeader::validate(&data[..]).unwrap();
-        let meta = match rtps[stream_id].rtp(
-            &retina::client::SessionOptions::default(),
-            &stream_ctx,
-            None,
-            &conn_ctx,
-            &pkt_ctx,
-            &mut timelines[stream_id],
-            stream_id,
-            &header,
-            std::time::Instant::now(),
-        ) {
-            Ok(Some(meta)) => meta,
-            _ => unreachable!(),
-        };
         let buf = &mut bufs[stream_id];
         let pos = buf.end();
         buf.extend(&data);
         buf.advance_unparsed(buf.end());
-        let pkt = ReceivedPacketRef::new(
-            meta,
-            buf,
+        let payload = (
             pos + u64::from(payload_range.start),
             payload_range.end - payload_range.start,
         );
-        match stream_id {
-            0 => audio.push(&pkt, &mut handler),
-            _ => video.push(&pkt, &mut handler),
+        let r = rtps[stream_id].get_or_insert_with(|| {
+            Receiver::new(
+                [header.payload_type()].into_iter().collect(),
+                rates[stream_id],
+                opts.clone(),
+            )
+        });
+        r.push(buf, header, pos, now, payload);
+        while let Some(p) = r.pop(buf, now) {
+            let pkt = p.packet_ref(pkt_ctx, buf, p.item.0, p.item.1);
+            match stream_id {
+                0 => audio.push(&pkt, &mut handler),
+                _ => video.push(&pkt, &mut handler),
+            }
         }
+    }
+    for r in &rtps {
+        // Each stream's source was selected by its second packet, so none
+        // were held back.
+        assert!(r.as_ref().unwrap().selected_ssrc().is_some());
     }
 }
 

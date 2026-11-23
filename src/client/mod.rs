@@ -44,7 +44,6 @@ use self::session_core::{SessionCore, SessionEvent, SetupTransport};
 pub use self::session_core::{SessionCore, SessionEvent, SetupTransport, UdpTransmit};
 #[cfg(feature = "unstable-sans-io")]
 pub use self::teardown::{TeardownAction, TeardownCore};
-pub use self::timeline::Timeline;
 use crate::inputs::Input as _;
 use crate::rtsp::msg::{self as msg, OwnedMessage};
 use bytes::Bytes;
@@ -64,13 +63,10 @@ pub(crate) mod parse;
 mod playing;
 mod receiver_report;
 
-/// Internal API, public for a benchmark only.
-#[doc(hidden)]
-pub mod rtp;
+mod rtp;
 
 mod session_core;
 mod teardown;
-mod timeline;
 
 /// Assumed expiration time for stale live555 TCP sessions (case #2 of "Stale
 /// sessions" in [`SessionGroup`]).
@@ -568,7 +564,13 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
     }
 }
 
-/// Policy for handling unknown `ssrc` value in RTCP messages.
+/// Policy for handling RTCP sender reports from an unknown `ssrc`.
+///
+/// A sender report is from an unknown `ssrc` if it's from a source other than
+/// the one the stream plays: the one given in the `SETUP` response, or (if
+/// none) the first to send RTP packets in sequence. Such a report never
+/// places its timestamp on the stream's timeline, whatever the policy; see
+/// [`crate::rtcp::ReceivedCompoundPacket::rtp_timestamp`].
 #[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum UnknownRtcpSsrcPolicy {
@@ -585,7 +587,7 @@ pub enum UnknownRtcpSsrcPolicy {
     #[display("drop-packets")]
     DropPackets,
 
-    /// Process the packets as if they had the expected `ssrc`.
+    /// Return the packets anyway, without a timestamp.
     #[display("process-packets")]
     ProcessPackets,
 }
@@ -782,11 +784,10 @@ pub enum Transport {
 
     /// Sends RTP packets over UDP (experimental).
     ///
-    /// This support is currently only suitable for a LAN for a couple reasons:
-    /// *   There's no reorder buffer, so out-of-order packets are all dropped.
-    /// *   RTCP RRs (receiver reports) aren't sent by default, so servers won't
-    ///     have the correct information to measure packet loss and pace packets
-    ///     appropriately. See [`SessionOptions::receiver_reports`].
+    /// This support is currently only suitable for a LAN: RTCP RRs (receiver
+    /// reports) aren't sent by default, so servers won't have the correct
+    /// information to measure packet loss and pace packets appropriately. See
+    /// [`SessionOptions::receiver_reports`].
     #[display("udp")]
     Udp(UdpTransportOptions),
 }
@@ -817,10 +818,26 @@ impl std::str::FromStr for Transport {
 #[non_exhaustive]
 pub struct TcpTransportOptions;
 
-/// Per-stream UDP transport options (placeholder for future expansion).
-#[derive(Clone, Default, Debug)]
+/// Per-stream UDP transport options.
+#[derive(Copy, Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct UdpTransportOptions;
+pub struct UdpTransportOptions {
+    pub(crate) reorder: crate::rtp::ReorderOptions,
+}
+
+impl UdpTransportOptions {
+    /// Sets how to put RTP packets received via UDP back in sequence order.
+    /// Defaults to [`crate::rtp::ReorderOptions::default`].
+    ///
+    /// Reordering briefly delays any packet following a gap in sequence
+    /// numbers, and the first packet unless the `PLAY` response supplies its
+    /// sequence number. A [`crate::rtp::ReorderOptions::max_delay`] of zero
+    /// drops out-of-order packets instead. (Over TCP, which doesn't reorder,
+    /// packets are never held for reordering.)
+    pub fn reorder(self, reorder: crate::rtp::ReorderOptions) -> Self {
+        Self { reorder }
+    }
+}
 
 impl SessionOptions {
     /// Uses the given credentials when/if the server requests digest authentication.
@@ -1078,6 +1095,11 @@ pub struct Stream {
     // See the matching accessors for descriptions of these fields.
     media: Box<str>,
     payload_formats: Box<[StreamFormat]>,
+
+    /// All payload types on the SDP `m=` line, for the receiver's payload
+    /// type filter. This may include payload types missing from
+    /// `payload_formats`, which Retina couldn't describe.
+    pub(crate) rtp_payload_types: crate::rtp::PayloadTypeSet,
     framerate: Option<f32>,
     control: Option<Url>,
     direction: StreamDirection,
@@ -1295,6 +1317,9 @@ struct StreamStateInit {
     initial_rtptime: Option<u32>,
 
     ctx: StreamContext,
+
+    /// For a UDP stream, how to reorder packets.
+    reorder: Option<crate::rtp::ReorderOptions>,
 }
 
 /// Username and password authentication credentials.
@@ -1782,7 +1807,7 @@ impl Session<Described> {
         let inner = &mut *self.0;
         let (transport, pair) = match options.transport {
             Transport::Tcp(_) => (SetupTransport::Tcp, None),
-            Transport::Udp(_) => {
+            Transport::Udp(udp_options) => {
                 // Bind an ephemeral UDP port on the same local address used to connect
                 // to the RTSP server.
                 let local_ip = inner.core.conn_ctx().local_addr.ip();
@@ -1791,6 +1816,7 @@ impl Session<Described> {
                 (
                     SetupTransport::Udp {
                         client_rtp_port: pair.rtp_port,
+                        options: udp_options,
                     },
                     Some(pair),
                 )
@@ -2008,7 +2034,7 @@ impl std::fmt::Debug for RtpPacket<'_> {
             .field("ssrc", &format_args!("{:08x}", meta.ssrc))
             .field("sequence_number", &meta.sequence_number)
             .field("mark", &meta.mark)
-            .field("loss", &meta.loss)
+            .field("continuity", &meta.continuity)
             .field(
                 "payload",
                 &crate::hex::LimitedHex::from_split(self.pkt.payload(), 64),
@@ -2130,6 +2156,16 @@ impl Session<Playing> {
                     .reset(tokio::time::Instant::from_std(core.poll_timeout()));
                 Self::send_udp_reports(core, udp);
                 continue;
+            }
+
+            // Move the timer earlier if needed, e.g. for a reorder buffer
+            // deadline set by a packet received above. Loop afterward to poll it.
+            if let Some(t) = keepalive_timer.as_mut() {
+                let deadline = tokio::time::Instant::from_std(core.poll_timeout());
+                if t.deadline() != deadline {
+                    t.as_mut().reset(deadline);
+                    continue;
+                }
             }
 
             // Nothing to do. The poll calls above have already registered cx as necessary.
@@ -3723,7 +3759,7 @@ mod tests {
         let block = receiver_report::tests::parse_block(rr);
         assert_eq!(
             block,
-            receiver_report::ReportBlock {
+            crate::rtp::ReceptionReport {
                 ssrc: REOLINK_SSRC,
                 fraction_lost: 85, // 1 of 3 expected since 0x41d5, the first valid packet.
                 cumulative_lost: 1,
@@ -4374,17 +4410,20 @@ mod tests {
                     .await
                     .unwrap();
             }
-            match session.next_item().await {
-                Some(Ok(PlayingItem::Rtp(p))) => {
-                    assert_eq!(p.stream_id(), 0);
-                    assert_eq!(p.packet().payload().to_vec(), b"hello");
-                }
-                o => panic!("unexpected item: {o:#?}"),
-            }
+            // The video stream's `SETUP` response gave no SSRC, so its lone
+            // packet waits a second for another in sequence before its source
+            // is selected; the receiver report comes through first.
             match session.next_item().await {
                 Some(Ok(PlayingItem::Rtcp(p))) => {
                     assert_eq!(p.stream_id(), 2);
                     assert_eq!(p.raw(), b"\x80\xc9\x00\x01\xaa\xbb\xcc\xdd");
+                }
+                o => panic!("unexpected item: {o:#?}"),
+            }
+            match session.next_item().await {
+                Some(Ok(PlayingItem::Rtp(p))) => {
+                    assert_eq!(p.stream_id(), 0);
+                    assert_eq!(p.packet().payload().to_vec(), b"hello");
                 }
                 o => panic!("unexpected item: {o:#?}"),
             }

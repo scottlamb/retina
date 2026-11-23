@@ -37,6 +37,12 @@ unstable-sans-io = []
 # without regard to semver.
 unstable-send = []
 
+# Exposes the receive side beneath the client: `rtp::Receiver`, which sorts an
+# RTP session's packets by source, chooses a source to play, and reorders its
+# packets, for callers feeding depacketizers from their own receive path. It's
+# experimental: it may change in any release, without regard to semver.
+unstable-rtp-receive = []
+
 [package.metadata.docs.rs]
 # https://docs.rs/about/metadata
 # To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
@@ -81,7 +87,16 @@ required-features = ["h264", "tokio", "unstable-send"]
 [[bench]]
 name = "depacketize"
 harness = false
-required-features = ["h264"]
+required-features = ["h264", "unstable-rtp-receive"]
+
+[[bench]]
+name = "reorder"
+harness = false
+required-features = ["unstable-rtp-receive"]
+
+[[example]]
+name = "depacketize_dump"
+required-features = ["unstable-rtp-receive"]
 
 [[test]]
 name = "repacketize"

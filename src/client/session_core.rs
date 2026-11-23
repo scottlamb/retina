@@ -22,7 +22,7 @@ use super::teardown::TeardownCore;
 use super::{
     InitialSequenceNumberPolicy, InitialTimestampPolicy, PlayOptions, Presentation, SessionFlag,
     SessionIdPolicy, SessionOptions, Stream, StreamDirection, StreamState, StreamStateInit,
-    TeardownPolicy, Timeline, Tool, receiver_report, rtp,
+    TeardownPolicy, Tool, rtp,
 };
 use crate::buf::MarkBuf;
 use crate::rtsp::msg::{self, OwnedMessage};
@@ -41,7 +41,10 @@ pub enum SetupTransport {
     /// RTP/AVP/UDP: send RTP and RTCP to a pair of UDP sockets the caller has
     /// bound on the RTSP connection's local address, on ports `client_rtp_port`
     /// (even) and `client_rtp_port + 1`. See [`crate::UdpPair`].
-    Udp { client_rtp_port: u16 },
+    Udp {
+        client_rtp_port: u16,
+        options: super::UdpTransportOptions,
+    },
 }
 
 /// A packet to send on a UDP stream's socket, from
@@ -93,6 +96,7 @@ enum Op {
     Setup {
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
     },
     Play {
         options: PlayOptions,
@@ -324,6 +328,7 @@ impl SetupCore {
             // backchannel's `SETUP` and not on the others.
             headers.insert(msg::HeaderName::REQUIRE, super::backchannel_require());
         }
+        let mut reorder = None;
         let udp = match transport {
             SetupTransport::Tcp => {
                 let proposed_channel_id =
@@ -343,7 +348,11 @@ impl SetupCore {
                 );
                 None
             }
-            SetupTransport::Udp { client_rtp_port } => {
+            SetupTransport::Udp {
+                client_rtp_port,
+                options,
+            } => {
+                reorder = Some(options.reorder);
                 headers.insert(
                     msg::HeaderName::TRANSPORT,
                     msg::HeaderValue::try_from(format!(
@@ -372,7 +381,15 @@ impl SetupCore {
             },
             body: Bytes::new(),
         };
-        self.start(ResponseMode::Normal, Op::Setup { stream_i, udp }, req)?;
+        self.start(
+            ResponseMode::Normal,
+            Op::Setup {
+                stream_i,
+                udp,
+                reorder,
+            },
+            req,
+        )?;
         self.flags |= if udp.is_some() {
             SessionFlag::UdpStreams
         } else {
@@ -547,7 +564,14 @@ impl SetupCore {
             }
             (_, Err(e)) => Err(e),
             (Op::Describe { url }, Ok(r)) => self.handle_describe(url, r),
-            (Op::Setup { stream_i, udp }, Ok(r)) => self.handle_setup(stream_i, udp, r),
+            (
+                Op::Setup {
+                    stream_i,
+                    udp,
+                    reorder,
+                },
+                Ok(r),
+            ) => self.handle_setup(stream_i, udp, reorder, r),
             (Op::Play { options }, Ok(r)) => self.handle_play(options, r),
         })
     }
@@ -570,6 +594,7 @@ impl SetupCore {
         &mut self,
         stream_i: usize,
         udp: Option<UdpStreamContext>,
+        reorder: Option<crate::rtp::ReorderOptions>,
         r: super::conn::Response,
     ) -> Result<SessionEvent, Error> {
         debug!("SETUP response: {:#?}", r.head);
@@ -657,6 +682,7 @@ impl SetupCore {
             initial_seq: None,
             initial_rtptime: None,
             ctx,
+            reorder: reorder.filter(|_| udp_peer.is_some()),
         });
         Ok(SessionEvent::SetUp { stream_i, udp_peer })
     }
@@ -699,31 +725,39 @@ impl SetupCore {
                 initial_seq,
                 ssrc,
                 ctx,
+                reorder,
             }) = s.state
             else {
                 continue;
             };
+            let clock_rate = std::num::NonZeroU32::new(s.payload_formats[0].format.clock_rate())
+                .ok_or_else(|| {
+                    r.error(
+                        &conn_ctx,
+                        format!(
+                            "stream {i} has clock rate 0; rejected to prevent division by zero"
+                        ),
+                    )
+                })?;
             if s.direction == StreamDirection::Sending {
+                // The receiver handles RTCP receiver reports the server sends
+                // about Retina's packets. These have the server's SSRC, so
+                // don't expect Retina's. RTP received on a sending stream is
+                // ignored, so no source is ever selected.
+                let receiver = crate::rtp::Receiver::new(
+                    s.rtp_payload_types,
+                    clock_rate,
+                    crate::rtp::ReceiverOptions::default()
+                        .reorder(crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO)),
+                );
                 core_streams[i] = Some(PlayingStream {
-                    // The timeline only places timestamps of any RTCP sender
-                    // reports the server sends on this stream.
-                    timeline: Timeline::new(None, s.payload_formats[0].format.clock_rate(), None)
-                        .map_err(|description| r.error(&conn_ctx, description))?,
-
-                    // Handles RTCP receiver reports the server sends about
-                    // Retina's packets. These have the server's SSRC, so don't
-                    // expect Retina's.
-                    rtp_handler: rtp::InorderParser::new(
-                        None,
-                        None,
-                        s.payload_formats[0].payload_type,
-                        policy.unknown_rtcp_ssrc,
-                    ),
+                    receiver,
+                    policy: rtp::StreamPolicy::new(policy.unknown_rtcp_ssrc),
                     ctx,
                     udp_buf: None,
 
                     // Receiver reports describe only media Retina receives.
-                    reception: None,
+                    reports: false,
                     sending: true,
                 });
                 continue;
@@ -774,25 +808,30 @@ impl SetupCore {
                     None
                 }
             };
-            let timeline = Timeline::new(
-                initial_rtptime,
-                s.payload_formats[0].format.clock_rate(),
-                None,
-            )
-            .map_err(|description| r.error(&conn_ctx, description))?;
+            // TCP doesn't reorder packets, so it doesn't wait for them. Its
+            // receiver still drops late packets and recognizes restarts.
+            let mut options = crate::rtp::ReceiverOptions {
+                reorder: reorder.unwrap_or_else(|| {
+                    crate::rtp::ReorderOptions::default().max_delay(Duration::ZERO)
+                }),
+                ..Default::default()
+            };
+            if let Some(ssrc) = ssrc {
+                options = options.ssrc(ssrc);
+            }
+            if let Some(seq) = initial_seq {
+                options = options.initial_sequence_number(seq);
+            }
+            if let Some(rtptime) = initial_rtptime {
+                options = options.initial_rtptime(rtptime);
+            }
+            let receiver = crate::rtp::Receiver::new(s.rtp_payload_types, clock_rate, options);
             core_streams[i] = Some(PlayingStream {
-                timeline,
-                rtp_handler: rtp::InorderParser::new(
-                    ssrc,
-                    initial_seq,
-                    s.payload_formats[0].payload_type,
-                    policy.unknown_rtcp_ssrc,
-                ),
+                receiver,
+                policy: rtp::StreamPolicy::new(policy.unknown_rtcp_ssrc),
                 ctx,
                 udp_buf: matches!(ctx.0, StreamContextInner::Udp(_)).then(|| MarkBuf::new(65536)),
-                reception: self.conn.options.receiver_reports.enabled().then(|| {
-                    receiver_report::ReceptionStats::new(s.payload_formats[0].format.clock_rate())
-                }),
+                reports: self.conn.options.receiver_reports.enabled(),
                 sending: false,
             });
         }
@@ -1710,8 +1749,13 @@ mod tests {
         ));
         assert!(core.is_playing());
         assert!(core.poll_event(t0).is_none());
-        assert!(core.poll_timeout().is_some());
-        match core.poll_item(t0) {
+
+        // The `SETUP` response gave no SSRC, so a lone packet waits a second
+        // for the next in sequence before its source is selected anyway.
+        assert!(core.poll_item(t0).is_none());
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert_eq!(core.poll_timeout(), Some(t1));
+        match core.poll_item(t1) {
             Some(Ok(PlayingItem::Rtp(p))) => {
                 assert_eq!(p.stream_id(), 0);
                 assert_eq!(p.packet().meta.sequence_number, 0x41d4);
@@ -1719,7 +1763,7 @@ mod tests {
             }
             o => panic!("unexpected item: {o:#?}"),
         }
-        assert!(core.poll_item(t0).is_none());
+        assert!(core.poll_item(t1).is_none());
         let e = core.setup(1, SetupTransport::Tcp).unwrap_err();
         assert!(e.to_string().contains("already playing"), "{e}");
 
@@ -1782,6 +1826,7 @@ mod tests {
                 2,
                 SetupTransport::Udp {
                     client_rtp_port: 5000,
+                    options: Default::default(),
                 },
             )
             .unwrap_err();
@@ -1890,6 +1935,7 @@ mod tests {
             1,
             SetupTransport::Udp {
                 client_rtp_port: 54060,
+                options: Default::default(),
             },
         )
         .unwrap();

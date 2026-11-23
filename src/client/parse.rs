@@ -276,6 +276,18 @@ fn parse_media(
         }
     }
 
+    // All of the `m=` line's formats, for the receiver's payload type filter.
+    // Ignore any after the first that aren't valid RTP payload types.
+    let mut rtp_payload_types = vec![rtp_payload_type];
+    for f in media_description.fmt.split_ascii_whitespace().skip(1) {
+        if let Ok(pt) = u8::from_str_radix(f, 10)
+            && pt < 0x80
+            && !rtp_payload_types.contains(&pt)
+        {
+            rtp_payload_types.push(pt);
+        }
+    }
+
     // Capture interesting attributes.
     // RFC 8866: "For dynamic payload type assignments, the "a=rtpmap:"
     // attribute (see Section 6.6) SHOULD be used to map from an RTP payload
@@ -367,6 +379,7 @@ fn parse_media(
     Ok(Stream {
         media,
         payload_formats: payload_formats.into(),
+        rtp_payload_types: rtp_payload_types.iter().copied().collect(),
         control,
         framerate,
         direction,
@@ -924,6 +937,7 @@ mod tests {
             ctx: StreamContext(StreamContextInner::Tcp(TcpStreamContext {
                 rtp_channel_id: 0,
             })),
+            reorder: None,
         })
     }
 
@@ -1550,6 +1564,10 @@ mod tests {
                 (101, "telephone-event", 8_000, Some("0-15")),
                 (13, "cn", 8_000, None),
             ]
+        );
+        assert_eq!(
+            s.rtp_payload_types.iter().collect::<Vec<_>>(),
+            [8, 13, 97, 99, 101]
         );
     }
 

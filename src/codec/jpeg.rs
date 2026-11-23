@@ -341,15 +341,16 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         pkt: &ReceivedPacketRef<'_, Ctx>,
         handler: &mut impl VideoHandler<Ctx>,
     ) -> Result<(), String> {
-        if pkt.meta.loss > 0 && self.metadata.is_some() {
+        let loss = pkt.meta.continuity.loss_count();
+        if !pkt.meta.continuity.is_contiguous() && self.metadata.is_some() {
             // As with the other codecs, discard a frame with interior loss
             // rather than returning it with a gap. If this packet starts a
             // new frame, it's handled below; otherwise the rest of this
             // frame's packets are ignored as having no header.
             log::debug!(
-                "Discarding {}-byte JPEG frame prefix due to loss of {} RTP packets",
+                "Discarding {}-byte JPEG frame prefix due to {:?}",
                 self.data.len(),
-                pkt.meta.loss,
+                pkt.meta.continuity,
             );
             self.metadata = None;
             self.data.clear();
@@ -529,7 +530,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             let expected = metadata.next_offset;
             self.metadata = None;
             self.data.clear();
-            if pkt.meta.loss > 0 {
+            if loss > 0 {
                 return Ok(());
             }
             return Err(format!(

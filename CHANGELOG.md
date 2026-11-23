@@ -17,11 +17,23 @@
 *   BREAKING: remove `client::PlayOptions::enforce_timestamps_with_max_jump_secs`.
     How to handle non-monotonic timestamps is application policy; callers
     can check `Timestamp`s themselves.
-*   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
-    `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
-    does, per `client::TeardownPolicy` and tracked in the session's
-    `SessionGroup`, until success or the session's expiration. A dropped
-    `Session` now uses it internally.
+*   client: handle more than one RTP source (SSRC) per stream. Each stream
+    keeps a small table of sources, each with its own reorder buffer,
+    sequence number and jitter statistics, timestamp extension, and sender
+    report, and plays one: the SSRC from the `SETUP` response's `Transport`
+    header if given, otherwise the first source to send two packets in
+    sequence (or the only one heard, after a second). Packets from other
+    sources, such as a stale live555 session's or another session's, are
+    dropped and logged once per source rather than returned as per-packet
+    errors, and no longer disrupt the played source's reordering or receiver
+    report statistics. Packets whose payload type isn't among the stream's
+    SDP formats are dropped, now even from the stream's known SSRC, which
+    v0.4.22 exempted. Sender reports are routed by
+    SSRC, and one alone no longer establishes the stream's source. RTCP BYE
+    is parsed. Receiver reports describe only the played source.
+    `UnknownRtcpSsrcPolicy::ProcessPackets` returns another source's sender
+    report without a timestamp rather than placing it on the stream's
+    timeline.
 *   BREAKING: `client::Stream` describes every payload format its SDP media
     description offers, via `Stream::payload_formats`, a non-empty slice of
     `client::StreamFormat` (payload type and `codec::PayloadFormat`) in `m=`
@@ -31,6 +43,24 @@
     only the first. An ONVIF backchannel caller can choose which format to
     send. `Stream::parameters` is also removed: use
     `Stream::new_depacketizer` and its `parameters`.
+*   add `client::UdpTransportOptions::reorder`, taking an `rtp::ReorderOptions`
+    (`max_delay`, `max_packets`), to put RTP packets received via UDP back in
+    sequence order. Over TCP, packets are never held for reordering.
+*   `unstable-rtp-receive`: add `rtp::Receiver`, the receive side beneath the
+    client and the counterpart of `rtp::Sender`, for callers feeding
+    depacketizers from their own receive path. It takes one RTP session's
+    packets (`push`) and returns the played source's in sequence order on one
+    timeline (`pop`, reordering per `rtp::ReorderOptions`, yielding
+    `rtp::Received`, whose `packet_ref` supplies the pin position a
+    depacketizer needs). Receiving never fails: dropped packets are counted in
+    `rtp::ReceiverCounters`. It also routes RTCP (`rtcp`) and supplies
+    reception statistics for receiver reports (`reception_report`). It's
+    created with the stream's payload types as an `rtp::PayloadTypeSet`.
+*   `unstable-sans-io`: `client::SessionCore::into_teardown` returns a
+    `client::TeardownCore`, which retries `TEARDOWN` as a dropped `Session`
+    does, per `client::TeardownPolicy` and tracked in the session's
+    `SessionGroup`, until success or the session's expiration. A dropped
+    `Session` now uses it internally.
 
 ## `v0.4.22` (2026-11-11)
 

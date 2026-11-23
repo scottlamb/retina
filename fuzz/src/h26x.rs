@@ -186,7 +186,7 @@ pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
             sequence_number,
             0,
             pkt.mark,
-            u16::from(pkt.loss),
+            retina::rtp::Continuity::from_loss(u16::from(pkt.loss)),
         );
         crate::push(
             &mut buf,

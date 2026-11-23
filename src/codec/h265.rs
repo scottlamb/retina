@@ -203,8 +203,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         // Reporting loss discards any access unit in progress, so first note
         // its timestamp.
         let au_timestamp = self.analyzer.au_timestamp();
-        let loss = meta.loss;
-        if let Some(reason) = super::packet_loss_reason(meta.loss) {
+        let loss = meta.continuity.loss_count();
+        if let Some(reason) = super::packet_loss_reason(meta.continuity) {
             self.analyzer.loss(&meta.ctx, reason, handler);
         }
 
@@ -278,6 +278,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if payload_len < 2 {
             return Err("Short NAL".into());
         }
+        // Pin the payload data in the ring buffer, allowing for reordering.
+        self.analyzer.pin_at(buf, pkt.pin_pos());
 
         let payload = pkt.payload();
 
@@ -1610,7 +1612,7 @@ mod tests {
                     ssrc: 0,
                     sequence_number: seq,
                     mark,
-                    loss: 0,
+                    continuity: crate::rtp::Continuity::Contiguous,
                 };
                 let pos = buf.end();
                 buf.extend(payload);
@@ -1745,7 +1747,7 @@ mod tests {
                     ssrc: 0,
                     sequence_number: seq,
                     mark,
-                    loss: 0,
+                    continuity: crate::rtp::Continuity::Contiguous,
                 };
                 let pos = buf.end();
                 buf.extend(payload);

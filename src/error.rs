@@ -78,21 +78,6 @@ pub(crate) enum ErrorInt {
         description: String,
     },
 
-    #[display(
-        "{description}\n\n\
-             conn: {conn_ctx}\nstream: {stream_ctx}\n\
-             ssrc: {ssrc:08x}\nseq: {sequence_number}\npkt: {pkt_ctx}"
-    )]
-    RtpPacketError {
-        conn_ctx: ConnectionContext,
-        stream_ctx: StreamContext,
-        pkt_ctx: crate::PacketContext,
-        stream_id: usize,
-        ssrc: u32,
-        sequence_number: u16,
-        description: String,
-    },
-
     #[display("Unable to connect to RTSP server: {_0}")]
     ConnectError(#[error(source)] std::io::Error),
 

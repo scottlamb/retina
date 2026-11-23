@@ -4,35 +4,45 @@
 //! Depacketizes one stream from a dump of RTSP interleaved data, without an
 //! RTSP session.
 //!
-//! This demonstrates Retina's sans-I/O depacketization API. The input is a file
-//! of RTSP interleaved frames (`$`, a channel id, a 16-bit big-endian length,
-//! and an RTP or RTCP packet), as in `benches/bunny.rtsp`. The packet context
-//! is each packet's byte offset within the file.
+//! This demonstrates Retina's sans-I/O receive and depacketization APIs. The
+//! input is a file of RTSP interleaved frames (`$`, a channel id, a 16-bit
+//! big-endian length, and an RTP or RTCP packet), as in `benches/bunny.rtsp`.
+//! The packet context is each packet's byte offset within the file. The RTP
+//! channel's payload type is taken from its first packet.
 //!
 //! ```text
-//! cargo run --example depacketize_dump -- FILE CHANNEL MEDIA ENCODING_NAME CLOCK_RATE [FMTP]
+//! cargo run --features unstable-rtp-receive --example depacketize_dump -- \
+//!     FILE CHANNEL MEDIA ENCODING_NAME CLOCK_RATE [FMTP]
 //! ```
 //!
 //! For example:
 //!
 //! ```text
-//! cargo run --example depacketize_dump -- benches/bunny.rtsp 2 video h264 90000 \
+//! cargo run --features unstable-rtp-receive --example depacketize_dump -- \
+//!     benches/bunny.rtsp 2 video h264 90000 \
 //!     'packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg=='
 //! ```
 
 use std::io::{IoSliceMut, Read};
 use std::num::NonZeroU32;
+use std::time::Instant;
 
 use retina::buf::MarkBuf;
 use retina::codec::{
     Accumulate, AudioFrameRef, AudioHandler, Depacketizer, Loss, MessageFrameRef, MessageHandler,
     PayloadFormat, VideoData, VideoFrameEnd, VideoFrameStart, VideoHandler,
 };
-use retina::rtp::ReceivedPacketRef;
-use retina::rtp::{PacketHeader, ReceivedPacketMeta};
+use retina::rtp::{PacketHeader, Received, Receiver, ReceiverOptions, ReorderOptions};
 
 /// The packet context: the packet's byte offset within the file.
 type Ctx = u64;
+
+/// The receiver's per-packet item: the packet's offset and payload location.
+struct Item {
+    offset: u64,
+    payload_pos: u64,
+    payload_len: u16,
+}
 
 /// Prints a line per frame, streaming video data rather than accumulating it.
 #[derive(Default)]
@@ -112,40 +122,6 @@ fn print_loss(loss: &Loss<'_, Ctx>) {
     println!("loss at offset {}: {:?}", loss.ctx(), loss.reason());
 }
 
-/// Tracks RTP sequence numbers and extends 32-bit RTP timestamps.
-///
-/// A real caller might also check the SSRC and enforce sane timestamp jumps.
-struct RtpState {
-    clock_rate: NonZeroU32,
-
-    /// The first packet's timestamp, which is time 0 in normal play time.
-    start: u32,
-
-    /// The previous packet's sequence number, raw timestamp, and extended timestamp.
-    prev: Option<(u16, u32, i64)>,
-}
-
-impl RtpState {
-    /// Returns the extended timestamp and number of lost packets.
-    fn update(&mut self, header: &PacketHeader) -> (retina::Timestamp, u16) {
-        let (seq, raw) = (header.sequence_number(), header.timestamp());
-        let (extended, loss) = match self.prev {
-            None => {
-                self.start = raw;
-                (i64::from(raw), 0)
-            }
-            Some((prev_seq, prev_raw, prev_extended)) => (
-                prev_extended + i64::from(raw.wrapping_sub(prev_raw) as i32),
-                seq.wrapping_sub(prev_seq).wrapping_sub(1),
-            ),
-        };
-        self.prev = Some((seq, raw, extended));
-        let timestamp = retina::Timestamp::new(extended, self.clock_rate, self.start)
-            .expect("timestamp should be valid");
-        (timestamp, loss)
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if !(6..=7).contains(&args.len()) {
@@ -157,18 +133,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut file = std::fs::File::open(&args[1])?;
     let channel: u8 = args[2].parse()?;
-    let clock_rate: u32 = args[5].parse()?;
-    let mut format = PayloadFormat::new(args[3].clone(), args[4].clone(), clock_rate);
+    let clock_rate: NonZeroU32 = args[5].parse()?;
+    let mut format = PayloadFormat::new(args[3].clone(), args[4].clone(), clock_rate.get());
     if let Some(fmtp) = args.get(6) {
         format = format.with_fmtp(fmtp.clone());
     }
     let mut depacketizer = Depacketizer::<Ctx>::new(&format)?;
-    let mut rtp = RtpState {
-        clock_rate: NonZeroU32::new(clock_rate).ok_or("clock rate must be non-zero")?,
-        start: 0,
-        prev: None,
-    };
+    // The receiver is created on the channel's first RTP packet, which gives
+    // the payload type. A dump has no arrival times, so there's no reordering.
+    let mut receiver: Option<Receiver<Item>> = None;
     let mut handler = Printer::default();
+    let now = Instant::now();
+    let mut depacketize = |buf: &MarkBuf, p: Received<Item>| {
+        let pkt = p.packet_ref(p.item.offset, buf, p.item.payload_pos, p.item.payload_len);
+        match &mut depacketizer {
+            Depacketizer::Video(d) => d.push(&pkt, &mut handler),
+            Depacketizer::Audio(d) => d.push(&pkt, &mut handler),
+            Depacketizer::Message(d) => d.push(&pkt, &mut handler),
+            _ => {} // a media type this example doesn't know about.
+        }
+    };
 
     // Stream positions in `buf` count from the first byte written, so they're
     // also file offsets.
@@ -201,28 +185,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let (header, payload) = PacketHeader::validate(buf.split(pkt_pos, len.into()))
                 .map_err(|e| format!("bad RTP packet at offset {offset}: {e}"))?;
-            let (timestamp, loss) = rtp.update(&header);
-            let meta = ReceivedPacketMeta::new(
+            let receiver = receiver.get_or_insert_with(|| {
+                let reorder = ReorderOptions::default().max_delay(std::time::Duration::ZERO);
+                let options = ReceiverOptions::default().reorder(reorder);
+                Receiver::new(
+                    [header.payload_type()].into_iter().collect(),
+                    clock_rate,
+                    options,
+                )
+            });
+            let item = Item {
                 offset,
-                timestamp,
-                header.payload_type(),
-                header.sequence_number(),
-                header.ssrc(),
-                header.mark(),
-                loss,
-            );
-            let pkt = ReceivedPacketRef::new(
-                meta,
-                &buf,
-                pkt_pos + u64::from(payload.start),
-                payload.end - payload.start,
-            );
-            match &mut depacketizer {
-                Depacketizer::Video(d) => d.push(&pkt, &mut handler),
-                Depacketizer::Audio(d) => d.push(&pkt, &mut handler),
-                Depacketizer::Message(d) => d.push(&pkt, &mut handler),
-                _ => {} // a media type this example doesn't know about.
+                payload_pos: pkt_pos + u64::from(payload.start),
+                payload_len: payload.end - payload.start,
+            };
+            receiver.push(&buf, header, pkt_pos, now, item);
+            while let Some(p) = receiver.pop(&buf, now) {
+                depacketize(&buf, p);
             }
+        }
+    }
+
+    // A lone source's first packet waits a second before it's selected.
+    if let Some(receiver) = &mut receiver {
+        let later = now + std::time::Duration::from_secs(1);
+        while let Some(p) = receiver.pop(&buf, later) {
+            depacketize(&buf, p);
         }
     }
     if buf.unparsed_len() > 0 {

@@ -16,10 +16,11 @@ use url::Url;
 use super::channel_mapping::ChannelType;
 use super::conn::ConnCore;
 use super::parse::{self, SessionHeader};
-use super::receiver_report::{ReceptionStats, ReportSchedule, ReportWriter};
+use super::receiver_report::{ReportSchedule, ReportWriter};
 use super::session_core::{SetupCore, UdpTransmit};
-use super::{PlayingItem, Presentation, RtpPacket, Stream, Timeline, Tool, rtp::InorderParser};
+use super::{PlayingItem, Presentation, RtpPacket, Stream, Tool, rtp::StreamPolicy};
 use crate::buf::MarkBuf;
+use crate::rtp::Receiver;
 use crate::rtsp::msg::{self, OwnedMessage, StatusCode};
 use crate::{
     ConnectionContext, Error, ErrorInt, PacketContext, PacketContextInner, RtspMessageContext,
@@ -69,15 +70,21 @@ pub(crate) struct Reports {
 
 /// The state of a stream which has been set up.
 pub(crate) struct PlayingStream {
-    pub(crate) timeline: Timeline,
-    pub(crate) rtp_handler: InorderParser,
+    /// The stream's RTP session: sorts packets by source, selects one, and
+    /// reorders its packets. On TCP, it has no reorder delay; it just drops
+    /// late packets and recognizes restarts. It also keeps reception
+    /// statistics for receiver reports.
+    pub(crate) receiver: Receiver<ReorderItem>,
+
+    pub(crate) policy: StreamPolicy,
+
     pub(crate) ctx: StreamContext,
 
     /// For a UDP stream, the buffer which datagrams are received into.
     pub(crate) udp_buf: Option<MarkBuf>,
 
-    /// Reception statistics for RTCP receiver reports, iff they're enabled.
-    pub(crate) reception: Option<ReceptionStats>,
+    /// True iff RTCP receiver reports are sent for this stream.
+    pub(crate) reports: bool,
 
     /// True for a stream Retina sends rather than receives (ONVIF
     /// backchannel).
@@ -154,6 +161,14 @@ struct StreamItem {
     body_len: u16,
 }
 
+/// An RTP packet held in a [`PlayingStream::receiver`].
+pub(crate) struct ReorderItem {
+    pkt_ctx: PacketContext,
+    body_pos: u64,
+    body_len: u16,
+    payload_range: std::ops::Range<u16>,
+}
+
 /// A validated RTP or RTCP packet; [`PlayingCore::item`] turns this into a
 /// [`PlayingItem`].
 ///
@@ -171,6 +186,9 @@ pub(crate) struct ValidatedRtp {
     body_pos: u64,
     body_len: u16,
     payload_range: std::ops::Range<u16>,
+
+    /// The pin position from the receiver.
+    pin_pos: u64,
 }
 
 impl PlayingCore {
@@ -358,6 +376,11 @@ impl PlayingCore {
     /// the item from within a loop.
     pub(crate) fn poll_validated(&mut self, now: Instant) -> Option<Result<ValidatedItem, Error>> {
         loop {
+            match self.pop_reordered(now) {
+                Err(e) => return Some(Err(e)),
+                Ok(Some(v)) => return Some(Ok(v)),
+                Ok(None) => {}
+            }
             let item = match self.conn.reader.decode(&self.conn.ctx, self.conn.eof, now) {
                 Err(e) => return Some(Err(e)),
                 Ok(Some(msg)) => match msg.msg {
@@ -403,6 +426,34 @@ impl PlayingCore {
         }
     }
 
+    /// Returns the next due packet from any stream's reorder buffer.
+    fn pop_reordered(&mut self, now: Instant) -> Result<Option<ValidatedItem>, Error> {
+        for (stream_i, stream) in self.streams.iter_mut().enumerate() {
+            let Some(stream) = stream else { continue };
+            let buf = stream.udp_buf.as_ref().unwrap_or(self.conn.reader.buf());
+            let Some(p) = stream.receiver.pop(buf, now) else {
+                continue;
+            };
+            if p.continuity == crate::rtp::Continuity::Discontinuity {
+                log::warn!(
+                    "stream {stream_i}: sender restarted RTP sequence numbers at seq={}",
+                    p.header.sequence_number()
+                );
+            }
+            let meta = p.meta(p.item.pkt_ctx);
+            let pin_pos = p.pin_pos();
+            return Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
+                stream_id: stream_i,
+                meta,
+                body_pos: p.item.body_pos,
+                body_len: p.item.body_len,
+                payload_range: p.item.payload_range,
+                pin_pos,
+            })));
+        }
+        Ok(None)
+    }
+
     /// Builds a [`PlayingItem`] which borrows the core's buffers and streams.
     pub(crate) fn item(&self, v: ValidatedItem) -> PlayingItem<'_> {
         let rtp = match v {
@@ -413,27 +464,37 @@ impl PlayingCore {
             .as_ref()
             .and_then(|s| s.udp_buf.as_ref())
             .unwrap_or(self.conn.reader.buf());
+        let pkt = crate::rtp::ReceivedPacketRef::new(
+            rtp.meta,
+            buf,
+            rtp.body_pos + u64::from(rtp.payload_range.start),
+            rtp.payload_range.end - rtp.payload_range.start,
+        )
+        .with_pin_pos(rtp.pin_pos);
         PlayingItem::Rtp(RtpPacket {
             stream_id: rtp.stream_id,
             stream: &self.presentation.streams[rtp.stream_id],
-            pkt: crate::rtp::ReceivedPacketRef::new(
-                rtp.meta,
-                buf,
-                rtp.body_pos + u64::from(rtp.payload_range.start),
-                rtp.payload_range.end - rtp.payload_range.start,
-            ),
+            pkt,
             raw_pos: rtp.body_pos,
             raw_len: rtp.body_len,
         })
     }
 
     /// Returns the next time [`PlayingCore::handle_timeout`] should be called.
-    #[inline]
+    ///
+    /// This includes when a stream's reorder buffer will give up on a missing
+    /// packet; [`PlayingCore::poll_item`] then returns the packets after it.
     pub fn poll_timeout(&self) -> Instant {
-        match &self.reports {
+        let mut t = match &self.reports {
             Some(r) => self.keepalive.deadline.min(r.due),
             None => self.keepalive.deadline,
+        };
+        for s in self.streams.iter().flatten() {
+            if let Some(r) = s.receiver.poll_timeout() {
+                t = t.min(r);
+            }
         }
+        t
     }
 
     /// Handles the passage of time, starting a keepalive request and/or
@@ -536,13 +597,14 @@ impl PlayingCore {
             let Some(PlayingStream {
                 ctx,
                 udp_buf,
-                reception: Some(reception),
+                reports: true,
+                receiver,
                 ..
             }) = s
             else {
                 continue;
             };
-            let block = reception.report_block(now);
+            let block = receiver.reception_report(now);
             trace!("sending RTCP receiver report for stream {i}: {block:?}");
             let pkt = reports.writer.write(block.as_ref());
             match (udp_buf, &ctx.0) {
@@ -634,7 +696,7 @@ impl PlayingCore {
     pub(crate) fn has_reception_stats(&self) -> bool {
         self.streams
             .iter()
-            .any(|s| s.as_ref().is_some_and(|s| s.reception.is_some()))
+            .any(|s| s.as_ref().is_some_and(|s| s.reports))
     }
 
     /// Returns the interleaved RTP channel id of sending stream `stream_i`.
@@ -810,8 +872,8 @@ impl PlayingCore {
     /// if the packet should be skipped.
     ///
     /// This is the single processing point for both TCP and UDP paths:
-    /// RTP header validation, `rtp_handler.rtp()`, and `rtp_handler.rtcp()`
-    /// all happen here.
+    /// RTP header validation, `receiver.push()`, and `receiver.rtcp()` all
+    /// happen here.
     fn validate(&mut self, item: StreamItem, now: Instant) -> Result<Option<ValidatedItem>, Error> {
         let stream = self.streams[item.stream_i]
             .as_mut()
@@ -835,79 +897,54 @@ impl PlayingCore {
                             stream_ctx: stream.ctx,
                             pkt_ctx: item.pkt_ctx,
                             stream_id: item.stream_i,
-                            description: stream.rtp_handler.validate_error(reason, split),
+                            description: super::rtp::validate_error(
+                                &stream.receiver,
+                                reason,
+                                split,
+                            ),
                         })
                     })?;
 
-                // Count the packet for receiver reports as it arrives, before
-                // `rtp_handler` skips or rejects it for being out of order: RFC
-                // 3550 appendix A.1 counts reordered and duplicate packets as
-                // received. Like `rtp_handler`, ignore pt=50 packets and
-                // another stream's packets.
-                if let Some(reception) = &mut stream.reception
-                    && header.payload_type() != 50
-                    && !stream.rtp_handler.is_other_stream(&header)
-                {
-                    reception.rtp(
-                        header.ssrc(),
-                        header.sequence_number(),
-                        header.timestamp(),
-                        now,
-                    );
-                }
-                let Some(meta) = stream.rtp_handler.rtp(
-                    &self.conn.options,
+                let pushed = stream.receiver.push(
+                    buf,
+                    header,
+                    item.body_pos,
+                    now,
+                    ReorderItem {
+                        pkt_ctx: item.pkt_ctx,
+                        body_pos: item.body_pos,
+                        body_len: item.body_len,
+                        payload_range,
+                    },
+                );
+
+                stream.policy.pushed(
+                    &stream.receiver,
+                    &self.conn,
                     &stream.ctx,
-                    self.conn.tool.as_ref(),
-                    &self.conn.ctx,
                     &item.pkt_ctx,
-                    &mut stream.timeline,
                     item.stream_i,
                     &header,
+                    pushed,
                     now,
-                )?
-                else {
-                    return Ok(None);
-                };
-                Ok(Some(ValidatedItem::Rtp(ValidatedRtp {
-                    stream_id: item.stream_i,
-                    meta,
-                    body_pos: item.body_pos,
-                    body_len: item.body_len,
-                    payload_range,
-                })))
+                );
+                Ok(None) // returned later via `pop_reordered`.
             }
             ChannelType::Rtcp => {
                 let body = Bytes::from(
                     buf.split(item.body_pos, usize::from(item.body_len))
                         .to_vec(),
                 );
-                match stream.rtp_handler.rtcp(
-                    &self.conn.options,
+                match stream.policy.rtcp(
+                    &mut stream.receiver,
+                    &self.conn,
                     &stream.ctx,
-                    self.conn.tool.as_ref(),
-                    &self.conn.ctx,
                     &item.pkt_ctx,
-                    &mut stream.timeline,
                     item.stream_i,
                     body,
                     now,
                 ) {
-                    Ok(p) => {
-                        // Note sender reports for the LSR and DLSR fields of
-                        // receiver reports. `rtp_handler` has already checked
-                        // the SSRC (per `UnknownRtcpSsrcPolicy`) and set
-                        // `rtp_timestamp` iff the packet begins with a valid
-                        // sender report.
-                        if let (Some(reception), Some(pkt)) = (&mut stream.reception, &p)
-                            && pkt.rtp_timestamp().is_some()
-                            && let Some(Ok(Some(sr))) =
-                                pkt.pkts().next().map(|p| p.as_sender_report())
-                        {
-                            reception.sender_report(sr.ssrc(), sr.ntp_timestamp(), now);
-                        }
-                        Ok(p.map(ValidatedItem::Rtcp))
-                    }
+                    Ok(p) => Ok(p.map(ValidatedItem::Rtcp)),
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
                         conn_ctx: self.conn.ctx,
                         stream_ctx: stream.ctx,
@@ -965,16 +1002,11 @@ mod tests {
         }
         let new_stream = |s: &Stream, udp: bool| {
             Some(PlayingStream {
-                timeline: Timeline::new(None, s.default_format().clock_rate(), None).unwrap(),
-                rtp_handler: InorderParser::new(
-                    None,
-                    None,
-                    s.payload_formats()[0].payload_type(),
-                    UnknownRtcpSsrcPolicy::Default,
-                ),
+                receiver: new_receiver(s, Duration::ZERO),
+                policy: StreamPolicy::new(UnknownRtcpSsrcPolicy::Default),
                 ctx: StreamContext::dummy(),
                 udp_buf: udp.then(|| MarkBuf::new(65536)),
-                reception: None,
+                reports: false,
                 sending: false,
             })
         };
@@ -996,6 +1028,20 @@ mod tests {
             t0,
         );
         Fixture { core, t0 }
+    }
+
+    /// The fixture streams' SSRC, as if from the `SETUP` response.
+    const SSRC: u32 = 0xdcc4a0d8;
+
+    /// Returns a receiver for `s`, expecting [`SSRC`].
+    fn new_receiver(s: &Stream, max_delay: Duration) -> Receiver<ReorderItem> {
+        Receiver::new(
+            s.rtp_payload_types,
+            std::num::NonZeroU32::new(s.default_format().clock_rate()).unwrap(),
+            crate::rtp::ReceiverOptions::default()
+                .ssrc(SSRC)
+                .reorder(crate::rtp::ReorderOptions::default().max_delay(max_delay)),
+        )
     }
 
     /// Returns the bytes not yet written, which must be non-empty.
@@ -1253,6 +1299,39 @@ mod tests {
         assert!(core.poll_item(t1).is_none());
     }
 
+    /// Over TCP, a late packet is dropped rather than failing the session, and
+    /// a sender restarting its sequence numbers shows up as a discontinuity.
+    #[test]
+    fn tcp_late_and_restart() {
+        use crate::rtp::Continuity;
+        let Fixture { mut core, t0 } = fixture();
+        for seq in [1000, 1001, 1003, 1002, 10, 11] {
+            core.read_buf().extend(&interleaved(0, seq, b"x"));
+        }
+        let items: Vec<_> = std::iter::from_fn(|| match core.poll_item(t0)? {
+            Ok(PlayingItem::Rtp(p)) => {
+                Some((p.packet().meta.sequence_number, p.packet().meta.continuity))
+            }
+            o => panic!("unexpected item: {o:#?}"),
+        })
+        .collect();
+        assert_eq!(
+            items,
+            [
+                (1000, Continuity::Contiguous),
+                (1001, Continuity::Contiguous),
+                (1003, Continuity::from_loss(1)),
+                // 1002 is late; 10 is a stray.
+                (11, Continuity::Discontinuity),
+            ]
+        );
+        let counters = core.streams[0].as_ref().unwrap().receiver.counters();
+        assert_eq!(
+            (counters.late, counters.strays, counters.restarts),
+            (1, 1, 1)
+        );
+    }
+
     #[test]
     fn udp_rtp_and_rtcp() {
         let Fixture { mut core, t0 } = fixture();
@@ -1288,6 +1367,54 @@ mod tests {
             o => panic!("unexpected item: {o:#?}"),
         }
         assert!(core.poll_item(t0).is_none());
+    }
+
+    #[test]
+    fn udp_reorder() {
+        let Fixture { mut core, t0 } = fixture();
+        core.streams[1].as_mut().unwrap().receiver =
+            new_receiver(&core.presentation.streams[1], Duration::from_millis(50));
+        let receive = |core: &mut PlayingCore, seq: u16, now: Instant| {
+            let payload = format!("pkt {seq}");
+            // The audio stream's payload type; see `reolink_describe.txt`.
+            let data = &crate::rtp::build_raw_rtp(seq, 0, 97, 0xdcc4a0d8, true, payload.bytes())
+                .unwrap()[..];
+            let (s1, _) = core.udp_buf(1).spare_capacity(data.len());
+            s1[..data.len()].copy_from_slice(data);
+            core.udp_received(1, ChannelType::Rtp, u16::try_from(data.len()).unwrap(), now);
+        };
+        let poll = |core: &mut PlayingCore, now: Instant| -> Vec<String> {
+            std::iter::from_fn(|| match core.poll_item(now)? {
+                Ok(PlayingItem::Rtp(p)) => {
+                    Some(String::from_utf8(p.packet().payload().to_vec()).unwrap())
+                }
+                o => panic!("unexpected item: {o:#?}"),
+            })
+            .collect()
+        };
+
+        // The first packets wait in case of earlier ones.
+        receive(&mut core, 2, t0);
+        receive(&mut core, 1, t0);
+        assert_eq!(poll(&mut core, t0), Vec::<String>::new());
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(core.poll_timeout(), t1);
+        assert_eq!(poll(&mut core, t1), ["pkt 1", "pkt 2"]);
+
+        // Then a gap waits for the missing packet.
+        receive(&mut core, 4, t1);
+        assert_eq!(poll(&mut core, t1), Vec::<String>::new());
+        receive(&mut core, 3, t1);
+        assert_eq!(poll(&mut core, t1), ["pkt 3", "pkt 4"]);
+
+        // ...or until the deadline.
+        receive(&mut core, 6, t1);
+        assert_eq!(poll(&mut core, t1), Vec::<String>::new());
+        let t2 = t1 + Duration::from_millis(50);
+        assert_eq!(core.poll_timeout(), t2);
+        assert_eq!(poll(&mut core, t2), ["pkt 6"]);
+        receive(&mut core, 5, t2);
+        assert_eq!(poll(&mut core, t2), Vec::<String>::new());
     }
 
     #[test]

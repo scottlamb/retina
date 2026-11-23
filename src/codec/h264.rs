@@ -267,8 +267,8 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         // Reporting loss discards any access unit in progress, so first note
         // its timestamp.
         let au_timestamp = self.analyzer.au_timestamp();
-        let loss = meta.loss;
-        if let Some(reason) = super::packet_loss_reason(meta.loss) {
+        let loss = meta.continuity.loss_count();
+        if let Some(reason) = super::packet_loss_reason(meta.continuity) {
             self.analyzer.loss(&meta.ctx, reason, handler);
         }
 
@@ -343,6 +343,16 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
         if payload_len == 0 {
             return Err("Empty NAL".into());
         }
+
+        // Pin the payload data in the ring buffer, allowing for reordering.
+        // Any zeros the FU-A scanner holds back are before this packet and
+        // may be supplied to the analyzer with it, so pin from them.
+        let pin_pos = access_unit
+            .fu_a
+            .as_ref()
+            .and_then(|fu_a| fu_a.scanner.pinned_pos())
+            .unwrap_or(pkt.pin_pos());
+        self.analyzer.pin_at(buf, pin_pos);
 
         let payload = pkt.payload();
 
@@ -444,6 +454,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             frag_pos,
                             usize::from(frag_len),
                             end,
+                            pkt.pin_pos(),
                             &mut self.analyzer,
                         )?;
                         if !end {
@@ -466,6 +477,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
                             frag_pos,
                             usize::from(frag_len),
                             end,
+                            pkt.pin_pos(),
                             &mut self.analyzer,
                         )?;
                         if !end {
@@ -522,6 +534,7 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             frag_pos,
             usize::from(frag_len),
             true,
+            frag_pos, // unused, as it never defers data.
             &mut self.analyzer,
         )
     }
@@ -2909,7 +2922,7 @@ mod tests {
             ssrc: 0,
             sequence_number,
             mark,
-            loss,
+            continuity: crate::rtp::Continuity::from_loss(loss),
         };
         let pos = buf.end();
         buf.extend(payload);
@@ -3395,7 +3408,7 @@ mod tests {
                 ssrc: 0,
                 sequence_number: seq,
                 mark,
-                loss: 0,
+                continuity: crate::rtp::Continuity::Contiguous,
             };
             let pos = buf.end();
             buf.extend(payload);
