@@ -1123,22 +1123,6 @@ impl PlayOptions {
             ..self
         }
     }
-
-    /// If the `RTP-Time` specifies `seq=0` or `seq=1`, ignore it.
-    ///
-    /// `ignore_zero_seq(true)` is an outdated spelling of
-    /// `initial_seq(InitialSequenceNumberPolicy::IgnoreSuspiciousValues)`,
-    /// which is currently the default anyway.
-    #[deprecated]
-    pub fn ignore_zero_seq(self, ignore_zero_seq: bool) -> Self {
-        Self {
-            initial_seq: match ignore_zero_seq {
-                true => InitialSequenceNumberPolicy::IgnoreSuspiciousValues,
-                false => InitialSequenceNumberPolicy::Respect,
-            },
-            ..self
-        }
-    }
 }
 
 #[derive(Debug)]
