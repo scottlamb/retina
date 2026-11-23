@@ -25,7 +25,12 @@ struct Pkt<'i> {
 
 fuzz_target!(|pkts: Vec<Pkt<'_>>| {
     retina_fuzz::init_logging();
-    let new = || retina::codec::VideoDepacketizer::<u64>::new("jpeg", 90_000, None).unwrap();
+    let new = || {
+        retina::codec::VideoDepacketizer::<u64>::new(&retina::codec::PayloadFormat::new(
+            "video", "jpeg", 90_000,
+        ))
+        .unwrap()
+    };
     let mut accumulating = new();
     let mut streaming = new();
     let mut accumulating_h = CheckingHandler::new(Accumulate::Yes, false);

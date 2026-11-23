@@ -151,7 +151,8 @@ impl VideoHandler<()> for H {
 /// Depacketizes `pkts`, returning `is_decodable` for each frame (checking
 /// that it's the same at start and end).
 fn decodable<'a>(pkts: impl IntoIterator<Item = &'a Pkt>) -> Vec<bool> {
-    let mut d = VideoDepacketizer::new("h264", 90_000, None).unwrap();
+    let mut d = VideoDepacketizer::new(&retina::codec::PayloadFormat::new("video", "h264", 90_000))
+        .unwrap();
     let mut f = Feeder::new();
     let mut h = H::default();
     for pkt in pkts {

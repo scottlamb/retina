@@ -37,7 +37,10 @@ fn bunny_video_packets() -> Vec<&'static [u8]> {
 }
 
 fn reference_frames() -> Vec<Frame> {
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     let mut c = Collector::default();
     let mut f = Feeder::new();
     for pkt in bunny_video_packets() {
@@ -53,7 +56,10 @@ fn repacketize(
     max_payload_size: u16,
     initial_seq: u16,
 ) -> (Vec<Pkt>, String) {
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     let mut p = VideoPacketizer::new(d.parameters().unwrap(), options).unwrap();
     let fmtp = p.payload_format().fmtp().unwrap().to_owned();
     let mut sender = Sender::new(
@@ -96,7 +102,10 @@ fn round_trip() {
                     .aggregate(aggregate);
                 let ctx = format!("{options:?}, max_payload_size={max_payload_size}");
                 let (pkts, fmtp) = repacketize(options, max_payload_size, 65_500);
-                let mut d = VideoDepacketizer::new("h264", 90_000, Some(&fmtp)).unwrap();
+                let mut d = VideoDepacketizer::new(
+                    &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(&fmtp),
+                )
+                .unwrap();
                 let mut c = Collector::default();
                 let mut f = Feeder::new();
                 let mut saw_stap_a = false;
@@ -185,7 +194,8 @@ fn parameter_set_insertion() {
         .iter()
         .rposition(|p| p.frame_start && p.random_access_point)
         .unwrap();
-    let mut d = VideoDepacketizer::new("h264", 90_000, None).unwrap();
+    let mut d = VideoDepacketizer::new(&retina::codec::PayloadFormat::new("video", "h264", 90_000))
+        .unwrap();
     let mut c = Collector::default();
     let mut f = Feeder::new();
     for pkt in &pkts[first_rap..] {
@@ -199,7 +209,10 @@ fn parameter_set_insertion() {
 /// FU-A becomes two properly separated NALs.
 #[test]
 fn cleans_annex_b_in_fu_a() {
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     let mut p = VideoPacketizer::new(
         d.parameters().unwrap(),
         VideoPacketizerOptions::default().parameter_set_insertion(ParameterSetInsertion::Never),
@@ -269,7 +282,10 @@ fn parameter_fixup() {
         }
     }
 
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     let mut p =
         VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
     let mut sender = Sender::new(
@@ -343,7 +359,10 @@ fn streams() {
     }
 
     const MAX_PAYLOAD_SIZE: u16 = 500;
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     let mut p =
         VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
     let mut sender = Sender::new(
@@ -421,7 +440,10 @@ fn throttle() {
     let mut saw_clean_drop = false;
     for start in 0..200 {
         let ctx = format!("congested from upstream packet {start}");
-        let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+        let mut d = VideoDepacketizer::new(
+            &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+        )
+        .unwrap();
         let options = VideoPacketizerOptions::default();
         let mut p = VideoPacketizer::new(d.parameters().unwrap(), options).unwrap();
         let mut sink = Throttled {
@@ -451,7 +473,10 @@ fn throttle() {
         let truncated = sink.out.iter().filter(|p| p.raw[12] & 0x80 != 0).count();
         assert!(truncated <= 1, "{ctx}");
 
-        let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+        let mut d = VideoDepacketizer::new(
+            &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+        )
+        .unwrap();
         let mut c = Collector::default();
         let mut f = Feeder::new();
         for (i, pkt) in sink.out.iter().enumerate() {
@@ -557,7 +582,10 @@ fn extensions_round_trip() {
     }
 
     let ids = ExtensionIds::default().with::<AbsCaptureTime>(std::num::NonZeroU8::new(7).unwrap());
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(BUNNY_FMTP)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(BUNNY_FMTP),
+    )
+    .unwrap();
     const MAX_PAYLOAD_SIZE: u16 = 500;
     let mut p =
         VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
@@ -582,7 +610,10 @@ fn extensions_round_trip() {
         );
     }
 
-    let mut d = VideoDepacketizer::new("h264", 90_000, Some(&fmtp)).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(&fmtp),
+    )
+    .unwrap();
     let mut f = Feeder::new();
     f.extension_ids = ids;
     let mut check = Check::default();

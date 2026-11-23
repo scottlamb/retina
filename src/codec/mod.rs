@@ -963,24 +963,19 @@ enum VideoInner<Ctx> {
 }
 
 impl<Ctx: Clone> VideoDepacketizer<Ctx> {
-    /// Creates a depacketizer for the given RTP payload format.
+    /// Creates a depacketizer for the given video RTP payload format.
     ///
-    /// Arguments are from the SDP media description's `rtpmap` and `fmtp`
-    /// attributes, for media type `video`. `encoding_name` is matched
-    /// case-insensitively.
+    /// The encoding name is matched case-insensitively. The media type isn't
+    /// checked; [`Depacketizer::new`] chooses a depacketizer by it.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format, or an [`ErrorKind::Invalid`] error if the parameters are
     /// malformed. Either way, the stream can't be depacketized.
-    pub fn new(
-        encoding_name: &str,
-        clock_rate: u32,
-        format_specific_params: Option<&str>,
-    ) -> Result<Self, Error> {
+    pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
         Self::new_inner(
-            &encoding_name.to_ascii_lowercase(),
-            clock_rate,
-            format_specific_params,
+            &format.encoding_name.to_ascii_lowercase(),
+            format.clock_rate,
+            format.fmtp.as_deref(),
         )
     }
 
@@ -1122,25 +1117,20 @@ enum AudioInner<Ctx> {
 }
 
 impl<Ctx: Clone> AudioDepacketizer<Ctx> {
-    /// Creates a depacketizer for the given RTP payload format.
+    /// Creates a depacketizer for the given audio RTP payload format.
     ///
-    /// Arguments are from the SDP media description's `rtpmap` and `fmtp`
-    /// attributes. `encoding_name` is matched case-insensitively.
+    /// The encoding name is matched case-insensitively. The media type isn't
+    /// checked; [`Depacketizer::new`] chooses a depacketizer by it.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format, or an [`ErrorKind::Invalid`] error if the parameters are
     /// malformed. Either way, the stream can't be depacketized.
-    pub fn new(
-        encoding_name: &str,
-        clock_rate: u32,
-        channels: Option<NonZeroU16>,
-        format_specific_params: Option<&str>,
-    ) -> Result<Self, Error> {
+    pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
         Self::new_inner(
-            &encoding_name.to_ascii_lowercase(),
-            clock_rate,
-            channels,
-            format_specific_params,
+            &format.encoding_name.to_ascii_lowercase(),
+            format.clock_rate,
+            format.channels,
+            format.fmtp.as_deref(),
         )
     }
 
@@ -1215,21 +1205,17 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
 pub struct MessageDepacketizer<Ctx>(Box<onvif::Depacketizer<Ctx>>);
 
 impl<Ctx: Clone> MessageDepacketizer<Ctx> {
-    /// Creates a depacketizer for the given RTP payload format.
+    /// Creates a depacketizer for the given message RTP payload format.
     ///
-    /// `encoding_name` is from the SDP media description's `rtpmap` attribute,
-    /// and is matched case-insensitively.
+    /// The encoding name is matched case-insensitively. The media type isn't
+    /// checked; [`Depacketizer::new`] chooses a depacketizer by it.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format.
-    pub fn new(encoding_name: &str) -> Result<Self, Error> {
-        Self::new_inner(&encoding_name.to_ascii_lowercase())
-    }
-
-    /// As [`MessageDepacketizer::new`], given a lowercase `encoding_name`.
-    fn new_inner(encoding_name: &str) -> Result<Self, Error> {
+    pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
         use onvif::CompressionType;
-        let compression_type = match encoding_name {
+        let encoding_name = format.encoding_name.to_ascii_lowercase();
+        let compression_type = match &*encoding_name {
             "vnd.onvif.metadata" => CompressionType::Uncompressed,
             "vnd.onvif.metadata+gzip" => CompressionType::GzipCompressed,
             "vnd.onvif.metadata.exi.onvif" => CompressionType::ExiDefault,
@@ -1388,22 +1374,15 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
     pub fn new(format: &PayloadFormat) -> Result<Self, Error> {
         let media = format.media.to_ascii_lowercase();
         let encoding_name = format.encoding_name.to_ascii_lowercase();
-        let clock_rate = format.clock_rate;
-        let fmtp = format.fmtp.as_deref();
 
         // RTP Payload Format Media Types
         // https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-2
         match (&*media, &*encoding_name) {
             // JPEG's registered media type is `video` (RFC 2435), but some
             // servers say `image`.
-            ("video", _) | ("image", "jpeg") => {
-                VideoDepacketizer::new_inner(&encoding_name, clock_rate, fmtp).map(Self::Video)
-            }
-            ("audio", _) => {
-                AudioDepacketizer::new_inner(&encoding_name, clock_rate, format.channels, fmtp)
-                    .map(Self::Audio)
-            }
-            ("application", _) => MessageDepacketizer::new_inner(&encoding_name).map(Self::Message),
+            ("video", _) | ("image", "jpeg") => VideoDepacketizer::new(format).map(Self::Video),
+            ("audio", _) => AudioDepacketizer::new(format).map(Self::Audio),
+            ("application", _) => MessageDepacketizer::new(format).map(Self::Message),
             _ => Err(Error::unsupported(format!(
                 "no depacketizer for media {media}"
             ))),
@@ -1500,10 +1479,11 @@ mod tests {
     #[test]
     fn encoding_name_case() {
         #[cfg(feature = "h264")]
-        VideoDepacketizer::<()>::new("H264", 90_000, None).unwrap();
-        VideoDepacketizer::<()>::new("JPEG", 90_000, None).unwrap();
-        AudioDepacketizer::<()>::new("PCMU", 8_000, None, None).unwrap();
-        MessageDepacketizer::<()>::new("VND.ONVIF.METADATA").unwrap();
+        VideoDepacketizer::<()>::new(&PayloadFormat::new("video", "H264", 90_000)).unwrap();
+        VideoDepacketizer::<()>::new(&PayloadFormat::new("video", "JPEG", 90_000)).unwrap();
+        AudioDepacketizer::<()>::new(&PayloadFormat::new("audio", "PCMU", 8_000)).unwrap();
+        MessageDepacketizer::<()>::new(&PayloadFormat::new("application", "VND.ONVIF.METADATA", 0))
+            .unwrap();
     }
 
     fn assert_corrupt(events: &[Event]) {
@@ -2161,8 +2141,12 @@ mod tests {
 
     #[test]
     fn onvif_gzip_encoding_name() {
-        let d =
-            MessageDepacketizer::<crate::PacketContext>::new("vnd.onvif.metadata+gzip").unwrap();
+        let d = MessageDepacketizer::<crate::PacketContext>::new(&PayloadFormat::new(
+            "application",
+            "vnd.onvif.metadata+gzip",
+            0,
+        ))
+        .unwrap();
         assert_eq!(d.parameters().0, onvif::CompressionType::GzipCompressed);
     }
 

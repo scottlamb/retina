@@ -59,11 +59,7 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
         n.len() < 2 || n[0] & 0x80 != 0 || n[0] >> 1 & 0b11_1111 >= 48 || n[1] & 0b111 == 0
     });
 
-    let mut d = retina::codec::VideoDepacketizer::<u64>::new(
-        "h265",
-        90_000,
-        Some("sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA"),
-    )
+    let mut d = retina::codec::VideoDepacketizer::<u64>::new(&retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp("sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA"))
     .unwrap();
     // Smaller limits can't make progress with fragments; the packetizer
     // exceeds them.

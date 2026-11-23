@@ -76,8 +76,8 @@ fn h264_aac<F: FnMut(&[u8])>(accumulate: Accumulate, f: F) {
     // Created on each stream's first packet, which gives its payload type.
     let mut rtps: [Option<Receiver<(u64, u16)>>; 2] = [None, None];
     let now = Instant::now();
-    let mut audio = AudioDepacketizer::new("mpeg4-generic", 12_000, NonZeroU16::new(2), Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap();
-    let mut video = VideoDepacketizer::new("h264", 90_000, Some("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap();
+    let mut audio = AudioDepacketizer::new(&retina::codec::PayloadFormat::new("audio", "mpeg4-generic", 12_000).with_channels(NonZeroU16::new(2).unwrap()).with_fmtp("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1490")).unwrap();
+    let mut video = VideoDepacketizer::new(&retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp("packetization-mode=1;profile-level-id=42C01E;sprop-parameter-sets=Z0LAHtkDxWhAAAADAEAAAAwDxYuS,aMuMsg==")).unwrap();
     let mut bufs = [MarkBuf::new(65536), MarkBuf::new(65536)];
     let mut handler = BenchHandler {
         accumulate,

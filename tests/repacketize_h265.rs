@@ -76,7 +76,10 @@ fn generated_frames() -> Vec<Frame> {
 
 /// Packetizes the generated frames as an upstream server would.
 fn upstream_packets(frames: &[Frame]) -> Vec<Pkt> {
-    let d = VideoDepacketizer::<()>::new("h265", 90_000, Some(&fmtp())).unwrap();
+    let d = VideoDepacketizer::<()>::new(
+        &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+    )
+    .unwrap();
     let mut p =
         VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
     let mut sender = Sender::new(
@@ -118,7 +121,10 @@ fn repacketize(
     max_payload_size: u16,
     initial_seq: u16,
 ) -> (Vec<Pkt>, String) {
-    let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+    )
+    .unwrap();
     let mut p = VideoPacketizer::new(d.parameters().unwrap(), options).unwrap();
     let fmtp = p.payload_format().fmtp().unwrap().to_owned();
     let mut sender = Sender::new(
@@ -150,7 +156,10 @@ fn repacketize(
 fn round_trip() {
     let reference = generated_frames();
     let upstream = upstream_packets(&reference);
-    let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+    )
+    .unwrap();
     let mut c = Collector::default();
     let mut f = Feeder::new();
     for pkt in &upstream {
@@ -171,7 +180,10 @@ fn round_trip() {
                     .aggregate(aggregate);
                 let ctx = format!("{options:?}, max_payload_size={max_payload_size}");
                 let (pkts, fmtp) = repacketize(&upstream, options, max_payload_size, 65_500);
-                let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp)).unwrap();
+                let mut d = VideoDepacketizer::new(
+                    &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(&fmtp),
+                )
+                .unwrap();
                 let mut c = Collector::default();
                 let mut f = Feeder::new();
                 let mut saw_ap = false;
@@ -253,7 +265,8 @@ fn parameter_set_insertion() {
         .iter()
         .rposition(|p| p.frame_start && p.random_access_point)
         .unwrap();
-    let mut d = VideoDepacketizer::new("h265", 90_000, None).unwrap();
+    let mut d = VideoDepacketizer::new(&retina::codec::PayloadFormat::new("video", "h265", 90_000))
+        .unwrap();
     let mut c = Collector::default();
     let mut f = Feeder::new();
     for pkt in &pkts[first_rap..] {
@@ -301,7 +314,10 @@ fn parameter_fixup() {
     // The upstream stream carries the original parameters in band at each
     // random access point; repeats of them don't undo the fixup.
     let upstream = upstream_packets(&generated_frames());
-    let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+    let mut d = VideoDepacketizer::new(
+        &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+    )
+    .unwrap();
     let mut p =
         VideoPacketizer::new(d.parameters().unwrap(), VideoPacketizerOptions::default()).unwrap();
     let mut sender = Sender::new(
@@ -391,7 +407,10 @@ fn throttle() {
     let mut saw_clean_drop = false;
     for start in 0..last_rap - 3 {
         let ctx = format!("congested from upstream packet {start}");
-        let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+        let mut d = VideoDepacketizer::new(
+            &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+        )
+        .unwrap();
         let options = VideoPacketizerOptions::default();
         let mut p = VideoPacketizer::new(d.parameters().unwrap(), options).unwrap();
         let mut sink = Throttled {
@@ -421,7 +440,10 @@ fn throttle() {
         let truncated = sink.out.iter().filter(|p| p.raw[12] & 0x80 != 0).count();
         assert!(truncated <= 1, "{ctx}");
 
-        let mut d = VideoDepacketizer::new("h265", 90_000, Some(&fmtp())).unwrap();
+        let mut d = VideoDepacketizer::new(
+            &retina::codec::PayloadFormat::new("video", "h265", 90_000).with_fmtp(fmtp()),
+        )
+        .unwrap();
         let mut c = Collector::default();
         let mut f = Feeder::new();
         for (i, pkt) in sink.out.iter().enumerate() {

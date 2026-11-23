@@ -155,7 +155,12 @@ pub fn run(codec: Codec, pkts: Vec<Pkt<'_>>) -> Corpus {
     if matches!(codec, Codec::H264) && pkts.first().is_none_or(|p| p.ts_change) {
         return Corpus::Reject;
     }
-    let new = || VideoDepacketizer::<u64>::new(encoding, 90_000, Some(params)).unwrap();
+    let new = || {
+        VideoDepacketizer::<u64>::new(
+            &retina::codec::PayloadFormat::new("video", encoding, 90_000).with_fmtp(params),
+        )
+        .unwrap()
+    };
     let mut accumulating = new();
     let mut streaming = new();
     let mut accumulating_h = CheckingHandler::new(Accumulate::Yes, true);

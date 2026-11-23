@@ -33,7 +33,7 @@
 //!     }
 //! }
 //!
-//! let mut d = AudioDepacketizer::<u64>::new("pcmu", 8_000, None, None).unwrap();
+//! let mut d = AudioDepacketizer::<u64>::new(&retina::codec::PayloadFormat::new("audio", "pcmu", 8_000)).unwrap();
 //! let mut buf = MarkBuf::new(65536);
 //! let received = b"payload";
 //!

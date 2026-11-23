@@ -80,9 +80,8 @@ fn make_test_data(max_payload_size: u16) -> Bytes {
     let mut dummy_frame = vec![1; 1048576];
     dummy_frame[4] = h264_reader::nal::UnitType::SliceLayerWithoutPartitioningIdr.id();
     let parameters = retina::codec::VideoDepacketizer::<()>::new(
-        "h264",
-        90_000,
-        Some("sprop-parameter-sets=Z00AKZpkA8ARPyzUBAQFAAADA+gAAOpgBA==,aO48gA=="),
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000)
+            .with_fmtp("sprop-parameter-sets=Z00AKZpkA8ARPyzUBAQFAAADA+gAAOpgBA==,aO48gA=="),
     )
     .unwrap()
     .parameters()

@@ -61,9 +61,9 @@ fuzz_target!(|input: Input<'_>| -> Corpus {
     };
 
     let mut d = retina::codec::VideoDepacketizer::<u64>::new(
-        "h264",
-        90_000,
-        Some("packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4"),
+        &retina::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(
+            "packetization-mode=1;sprop-parameter-sets=J01AHqkYGwe83gDUBAQG2wrXvfAQ,KN4JXGM4",
+        ),
     )
     .unwrap();
     // Smaller limits can't make progress with fragments; the packetizer

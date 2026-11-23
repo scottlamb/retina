@@ -932,9 +932,7 @@ mod tests {
         }
 
         let mut d = VideoDepacketizer::<()>::new(
-            "h264",
-            90_000,
-            Some(
+            &crate::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(
                 "packetization-mode=1;profile-level-id=4d002a;\
                  sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
             ),
@@ -1025,9 +1023,7 @@ mod tests {
             }
 
             let mut d = VideoDepacketizer::<()>::new(
-                "h264",
-                90_000,
-                Some(
+                &crate::codec::PayloadFormat::new("video", "h264", 90_000).with_fmtp(
                     "packetization-mode=1;profile-level-id=4d002a;\
                  sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
                 ),
