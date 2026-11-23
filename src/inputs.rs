@@ -18,7 +18,10 @@ use crate::mostly_ascii::MostlyAscii;
 ///
 /// This is a pure view over bytes with no streaming semantics.
 /// The caller decides whether incomplete parses are retriable.
-pub trait Input<'i>: Copy {
+///
+/// This trait is sealed: it's implemented only for the types above, so
+/// methods can be added to it compatibly.
+pub trait Input<'i>: Copy + private::Sealed {
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {
@@ -74,6 +77,12 @@ pub trait Input<'i>: Copy {
 // ---------------------------------------------------------------------------
 // &[u8] — contiguous byte slice
 // ---------------------------------------------------------------------------
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for &[u8] {}
+    impl Sealed for super::Split<'_> {}
+}
 
 impl<'i> Input<'i> for &'i [u8] {
     fn len(&self) -> usize {
