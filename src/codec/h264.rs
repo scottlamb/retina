@@ -84,6 +84,11 @@ pub fn parameters_from_sps_and_pps(
 /// Currently, `00 00 01` is not understood as the very start of payload; the
 /// first byte is expected to be a NAL header.
 ///
+/// `00 00 00` followed by a byte other than `00` or `01` ends the NAL at the
+/// zeros, and the bytes up to the next start code are discarded, as an
+/// Annex B parser such as ffmpeg's discards them. Some TP-Link Tapo cameras
+/// end slices this way.
+///
 /// Finally, it errors on the sequence `00 00 02`, which is not allowed in
 /// a single NAL or on an Annex B byte stream.
 #[derive(Debug)]
@@ -2721,6 +2726,131 @@ mod tests {
                 };
                 assert_eq_hex!(frame.data(), &PREFIXED_NALS);
             }
+        }
+    }
+
+    /// What a TP-Link Tapo C100 appends to some slices.
+    const TAPO_TRAILER: [u8; 7] = [0x00, 0x00, 0x00, 0x21, 0x0c, 0xff, 0x80];
+
+    /// `ANNEX_B_NALS` with `trailer` after the IDR slice, in place of its
+    /// trailing zero.
+    fn with_trailer(trailer: &[u8]) -> Vec<u8> {
+        let mut v = ANNEX_B_NALS[..ANNEX_B_NALS.len() - 1].to_vec();
+        v.extend_from_slice(trailer);
+        v
+    }
+
+    /// Pushes one packet carrying `payload`.
+    fn push_one(
+        d: &mut super::Depacketizer,
+        buf: &mut MarkBuf,
+        seq: u16,
+        mark: bool,
+        payload: Vec<u8>,
+    ) -> Result<(), String> {
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        let pkt = ReceivedPacketBuilder {
+            ctx: crate::PacketContext::dummy(),
+            stream_id: 0,
+            timestamp,
+            ssrc: 0,
+            sequence_number: seq,
+            loss: 0,
+            mark,
+            payload_type: 0,
+        }
+        .build(payload)
+        .unwrap();
+        push_via_buf(
+            d,
+            crate::rtp::PacketMeta::from_received(&pkt),
+            pkt.payload(),
+            buf,
+        )
+    }
+
+    fn depacketizer() -> super::Depacketizer {
+        super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+            .unwrap()
+    }
+
+    /// `00 00 00` then a byte other than `00` or `01` ends the NAL, and the
+    /// bytes up to the next separator are discarded, rather than failing.
+    #[test]
+    fn tapo_trailer_in_a_single_nal_is_dropped() {
+        init_logging();
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("the trailer ends the payload", with_trailer(&TAPO_TRAILER)),
+            ("more zeros before the stray byte", {
+                let mut t = vec![0x00];
+                t.extend_from_slice(&TAPO_TRAILER);
+                with_trailer(&t)
+            }),
+            ("trailing zeros after the stray bytes", {
+                let mut t = TAPO_TRAILER.to_vec();
+                t.extend_from_slice(&[0x00, 0x00]);
+                with_trailer(&t)
+            }),
+        ];
+        for (name, data) in cases {
+            let mut buf = MarkBuf::new(65536);
+            let mut d = depacketizer();
+            push_one(&mut d, &mut buf, 0, true, data).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                panic!("{name}: no frame");
+            };
+            assert_eq_hex!(frame.data(), &PREFIXED_NALS);
+        }
+    }
+
+    /// The trailer, then a separator and the NALs after it, all in one
+    /// payload: the NALs after the separator are kept.
+    #[test]
+    fn tapo_trailer_then_a_separator_keeps_the_next_nals() {
+        init_logging();
+        // The trailer after the SPS, before the PPS's separator.
+        let sps_end = 20;
+        assert_eq!(
+            &ANNEX_B_NALS[sps_end..sps_end + 4],
+            &[0x00, 0x00, 0x00, 0x01]
+        );
+        let mut data = ANNEX_B_NALS[..sps_end].to_vec();
+        data.extend_from_slice(&TAPO_TRAILER);
+        data.extend_from_slice(&ANNEX_B_NALS[sps_end..]);
+        let mut buf = MarkBuf::new(65536);
+        let mut d = depacketizer();
+        push_one(&mut d, &mut buf, 0, true, data).unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+            panic!("no frame");
+        };
+        assert_eq_hex!(frame.data(), &PREFIXED_NALS);
+    }
+
+    /// The trailer in a FU-A, split across two fragments at every point.
+    #[test]
+    fn tapo_trailer_in_a_fu_a_is_dropped() {
+        init_logging();
+        let data = with_trailer(&TAPO_TRAILER);
+        for first_len in 2..data.len() - 1 {
+            let mut buf = MarkBuf::new(65536);
+            let mut d = depacketizer();
+            let mut first = vec![(data[0] & 0b1110_0000) | 28, (data[0] & 0b0001_1111) | 0x80];
+            first.extend_from_slice(&data[1..first_len]);
+            let mut last = vec![(data[0] & 0b1110_0000) | 28, (data[0] & 0b0001_1111) | 0x40];
+            last.extend_from_slice(&data[first_len..]);
+            push_one(&mut d, &mut buf, 0, false, first)
+                .unwrap_or_else(|e| panic!("split at {first_len}: {e}"));
+            assert_eq!(d.pull(), None);
+            push_one(&mut d, &mut buf, 1, true, last)
+                .unwrap_or_else(|e| panic!("split at {first_len}: {e}"));
+            let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                panic!("split at {first_len}: no frame");
+            };
+            assert_eq_hex!(frame.data(), &PREFIXED_NALS);
         }
     }
 
