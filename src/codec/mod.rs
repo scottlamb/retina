@@ -953,8 +953,8 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
     /// Creates a depacketizer for the given RTP payload format.
     ///
     /// Arguments are from the SDP media description's `rtpmap` and `fmtp`
-    /// attributes, for media type `video`. `encoding_name` is expected to be
-    /// lowercase.
+    /// attributes, for media type `video`. `encoding_name` is matched
+    /// case-insensitively.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format, or an [`ErrorKind::Invalid`] error if the parameters are
@@ -964,7 +964,11 @@ impl<Ctx: Clone> VideoDepacketizer<Ctx> {
         clock_rate: u32,
         format_specific_params: Option<&str>,
     ) -> Result<Self, Error> {
-        Self::new_inner(encoding_name, clock_rate, format_specific_params)
+        Self::new_inner(
+            &encoding_name.to_ascii_lowercase(),
+            clock_rate,
+            format_specific_params,
+        )
     }
 
     #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
@@ -1108,7 +1112,7 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
     /// Creates a depacketizer for the given RTP payload format.
     ///
     /// Arguments are from the SDP media description's `rtpmap` and `fmtp`
-    /// attributes. `encoding_name` is expected to be lowercase.
+    /// attributes. `encoding_name` is matched case-insensitively.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format, or an [`ErrorKind::Invalid`] error if the parameters are
@@ -1119,7 +1123,12 @@ impl<Ctx: Clone> AudioDepacketizer<Ctx> {
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
     ) -> Result<Self, Error> {
-        Self::new_inner(encoding_name, clock_rate, channels, format_specific_params)
+        Self::new_inner(
+            &encoding_name.to_ascii_lowercase(),
+            clock_rate,
+            channels,
+            format_specific_params,
+        )
     }
 
     fn new_inner(
@@ -1196,11 +1205,16 @@ impl<Ctx: Clone> MessageDepacketizer<Ctx> {
     /// Creates a depacketizer for the given RTP payload format.
     ///
     /// `encoding_name` is from the SDP media description's `rtpmap` attribute,
-    /// and is expected to be lowercase.
+    /// and is matched case-insensitively.
     ///
     /// Returns an [`ErrorKind::Unsupported`] error if Retina doesn't handle the
     /// format.
     pub fn new(encoding_name: &str) -> Result<Self, Error> {
+        Self::new_inner(&encoding_name.to_ascii_lowercase())
+    }
+
+    /// As [`MessageDepacketizer::new`], given a lowercase `encoding_name`.
+    fn new_inner(encoding_name: &str) -> Result<Self, Error> {
         use onvif::CompressionType;
         let compression_type = match encoding_name {
             "vnd.onvif.metadata" => CompressionType::Uncompressed,
@@ -1370,13 +1384,13 @@ impl<Ctx: Clone> Depacketizer<Ctx> {
             // JPEG's registered media type is `video` (RFC 2435), but some
             // servers say `image`.
             ("video", _) | ("image", "jpeg") => {
-                VideoDepacketizer::new(&encoding_name, clock_rate, fmtp).map(Self::Video)
+                VideoDepacketizer::new_inner(&encoding_name, clock_rate, fmtp).map(Self::Video)
             }
             ("audio", _) => {
-                AudioDepacketizer::new(&encoding_name, clock_rate, format.channels, fmtp)
+                AudioDepacketizer::new_inner(&encoding_name, clock_rate, format.channels, fmtp)
                     .map(Self::Audio)
             }
-            ("application", _) => MessageDepacketizer::new(&encoding_name).map(Self::Message),
+            ("application", _) => MessageDepacketizer::new_inner(&encoding_name).map(Self::Message),
             _ => Err(Error::unsupported(format!(
                 "no depacketizer for media {media}"
             ))),
@@ -1466,6 +1480,17 @@ mod tests {
              sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
         ))
         .unwrap()
+    }
+
+    /// The per-type constructors, like [`Depacketizer::new`], match encoding
+    /// names case-insensitively, as SDP usually spells them in uppercase.
+    #[test]
+    fn encoding_name_case() {
+        #[cfg(feature = "h264")]
+        VideoDepacketizer::<()>::new("H264", 90_000, None).unwrap();
+        VideoDepacketizer::<()>::new("JPEG", 90_000, None).unwrap();
+        AudioDepacketizer::<()>::new("PCMU", 8_000, None, None).unwrap();
+        MessageDepacketizer::<()>::new("VND.ONVIF.METADATA").unwrap();
     }
 
     fn assert_corrupt(events: &[Event]) {
