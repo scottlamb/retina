@@ -498,6 +498,12 @@ impl VideoParameters {
     /// header to find the type rather than relying on position. To insert the
     /// parameter sets in-band yourself, [`VideoParameters::extra_data`] with
     /// [`h26x::Framing::AnnexB`] returns them already framed.
+    ///
+    /// Any data following an SPS's `rbsp_trailing_bits`, or an H.265 PPS's,
+    /// is dropped. Some cameras send such data, varying it from one
+    /// repetition of a set to the next; dropping it means those repetitions
+    /// aren't parameter changes. (An H.264 PPS's syntax gives trailing data
+    /// meaning, and an H.265 VPS isn't parsed, so they're kept as is.)
     pub fn parameter_sets(&self) -> impl Iterator<Item = &[u8]> {
         let sets: [Option<&Bytes>; 3] = match &self.codec {
             #[cfg(feature = "h264")]

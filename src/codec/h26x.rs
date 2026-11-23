@@ -9,6 +9,7 @@
 use crate::buf::{BufRange, Mark, MarkBuf};
 use crate::codec::{Position, VideoData, VideoHandler};
 use crate::inputs::Input as _;
+use std::borrow::Cow;
 
 #[cfg(feature = "unstable-send")]
 pub(crate) mod packetizer;
@@ -499,27 +500,73 @@ pub(super) fn deliver<Ctx>(
     });
 }
 
+/// Where an RBSP parsed via [`TolerantBitReader`] ended.
+#[derive(Debug, Default)]
+pub(super) struct RbspEnd {
+    /// True iff there was data other than zero bits after the `rbsp_stop_one_bit`,
+    /// or the bit where the parse ended wasn't a `1` (so there was no
+    /// `rbsp_stop_one_bit` there).
+    pub(super) has_extra_trailing_data: bool,
+
+    /// The bit position within the RBSP of the `rbsp_stop_one_bit`, as of a
+    /// successful `finish_rbsp` call which found one where the parse ended.
+    pub(super) stop_bit_pos: Option<u64>,
+}
+
 /// `h264_reader::rbsp::BitRead` impl that *notes* extra trailing data rather than failing on it.
 ///
 /// Some (Reolink) cameras appear to have a stray extra byte at the end. Follow the lead of most
 /// other RTSP implementations in tolerating this.
+///
+/// It also counts the bits read, so that [`canonical_len`] can strip the trailing data.
 #[derive(Debug)]
 pub(super) struct TolerantBitReader<'a, R> {
-    pub(super) inner: R,
-    pub(super) has_extra_trailing_data: &'a mut bool,
+    inner: R,
+
+    /// The number of bits consumed so far.
+    pos: u64,
+    end: &'a mut RbspEnd,
+}
+
+impl<'a, R> TolerantBitReader<'a, R> {
+    pub(super) fn new(inner: R, end: &'a mut RbspEnd) -> Self {
+        Self { inner, pos: 0, end }
+    }
+
+    #[inline]
+    fn advance<T>(&mut self, r: T, bits: impl FnOnce(&T) -> u64) -> T {
+        self.pos += bits(&r);
+        r
+    }
+}
+
+/// Returns the bit length of the Exp-Golomb code for `v`.
+#[inline]
+fn ue_bits(v: u32) -> u64 {
+    2 * u64::from((u64::from(v) + 1).ilog2()) + 1
 }
 
 impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitReader<'_, R> {
     fn read_ue(&mut self, name: &'static str) -> Result<u32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_ue(name)
+        let r = self.inner.read_ue(name);
+        self.advance(r, |r| r.as_ref().map_or(0, |&v| ue_bits(v)))
     }
 
     fn read_se(&mut self, name: &'static str) -> Result<i32, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_se(name)
+        let r = self.inner.read_se(name);
+        self.advance(r, |r| {
+            r.as_ref().map_or(0, |&v| {
+                // Inverse of the mapping in H.264 section 9.1.1, Table 9-3.
+                let v = i64::from(v);
+                let k = if v > 0 { 2 * v - 1 } else { -2 * v };
+                ue_bits(u32::try_from(k).expect("se(v) maps from a u32 ue(v)"))
+            })
+        })
     }
 
     fn read_bit(&mut self, name: &'static str) -> Result<bool, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_bit(name)
+        let r = self.inner.read_bit(name);
+        self.advance(r, |r| u64::from(r.is_ok()))
     }
 
     fn skip(
@@ -527,14 +574,16 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         bit_count: u32,
         name: &'static str,
     ) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        self.inner.skip(bit_count, name)
+        let r = self.inner.skip(bit_count, name);
+        self.advance(r, |r| if r.is_ok() { u64::from(bit_count) } else { 0 })
     }
 
     fn read<const BITS: u32, I: h264_reader::rbsp::Integer>(
         &mut self,
         name: &'static str,
     ) -> Result<I, h264_reader::rbsp::BitReaderError> {
-        self.inner.read::<BITS, I>(name)
+        let r = self.inner.read::<BITS, I>(name);
+        self.advance(r, |r| if r.is_ok() { u64::from(BITS) } else { 0 })
     }
 
     fn read_var<I: h264_reader::rbsp::Integer>(
@@ -542,14 +591,22 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         bit_count: u32,
         name: &'static str,
     ) -> Result<I, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_var(bit_count, name)
+        let r = self.inner.read_var(bit_count, name);
+        self.advance(r, |r| if r.is_ok() { u64::from(bit_count) } else { 0 })
     }
 
     fn read_to<V: h264_reader::rbsp::Primitive>(
         &mut self,
         name: &'static str,
     ) -> Result<V, h264_reader::rbsp::BitReaderError> {
-        self.inner.read_to(name)
+        let r = self.inner.read_to(name);
+        self.advance(r, |r| {
+            if r.is_ok() {
+                crate::to_u64(std::mem::size_of::<V>() * 8)
+            } else {
+                0
+            }
+        })
     }
 
     fn byte_aligned(&self) -> bool {
@@ -563,20 +620,144 @@ impl<R: h264_reader::rbsp::BitRead> h264_reader::rbsp::BitRead for TolerantBitRe
         self.inner.has_more_rbsp_data(name)
     }
 
-    fn finish_rbsp(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
-        match self.inner.finish_rbsp() {
-            Ok(()) => Ok(()),
-            Err(h264_reader::rbsp::BitReaderError::RemainingData) => {
-                *self.has_extra_trailing_data = true;
-                Ok(())
-            }
-            Err(e) => Err(e),
+    fn finish_rbsp(mut self) -> Result<(), h264_reader::rbsp::BitReaderError> {
+        use h264_reader::rbsp::BitReaderError;
+
+        // Read the `rbsp_stop_one_bit` here rather than via `inner.finish_rbsp`,
+        // which reports `RemainingData` both for data after it and for its
+        // absence. Only the former is the stray trailing data tolerated below.
+        if !self.inner.read_bit("rbsp_stop_one_bit")? {
+            // The parse ended at a `0` bit, so either the parameter set is
+            // malformed or it has syntax the parse doesn't understand.
+            // Tolerate this as trailing data, but there's no stop bit position
+            // for `canonical_nal` to truncate after.
+            self.end.has_extra_trailing_data = true;
+            return Ok(());
         }
+
+        // Only zero bits should follow. `inner.finish_rbsp` expects to read
+        // the stop bit first, so it reports a clean end as an EOF error, and
+        // any further `1` bit as success or `RemainingData`.
+        match self.inner.finish_rbsp() {
+            Err(BitReaderError::ReaderError(_, e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Ok(()) | Err(BitReaderError::RemainingData) => {
+                self.end.has_extra_trailing_data = true;
+            }
+            Err(e) => return Err(e),
+        }
+        self.end.stop_bit_pos = Some(self.pos);
+        Ok(())
     }
 
     fn finish_sei_payload(self) -> Result<(), h264_reader::rbsp::BitReaderError> {
         self.inner.finish_sei_payload()
     }
+}
+
+/// Returns the canonical form of a parameter set NAL parsed via [`TolerantBitReader`]: one that
+/// ends with the byte holding its `rbsp_stop_one_bit`, with the bits after that zeroed.
+///
+/// This strips trailing data, including zero bytes, which some cameras vary from one repetition
+/// of a parameter set to the next. `hdr_len` is the NAL header's length, which isn't part of
+/// the RBSP. Returns `nal` unchanged if `end` has no stop bit position (see
+/// [`RbspEnd::stop_bit_pos`]) or doesn't describe a stop bit within `nal` (a bug).
+///
+/// The result must only be used for parameter sets whose syntax has no `more_rbsp_data()`
+/// lookahead, which trailing data would affect. See [`set_matches`].
+pub(super) fn canonical_nal<'n>(nal: &'n [u8], hdr_len: usize, end: &RbspEnd) -> Cow<'n, [u8]> {
+    let Some(pos) = end.stop_bit_pos else {
+        // There's no stop bit where the parse ended (see `RbspEnd::stop_bit_pos`),
+        // or `finish_rbsp` wasn't called (a bug).
+        debug_assert!(end.has_extra_trailing_data, "no stop bit position");
+        return Cow::Borrowed(nal);
+    };
+    let Ok(rbsp_byte) = usize::try_from(pos / 8) else {
+        return Cow::Borrowed(nal);
+    };
+    let stop_bit = 0x80u8 >> (pos % 8);
+
+    // Find `rbsp_byte` within `nal`, skipping `emulation_prevention_three_byte`s as
+    // `h264_reader::rbsp::ByteReader` does.
+    let mut zeros = 0;
+    let mut i_rbsp = 0;
+    let mut off = None;
+    for (i, &b) in nal.iter().enumerate().skip(hdr_len) {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        if i_rbsp == rbsp_byte {
+            off = Some(i);
+            break;
+        }
+        i_rbsp += 1;
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+    }
+    let Some(off) = off.filter(|&off| nal[off] & stop_bit != 0) else {
+        debug_assert!(false, "stop bit {pos} not found in {nal:02x?}");
+        return Cow::Borrowed(nal);
+    };
+
+    // Keep the bits up to and including the stop bit.
+    let last = nal[off] & !(stop_bit - 1);
+    debug_assert!(
+        end.has_extra_trailing_data
+            || (last == nal[off] && nal[off + 1..].iter().all(|&b| b == 0 || b == 3)),
+        "stop bit {pos} is followed by data in {nal:02x?}, yet no trailing data was reported",
+    );
+    if off + 1 == nal.len() && last == nal[off] {
+        return Cow::Borrowed(nal);
+    }
+    let mut canonical = nal[..=off].to_vec();
+    canonical[off] = last;
+    Cow::Owned(canonical)
+}
+
+/// Returns true iff the parameter set NAL given in `chunks` is equivalent to `stored`.
+///
+/// If `tolerant`, NALs are equivalent iff they're identical through `stored`'s
+/// last `1` bit, whatever follows. As `stored` was successfully parsed, its
+/// `rbsp_stop_one_bit` is at or before that bit. If the NALs' syntax has no
+/// `more_rbsp_data()` lookahead, a parse of the `chunks` NAL reads the same
+/// bits and stops at the same stop bit, ignoring trailing data. For a
+/// [`canonical_nal`], this is exact: other NALs match iff their canonical forms
+/// are identical. Otherwise, it's conservative.
+///
+/// If not `tolerant`, NALs are equivalent iff they're identical.
+pub(super) fn set_matches<'c>(
+    stored: &[u8],
+    tolerant: bool,
+    chunks: impl IntoIterator<Item = &'c [u8]>,
+) -> bool {
+    let (mut prefix, last) = match tolerant
+        .then(|| stored.iter().rposition(|&b| b != 0))
+        .flatten()
+    {
+        Some(i) => (&stored[..i], Some(stored[i])),
+        None => (stored, None),
+    };
+    for mut chunk in chunks {
+        let n = prefix.len().min(chunk.len());
+        if chunk[..n] != prefix[..n] {
+            return false;
+        }
+        prefix = &prefix[n..];
+        chunk = &chunk[n..];
+        if !prefix.is_empty() {
+            continue; // chunk exhausted.
+        }
+        match (last, chunk.first()) {
+            (_, None) => {}
+            (None, Some(_)) => return false,
+            (Some(last), Some(&b)) => {
+                // Compare the bits up to and including `last`'s lowest `1`.
+                let mask = !((last & last.wrapping_neg()) - 1);
+                return b & mask == last;
+            }
+        }
+    }
+    prefix.is_empty() && last.is_none()
 }
 
 /// [`std::io::BufRead`] over a NAL's pieces within a [`MarkBuf`], without copying.
@@ -1179,5 +1360,144 @@ mod tests {
             .read_to_end(&mut rbsp)
             .unwrap();
         assert_eq!(rbsp, b"\x01\x00\x00\x01\x02\x03\x04");
+    }
+
+    #[test]
+    fn ue_bits() {
+        for (v, bits) in [
+            (0, 1),
+            (1, 3),
+            (2, 3),
+            (3, 5),
+            (6, 5),
+            (7, 7),
+            (u32::MAX - 1, 63),
+        ] {
+            assert_eq!(super::ue_bits(v), bits, "v={v}");
+        }
+    }
+
+    /// `TolerantBitReader` counts the bits each kind of read consumes, so
+    /// `canonical_nal` can find the stop bit, despite trailing data.
+    #[test]
+    fn tolerant_bit_reader_canonical() {
+        use h264_reader::rbsp::BitRead as _;
+
+        // ue(0)=1, ue(3)=00100, se(-2)=00101, se(1)=010, u(4)=1010, a skipped bit (1),
+        // u(8) via `read_to`=0xad, then the stop bit at position 27, then garbage.
+        let nal = b"\x67\x90\xaa\xb5\xb7\x55";
+        let mut end = RbspEnd::default();
+        let mut r = TolerantBitReader::new(
+            h264_reader::rbsp::BitReader::new(h264_reader::rbsp::ByteReader::without_skip(
+                &nal[1..],
+            )),
+            &mut end,
+        );
+        assert_eq!(r.read_ue("a").unwrap(), 0);
+        assert_eq!(r.read_ue("b").unwrap(), 3);
+        assert_eq!(r.read_se("c").unwrap(), -2);
+        assert_eq!(r.read_se("d").unwrap(), 1);
+        assert_eq!(r.read::<4, u8>("e").unwrap(), 0b1010);
+        r.skip(1, "f").unwrap();
+        assert_eq!(r.read_to::<u8>("g").unwrap(), 0xad);
+        r.finish_rbsp().unwrap();
+        assert!(end.has_extra_trailing_data);
+        assert_eq!(end.stop_bit_pos, Some(27));
+        assert_eq!(&*canonical_nal(nal, 1, &end), b"\x67\x90\xaa\xb5\xb0");
+
+        // Canonical already: borrowed. Trailing zero bytes: stripped, though
+        // they aren't reported as trailing data.
+        let end = RbspEnd {
+            has_extra_trailing_data: false,
+            stop_bit_pos: Some(27),
+        };
+        let canonical = canonical_nal(b"\x67\x90\xaa\xb5\xb0", 1, &end);
+        assert!(matches!(canonical, Cow::Borrowed(_)));
+        assert_eq!(
+            &*canonical_nal(b"\x67\x90\xaa\xb5\xb0\x00\x00", 1, &end),
+            b"\x67\x90\xaa\xb5\xb0"
+        );
+    }
+
+    /// `TolerantBitReader::finish_rbsp` distinguishes a clean end, data after
+    /// the stop bit, and a missing stop bit.
+    #[test]
+    fn tolerant_bit_reader_finish() {
+        use h264_reader::rbsp::BitRead as _;
+        let finish = |nal: &[u8]| {
+            let mut end = RbspEnd::default();
+            let mut r = TolerantBitReader::new(
+                h264_reader::rbsp::BitReader::new(h264_reader::rbsp::ByteReader::without_skip(
+                    &nal[1..],
+                )),
+                &mut end,
+            );
+            assert_eq!(r.read_ue("a").unwrap(), 0);
+            r.finish_rbsp().unwrap();
+            (end.has_extra_trailing_data, end.stop_bit_pos)
+        };
+
+        // ue(0), then the stop bit.
+        assert_eq!(finish(b"\x67\xc0"), (false, Some(1)));
+        assert_eq!(finish(b"\x67\xc0\x00"), (false, Some(1)));
+
+        // ue(0), then the stop bit, then garbage.
+        assert_eq!(finish(b"\x67\xc1"), (true, Some(1)));
+        assert_eq!(finish(b"\x67\xc0\x01"), (true, Some(1)));
+
+        // ue(0), then a 0 where the stop bit should be. This is tolerated, but
+        // there's no stop bit for `canonical_nal` to truncate after.
+        let nal = b"\x67\x90";
+        assert_eq!(finish(nal), (true, None));
+        let end = RbspEnd {
+            has_extra_trailing_data: true,
+            stop_bit_pos: None,
+        };
+        assert!(matches!(canonical_nal(nal, 1, &end), Cow::Borrowed(n) if n == nal));
+    }
+
+    /// `canonical_nal` maps the RBSP stop bit position to the NAL, past
+    /// `emulation_prevention_three_byte`s.
+    #[test]
+    fn canonical_nal_emulation_prevention() {
+        // RBSP: 00 00 01 80 ff; the stop bit is at position 24.
+        let end = RbspEnd {
+            has_extra_trailing_data: true,
+            stop_bit_pos: Some(24),
+        };
+        assert_eq!(
+            &*canonical_nal(b"\x42\x01\x00\x00\x03\x01\x80\xff", 2, &end),
+            b"\x42\x01\x00\x00\x03\x01\x80"
+        );
+    }
+
+    #[test]
+    fn set_matches() {
+        let stored = b"\x67\x90\xaa\xa0";
+        let tolerant = |chunks: &[&[u8]]| super::set_matches(stored, true, chunks.iter().copied());
+        let exact = |chunks: &[&[u8]]| super::set_matches(stored, false, chunks.iter().copied());
+        for (chunks, want_tolerant, want_exact) in [
+            (&[&b"\x67\x90\xaa\xa0"[..]][..], true, true),
+            (&[b"\x67", b"\x90\xaa", b"", b"\xa0"], true, true),
+            (&[b"\x67\x90\xaa\xa7\x55"], true, false),
+            (&[b"\x67\x90", b"\xaa", b"\xbf"], true, false),
+            (&[b"\x67\x90\xaa\xa0\x00"], true, false),
+            (&[b"\x67\x90\xaa"], false, false),
+            (&[b"\x67\x90\xaa", b""], false, false),
+            (&[b"\x67\x90\xaa\x80"], false, false), // stop bit moved.
+            (&[b"\x67\x90\xaa\xc0"], false, false), // bit before stop bit changed.
+            (&[b"\x67\x90\xab\xa0"], false, false),
+            (&[b"\x68\x90\xaa\xa0"], false, false),
+        ] {
+            assert_eq!(tolerant(chunks), want_tolerant, "tolerant {chunks:02x?}");
+            assert_eq!(exact(chunks), want_exact, "exact {chunks:02x?}");
+        }
+
+        // Trailing zero bytes in the stored set don't matter when tolerant.
+        assert!(super::set_matches(
+            b"\x67\x90\xaa\xa0\x00",
+            true,
+            [&b"\x67\x90\xaa\xa1"[..]]
+        ));
     }
 }

@@ -433,6 +433,7 @@ impl Sps {
                 r.skip(1, "inter_view_mv_vert_constraint_flag")?;
             }
             if sps_3d_extension_flag {
+                // H.265 section I.7.3.2.2.5, `sps_3d_extension`.
                 // d == 0
                 r.skip(1, "iv_di_mc_enabled_flag")?;
                 r.skip(1, "iv_mv_scal_enabled_flag")?;
@@ -443,6 +444,8 @@ impl Sps {
                 r.skip(1, "dbbp_enabled_flag")?;
 
                 // d == 1
+                r.skip(1, "iv_di_mc_enabled_flag")?;
+                r.skip(1, "iv_mv_scal_enabled_flag")?;
                 r.skip(1, "tex_mc_enabled_flag")?;
                 let _ = r.read_ue("log2_texmc_sub_pb_size_minus3")?;
                 r.skip(1, "intra_contour_enabled_flag")?;
@@ -455,12 +458,26 @@ impl Sps {
                 // H.265 section 7.3.2.2.3, `sps_scc_extension`.
                 r.skip(1, "sps_curr_pic_ref_enabled_flag")?;
                 if r.read_bit("palette_mode_enabled_flag")? {
-                    let _ = r.read_ue("palette_max_size");
+                    let _ = r.read_ue("palette_max_size")?;
                     let _ = r.read_ue("delta_palette_max_predictor_size")?;
                     if r.read_bit("sps_palette_predictor_initializers_present_flag")? {
-                        let _ = r.read_ue("sps_num_palette_predictor_initializers_minus1")?;
+                        let num_minus1 =
+                            r.read_ue("sps_num_palette_predictor_initializers_minus1")?;
+                        let num_comps = if chroma_format_idc == 0 { 1 } else { 3 };
+                        for comp in 0..num_comps {
+                            let bit_depth = 8 + u32::from(if comp == 0 {
+                                bit_depth_luma_minus8
+                            } else {
+                                bit_depth_chroma_minus8
+                            });
+                            for _ in 0..=num_minus1 {
+                                r.skip(bit_depth, "sps_palette_predictor_initializer")?;
+                            }
+                        }
                     }
                 }
+                r.skip(2, "motion_vector_resolution_control_idc")?;
+                r.skip(1, "intra_boundary_filtering_disabled_flag")?;
             }
             if sps_extension_4bits != 0 {
                 return Err(Error("sps_extension_4bits unimplemented".to_owned()));

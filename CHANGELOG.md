@@ -34,6 +34,13 @@
     `VideoPacketizer`, and `AudioParameters::payload_format`. It supports AAC
     as RFC 3640 `AAC-hbr`, fragmenting access units that don't fit in one
     payload.
+*   H.264 and H.265: drop data following an SPS's `rbsp_trailing_bits` (or an
+    H.265 PPS's), so that in-band sets which differ only in such data aren't
+    reported as parameter changes or re-parsed, by depacketizers or
+    packetizers. Some cameras vary this data with every frame.
+    `VideoParameters::parameter_sets` and the extra data hold the sets
+    without it.
+*   H.265: fix parsing of SPSs with `sps_3d_extension` or `sps_scc_extension`.
 *   H.264 and H.265: an access unit without slices (possible only from a
     misbehaving sender) no longer produces an empty frame.
 *   BREAKING: replace the crate-wide `retina::Error` with module-scoped error

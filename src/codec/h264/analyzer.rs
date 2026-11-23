@@ -147,6 +147,14 @@ impl ParameterSetKind {
             Self::Pps => p.in_band_pps(),
         }
     }
+
+    /// Returns true if sets of this kind are equivalent despite differing
+    /// trailing data; see [`crate::codec::h26x::set_matches`].
+    ///
+    /// Not the PPS: its `more_rbsp_data()` makes trailing data significant.
+    fn tolerates_trailing_data(self) -> bool {
+        matches!(self, Self::Sps)
+    }
 }
 
 impl NewParams {
@@ -394,7 +402,7 @@ impl<Ctx: Clone> NalAnalyzer<Ctx> for Analyzer<Ctx> {
             &mut self.pending,
             kind,
             self.parameters.as_ref().map(|p| kind.in_band(p)),
-            |b| b == nal,
+            |b| crate::codec::h26x::set_matches(b, kind.tolerates_trailing_data(), [nal]),
             || Bytes::copy_from_slice(nal),
         );
         Ok(())
@@ -885,7 +893,7 @@ impl AuView<'_> {
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             if let Some(kind) = ParameterSetKind::of(nal.hdr) {
                 let in_band = self.parameters.as_ref().map(|p| kind.in_band(p));
-                let matches = |b: &[u8]| nal_matches(b, nal.hdr, nal_pieces, buf);
+                let matches = |b: &[u8]| nal_matches(b, kind, nal.hdr, nal_pieces, buf);
                 let copy = || to_bytes(nal.hdr, nal.len, nal_pieces, buf);
                 if meta.seen_vcl {
                     // A parameter set after the first slice is for a later
@@ -1314,28 +1322,24 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
     }
 }
 
-/// Returns true iff the bytes of `nal` equal the bytes of `[hdr, ..pieces]`.
-fn nal_matches(nal: &[u8], hdr: NalHeader, pieces: &[BufRange], buf: &MarkBuf) -> bool {
-    if nal.first() != Some(&u8::from(hdr)) {
-        return false;
-    }
-    let mut nal_pos = 1;
-    for piece in pieces {
-        let (s1, s2) = buf.split(piece.pos, piece.len as usize).slices();
-        let new_pos = nal_pos + piece.len as usize;
-        if nal.len() < new_pos {
-            return false;
-        }
-        let s1_end = nal_pos + s1.len();
-        if s1[..] != nal[nal_pos..s1_end] {
-            return false;
-        }
-        if !s2.is_empty() && s2[..] != nal[s1_end..new_pos] {
-            return false;
-        }
-        nal_pos = new_pos;
-    }
-    nal_pos == nal.len()
+/// Returns true iff stored parameter set `nal` is equivalent to `[hdr, ..pieces]`;
+/// see [`crate::codec::h26x::set_matches`].
+fn nal_matches(
+    nal: &[u8],
+    kind: ParameterSetKind,
+    hdr: NalHeader,
+    pieces: &[BufRange],
+    buf: &MarkBuf,
+) -> bool {
+    let hdr = [u8::from(hdr)];
+    crate::codec::h26x::set_matches(
+        nal,
+        kind.tolerates_trailing_data(),
+        std::iter::once(&hdr[..]).chain(pieces.iter().flat_map(|piece| {
+            let (s1, s2) = buf.split(piece.pos, piece.len as usize).slices();
+            [s1, s2]
+        })),
+    )
 }
 
 /// Saves the given NAL to a contiguous `Bytes`.

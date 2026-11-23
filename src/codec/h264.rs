@@ -13,7 +13,7 @@ use h264_reader::nal::{NalHeader, UnitType};
 use tracing::debug;
 
 use crate::buf::{BufRange, MarkBuf};
-use crate::codec::h26x::{NalAnalyzer as _, TolerantBitReader};
+use crate::codec::h26x::{NalAnalyzer as _, RbspEnd, TolerantBitReader};
 use crate::codec::{AllPixelDimensions, LossReason, VideoHandler};
 use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
@@ -868,15 +868,15 @@ impl InternalParameters {
             sps_rbsp[0], sps_rbsp[1], sps_rbsp[2]
         );
 
-        let mut sps_has_extra_trailing_data = false;
+        let mut sps_end = RbspEnd::default();
         let sps_hex = crate::hex::LimitedHex::new(sps_nal, 256);
-        let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(TolerantBitReader {
-            inner: h264_reader::rbsp::BitReader::new(&*sps_rbsp),
-            has_extra_trailing_data: &mut sps_has_extra_trailing_data,
-        })
+        let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(TolerantBitReader::new(
+            h264_reader::rbsp::BitReader::new(&*sps_rbsp),
+            &mut sps_end,
+        ))
         .map_err(|e| format!("Bad SPS {sps_hex}: {e:?}"))?;
         debug!(sps = %sps_hex, "parsed SPS: {:#?}", sps);
-        if sps_has_extra_trailing_data && !seen_extra_trailing_data {
+        if sps_end.has_extra_trailing_data && !seen_extra_trailing_data {
             tracing::warn!(
                 sps = %sps_hex,
                 "Ignoring trailing data in SPS; \
@@ -884,6 +884,13 @@ impl InternalParameters {
             );
             seen_extra_trailing_data = true;
         }
+
+        // Drop any trailing data, so that repetitions of the SPS which differ
+        // only in trailing data are recognized as the same. The H.264 SPS
+        // syntax has no `more_rbsp_data()`, so this doesn't change its
+        // meaning. The PPS syntax does, so it's left as is.
+        let canonical_sps = super::h26x::canonical_nal(sps_nal, 1, &sps_end);
+        let sps_nal = &*canonical_sps;
 
         let all_pixel_dimensions = Self::all_pixel_dimensions(&sps)
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
@@ -998,13 +1005,10 @@ impl InternalParameters {
                 return None;
             }
         };
-        let mut has_extra_trailing_data = false;
+        let mut end = RbspEnd::default();
         match h264_reader::nal::pps::PicParameterSet::from_bits(
             &ctx,
-            TolerantBitReader {
-                inner: h264_reader::rbsp::BitReader::new(&*pps_rbsp),
-                has_extra_trailing_data: &mut has_extra_trailing_data,
-            },
+            TolerantBitReader::new(h264_reader::rbsp::BitReader::new(&*pps_rbsp), &mut end),
         ) {
             Ok(pps) => ctx.put_pic_param_set(pps),
             Err(e) => {
@@ -1145,6 +1149,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
     type Header = [u8; 1];
     type FuHeader = [u8; 2];
     const PARAMETER_SETS: usize = 2;
+    const TOLERATES_TRAILING_DATA: &'static [bool] = &[true, false];
 
     fn parameter_sets(parameters: &VideoParameters) -> Option<Vec<Bytes>> {
         match &parameters.codec {
@@ -1913,6 +1918,84 @@ mod tests {
         };
         assert!(frame.has_new_parameters);
         assert!(d.parameters().is_some());
+    }
+
+    /// In-band SPSs which differ only in trailing data are the same
+    /// parameters, and the parameters hold the SPS without trailing data.
+    #[test]
+    fn sps_trailing_data_not_a_change() {
+        init_logging();
+        // As in `sps_with_extra_trailing_bytes`, without its extra byte.
+        let sps =
+            b"\x67\x64\x00\x33\xac\x15\x14\xa0\xa0\x3d\xa1\x00\x00\x04\xf6\x00\x00\x63\x38\x04";
+        let pps = b"\x68\xee\x3c\xb0";
+        let mut buf = MarkBuf::new(65536);
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::OnChange,
+            ..crate::codec::FrameFormat::MP4
+        });
+        let mut seq = 0;
+        let mut push_frame = |in_band_sps: &[u8]| {
+            let nals: [&[u8]; 3] = [in_band_sps, pps, b"\x65idr slice"];
+            for (i, nal) in nals.iter().enumerate() {
+                let pkt = TestPacket {
+                    ctx: crate::PacketContext::dummy(),
+                    timestamp: crate::Timestamp {
+                        timestamp: i64::from(seq),
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: seq,
+                    loss: 0,
+                    mark: i == nals.len() - 1,
+                    payload_type: 0,
+                }
+                .write(&mut buf, nal.iter().copied());
+                seq += 1;
+                d.push_collect(&pkt);
+            }
+            let frame = match d.pull() {
+                Some(Ok(Item::Video(frame))) => frame,
+                o => panic!("unexpected pull result {o:#?}"),
+            };
+            let params = d.parameters().unwrap();
+            assert_eq!(
+                params.parameter_sets().collect::<Vec<_>>(),
+                [&sps[..], &pps[..]]
+            );
+            (frame.has_new_parameters, frame.data().to_vec())
+        };
+
+        // The first frame's parameters are new, and the SPS inserted into the frame has no
+        // trailing data.
+        let with_trailing = |trailing: &[u8]| -> Vec<u8> { [&sps[..], trailing].concat() };
+        let (new, data) = push_frame(&with_trailing(b"\x04"));
+        assert!(new);
+        let mut expected = Vec::new();
+        for nal in [&sps[..], &pps[..], b"\x65idr slice"] {
+            expected.extend_from_slice(&u32::try_from(nal.len()).unwrap().to_be_bytes());
+            expected.extend_from_slice(nal);
+        }
+        assert_eq_hex!(data, expected);
+
+        // Later frames' differing trailing data (garbage, zeros, garbage in
+        // the stop bit's byte, or none) isn't a change.
+        let mut garbage_in_stop_byte = sps.to_vec();
+        *garbage_in_stop_byte.last_mut().unwrap() = 0x07;
+        for in_band_sps in [
+            with_trailing(b"\x05\x06"),
+            with_trailing(b"\x00\x00"),
+            with_trailing(b""),
+            with_trailing(b"\x00\x01"),
+            garbage_in_stop_byte,
+        ] {
+            let (new, _) = push_frame(&in_band_sps);
+            assert!(!new, "SPS {in_band_sps:02x?}");
+        }
     }
 
     #[rustfmt::skip]
@@ -4193,6 +4276,31 @@ mod packetizer_tests {
             r.take(),
             [rec(true, true, &stap_a_of(0x58, &[b"\x06sei", b"\x41p"]))]
         );
+    }
+
+    /// An in-band SPS which differs from the current one only in trailing
+    /// data isn't a change, before or after the insertion point.
+    #[test]
+    fn in_band_sps_trailing_data() {
+        let sps_with_trailing = [SPS, b"\x01\x02"].concat();
+        let mut p = packetizer(ParameterSetInsertion::OnChange);
+        let mut r = Recorder::default();
+        let before = p.payload_format();
+        p.start_frame(frame(0, false), &mut r);
+        for nal in [
+            b"\x06sei",
+            &sps_with_trailing[..],
+            b"\x41p",
+            &sps_with_trailing[..],
+        ] {
+            p.push_unit(Position::Complete, &[nal], &mut r);
+        }
+        p.end_frame(&mut r);
+        assert_eq!(
+            r.take(),
+            [rec(true, true, &stap_a_of(0x58, &[b"\x06sei", b"\x41p"]))]
+        );
+        assert_eq!(p.payload_format(), before);
     }
 
     /// In-band parameter sets which can't be parsed are passed through at

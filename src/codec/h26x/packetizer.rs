@@ -32,6 +32,10 @@ pub(crate) trait Codec {
     /// for H.265.
     const PARAMETER_SETS: usize;
 
+    /// For each of [`Codec::parameter_sets`], whether sets which differ only
+    /// in trailing data are equivalent; see [`super::set_matches`].
+    const TOLERATES_TRAILING_DATA: &'static [bool];
+
     /// Returns the parameter sets within `parameters`, in insertion order, or
     /// `None` if they're for a different codec.
     fn parameter_sets(parameters: &VideoParameters) -> Option<Vec<Bytes>>;
@@ -353,7 +357,11 @@ impl<C: Codec> Packetizer<C> {
         if !new_sets
             .iter()
             .zip(&self.parameter_sets)
-            .any(|(new, old)| new.as_ref().is_some_and(|n| n[..] != old[..]))
+            .zip(C::TOLERATES_TRAILING_DATA)
+            .any(|((new, old), &tolerant)| {
+                new.as_ref()
+                    .is_some_and(|n| !super::set_matches(old, tolerant, [&n[..]]))
+            })
         {
             return;
         }
@@ -392,10 +400,13 @@ impl<C: Codec> Packetizer<C> {
         let (i, set) = self.set_unit.take().expect("set unit in progress");
         let late = !self.insertion_pending && !self.dropping_frame;
         if late
-            && self.new_sets[i]
-                .as_deref()
-                .unwrap_or(&self.parameter_sets[i][..])
-                != &set[..]
+            && !super::set_matches(
+                self.new_sets[i]
+                    .as_deref()
+                    .unwrap_or(&self.parameter_sets[i][..]),
+                C::TOLERATES_TRAILING_DATA[i],
+                [&set[..]],
+            )
         {
             self.push_nal(Position::Complete, &[&set], sink);
             self.late_sets_delivered |= !self.dropping_frame;

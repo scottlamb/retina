@@ -22,7 +22,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 
 use crate::buf::{BufRange, MarkBuf};
-use crate::codec::h26x::{NalAnalyzer as _, TolerantBitReader};
+use crate::codec::h26x::{NalAnalyzer as _, RbspEnd, TolerantBitReader};
 use crate::codec::{FmtpParser, LossReason, VideoHandler, VideoParameters};
 use crate::inputs::Input as _;
 use crate::rtp::ReceivedPacketRef;
@@ -765,15 +765,12 @@ impl InternalParameters {
         if sps_h.unit_type() != nal::UnitType::SpsNut {
             return Err(super::Error::invalid("SPS NAL is not SPS"));
         }
-        let mut sps_has_extra_trailing_data = false;
-        let sps_bits = TolerantBitReader {
-            inner: sps_bits,
-            has_extra_trailing_data: &mut sps_has_extra_trailing_data,
-        };
+        let mut sps_end = RbspEnd::default();
+        let sps_bits = TolerantBitReader::new(sps_bits, &mut sps_end);
         let sps = nal::Sps::from_bits(sps_bits).map_err(|e| {
             super::Error::invalid(format!("{e}\nwhile parsing SPS: {sps_hex}")).with_source(e)
         })?;
-        if sps_has_extra_trailing_data && !seen_extra_trailing_data {
+        if sps_end.has_extra_trailing_data && !seen_extra_trailing_data {
             tracing::warn!(
                 sps = %sps_hex,
                 "Ignoring trailing data in SPS; \
@@ -789,15 +786,12 @@ impl InternalParameters {
         if pps_h.unit_type() != nal::UnitType::PpsNut {
             return Err(super::Error::invalid("PPS NAL is not PPS"));
         }
-        let mut pps_has_extra_trailing_data = false;
-        let pps_bits = TolerantBitReader {
-            inner: pps_bits,
-            has_extra_trailing_data: &mut pps_has_extra_trailing_data,
-        };
+        let mut pps_end = RbspEnd::default();
+        let pps_bits = TolerantBitReader::new(pps_bits, &mut pps_end);
         let pps = nal::Pps::from_bits(pps_bits).map_err(|e| {
             super::Error::invalid(format!("{e}\nwhile parsing PPS: {pps_hex}")).with_source(e)
         })?;
-        if pps_has_extra_trailing_data && !seen_extra_trailing_data {
+        if pps_end.has_extra_trailing_data && !seen_extra_trailing_data {
             tracing::warn!(
                 pps = %pps_hex,
                 "Ignoring trailing data in PPS; \
@@ -805,6 +799,15 @@ impl InternalParameters {
             );
             seen_extra_trailing_data = true;
         }
+
+        // Drop any trailing data, so that repetitions of the SPS or PPS which
+        // differ only in trailing data are recognized as the same. Neither's
+        // syntax has `more_rbsp_data()`, so this doesn't change their meaning.
+        // The VPS isn't parsed, so it's left as is.
+        let canonical_sps = super::h26x::canonical_nal(sps_nal, 2, &sps_end);
+        let sps_nal = &*canonical_sps;
+        let canonical_pps = super::h26x::canonical_nal(pps_nal, 2, &pps_end);
+        let pps_nal = &*canonical_pps;
 
         let rfc6381_codec = sps.rfc6381_codec();
 
@@ -900,6 +903,7 @@ impl super::h26x::packetizer::Codec for PacketizeCodec {
     type Header = [u8; 2];
     type FuHeader = [u8; 3];
     const PARAMETER_SETS: usize = 3;
+    const TOLERATES_TRAILING_DATA: &'static [bool] = &[false, true, true];
 
     fn parameter_sets(parameters: &VideoParameters) -> Option<Vec<Bytes>> {
         match &parameters.codec {
@@ -1267,6 +1271,89 @@ mod tests {
             }
             assert_eq_hex!(frame.data(), &expected);
         }
+    }
+
+    /// SPSs and PPSs which differ only in trailing data are the same
+    /// parameters, and the parameters hold them without trailing data. VPSs
+    /// aren't parsed, so must match exactly.
+    #[test]
+    fn trailing_data_not_a_change() {
+        init_logging();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let vps = b64
+            .decode("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")
+            .unwrap();
+        let sps = b64
+            .decode("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=")
+            .unwrap();
+        let pps = b64.decode("RAHA8saNA7NA").unwrap();
+        let with_trailing = |nal: &[u8], trailing: &[u8]| -> Vec<u8> { [nal, trailing].concat() };
+
+        // `sprop-sps` and `sprop-pps` with trailing data yield the sets without.
+        let sprop = format!(
+            "profile-id=1;sprop-sps={};sprop-pps={};sprop-vps={}",
+            b64.encode(with_trailing(&sps, b"\x04")),
+            b64.encode(with_trailing(&pps, b"\x00\x00")),
+            b64.encode(&vps),
+        );
+        let mut d = super::Depacketizer::new(90_000, Some(&sprop)).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat::MP4);
+        let expected_sets = [&vps[..], &sps[..], &pps[..]];
+        assert_eq!(
+            d.parameters().unwrap().parameter_sets().collect::<Vec<_>>(),
+            expected_sets
+        );
+
+        let mut buf = MarkBuf::new(65536);
+        let mut seq = 0;
+        let mut push_frame = |nals: &[&[u8]]| {
+            for (i, nal) in nals.iter().chain([&&b"\x26\x01idr"[..]]).enumerate() {
+                let pkt = TestPacket {
+                    ctx: PacketContext::dummy(),
+                    timestamp: crate::Timestamp {
+                        timestamp: i64::from(seq),
+                        clock_rate: NonZeroU32::new(90_000).unwrap(),
+                        start: 0,
+                    },
+                    ssrc: 0,
+                    sequence_number: seq,
+                    loss: 0,
+                    mark: i == nals.len(),
+                    payload_type: 0,
+                }
+                .write(&mut buf, nal.iter().copied());
+                seq += 1;
+                d.push_collect(&pkt);
+            }
+            let frame = match d.pull() {
+                Some(Ok(Item::Video(frame))) => frame,
+                o => panic!("unexpected pull result {o:#?}"),
+            };
+            let sets = d.parameters().unwrap().parameter_sets().map(<[u8]>::to_vec);
+            (frame.has_new_parameters, sets.collect::<Vec<_>>())
+        };
+
+        let mut garbage_in_stop_byte = pps.clone();
+        *garbage_in_stop_byte.last_mut().unwrap() = 0x5f;
+        for (sps, pps) in [
+            (sps.clone(), pps.clone()),
+            (
+                with_trailing(&sps, b"\x05\x06"),
+                with_trailing(&pps, b"\x80"),
+            ),
+            (with_trailing(&sps, b"\x00\x00"), garbage_in_stop_byte),
+        ] {
+            let (new, sets) = push_frame(&[&vps, &sps, &pps]);
+            assert!(!new, "SPS {sps:02x?} PPS {pps:02x?}");
+            assert_eq!(sets, expected_sets);
+        }
+
+        // A VPS with trailing data is a change, though it parses the same.
+        let vps_with_trailing = with_trailing(&vps, b"\x01");
+        let (new, sets) = push_frame(&[&vps_with_trailing, &sps, &pps]);
+        assert!(new);
+        assert_eq!(sets, [&vps_with_trailing[..], &sps[..], &pps[..]]);
     }
 
     /// Tests that every IRAP picture type (not just IDR) is a random access
