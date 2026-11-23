@@ -187,7 +187,6 @@ impl RingBuf {
     }
 
     /// Appends `data` to the buffer, growing if necessary.
-    #[cfg(test)]
     pub fn extend(&mut self, data: &[u8]) {
         let (s1, s2) = self.spare_capacity(data.len());
         let mid = data.len().min(s1.len());
@@ -472,7 +471,6 @@ impl MarkBuf {
     }
 
     /// Appends data directly to the buffer.
-    #[cfg(test)]
     pub fn extend(&mut self, data: &[u8]) {
         self.reclaim();
         self.ring.extend(data);
